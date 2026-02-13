@@ -1,0 +1,63 @@
+# Weights & Biases Configuration for Academic Research
+# Configuration for experiment tracking and collaboration
+
+version: "wandb-1.0"
+
+# Connection Settings
+connection:
+  api_key: ${WANDB_API_KEY}  # Load from environment
+  base_url: "https://api.wandb.ai"
+  timeout_seconds: 30
+  retry_attempts: 3
+
+# Project Structure
+project:
+  name: "velora-pillar0-2026"
+  entity: "shaheryarsadaqat-jxt-harbin-institute-of-technology"
+  description: "VeLoRA Pillar 0: Wasted Compute Quantification in Transformer Fine-tuning"
+  access: "public"  # Public for academic collaboration
+
+# Run Configuration
+run:
+  name_template: "{model}_{task}_seed{seed}_lr{lr}"
+  group_template: "{model_type}_comparison"
+  job_type: "fine-tuning-experiment"
+  tags: ["academic-research", "efficiency", "nlp", "2026"]
+
+# Logging Configuration
+logging:
+  metrics_frequency: "step"
+  system_metrics: true
+  gradient_logging: false  # Memory intensive
+  histogram_logging: false
+  media_logging: false
+  
+  # Custom Metrics
+  custom_metrics:
+    - "efficiency/wasted_percentage"
+    - "efficiency/gsnr"
+    - "efficiency/ler"
+    - "performance/validation_accuracy"
+    - "performance/training_loss"
+
+# Artifact Management
+artifacts:
+  save_model_checkpoints: false
+  save_training_logs: true
+  save_configuration: true
+  save_analysis_results: true
+  artifact_versioning: "incremental"
+
+# Collaboration Features
+collaboration:
+  share_dashboard: true
+  generate_reports: true
+  export_formats: ["pdf", "html", "json"]
+  notification_level: "important"
+
+# Integration with Other Tools
+integrations:
+  tensorboard: false
+  mlflow: false
+  comet_ml: false
+  neptune: false
