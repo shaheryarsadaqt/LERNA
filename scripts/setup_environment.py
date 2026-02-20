@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class EnvironmentSetup:
     """Comprehensive environment setup for research."""
     
-    def __init__(self, config_path: str = "./configs/pillar0_research_2026.yaml"):
+    def __init__(self, config_path: str = "./configs/lerna_research_2026.yaml"):
         self.config_path = Path(config_path)
         self.project_root = Path(__file__).parent.parent
         self.requirements_dir = self.project_root / "requirements"
@@ -39,7 +39,7 @@ class EnvironmentSetup:
         # System information
         self.system_info = self._get_system_info()
         
-        logger.info(f"🧪 Environment Setup for VeLoRA Pillar 0 Research")
+        logger.info(f"Environment Setup for LERNA Research")
         logger.info(f"   Project root: {self.project_root}")
         logger.info(f"   System: {self.system_info['system']} {self.system_info['release']}")
         logger.info(f"   Python: {self.system_info['python_version']}")
@@ -78,8 +78,8 @@ class EnvironmentSetup:
         
         directories = [
             "configs",
-            "pillar0/utils",
-            "pillar0/callbacks",
+            "lerna/utils",
+            "lerna/callbacks",
             "scripts",
             "experiments/runs",
             "experiments/analysis",
@@ -214,9 +214,9 @@ Jupyter notebooks for exploratory analysis and visualization.
         # Create example wandb config
         wandb_config = {
             "entity": self.config.get("wandb", {}).get("entity", "your-entity"),
-            "project": self.config.get("wandb", {}).get("project", "velora-pillar0"),
+            "project": self.config.get("wandb", {}).get("project", "lerna-research"),
             "tags": ["research", "efficiency", "nlp"],
-            "notes": "VeLoRA Pillar 0: Compute Waste Quantification",
+            "notes": "LERNA: Energy-Efficient LLM Fine-Tuning",
         }
         
         config_path = self.project_root / "configs" / "wandb_config.json"
@@ -324,7 +324,7 @@ Jupyter notebooks for exploratory analysis and visualization.
         
         env_config = {
             "timestamp": self._get_timestamp(),
-            "project": "VeLoRA Pillar 0",
+            "project": "LERNA",
             "version": "research-2.0",
             "system": self.system_info,
             "python_dependencies": self._get_installed_packages(),
@@ -420,8 +420,8 @@ Jupyter notebooks for exploratory analysis and visualization.
         """Validate directory structure."""
         required_dirs = [
             "configs",
-            "pillar0/utils",
-            "pillar0/callbacks",
+            "lerna/utils",
+            "lerna/callbacks",
             "scripts",
             "experiments/runs",
             "requirements",
@@ -524,7 +524,7 @@ Jupyter notebooks for exploratory analysis and visualization.
         """Save validation report."""
         report = {
             "timestamp": self._get_timestamp(),
-            "project": "VeLoRA Pillar 0",
+            "project": "LERNA",
             "validation_results": results,
             "overall_status": all(r["valid"] for r in results.values()),
             "next_steps": self._get_next_steps(results),
@@ -590,8 +590,8 @@ Jupyter notebooks for exploratory analysis and visualization.
         if validation.get("overall_status", False):
             logger.info("\n🎉 Environment is ready for research!")
             logger.info("\nNext steps:")
-            logger.info("1. Configure your experiment in configs/pillar0_research_2026.yaml")
-            logger.info("2. Run: python scripts/run_research_sweep.py --config configs/pillar0_research_2026.yaml")
+            logger.info("1. Configure your experiment in configs/lerna_research_2026.yaml")
+            logger.info("2. Run: python scripts/run_research_sweep.py --config configs/lerna_research_2026.yaml")
             logger.info("3. Monitor experiments: wandb.ai")
         else:
             logger.info("\n⚠️  Setup completed with issues:")
@@ -608,7 +608,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="./configs/pillar0_research_2026.yaml",
+        default="./configs/lerna_research_2026.yaml",
         help="Path to configuration file",
     )
     parser.add_argument(

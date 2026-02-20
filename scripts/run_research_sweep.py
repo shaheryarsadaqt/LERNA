@@ -40,11 +40,11 @@ from transformers import (
     set_seed,
 )
 
-from pillar0.utils.plateau_ies import IESPlateauDetector, compute_statistical_significance
-from pillar0.utils.efficiency_metrics import EfficiencyMetricsCollector, validate_ler_metric
-from pillar0.utils.experiment_tracking import ResearchExperimentLogger, StatisticalAnalysisEngine
-from pillar0.callbacks.ies_callback import IESCallback, EfficiencyMonitoringCallback
-from pillar0.callbacks.efficiency_callback import EfficiencyMetricsCallback, ProbeAccuracyCallback
+from lerna.utils.plateau_ies import IESPlateauDetector, compute_statistical_significance
+from lerna.utils.efficiency_metrics import EfficiencyMetricsCollector, validate_ler_metric
+from lerna.utils.experiment_tracking import ResearchExperimentLogger, StatisticalAnalysisEngine
+from lerna.callbacks.ies_callback import IESCallback, EfficiencyMonitoringCallback
+from lerna.callbacks.efficiency_callback import EfficiencyMetricsCallback, ProbeAccuracyCallback
 
 # Configure logging
 logging.basicConfig(
@@ -166,7 +166,7 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
     # Initialize experiment logger
     experiment_logger = ResearchExperimentLogger(
         experiment_name=run_name,
-        researcher="VeLoRA Research Team",
+        researcher="LERNA Research Team",
         institution="Harbin Institute of Technology",
         enable_wandb=config.use_wandb,
         output_dir=str(output_dir),
@@ -685,7 +685,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="./configs/pillar0_research_2026.yaml",
+        default="./configs/lerna_research_2026.yaml",
         help="Path to configuration YAML file",
     )
     parser.add_argument(

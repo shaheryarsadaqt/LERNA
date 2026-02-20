@@ -12,9 +12,9 @@ connection:
 
 # Project Structure
 project:
-  name: "velora-pillar0-2026"
+  name: "lerna-2026"
   entity: "shaheryarsadaqat-jxt-harbin-institute-of-technology"
-  description: "VeLoRA Pillar 0: Wasted Compute Quantification in Transformer Fine-tuning"
+  description: "LERNA: Energy-Efficient Fine-Tuning via Causal Learning Diagnostics and Adaptive Gradient Bypassing"
   access: "public"  # Public for academic collaboration
 
 # Run Configuration

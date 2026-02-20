@@ -373,8 +373,8 @@ class InstallationValidator:
         
         required_dirs = [
             "configs",
-            "pillar0/utils",
-            "pillar0/callbacks",
+            "lerna/utils",
+            "lerna/callbacks",
             "scripts",
             "experiments/runs",
             "experiments/analysis",
@@ -383,8 +383,8 @@ class InstallationValidator:
         ]
         
         required_files = [
-            "configs/pillar0_research_2026.yaml",
-            "pillar0/__init__.py",
+            "configs/lerna_research_2026.yaml",
+            "lerna/__init__.py",
             "scripts/run_research_sweep.py",
             "requirements/requirements.txt",
             "README.md",
@@ -467,9 +467,9 @@ class InstallationValidator:
         
         # Check if can import project modules
         project_modules = [
-            "pillar0.utils.plateau_ies",
-            "pillar0.utils.efficiency_metrics",
-            "pillar0.callbacks.ies_callback",
+            "lerna.utils.plateau_ies",
+            "lerna.utils.efficiency_metrics",
+            "lerna.callbacks.ies_callback",
             "scripts.run_research_sweep",
         ]
         
@@ -629,7 +629,7 @@ class InstallationValidator:
             
             steps = [
                 "✅ Installation validated successfully!",
-                "Next: Configure your experiments in configs/pillar0_research_2026.yaml",
+                "Next: Configure your experiments in configs/lerna_research_2026.yaml",
                 "Next: Run experiments: python scripts/run_research_sweep.py",
                 "Next: Monitor results: wandb.ai",
             ]
