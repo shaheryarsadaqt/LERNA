@@ -34,6 +34,11 @@ from datetime import datetime
 import torch
 torch._dynamo.config.disable = True
 
+# RTX 5090 Blackwell: disable flash/mem-efficient SDP kernels (cause SIGFPE)
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -187,11 +192,13 @@ def run_single_experiment(
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     cfg = GLUE_TASK_CONFIG[task_name]
 
+    # Load in fp16 to avoid CUBLAS_STATUS_NOT_INITIALIZED on Blackwell
+    # when cuDNN version mismatch corrupts CUDA context for fp32 kernels
     model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME,
         num_labels=cfg["num_labels"],
         reference_compile=False,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
     )
 
     if hw_cfg["gradient_checkpointing"]:
@@ -356,7 +363,7 @@ def run_single_experiment(
         save_strategy="steps",
         save_steps=eval_steps,
         save_total_limit=2,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         logging_steps=max(eval_steps // 5, 1),
@@ -379,7 +386,7 @@ def run_single_experiment(
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        tokenizer=tokenizer,
+        # # tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[
