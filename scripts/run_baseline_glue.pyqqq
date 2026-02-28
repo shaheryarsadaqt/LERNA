@@ -300,17 +300,15 @@ class WasteQuantifier:
 
     def compute_waste_metrics(self):
         """Compute waste metrics with 95% confidence intervals."""
-        try:
-            from scipy import stats as scipy_stats
-        except ImportError:
-            scipy_stats = None
+        from scipy import stats as scipy_stats
         
         n = len(self.improving_steps)
         if n == 0:
-            return {"waste_ratio": 0, "ci_95_low": 0, "ci_95_high": 0, "total_steps": 0,
-                    "wasted_steps": 0, "improving_steps": 0, "wasted_energy_j": 0,
-                    "total_energy_j": 0, "energy_waste_pct": 0, "wasted_time_s": 0,
-                    "total_time_s": 0, "waste_reasons": {}}
+            return {"waste_ratio": 0, "ci_95": (0, 0), "total_steps": 0,
+                    "ci_95_low": 0, "ci_95_high": 0, "wasted_steps": 0,
+                    "improving_steps": 0, "wasted_energy_j": 0, "total_energy_j": 0,
+                    "energy_waste_pct": 0, "wasted_time_s": 0, "total_time_s": 0,
+                    "waste_reasons": {}}
         
         waste_flags = [0 if imp else 1 for imp in self.improving_steps]
         waste_ratio = np.mean(waste_flags)
@@ -537,10 +535,7 @@ class LRLossCorrelationTracker:
 
     def compute_correlation(self, window=None):
         """Compute Pearson correlation between LR and loss."""
-        try:
-            from scipy import stats as scipy_stats
-        except ImportError:
-            return None
+        from scipy import stats as scipy_stats
         
         if len(self.lr_loss_pairs) < 5:
             return None
@@ -550,7 +545,7 @@ class LRLossCorrelationTracker:
         losses = [p[1] for p in pairs]
         
         if np.std(lrs) < 1e-10 or np.std(losses) < 1e-10:
-            return {"correlation": 0, "p_value": 1.0, "n_samples": len(pairs)}
+            return {"correlation": 0, "p_value": 1.0}
         
         corr, p_val = scipy_stats.pearsonr(lrs, losses)
         return {
@@ -653,8 +648,7 @@ def build_compute_metrics(task_name: str):
         metric = evaluate.load("glue", task_name)
 
     def compute_metrics(eval_pred):
-        predictions = eval_pred.predictions
-        labels = eval_pred.label_ids
+        predictions, labels = eval_pred
         if cfg["num_labels"] == 1:
             predictions = predictions.squeeze()
         else:
@@ -694,12 +688,11 @@ def log_training_dynamics_plots(
         if wandb.run is None:
             return
 
-        # ── 1. GSNR Heatmap (per-layer over time) ────────────────────
+        # 1. GSNR Heatmap (per-layer over time)
         if gsnr_tracker.gsnr_per_layer_history:
             layers = sorted(gsnr_tracker.gsnr_per_layer_history.keys())
             max_len = max(len(v) for v in gsnr_tracker.gsnr_per_layer_history.values())
             
-            # Shorten layer names for display
             short_names = []
             for l in layers:
                 parts = l.split(".")
@@ -711,9 +704,7 @@ def log_training_dynamics_plots(
             z_data = []
             for layer in layers:
                 vals = gsnr_tracker.gsnr_per_layer_history[layer]
-                # Pad with None if needed
                 padded = vals + [None] * (max_len - len(vals))
-                # Log scale for better visualization
                 z_data.append([math.log10(v + 1e-10) if v is not None else None for v in padded])
             
             fig = go.Figure(data=go.Heatmap(
@@ -729,16 +720,16 @@ def log_training_dynamics_plots(
                 height=max(400, len(layers) * 25),
                 width=900,
             )
-            wandb.log({f"dynamics/gsnr_heatmap": wandb.Plotly(fig)})
+            wandb.log({"dynamics/gsnr_heatmap": wandb.Plotly(fig)})
 
-        # ── 2. Gradient Norm Distribution (per-layer) ─────────────────
+        # 2. Gradient Norm Distribution (per-layer)
         if gsnr_tracker.grad_norm_history:
             fig = go.Figure()
-            for layer_name in list(gsnr_tracker.grad_norm_history.keys())[:15]:  # Top 15 layers
+            for layer_name in list(gsnr_tracker.grad_norm_history.keys())[:15]:
                 norms = gsnr_tracker.grad_norm_history[layer_name]
                 short = layer_name.split(".")[-2:] if len(layer_name.split(".")) > 2 else [layer_name]
                 fig.add_trace(go.Box(
-                    y=norms[-100:],  # Last 100 values
+                    y=norms[-100:],
                     name=".".join(short),
                     boxpoints="outliers",
                 ))
@@ -750,9 +741,9 @@ def log_training_dynamics_plots(
                 width=1000,
                 showlegend=False,
             )
-            wandb.log({f"dynamics/grad_norm_distribution": wandb.Plotly(fig)})
+            wandb.log({"dynamics/grad_norm_distribution": wandb.Plotly(fig)})
 
-        # ── 3. Training Dynamics Multi-Panel ──────────────────────────
+        # 3. Training Dynamics Multi-Panel
         fig = make_subplots(
             rows=3, cols=2,
             subplot_titles=(
@@ -763,7 +754,6 @@ def log_training_dynamics_plots(
             vertical_spacing=0.08,
         )
 
-        # Loss trajectory
         if phase_detector.loss_history:
             fig.add_trace(go.Scatter(
                 y=phase_detector.loss_history,
@@ -772,7 +762,6 @@ def log_training_dynamics_plots(
                 line=dict(color="#1565C0"),
             ), row=1, col=1)
 
-        # Global GSNR over time
         if gsnr_tracker.gsnr_global_history:
             fig.add_trace(go.Scatter(
                 y=gsnr_tracker.gsnr_global_history,
@@ -781,7 +770,6 @@ def log_training_dynamics_plots(
                 line=dict(color="#E65100"),
             ), row=1, col=2)
 
-        # Global gradient norm
         if gsnr_tracker.global_grad_norm_history:
             fig.add_trace(go.Scatter(
                 y=gsnr_tracker.global_grad_norm_history,
@@ -790,7 +778,6 @@ def log_training_dynamics_plots(
                 line=dict(color="#2E7D32"),
             ), row=2, col=1)
 
-        # Phase transitions
         if phase_detector.phase_history:
             phase_map = {"warmup": 0, "active_learning": 1, "fine_tuning": 2, "plateau": 3, "diverging": 4}
             steps = [p[0] for p in phase_detector.phase_history]
@@ -807,12 +794,10 @@ def log_training_dynamics_plots(
                 ticktext=list(phase_map.keys()),
                 row=2, col=2,
             )
-            # Mark transitions
             for step, from_p, to_p, evidence in phase_detector.transition_points:
                 fig.add_vline(x=step, line_dash="dash", line_color="red",
                               row=2, col=2)
 
-        # LR vs Loss
         if lr_loss_tracker.lr_loss_pairs:
             lrs = [p[0] for p in lr_loss_tracker.lr_loss_pairs]
             losses = [p[1] for p in lr_loss_tracker.lr_loss_pairs]
@@ -823,7 +808,6 @@ def log_training_dynamics_plots(
                 marker=dict(size=3, color="#00695C", opacity=0.5),
             ), row=3, col=1)
 
-        # Waste accumulation
         if waste_quantifier.improving_steps:
             cumulative_waste = np.cumsum([0 if imp else 1 for imp in waste_quantifier.improving_steps])
             fig.add_trace(go.Scatter(
@@ -838,9 +822,9 @@ def log_training_dynamics_plots(
             title_text=f"Training Dynamics Dashboard - {task_name}",
             showlegend=False,
         )
-        wandb.log({f"dynamics/training_dashboard": wandb.Plotly(fig)})
+        wandb.log({"dynamics/training_dashboard": wandb.Plotly(fig)})
 
-        # ── 4. Waste Breakdown Pie Chart ──────────────────────────────
+        # 4. Waste Breakdown Pie Chart
         waste_metrics = waste_quantifier.compute_waste_metrics()
         if waste_metrics["total_steps"] > 0:
             fig = make_subplots(rows=1, cols=2, specs=[[{"type": "pie"}, {"type": "bar"}]],
@@ -869,9 +853,9 @@ def log_training_dynamics_plots(
                 title_text=f"Waste Analysis - {task_name}",
                 height=400, width=800,
             )
-            wandb.log({f"dynamics/waste_analysis": wandb.Plotly(fig)})
+            wandb.log({"dynamics/waste_analysis": wandb.Plotly(fig)})
 
-        # ── 5. LER + rho_VG over time ────────────────────────────────
+        # 5. LER + rho_VG over time
         if hasattr(ler_tracker, 'ler_history') and ler_tracker.ler_history:
             fig = make_subplots(rows=1, cols=2,
                                 subplot_titles=("LER Over Time", "rho_VG Over Time"))
@@ -897,7 +881,7 @@ def log_training_dynamics_plots(
                 title_text=f"LER & rho_VG Dynamics - {task_name}",
                 height=400, width=900,
             )
-            wandb.log({f"dynamics/ler_rho_dynamics": wandb.Plotly(fig)})
+            wandb.log({"dynamics/ler_rho_dynamics": wandb.Plotly(fig)})
 
     except Exception as e:
         print(f"  [W&B dynamics plots warn] {e}")
@@ -927,7 +911,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             reinit=True,
         )
 
-        # ── Cross-task performance heatmap ────────────────────────────
+        # Cross-task performance heatmap
         seeds = sorted(set(r["seed"] for r in successful))
         matrix = []
         for task in tasks:
@@ -960,7 +944,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
         )
         wandb.log({"summary/performance_heatmap": wandb.Plotly(fig)})
 
-        # ── GSNR cross-task comparison ────────────────────────────────
+        # GSNR cross-task comparison
         task_gsnr = {}
         for r in successful:
             task = r["task"]
@@ -987,7 +971,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             )
             wandb.log({"summary/gsnr_comparison": wandb.Plotly(fig)})
 
-        # ── Waste comparison across tasks ─────────────────────────────
+        # Waste comparison across tasks
         task_waste = {}
         task_waste_ci = {}
         for r in successful:
@@ -1026,7 +1010,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             )
             wandb.log({"summary/waste_comparison": wandb.Plotly(fig)})
 
-        # ── Energy breakdown ──────────────────────────────────────────
+        # Energy breakdown
         task_kwh = {}
         task_kwh_std = {}
         task_acc = {}
@@ -1073,7 +1057,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
 
         wandb.log({"summary/energy_analysis": wandb.Plotly(fig)})
 
-        # ── Results table with 95% CI ─────────────────────────────────
+        # Results table with 95% CI
         summary_table = wandb.Table(columns=[
             "task", "n_seeds", "mean_acc", "std_acc", "ci_95_low", "ci_95_high",
             "mean_kwh", "mean_runtime_s", "mean_waste_ratio", "mean_gsnr",
@@ -1176,7 +1160,7 @@ def run_single_experiment(
     output_dir = os.path.join(base_output_dir, run_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── W&B: explicitly create a NEW run for this experiment ──────────
+    # W&B: explicitly create a NEW run for this experiment
     if use_wandb:
         import wandb
         _ensure_wandb_finished()
@@ -1208,13 +1192,13 @@ def run_single_experiment(
         print(f"  Progress: run {run_idx}/{total_runs}")
     print(f"{'='*60}")
 
-    # ── Reproducibility ───────────────────────────────────────────────
+    # Reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # ── Model & tokenizer ─────────────────────────────────────────────
+    # Model & tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     cfg = GLUE_TASK_CONFIG[task_name]
 
@@ -1233,13 +1217,13 @@ def run_single_experiment(
         if hasattr(model.config, "use_cache"):
             model.config.use_cache = False
 
-    # ── Data ──────────────────────────────────────────────────────────
+    # Data
     train_ds, eval_ds, task_cfg = load_glue_task(
         task_name, tokenizer, max_length=128, max_samples=hw_cfg["max_samples"]
     )
     print(f"  Train samples: {len(train_ds)}, Eval samples: {len(eval_ds)}")
 
-    # ── Initialize ALL trackers ───────────────────────────────────────
+    # Initialize ALL trackers
     ler_tracker = LERTracker(task=task_name, window_size=5)
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
@@ -1264,7 +1248,7 @@ def run_single_experiment(
     
     eta_estimator = ETAEstimator(total_steps)
 
-    # ── Enhanced Diagnostics Callback ─────────────────────────────────
+    # Enhanced Diagnostics Callback
     class FullDiagnosticsCallback:
         """Comprehensive diagnostics: LER + GSNR + waste + phase + ETA."""
 
@@ -1276,13 +1260,12 @@ def run_single_experiment(
             self.lr_loss_tracker = lr_loss_trk
             self.eta_estimator = eta_est
             self._model = model_ref
-            self._trainer_holder = trainer_ref_holder  # mutable list to hold trainer ref
+            self._trainer_holder = trainer_ref_holder
             self.step_count = 0
             self._last_loss = None
             self._step_start_time = None
-            self._gsnr_log_interval = max(eval_steps // 2, 5)  # Log GSNR less frequently
+            self._gsnr_log_interval = max(eval_steps // 2, 5)
 
-        # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
             return control
 
@@ -1290,10 +1273,7 @@ def run_single_experiment(
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
-            # Save all diagnostics
             self._save_all_diagnostics()
-            
-            # Log training dynamics plots to W&B
             log_training_dynamics_plots(
                 self.gsnr_tracker, self.waste_quantifier, self.phase_detector,
                 self.lr_loss_tracker, self.ler_tracker, task_name, use_wandb,
@@ -1317,11 +1297,10 @@ def run_single_experiment(
             except Exception:
                 pass
             
-            # Capture GSNR gradients (less frequently to save compute)
             if self.step_count % self._gsnr_log_interval == 0:
                 try:
                     self.gsnr_tracker.capture_gradients(self._model)
-                except Exception as e:
+                except Exception:
                     pass
             return control
 
@@ -1331,10 +1310,8 @@ def run_single_experiment(
         def on_step_end(self, args, state, control, model=None, **kwargs):
             self.step_count += 1
             
-            # ETA tracking
             self.eta_estimator.step_completed(state.global_step)
             
-            # Fallback gradient capture if pre_optimizer didn't fire
             if self.ler_tracker._cached_rho_vg is None and self._model is not None:
                 has_grad = any(
                     p.grad is not None for p in self._model.parameters() if p.requires_grad
@@ -1345,10 +1322,8 @@ def run_single_experiment(
                     except Exception:
                         pass
             
-            # Step time for waste tracking
             step_time = time.time() - self._step_start_time if self._step_start_time else None
             
-            # Get current LR from scheduler
             current_lr = None
             trainer = self._trainer_holder[0] if self._trainer_holder else None
             if trainer is not None and hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
@@ -1357,9 +1332,7 @@ def run_single_experiment(
                 except Exception:
                     pass
             
-            # Record waste and phase data
             if self._last_loss is not None:
-                # Get global grad norm
                 global_grad_norm = None
                 if self.gsnr_tracker.global_grad_norm_history:
                     global_grad_norm = self.gsnr_tracker.global_grad_norm_history[-1]
@@ -1403,15 +1376,12 @@ def run_single_experiment(
                                 "gsnr/global": global_gsnr,
                                 "gsnr/global_log10": math.log10(global_gsnr + 1e-10),
                             }
-                            # Log top/bottom layers
                             layer_gsnrs = {k: v for k, v in gsnr_results.items() if k != "__global__"}
                             if layer_gsnrs:
                                 sorted_layers = sorted(layer_gsnrs.items(), key=lambda x: x[1])
-                                # Bottom 3 (worst GSNR)
                                 for i, (name, val) in enumerate(sorted_layers[:3]):
                                     short = name.split(".")[-2:]
                                     log_data[f"gsnr/bottom_{i+1}_{'_'.join(short)}"] = val
-                                # Top 3 (best GSNR)
                                 for i, (name, val) in enumerate(sorted_layers[-3:]):
                                     short = name.split(".")[-2:]
                                     log_data[f"gsnr/top_{i+1}_{'_'.join(short)}"] = val
@@ -1434,207 +1404,79 @@ def run_single_experiment(
                             "phase/current": self.phase_detector.current_phase,
                             "phase/num_transitions": len(self.phase_detector.transition_points),
                         }, step=state.global_step)
-                        
-                        # LR-loss correlation
-                        corr = self.lr_loss_tracker.compute_correlation(window=100)
-                        if corr:
-                            wandb.log({
-                                "lr_loss/correlation": corr["correlation"],
-                                "lr_loss/p_value": corr["p_value"],
-                            }, step=state.global_step)
                 except Exception:
                     pass
             
-            return control
-
-        def on_substep_end(self, args, state, control, **kwargs):
-            return control
-
-        def on_save(self, args, state, control, **kwargs):
             return control
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs is not None:
-                self._last_loss = logs.get("loss", self._last_loss)
+            """Capture training loss from logs."""
+            if logs and "loss" in logs:
+                self._last_loss = logs["loss"]
                 
-                # Log gradient norms from trainer logs
-                if use_wandb:
+                # Feed real logits to LER tracker
+                trainer = self._trainer_holder[0] if self._trainer_holder else None
+                if trainer is not None and hasattr(trainer, '_last_real_logits') and trainer._last_real_logits is not None:
                     try:
-                        import wandb
-                        if wandb.run is not None:
-                            grad_norm_val = logs.get("grad_norm")
-                            if grad_norm_val is not None:
-                                wandb.log({
-                                    "gradients/trainer_grad_norm": grad_norm_val,
-                                }, step=state.global_step)
+                        self.ler_tracker.step(
+                            loss=logs["loss"],
+                            logits=trainer._last_real_logits,
+                        )
                     except Exception:
-                        pass
+                        self.ler_tracker.step(loss=logs["loss"])
+                else:
+                    self.ler_tracker.step(loss=logs["loss"])
             return control
 
-        def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
-            if metrics is None:
-                return control
-
-            eval_loss = metrics.get("eval_loss", 0)
-            accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
-
-            # FIX #4: Use REAL logits from the custom trainer instead of dummy
-            trainer = self._trainer_holder[0] if self._trainer_holder else None
-            real_logits = None
-            if trainer is not None and hasattr(trainer, '_last_real_logits') and trainer._last_real_logits is not None:
-                real_logits = trainer._last_real_logits
-            
-            # Fallback: generate logits from a small eval batch if no cached logits
-            if real_logits is None and model is not None:
-                try:
-                    model.eval()
-                    # Get a small batch from eval dataset
-                    small_batch_size = min(8, len(eval_ds))
-                    small_batch = eval_ds.select(range(small_batch_size))
-                    from torch.utils.data import DataLoader
-                    dl = DataLoader(
-                        small_batch,
-                        batch_size=small_batch_size,
-                        collate_fn=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8),
-                    )
-                    batch = next(iter(dl))
-                    batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                    with torch.no_grad():
-                        outputs = model(**batch)
-                    real_logits = outputs.logits.detach()
-                except Exception as e:
-                    # Last resort: use dummy logits (but log warning)
-                    print(f"  [WARN] Could not get real logits, using dummy: {e}")
-                    num_labels = GLUE_TASK_CONFIG[task_name]["num_labels"]
-                    real_logits = torch.randn(8, num_labels)
-
-            loss_for_ler = self._last_loss if self._last_loss is not None else eval_loss
-
-            try:
-                self.ler_tracker.update(
-                    loss=loss_for_ler,
-                    logits=real_logits,
-                    accuracy=accuracy,
-                    model=model,
-                )
-            except Exception as e:
-                print(f"  [LER warn] {e}")
-
-            diag = self.ler_tracker.get_diagnostics()
-            ler_val = diag.get("ler")
-            vel_val = diag.get("param_velocity")
-            rho_val = diag.get("rho_vg")
-            phase = diag.get("phase", "?")
-
-            ler_str = f"{ler_val:.6f}" if ler_val is not None else "warming"
-            vel_str = f"{vel_val:.6f}" if vel_val is not None else "N/A"
-            rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
-
-            # Also get GSNR and waste info for the print
-            gsnr_global = None
-            if gsnr_tracker.gsnr_global_history:
-                gsnr_global = gsnr_tracker.gsnr_global_history[-1]
-            gsnr_str = f"{gsnr_global:.4f}" if gsnr_global is not None else "N/A"
-            
-            waste_metrics = waste_quantifier.compute_waste_metrics()
-            waste_str = f"{waste_metrics['waste_ratio']:.3f}"
-            
-            phase_det_str = phase_detector.current_phase
-
-            print(
-                f"  [LERNA step={state.global_step}] "
-                f"LER={ler_str} | vel={vel_str} | rho_VG={rho_str} | "
-                f"GSNR={gsnr_str} | waste={waste_str} | "
-                f"phase_LER={phase} | phase_det={phase_det_str} | acc={accuracy:.3f}"
-            )
-
-            # Log comprehensive diagnostics to W&B
-            if use_wandb:
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            """Log evaluation metrics."""
+            if use_wandb and metrics:
                 try:
                     import wandb
                     if wandb.run is not None:
-                        log_data = {
-                            "lerna/ler": ler_val,
-                            "lerna/velocity": vel_val,
-                            "lerna/rho_vg": rho_val,
-                            "lerna/phase": phase,
-                            "lerna/eval_accuracy": accuracy,
-                            "lerna/eval_loss": eval_loss,
-                        }
-                        
-                        # Per-layer gradient norm stats
-                        grad_stats = gsnr_tracker.get_gradient_norm_stats()
-                        for layer_name, stats in list(grad_stats.items())[:10]:  # Top 10
-                            short = "_".join(layer_name.split(".")[-2:])
-                            log_data[f"grad_norms/{short}_mean"] = stats["mean"]
-                            log_data[f"grad_norms/{short}_std"] = stats["std"]
-                        
-                        wandb.log(log_data, step=state.global_step)
+                        diag = self.ler_tracker.get_diagnostics()
+                        wandb.log({
+                            "ler/value": diag.get("ler"),
+                            "ler/rho_vg": diag.get("rho_vg"),
+                            "ler/window_size": diag.get("window_size"),
+                        }, step=state.global_step)
                 except Exception:
                     pass
-
-            return control
-
-        def on_predict(self, args, state, control, **kwargs):
-            return control
-
-        def on_prediction_step(self, args, state, control, **kwargs):
             return control
 
         def _save_all_diagnostics(self):
-            """Save all diagnostics to JSON files."""
-            # LER diagnostics
-            diag_path = os.path.join(output_dir, "ler_diagnostics.json")
-            final = self.ler_tracker.get_diagnostics()
-            final["ler_history"] = self.ler_tracker.ler_history
-            final["velocity_history"] = self.ler_tracker.velocity_history
-            final["rho_vg_history"] = self.ler_tracker.rho_vg_history
-            final["loss_history"] = self.ler_tracker.loss_history
-            final["entropy_history"] = self.ler_tracker.entropy_history
-            with open(diag_path, "w") as f:
-                json.dump(final, f, indent=2, default=str)
-            print(f"  LER diagnostics saved: {diag_path}")
+            """Save all diagnostic data to disk."""
+            diag_dir = os.path.join(output_dir, "diagnostics")
+            os.makedirs(diag_dir, exist_ok=True)
+            
+            try:
+                with open(os.path.join(diag_dir, "gsnr_summary.json"), "w") as f:
+                    json.dump(self.gsnr_tracker.get_summary(), f, indent=2, default=str)
+            except Exception:
+                pass
+            
+            try:
+                with open(os.path.join(diag_dir, "waste_metrics.json"), "w") as f:
+                    json.dump(self.waste_quantifier.compute_waste_metrics(), f, indent=2, default=str)
+            except Exception:
+                pass
+            
+            try:
+                with open(os.path.join(diag_dir, "phase_transitions.json"), "w") as f:
+                    json.dump(self.phase_detector.get_summary(), f, indent=2, default=str)
+            except Exception:
+                pass
+            
+            try:
+                corr = self.lr_loss_tracker.compute_correlation()
+                if corr:
+                    with open(os.path.join(diag_dir, "lr_loss_correlation.json"), "w") as f:
+                        json.dump(corr, f, indent=2, default=str)
+            except Exception:
+                pass
 
-            # GSNR diagnostics
-            gsnr_path = os.path.join(output_dir, "gsnr_diagnostics.json")
-            gsnr_summary = self.gsnr_tracker.get_summary()
-            gsnr_summary["gsnr_global_history"] = self.gsnr_tracker.gsnr_global_history
-            gsnr_summary["gsnr_per_layer_history"] = {
-                k: v for k, v in self.gsnr_tracker.gsnr_per_layer_history.items()
-            }
-            with open(gsnr_path, "w") as f:
-                json.dump(gsnr_summary, f, indent=2, default=str)
-            print(f"  GSNR diagnostics saved: {gsnr_path}")
-
-            # Waste diagnostics
-            waste_path = os.path.join(output_dir, "waste_diagnostics.json")
-            waste_metrics = self.waste_quantifier.compute_waste_metrics()
-            with open(waste_path, "w") as f:
-                json.dump(waste_metrics, f, indent=2, default=str)
-            print(f"  Waste diagnostics saved: {waste_path}")
-
-            # Phase transition diagnostics
-            phase_path = os.path.join(output_dir, "phase_diagnostics.json")
-            phase_summary = self.phase_detector.get_summary()
-            with open(phase_path, "w") as f:
-                json.dump(phase_summary, f, indent=2, default=str)
-            print(f"  Phase diagnostics saved: {phase_path}")
-
-            # LR-Loss correlation
-            lr_loss_path = os.path.join(output_dir, "lr_loss_correlation.json")
-            lr_loss_corr = self.lr_loss_tracker.compute_correlation()
-            lr_loss_data = {
-                "final_correlation": lr_loss_corr,
-                "lr_history": self.lr_loss_tracker.lr_history[-1000:],  # Last 1000
-                "loss_history": self.lr_loss_tracker.loss_history[-1000:],
-            }
-            with open(lr_loss_path, "w") as f:
-                json.dump(lr_loss_data, f, indent=2, default=str)
-            print(f"  LR-Loss correlation saved: {lr_loss_path}")
-
-    # Mutable holder for trainer reference (needed inside callback)
+    # Instantiate the diagnostics callback
     trainer_holder = [None]
-    
     diag_callback = FullDiagnosticsCallback(
         ler_trk=ler_tracker,
         gsnr_trk=gsnr_tracker,
@@ -1646,7 +1488,7 @@ def run_single_experiment(
         trainer_ref_holder=trainer_holder,
     )
 
-    # ── Training arguments ────────────────────────────────────────────
+    # Training arguments — FIX #9: evaluate best model
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -1655,16 +1497,14 @@ def run_single_experiment(
         gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
         learning_rate=lr,
         weight_decay=0.01,
-        warmup_ratio=0.1,
-        max_grad_norm=1.0,
-        fp16=hw_cfg["fp16"],
-        bf16=hw_cfg["bf16"],
+        warmup_ratio=0.06,
         eval_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
         save_total_limit=2,
-        # FIX #9: load_best_model_at_end=True to evaluate best model
+        fp16=hw_cfg["fp16"],
+        bf16=hw_cfg["bf16"],
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -1676,14 +1516,7 @@ def run_single_experiment(
         dataloader_pin_memory=(profile == "server"),
         gradient_checkpointing=hw_cfg["gradient_checkpointing"],
         remove_unused_columns=True,
-        # Include grad norm in logs for tracking
-        #include_for_metrics=["loss"],
     )
-
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
-    compute_metrics = build_compute_metrics(task_name)
-
-    # Use custom trainer that captures real logits (FIX #4)
     trainer = LERNATrainer(
         model=model,
         args=training_args,
@@ -1702,7 +1535,7 @@ def run_single_experiment(
     # Set trainer reference in callback
     trainer_holder[0] = trainer
 
-    # ── Train & evaluate ──────────────────────────────────────────────
+    # Train & evaluate
     start_time = time.time()
     print(f"\n  Starting training: {total_steps} total steps, eval every {eval_steps} steps")
     print(f"  ETA will be shown after first eval checkpoint\n")
@@ -1710,27 +1543,20 @@ def run_single_experiment(
     train_result = trainer.train()
     total_time = time.time() - start_time
 
-    # FIX #9: Now evaluating the BEST model (loaded automatically)
+    # FIX #8: Now evaluating the BEST model (loaded automatically)
     print(f"\n  Evaluating best model (loaded via load_best_model_at_end=True)...")
     eval_result = trainer.evaluate()
 
-    # ── Collect results ───────────────────────────────────────────────
+    # Collect results
     avg_power = (
         float(np.mean([s["power_w"] for s in power_callback._power_samples]))
         if power_callback._power_samples
         else 0
     )
 
-    # Compute final GSNR
     gsnr_final = gsnr_tracker.get_summary()
-    
-    # Compute final waste metrics
     waste_metrics = waste_quantifier.compute_waste_metrics()
-    
-    # Phase transition summary
     phase_summary = phase_detector.get_summary()
-    
-    # LR-Loss correlation
     lr_loss_corr = lr_loss_tracker.compute_correlation()
 
     results = {
@@ -1756,7 +1582,7 @@ def run_single_experiment(
         "lr_loss_correlation": lr_loss_corr,
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
-        "evaluated_best_model": True,  # FIX #9 flag
+        "evaluated_best_model": True,
     }
 
     results_path = os.path.join(output_dir, "results.json")
@@ -1792,12 +1618,14 @@ def run_single_experiment(
         except Exception:
             pass
 
-    print(f"\n  ── Final Results ──────────────────────────────────────")
+    print(f"\n  -- Final Results --")
     print(f"  Eval metrics: {eval_result}")
     print(f"  Energy: {power_callback.cumulative_kwh:.6f} kWh")
     print(f"  Time: {total_time:.1f}s")
     if gsnr_tracker.gsnr_global_history:
         print(f"  GSNR (global): {gsnr_tracker.gsnr_global_history[-1]:.4f}")
+    else:
+        print(f"  GSNR: N/A")
     print(f"  Waste ratio: {waste_metrics['waste_ratio']:.3f} "
           f"(95% CI: [{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}])")
     print(f"  Phase: {phase_summary['current_phase']} "
@@ -1808,13 +1636,12 @@ def run_single_experiment(
     print(f"  Saved: {results_path}")
     print(f"  Best model evaluated: Yes (load_best_model_at_end=True)")
 
-    # ── Cleanup ───────────────────────────────────────────────────────
+    # Cleanup
     del model, trainer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # ── W&B: finish this run so the next experiment gets a fresh one ──
     if use_wandb:
         _ensure_wandb_finished()
 
@@ -1845,7 +1672,7 @@ def main():
 
     profile = detect_device_profile()
 
-    # ── Determine tasks and seeds ─────────────────────────────────────
+    # Determine tasks and seeds
     if args.mode == "smoke":
         tasks = ["sst2"]
         seeds = [42]
@@ -1859,12 +1686,11 @@ def main():
         tasks = args.tasks or ["sst2"]
         seeds = args.seeds or [42]
 
-    # ── W&B group: unique per invocation so runs are grouped properly ─
     wandb_group = args.wandb_group or f"{args.mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    print(f"\n  ═══════════════════════════════════════════════════════")
+    print(f"\n  ===============================================")
     print(f"  LERNA Baseline v2 (Full Diagnostics)")
-    print(f"  ═══════════════════════════════════════════════════════")
+    print(f"  ===============================================")
     print(f"  Tasks: {tasks}")
     print(f"  Seeds: {seeds}")
     print(f"  LR: {args.lr}")
@@ -1876,7 +1702,7 @@ def main():
         print(f"  W&B group: {wandb_group}")
         print(f"  W&B viz: heatmaps, training dynamics, layer analysis")
 
-    # ── Sample cap logic ──────────────────────────────────────────────
+    # Sample cap logic
     if args.max_samples is not None:
         effective_max_samples = args.max_samples
     elif args.unlimited:
@@ -1888,19 +1714,18 @@ def main():
 
     print(f"  Max samples/task: {effective_max_samples or 'unlimited'}")
 
-    # ── Estimate total time ───────────────────────────────────────────
+    # Estimate total time
     total_runs = len(tasks) * len(seeds)
-    est_time_per_run = 120 if profile == "server" else 300  # rough estimate in seconds
+    est_time_per_run = 120 if profile == "server" else 300
     est_total = total_runs * est_time_per_run
     print(f"  Total runs: {total_runs}")
     print(f"  Estimated total time: ~{timedelta(seconds=est_total)}")
-    print(f"  ═══════════════════════════════════════════════════════\n")
+    print(f"  ===============================================\n")
 
-    # ── Ensure no stale W&B run from a previous crash ─────────────────
     if args.wandb:
         _ensure_wandb_finished()
 
-    # ── Main experiment loop ──────────────────────────────────────────
+    # Main experiment loop
     all_results = []
     run_idx = 0
     overall_start = time.time()
@@ -1909,15 +1734,14 @@ def main():
         for seed in seeds:
             run_idx += 1
             
-            # Overall ETA
             if run_idx > 1:
                 elapsed = time.time() - overall_start
                 avg_per_run = elapsed / (run_idx - 1)
                 remaining = (total_runs - run_idx + 1) * avg_per_run
-                print(f"\n  ═══ Run {run_idx}/{total_runs} | "
-                      f"Overall ETA: {timedelta(seconds=int(remaining))} ═══")
+                print(f"\n  === Run {run_idx}/{total_runs} | "
+                      f"Overall ETA: {timedelta(seconds=int(remaining))} ===")
             else:
-                print(f"\n  ═══ Run {run_idx}/{total_runs} ═══")
+                print(f"\n  === Run {run_idx}/{total_runs} ===")
             
             try:
                 result = run_single_experiment(
@@ -1942,13 +1766,12 @@ def main():
                 if args.wandb:
                     _ensure_wandb_finished()
 
-    # ── Final summary ─────────────────────────────────────────────────
+    # Final summary
     summary_path = os.path.join(args.output_dir, "baseline_summary.json")
     os.makedirs(args.output_dir, exist_ok=True)
     with open(summary_path, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
 
-    # ── Cross-run W&B summary ─────────────────────────────────────────
     if args.wandb:
         log_cross_run_summary(all_results, tasks, args.wandb_project, wandb_group)
 
@@ -1966,7 +1789,6 @@ def main():
         print(f"  Total energy: {total_kwh:.6f} kWh")
         print(f"  Total compute time: {total_time:.1f}s ({total_time/3600:.2f}h)")
 
-        # Print per-task summary table with NEW metrics
         print(f"\n  {'Task':<8} {'Seeds':>5} {'Avg Acc':>10} {'Std':>8} {'Avg kWh':>10} {'GSNR':>10} {'Waste':>8} {'Phase':>14}")
         print(f"  {'-'*75}")
         for task in tasks:
@@ -1982,7 +1804,6 @@ def main():
             gsnrs = [r.get("gsnr_final", {}).get("gsnr_global", 0) for r in task_results]
             wastes = [r.get("waste_metrics", {}).get("waste_ratio", 0) for r in task_results]
             phases = [r.get("phase_summary", {}).get("current_phase", "?") for r in task_results]
-            # Most common phase
             from collections import Counter
             common_phase = Counter(phases).most_common(1)[0][0] if phases else "?"
             
