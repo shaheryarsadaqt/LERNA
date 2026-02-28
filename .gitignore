@@ -4,42 +4,73 @@ __pycache__/
 *$py.class
 *.so
 .Python
-
-# Model checkpoints and experiment data
-experiments/
-*.bin
-*.pt
-*.pth
-*.safetensors
-*.msgpack
-checkpoint-*/
-wandb/
-*.csv
-
-# Backups
-*.backup
-*.backup1
-*.backup2
-*.backup3
-*.bak
-
-# Build artifacts
-*.egg-info/
-build/
-dist/
-
-# Virtual Environment
-venv/
 env/
+venv/
 ENV/
-.venv
+env.bak/
+venv.bak/
+pythonenv.*
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+!**/*.ipynb
+
+# PyTorch / ML
+*.pth
+*.pt
+*.bin
+*.ckpt
+checkpoints/
+lightning_logs/
+
+# Experiment outputs
+experiments/
+wandb/
+lightning_logs/
+*.log
+*.csv
+*.json
+!**/baseline_summary.json
+!**/results.json
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
+*~
 .DS_Store
+Thumbs.db
+
+# CUDA/System
+cuda_fix.sh
+*.o
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Environment files
+.env
+.venv
+conda_env.yaml
+environment.yaml
+
+# Git
+*.orig
+*.patch
+*.diff
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db

@@ -1,6 +1,0 @@
-# Copy the backup back to the original
-cp lerna/callbacks/efficiency_callback.py.backup lerna/callbacks/efficiency_callback.py
-
-# Verify it's restored
-ls -la lerna/callbacks/efficiency_callback.py
-head -5 lerna/callbacks/efficiency_callback.py
