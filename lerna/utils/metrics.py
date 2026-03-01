@@ -334,10 +334,12 @@ class LERTracker:
         window_size: int = 50,
         validate_correlation: bool = True,
         task_calibration: Optional[Dict] = None,
+        min_phase_duration: int = 20,
     ):
         self.task = task
         self.window_size = window_size
         self.validate_correlation = validate_correlation
+        self.min_phase_duration = min_phase_duration
         
         self.loss_history: List[float] = []
         self.entropy_history: List[float] = []
@@ -351,6 +353,11 @@ class LERTracker:
         
         self.correlation_history: List[Tuple[float, float]] = []
         self.validation_results: Dict = {}
+        
+        # Hysteresis state for phase detection
+        self._committed_phase: str = "warmup"
+        self._candidate_phase: Optional[str] = None
+        self._candidate_phase_count: int = 0
         
         if task_calibration is None:
             task_calibration = self._get_default_calibration()
@@ -518,7 +525,13 @@ class LERTracker:
         return np.mean(self.ler_history[-window:])
     
     def get_efficiency_phase(self) -> str:
-        """Identify current learning phase based on LER."""
+        """Identify current learning phase based on LER with hysteresis.
+        
+        Uses a minimum phase duration (min_phase_duration) to prevent
+        rapid oscillation between phases due to noisy LER values.
+        A candidate phase must be sustained for min_phase_duration
+        consecutive calls before the transition is committed.
+        """
         if len(self.ler_history) < 10:
             return "warmup"
         
@@ -532,14 +545,36 @@ class LERTracker:
         else:
             threshold = 0.01
         
-        if avg_ler > threshold * 2 and std_ler / avg_ler < 0.5:
-            return "high_efficiency"
+        # Compute raw (instantaneous) phase
+        if avg_ler > threshold * 2 and (avg_ler > 0 and std_ler / avg_ler < 0.5):
+            raw_phase = "high_efficiency"
         elif avg_ler > threshold:
-            return "medium_efficiency"
+            raw_phase = "medium_efficiency"
         elif avg_ler > threshold * 0.1:
-            return "low_efficiency"
+            raw_phase = "low_efficiency"
         else:
-            return "plateau"
+            raw_phase = "plateau"
+        
+        # Hysteresis: require min_phase_duration consecutive observations
+        # of the same new phase before committing the transition.
+        if raw_phase == self._committed_phase:
+            # Still in the committed phase; reset any pending candidate
+            self._candidate_phase = None
+            self._candidate_phase_count = 0
+        elif raw_phase == self._candidate_phase:
+            # Same candidate as before; increment counter
+            self._candidate_phase_count += 1
+            if self._candidate_phase_count >= self.min_phase_duration:
+                # Sustained long enough; commit the transition
+                self._committed_phase = raw_phase
+                self._candidate_phase = None
+                self._candidate_phase_count = 0
+        else:
+            # New candidate phase; start counting
+            self._candidate_phase = raw_phase
+            self._candidate_phase_count = 1
+        
+        return self._committed_phase
     
     def get_ler_plateau_indicator(self) -> Tuple[bool, float]:
         """Check if LER indicates plateau and return confidence."""
