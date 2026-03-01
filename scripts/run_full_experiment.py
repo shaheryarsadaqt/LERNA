@@ -10,10 +10,7 @@ Runs all GLUE tasks × seeds with:
   ✅ Graceful shutdown (Ctrl+C saves progress)
   ✅ Final summary generation
   ✅ Detailed logging
-<<<<<<< HEAD
   ✅ Faster cooldown (5s between runs)
-=======
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
 
 Usage:
   python scripts/run_full_experiment.py \
@@ -45,13 +42,8 @@ GLUE_TASKS = ["sst2", "qnli", "qqp", "mnli", "rte", "mrpc", "cola", "stsb"]
 DEFAULT_LR = 2e-5
 MAX_RETRIES = 3
 MEMORY_WARN_THRESHOLD_GB = 4.0  # Warn if less than 4GB RAM free
-<<<<<<< HEAD
-COOLDOWN_SECONDS = 5  # ⚡ REDUCED FROM 10s TO 5s FOR FASTER RUNS
-GPU_COOLDOWN_SECONDS = 3  # ⚡ REDUCED GPU COOLDOWN
-=======
-COOLDOWN_SECONDS = 10  # Pause between runs for cleanup
-GPU_COOLDOWN_SECONDS = 5  # Extra pause for GPU memory release
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
+COOLDOWN_SECONDS = 5  # Pause between runs for cleanup (5s sufficient with subprocess isolation)
+GPU_COOLDOWN_SECONDS = 3  # Extra pause for GPU memory release
 
 # ═══════════════════════════════════════════════════════════════════════
 # Logging Setup
@@ -382,11 +374,7 @@ def main():
     parser.add_argument("--wandb-group", default=None, help="W&B group name")
     parser.add_argument("--max-samples", type=int, default=25000, help="Max samples per task (default: 25000, 0=unlimited)")
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help="Max retries per failed run")
-<<<<<<< HEAD
     parser.add_argument("--cooldown", type=int, default=COOLDOWN_SECONDS, help="Seconds between runs (default: 5)")
-=======
-    parser.add_argument("--cooldown", type=int, default=COOLDOWN_SECONDS, help="Seconds between runs")
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
     parser.add_argument("--timeout", type=int, default=7200, help="Timeout per run in seconds (default: 2h)")
     parser.add_argument("--script", default="scripts/run_baseline_glue.py", help="Path to training script")
     args = parser.parse_args()
@@ -429,11 +417,7 @@ def main():
     logger.info(f"  Completed:    {len(completed)} (will skip)")
     logger.info(f"  Pending:      {len(pending)}")
     logger.info(f"  Max retries:  {args.max_retries}")
-<<<<<<< HEAD
-    logger.info(f"  Cooldown:     {args.cooldown}s between runs ⚡")
-=======
     logger.info(f"  Cooldown:     {args.cooldown}s between runs")
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
     logger.info(f"  Timeout:      {args.timeout}s per run")
     logger.info(f"  Max samples:  {max_samples or 'unlimited'}")
     logger.info(f"  W&B:          {'enabled' if args.wandb else 'disabled'}")
@@ -529,11 +513,7 @@ def main():
             logger.error(f"💀 {run_id}: All {args.max_retries} attempts failed!")
             results_tracker["failed"].append((task, seed))
         
-<<<<<<< HEAD
-        # Cooldown between runs (REDUCED TO 5s)
-=======
         # Cooldown between runs
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
         if not shutdown_requested[0]:
             logger.debug(f"💤 Cooldown: {args.cooldown}s")
             time.sleep(args.cooldown)
@@ -563,10 +543,7 @@ def main():
             "failed_runs": [(t, s) for t, s in results_tracker["failed"]],
             "wall_time_s": total_elapsed,
             "avg_run_duration_s": float(np.mean(results_tracker["durations"])) if results_tracker["durations"] else 0,
-<<<<<<< HEAD
             "cooldown_s": args.cooldown,
-=======
->>>>>>> 112fc49b0ffcf5272f58d0ca26d69c15c4688ece
             "timestamp": datetime.now().isoformat(),
         }, f, indent=2)
     
