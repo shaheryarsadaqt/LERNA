@@ -261,18 +261,40 @@ class GSNRTracker:
 class WasteQuantifier:
     """Quantifies computational waste during training with confidence intervals.
     
-    Tracks:
-    - Steps where loss increased (wasted compute)
-    - Steps with near-zero gradient (no learning)
-    - Energy spent on non-improving steps
-    - Confidence intervals on waste estimates
+    Waste is defined as compute spent AFTER the model has converged (plateau),
+    not step-by-step loss fluctuations (which are normal SGD noise).
+    
+    Uses EMA-smoothed loss to detect plateau onset, then computes:
+        waste_ratio = (total_steps - plateau_step) / total_steps
+    
+    Also preserves the raw per-step improving ratio as a secondary metric
+    for backward compatibility with existing W&B panels.
     """
 
-    def __init__(self):
+    def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001):
+        """
+        Args:
+            ema_alpha: Smoothing factor for EMA loss (lower = smoother).
+            plateau_patience: Number of steps with no EMA improvement to declare plateau.
+            plateau_min_improvement: Minimum relative improvement in EMA loss to count
+                                     as "still improving" (0.001 = 0.1%).
+        """
+        self.ema_alpha = ema_alpha
+        self.plateau_patience = plateau_patience
+        self.plateau_min_improvement = plateau_min_improvement
+
         self.loss_history = []
         self.grad_norm_history = []
         self.energy_per_step = []
         self.step_times = []
+
+        # EMA-based plateau detection state
+        self._ema_loss = None
+        self._best_ema_loss = None
+        self._steps_since_ema_improvement = 0
+        self._plateau_step = None  # Step at which plateau was first detected
+
+        # Legacy per-step improving flags (kept for backward compat / raw metric)
         self.improving_steps = []  # True/False per step
         self.waste_reasons = defaultdict(int)
 
@@ -285,8 +307,35 @@ class WasteQuantifier:
             self.energy_per_step.append(energy_j)
         if step_time is not None:
             self.step_times.append(step_time)
-        
-        # Determine if step was improving
+
+        # --- EMA-based plateau detection (the correct metric) ---
+        if self._ema_loss is None:
+            self._ema_loss = loss
+            self._best_ema_loss = loss
+        else:
+            self._ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+
+            # Check if EMA loss improved meaningfully
+            if self._best_ema_loss is not None and self._best_ema_loss > 0:
+                relative_improvement = (self._best_ema_loss - self._ema_loss) / self._best_ema_loss
+                if relative_improvement > self.plateau_min_improvement:
+                    self._best_ema_loss = self._ema_loss
+                    self._steps_since_ema_improvement = 0
+                else:
+                    self._steps_since_ema_improvement += 1
+            else:
+                if self._ema_loss < self._best_ema_loss:
+                    self._best_ema_loss = self._ema_loss
+                    self._steps_since_ema_improvement = 0
+                else:
+                    self._steps_since_ema_improvement += 1
+
+            # Detect plateau onset (only set once)
+            if (self._plateau_step is None
+                    and self._steps_since_ema_improvement >= self.plateau_patience):
+                self._plateau_step = len(self.loss_history) - self.plateau_patience
+
+        # --- Legacy per-step comparison (kept as secondary metric) ---
         if len(self.loss_history) >= 2:
             improved = self.loss_history[-1] < self.loss_history[-2]
             self.improving_steps.append(improved)
@@ -299,24 +348,31 @@ class WasteQuantifier:
                     self.waste_reasons["no_improvement"] += 1
 
     def compute_waste_metrics(self):
-        """Compute waste metrics with 95% confidence intervals."""
-        try:
-            from scipy import stats as scipy_stats
-        except ImportError:
-            scipy_stats = None
+        """Compute waste metrics with 95% confidence intervals.
         
-        n = len(self.improving_steps)
+        Primary metric (waste_ratio): fraction of steps after plateau onset.
+        Secondary metric (raw_improving_ratio): legacy per-step comparison.
+        """
+        n = len(self.loss_history)
         if n == 0:
             return {"waste_ratio": 0, "ci_95_low": 0, "ci_95_high": 0, "total_steps": 0,
-                    "wasted_steps": 0, "improving_steps": 0, "wasted_energy_j": 0,
-                    "total_energy_j": 0, "energy_waste_pct": 0, "wasted_time_s": 0,
-                    "total_time_s": 0, "waste_reasons": {}}
-        
-        waste_flags = [0 if imp else 1 for imp in self.improving_steps]
-        waste_ratio = np.mean(waste_flags)
-        
-        # 95% CI using Wilson score interval (better for proportions)
-        if n >= 2:
+                    "wasted_steps": 0, "plateau_step": None, "improving_steps": 0,
+                    "raw_improving_ratio": 0,
+                    "wasted_energy_j": 0, "total_energy_j": 0, "energy_waste_pct": 0,
+                    "wasted_time_s": 0, "total_time_s": 0, "waste_reasons": {}}
+
+        # --- Primary: plateau-based waste ---
+        if self._plateau_step is not None:
+            plateau_step = max(0, self._plateau_step)
+            wasted_steps = n - plateau_step
+            waste_ratio = wasted_steps / n
+        else:
+            plateau_step = None
+            wasted_steps = 0
+            waste_ratio = 0.0
+
+        # 95% CI for waste ratio using Wilson score interval
+        if n >= 2 and waste_ratio > 0:
             z = 1.96
             p_hat = waste_ratio
             denominator = 1 + z**2 / n
@@ -326,30 +382,36 @@ class WasteQuantifier:
             ci_high = min(1, center + spread)
         else:
             ci_low = ci_high = waste_ratio
-        
-        # Energy waste
+
+        # --- Secondary: legacy raw per-step improving ratio ---
+        n_legacy = len(self.improving_steps)
+        if n_legacy > 0:
+            raw_waste_flags = [0 if imp else 1 for imp in self.improving_steps]
+            raw_improving_ratio = 1.0 - np.mean(raw_waste_flags)
+        else:
+            raw_improving_ratio = 0.0
+
+        # Energy waste (attributed to post-plateau steps)
         total_energy = sum(self.energy_per_step) if self.energy_per_step else 0
-        wasted_energy = 0
-        if self.energy_per_step and len(self.energy_per_step) >= len(self.improving_steps):
-            for i, imp in enumerate(self.improving_steps):
-                if not imp and i < len(self.energy_per_step):
-                    wasted_energy += self.energy_per_step[i + 1] if i + 1 < len(self.energy_per_step) else 0
-        
-        # Time waste
+        wasted_energy = 0.0
+        if self.energy_per_step and plateau_step is not None:
+            wasted_energy = sum(self.energy_per_step[plateau_step:])
+
+        # Time waste (attributed to post-plateau steps)
         total_time = sum(self.step_times) if self.step_times else 0
-        wasted_time = 0
-        if self.step_times and len(self.step_times) >= len(self.improving_steps):
-            for i, imp in enumerate(self.improving_steps):
-                if not imp and i + 1 < len(self.step_times):
-                    wasted_time += self.step_times[i + 1]
-        
+        wasted_time = 0.0
+        if self.step_times and plateau_step is not None:
+            wasted_time = sum(self.step_times[plateau_step:])
+
         return {
             "waste_ratio": float(waste_ratio),
             "ci_95_low": float(ci_low),
             "ci_95_high": float(ci_high),
             "total_steps": n,
-            "wasted_steps": int(sum(waste_flags)),
-            "improving_steps": int(n - sum(waste_flags)),
+            "wasted_steps": int(wasted_steps),
+            "plateau_step": plateau_step,
+            "improving_steps": int(n - wasted_steps),
+            "raw_improving_ratio": float(raw_improving_ratio),
             "wasted_energy_j": float(wasted_energy),
             "total_energy_j": float(total_energy),
             "energy_waste_pct": float(wasted_energy / total_energy * 100) if total_energy > 0 else 0,
@@ -1989,11 +2051,25 @@ def main():
             gsnr_vals = [g for g in gsnrs if g is not None and g > 0]
             gsnr_str = f"{np.mean(gsnr_vals):.4f}" if gsnr_vals else "N/A"
             
+            # GSNR outlier detection: flag seeds with GSNR > 5x median
+            gsnr_outlier_warning = ""
+            if len(gsnr_vals) >= 3:
+                gsnr_median = np.median(gsnr_vals)
+                gsnr_outliers = [
+                    (r["seed"], r.get("gsnr_final", {}).get("gsnr_global", 0))
+                    for r in task_results
+                    if r.get("gsnr_final", {}).get("gsnr_global", 0) is not None
+                    and r.get("gsnr_final", {}).get("gsnr_global", 0) > gsnr_median * 5
+                ]
+                if gsnr_outliers:
+                    gsnr_outlier_warning = f" \u26a0\ufe0f GSNR outliers: {gsnr_outliers}"
+            
             print(
                 f"  {task:<8} {len(task_results):>5} "
                 f"{np.mean(accs):>10.4f} {np.std(accs):>8.4f} "
                 f"{np.mean(kwhs):>10.6f} {gsnr_str:>10} "
                 f"{np.mean(wastes):>8.3f} {common_phase:>14}"
+                f"{gsnr_outlier_warning}"
             )
 
     print(f"{'='*60}")
