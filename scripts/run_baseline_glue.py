@@ -271,17 +271,22 @@ class WasteQuantifier:
     for backward compatibility with existing W&B panels.
     """
 
-    def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001):
+    def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001,
+                 min_steps_before_plateau=100):
         """
         Args:
             ema_alpha: Smoothing factor for EMA loss (lower = smoother).
             plateau_patience: Number of steps with no EMA improvement to declare plateau.
             plateau_min_improvement: Minimum relative improvement in EMA loss to count
                                      as "still improving" (0.001 = 0.1%).
+            min_steps_before_plateau: Minimum number of steps before plateau detection
+                                      activates. Prevents false early detection on
+                                      large-dataset tasks where EMA needs warmup time.
         """
         self.ema_alpha = ema_alpha
         self.plateau_patience = plateau_patience
         self.plateau_min_improvement = plateau_min_improvement
+        self.min_steps_before_plateau = min_steps_before_plateau
 
         self.loss_history = []
         self.grad_norm_history = []
@@ -330,9 +335,10 @@ class WasteQuantifier:
                 else:
                     self._steps_since_ema_improvement += 1
 
-            # Detect plateau onset (only set once)
+            # Detect plateau onset (only set once, after warmup period)
             if (self._plateau_step is None
-                    and self._steps_since_ema_improvement >= self.plateau_patience):
+                    and self._steps_since_ema_improvement >= self.plateau_patience
+                    and len(self.loss_history) >= self.min_steps_before_plateau):
                 self._plateau_step = len(self.loss_history) - self.plateau_patience
 
         # --- Legacy per-step comparison (kept as secondary metric) ---
@@ -436,14 +442,18 @@ class PhaseTransitionDetector:
     - Potential divergence
     """
 
-    def __init__(self, smoothing_window=20):
+    def __init__(self, smoothing_window=20, min_phase_duration=20):
         self.smoothing_window = smoothing_window
+        self.min_phase_duration = min_phase_duration
         self.loss_history = []
         self.grad_norm_history = []
         self.lr_history = []
         self.phase_history = []  # (step, phase_name)
         self.transition_points = []  # (step, from_phase, to_phase, evidence)
         self.current_phase = "warmup"
+        # Hysteresis state
+        self._candidate_phase = None
+        self._candidate_count = 0
 
     def update(self, step, loss, grad_norm=None, lr=None):
         """Update detector with new step data."""
@@ -453,11 +463,24 @@ class PhaseTransitionDetector:
         if lr is not None:
             self.lr_history.append(lr)
         
-        new_phase = self._detect_phase(step)
-        if new_phase != self.current_phase:
-            evidence = self._gather_evidence(step)
-            self.transition_points.append((step, self.current_phase, new_phase, evidence))
-            self.current_phase = new_phase
+        raw_phase = self._detect_phase(step)
+        
+        # Hysteresis: require min_phase_duration consecutive observations
+        # of the same new phase before committing the transition.
+        if raw_phase == self.current_phase:
+            self._candidate_phase = None
+            self._candidate_count = 0
+        elif raw_phase == self._candidate_phase:
+            self._candidate_count += 1
+            if self._candidate_count >= self.min_phase_duration:
+                evidence = self._gather_evidence(step)
+                self.transition_points.append((step, self.current_phase, raw_phase, evidence))
+                self.current_phase = raw_phase
+                self._candidate_phase = None
+                self._candidate_count = 0
+        else:
+            self._candidate_phase = raw_phase
+            self._candidate_count = 1
         
         self.phase_history.append((step, self.current_phase))
 
@@ -1312,8 +1335,11 @@ def run_single_experiment(
     
     # NEW trackers
     gsnr_tracker = GSNRTracker(model, window_size=50)
-    waste_quantifier = WasteQuantifier()
-    phase_detector = PhaseTransitionDetector(smoothing_window=20)
+    # min_steps_before_plateau: 10% of total steps (min 100) to prevent
+    # false early plateau detection on large-dataset tasks like MNLI/QQP
+    waste_min_steps = max(100, total_steps // 10)
+    waste_quantifier = WasteQuantifier(min_steps_before_plateau=waste_min_steps)
+    phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
 
     # Compute total steps for ETA
