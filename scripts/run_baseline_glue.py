@@ -1324,6 +1324,14 @@ def run_single_experiment(
     )
     print(f"  Train samples: {len(train_ds)}, Eval samples: {len(eval_ds)}")
 
+    # ── Compute total steps (needed by trackers below) ───────────────
+    num_epochs = 3
+    steps_per_epoch = len(train_ds) // (
+        hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"]
+    )
+    total_steps = steps_per_epoch * num_epochs
+    eval_steps = max(total_steps // 20, 10)
+
     # ── Initialize ALL trackers ───────────────────────────────────────
     ler_tracker = LERTracker(task=task_name, window_size=5)
     power_callback = PowerTelemetryCallback(
@@ -1341,15 +1349,6 @@ def run_single_experiment(
     waste_quantifier = WasteQuantifier(min_steps_before_plateau=waste_min_steps)
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
-
-    # Compute total steps for ETA
-    num_epochs = 3
-    steps_per_epoch = len(train_ds) // (
-        hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"]
-    )
-    total_steps = steps_per_epoch * num_epochs
-    eval_steps = max(total_steps // 20, 10)
-    
     eta_estimator = ETAEstimator(total_steps)
 
     # ── Enhanced Diagnostics Callback ─────────────────────────────────
