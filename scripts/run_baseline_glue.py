@@ -1,4 +1,3 @@
-cat > /ssd_xs/home/scvi383/scvi383/lerna/scripts/run_baseline_glue.py << 'EOF'
 #!/usr/bin/env python3
 """
 LERNA Baseline: ModernBERT-base on GLUE with FULL diagnostics.
@@ -2139,4 +2138,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
