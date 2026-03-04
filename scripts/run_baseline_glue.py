@@ -1,3 +1,4 @@
+cat > /ssd_xs/home/scvi383/scvi383/lerna/scripts/run_baseline_glue.py << 'EOF'
 #!/usr/bin/env python3
 """
 LERNA Baseline: ModernBERT-base on GLUE with FULL diagnostics.
@@ -293,6 +294,9 @@ class WasteQuantifier:
         self.energy_per_step = []
         self.step_times = []
 
+        # True step counter (not affected by history capping)
+        self._total_steps_seen = 0
+
         # EMA-based plateau detection state
         self._ema_loss = None
         self._best_ema_loss = None
@@ -305,6 +309,7 @@ class WasteQuantifier:
 
     def record_step(self, loss, grad_norm=None, energy_j=None, step_time=None):
         """Record metrics for a single training step."""
+        self._total_steps_seen += 1
         self.loss_history.append(loss)
         if grad_norm is not None:
             self.grad_norm_history.append(grad_norm)
@@ -312,6 +317,17 @@ class WasteQuantifier:
             self.energy_per_step.append(energy_j)
         if step_time is not None:
             self.step_times.append(step_time)
+
+        # Cap histories to prevent memory growth on large datasets (MNLI/QQP)
+        _MAX_HIST = 5000
+        if len(self.loss_history) > _MAX_HIST * 2:
+            self.loss_history = self.loss_history[-_MAX_HIST:]
+        if len(self.grad_norm_history) > _MAX_HIST * 2:
+            self.grad_norm_history = self.grad_norm_history[-_MAX_HIST:]
+        if len(self.step_times) > _MAX_HIST * 2:
+            self.step_times = self.step_times[-_MAX_HIST:]
+        if len(self.improving_steps) > _MAX_HIST * 2:
+            self.improving_steps = self.improving_steps[-_MAX_HIST:]
 
         # --- EMA-based plateau detection (the correct metric) ---
         if self._ema_loss is None:
@@ -338,8 +354,8 @@ class WasteQuantifier:
             # Detect plateau onset (only set once, after warmup period)
             if (self._plateau_step is None
                     and self._steps_since_ema_improvement >= self.plateau_patience
-                    and len(self.loss_history) >= self.min_steps_before_plateau):
-                self._plateau_step = len(self.loss_history) - self.plateau_patience
+                    and self._total_steps_seen >= self.min_steps_before_plateau):
+                self._plateau_step = self._total_steps_seen - self.plateau_patience
 
         # --- Legacy per-step comparison (kept as secondary metric) ---
         if len(self.loss_history) >= 2:
@@ -359,7 +375,7 @@ class WasteQuantifier:
         Primary metric (waste_ratio): fraction of steps after plateau onset.
         Secondary metric (raw_improving_ratio): legacy per-step comparison.
         """
-        n = len(self.loss_history)
+        n = self._total_steps_seen
         if n == 0:
             return {"waste_ratio": 0, "ci_95_low": 0, "ci_95_high": 0, "total_steps": 0,
                     "wasted_steps": 0, "plateau_step": None, "improving_steps": 0,
@@ -462,6 +478,17 @@ class PhaseTransitionDetector:
             self.grad_norm_history.append(grad_norm)
         if lr is not None:
             self.lr_history.append(lr)
+
+        # Cap histories to prevent memory growth on large datasets
+        _MAX_HIST = 5000
+        if len(self.loss_history) > _MAX_HIST * 2:
+            self.loss_history = self.loss_history[-_MAX_HIST:]
+        if len(self.grad_norm_history) > _MAX_HIST * 2:
+            self.grad_norm_history = self.grad_norm_history[-_MAX_HIST:]
+        if len(self.lr_history) > _MAX_HIST * 2:
+            self.lr_history = self.lr_history[-_MAX_HIST:]
+        if len(self.phase_history) > _MAX_HIST * 2:
+            self.phase_history = self.phase_history[-_MAX_HIST:]
         
         raw_phase = self._detect_phase(step)
         
@@ -619,6 +646,13 @@ class LRLossCorrelationTracker:
         self.lr_history.append(lr)
         self.loss_history.append(loss)
         self.lr_loss_pairs.append((lr, loss))
+
+        # Cap to prevent memory growth on large datasets
+        _MAX = 10000
+        if len(self.lr_loss_pairs) > _MAX * 2:
+            self.lr_loss_pairs = self.lr_loss_pairs[-_MAX:]
+            self.lr_history = self.lr_history[-_MAX:]
+            self.loss_history = self.loss_history[-_MAX:]
 
     def compute_correlation(self, window=None):
         """Compute Pearson correlation between LR and loss."""
@@ -1367,7 +1401,10 @@ def run_single_experiment(
             self.step_count = 0
             self._last_loss = None
             self._step_start_time = None
-            self._gsnr_log_interval = max(eval_steps // 2, 5)  # Log GSNR less frequently
+            # Scale GSNR interval with dataset size to avoid CPU bottleneck
+            # Small datasets (~800 steps): every ~5 steps
+            # Large datasets (~36K steps): every ~100 steps
+            self._gsnr_log_interval = max(min(eval_steps // 2, 100), 5)
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
@@ -2102,3 +2139,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
