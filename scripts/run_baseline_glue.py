@@ -1,3 +1,4 @@
+cat > /ssd_xs/home/scvi383/scvi383/lerna/scripts/run_baseline_glue.py << 'EOF'
 #!/usr/bin/env python3
 """
 LERNA Baseline: ModernBERT-base on GLUE with FULL diagnostics.
@@ -86,37 +87,103 @@ MODEL_NAME = "answerdotai/ModernBERT-base"
 # GSNR Tracker (NEW)
 # ═══════════════════════════════════════════════════════════════════════
 
+class _EMAWelfordAccumulator:
+    """EMA-Welford accumulator for smooth online GSNR estimation.
+
+    Uses exponentially weighted moving averages instead of the discontinuous
+    halving approach.  Each new gradient's contribution decays smoothly with
+    factor alpha = 2 / (window_size + 1), giving an effective window equal
+    to *window_size* samples.
+
+    Also tracks E[||g||^2] (Fisher Information trace) as a byproduct.
+
+    Memory: O(dim) regardless of window size.
+    """
+
+    def __init__(self, window_size: int = 50):
+        self.window_size = window_size
+        self.alpha = 2.0 / (window_size + 1)  # EMA decay factor
+        self.n = 0
+        self._ema_mean = None      # EMA of gradient (1-D tensor, CPU)
+        self._ema_var = None       # EMA of (g - mean)^2 per element
+        self._ema_grad_sq = 0.0    # EMA of ||g||^2 (scalar, for Fisher Info)
+
+    def update(self, grad_vec: torch.Tensor):
+        """Incorporate a new gradient vector (already on CPU, float32)."""
+        self.n += 1
+        if self._ema_mean is None:
+            self._ema_mean = grad_vec.clone()
+            self._ema_var = torch.zeros_like(grad_vec)
+            self._ema_grad_sq = grad_vec.norm().item() ** 2
+            return
+
+        # Update EMA mean
+        delta = grad_vec - self._ema_mean
+        self._ema_mean += self.alpha * delta
+
+        # Update EMA variance: Var_ema = (1-alpha) * (Var_ema + alpha * delta^2)
+        delta2 = grad_vec - self._ema_mean
+        self._ema_var = (1 - self.alpha) * (self._ema_var + self.alpha * delta * delta2)
+
+        # Update Fisher Information trace: EMA of ||g||^2
+        g_sq = grad_vec.norm().item() ** 2
+        self._ema_grad_sq = (1 - self.alpha) * self._ema_grad_sq + self.alpha * g_sq
+
+    def compute_gsnr(self) -> float:
+        """Return GSNR = ||E[g]||^2 / sum(Var[g_i])."""
+        if self.n < 2 or self._ema_mean is None:
+            return 0.0
+        signal = self._ema_mean.norm().item() ** 2
+        noise = self._ema_var.sum().item()
+        return signal / (noise + 1e-10)
+
+    def compute_fisher_info(self) -> float:
+        """Return trace of empirical Fisher Information: E[||g||^2].
+
+        This is a theoretically grounded metric (information geometry)
+        that NeurIPS/ICLR reviewers expect when discussing gradient
+        signal analysis.  It measures the expected curvature of the
+        loss landscape.
+        """
+        if self.n < 1:
+            return 0.0
+        return self._ema_grad_sq
+
+    @property
+    def ready(self) -> bool:
+        return self.n >= 2
+
+
 class GSNRTracker:
-    """Gradient Signal-to-Noise Ratio tracker.
-    
-    GSNR = ||E[g]||^2 / E[||g - E[g]||^2]
-    
-    Tracks per-layer and global GSNR over training to identify:
-    - Layers with low signal (vanishing gradients)
-    - Layers with high noise (unstable training)
-    - Phase transitions in training dynamics
+    """Gradient Signal-to-Noise Ratio tracker (memory-safe).
+
+    Uses Welford's online algorithm so memory is O(total_params) regardless
+    of window size, instead of the previous O(total_params * window_size)
+    which caused OOM on large models like ModernBERT.
     """
 
     def __init__(self, model, window_size=50):
         self.window_size = window_size
         self.layer_names = []
         self.layer_param_map = {}  # layer_name -> list of param names
-        
+
         # Discover layer structure
         self._discover_layers(model)
-        
-        # Per-layer gradient accumulators (rolling window)
-        self.grad_history = defaultdict(list)  # layer_name -> list of grad vectors
-        self.global_grad_history = []
-        
-        # GSNR history
-        self.gsnr_per_layer_history = defaultdict(list)  # layer_name -> list of GSNR values
+
+        # Per-layer EMA-Welford accumulators (O(layer_params) each)
+        self._layer_accum = {}
+        for ln in self.layer_names:
+            self._layer_accum[ln] = _EMAWelfordAccumulator(window_size)
+        self._global_accum = _EMAWelfordAccumulator(window_size)
+
+        # GSNR history (scalar values only, negligible memory)
+        self.gsnr_per_layer_history = defaultdict(list)
         self.gsnr_global_history = []
-        
-        # Gradient norm history (per-layer)
+
+        # Gradient norm history (scalars)
         self.grad_norm_history = defaultdict(list)
         self.global_grad_norm_history = []
-        
+
         # Step counter
         self.step = 0
 
@@ -126,9 +193,7 @@ class GSNRTracker:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            # Group by layer: e.g., "model.encoder.layer.0" or "classifier"
             parts = name.split(".")
-            # Find a reasonable grouping
             if "layer" in parts:
                 idx = parts.index("layer")
                 if idx + 1 < len(parts):
@@ -141,87 +206,117 @@ class GSNRTracker:
                 layer_name = ".".join(parts[:2]) if len(parts) >= 2 else parts[0]
             else:
                 layer_name = ".".join(parts[:3]) if len(parts) >= 3 else ".".join(parts[:2])
-            
             layer_params[layer_name].append(name)
-        
+
         self.layer_names = sorted(layer_params.keys())
         self.layer_param_map = dict(layer_params)
 
+    def capture_scalar_norms(self, model):
+        """Lightweight: capture only scalar gradient norms (no Welford update).
+
+        Call this frequently (every step or every few steps) to feed the
+        PhaseTransitionDetector with high-resolution gradient norm data
+        without the cost of full EMA-Welford accumulation.
+        """
+        global_norm_sq = 0.0
+        has_grad = False
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                pnorm = param.grad.detach().float().norm().item()
+                global_norm_sq += pnorm ** 2
+                has_grad = True
+                # Per-layer norm (find which layer this param belongs to)
+                for layer_name, param_names in self.layer_param_map.items():
+                    if name in param_names:
+                        self.grad_norm_history[layer_name].append(pnorm)
+                        if len(self.grad_norm_history[layer_name]) > self.window_size * 10:
+                            self.grad_norm_history[layer_name] = self.grad_norm_history[layer_name][-self.window_size * 5:]
+                        break
+        if has_grad:
+            self.global_grad_norm_history.append(global_norm_sq ** 0.5)
+            if len(self.global_grad_norm_history) > self.window_size * 10:
+                self.global_grad_norm_history = self.global_grad_norm_history[-self.window_size * 5:]
+
     def capture_gradients(self, model):
-        """Capture current gradients from model parameters."""
+        """Full capture: update EMA-Welford accumulators + scalar norms.
+
+        Call this less frequently (at eval intervals) since it builds
+        concatenated gradient vectors for the Welford update.
+        """
         self.step += 1
-        
-        # Per-layer gradient capture
+
+        # Build a name -> grad lookup once to avoid repeated iteration
+        grad_lookup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                grad_lookup[name] = param.grad
+
+        # Per-layer accumulation
         for layer_name, param_names in self.layer_param_map.items():
             layer_grads = []
-            for name, param in model.named_parameters():
-                if name in param_names and param.grad is not None:
-                    layer_grads.append(param.grad.detach().float().flatten())
-            
+            for pn in param_names:
+                if pn in grad_lookup:
+                    layer_grads.append(grad_lookup[pn].detach().float().flatten())
             if layer_grads:
                 layer_grad_vec = torch.cat(layer_grads)
                 grad_norm = layer_grad_vec.norm().item()
                 self.grad_norm_history[layer_name].append(grad_norm)
-                
-                # Keep rolling window of gradient vectors for GSNR computation
-                # Store as CPU to save GPU memory
-                self.grad_history[layer_name].append(layer_grad_vec.cpu())
-                if len(self.grad_history[layer_name]) > self.window_size:
-                    self.grad_history[layer_name].pop(0)
                 if len(self.grad_norm_history[layer_name]) > self.window_size * 10:
                     self.grad_norm_history[layer_name] = self.grad_norm_history[layer_name][-self.window_size * 5:]
-        
-        # Global gradient
+                self._layer_accum[layer_name].update(layer_grad_vec.cpu())
+                del layer_grad_vec
+
+        # Global accumulation
         all_grads = []
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                all_grads.append(param.grad.detach().float().flatten())
-        
+        for name in sorted(grad_lookup.keys()):
+            all_grads.append(grad_lookup[name].detach().float().flatten())
         if all_grads:
             global_grad = torch.cat(all_grads)
             self.global_grad_norm_history.append(global_grad.norm().item())
-            self.global_grad_history.append(global_grad.cpu())
-            if len(self.global_grad_history) > self.window_size:
-                self.global_grad_history.pop(0)
             if len(self.global_grad_norm_history) > self.window_size * 10:
                 self.global_grad_norm_history = self.global_grad_norm_history[-self.window_size * 5:]
+            self._global_accum.update(global_grad.cpu())
+            del global_grad
+        del all_grads
 
     def compute_gsnr(self):
-        """Compute GSNR for all layers and globally.
-        
-        Returns dict with per-layer and global GSNR values.
+        """Compute GSNR for all layers and globally (memory-safe)."""
+        results = {}
+        try:
+            for layer_name in self.layer_names:
+                acc = self._layer_accum.get(layer_name)
+                if acc is not None and acc.ready:
+                    gsnr = acc.compute_gsnr()
+                    results[layer_name] = gsnr
+                    self.gsnr_per_layer_history[layer_name].append(gsnr)
+
+            if self._global_accum.ready:
+                global_gsnr = self._global_accum.compute_gsnr()
+                results["__global__"] = global_gsnr
+                self.gsnr_global_history.append(global_gsnr)
+        except (RuntimeError, MemoryError) as e:
+            print(f"  [GSNR warn] compute_gsnr failed: {e}")
+        return results
+
+    def compute_fisher_info(self):
+        """Compute empirical Fisher Information trace per layer and globally.
+
+        FI = E[||g||^2] measures the expected curvature of the loss surface.
+        It is a theoretically grounded metric from information geometry that
+        complements GSNR for NeurIPS/ICLR-level analysis.
+
+        Returns dict with per-layer and global Fisher Information values.
         """
         results = {}
-        
-        # Per-layer GSNR
-        for layer_name in self.layer_names:
-            grads = self.grad_history.get(layer_name, [])
-            if len(grads) < 2:
-                continue
-            
-            stacked = torch.stack(grads)  # [window, dim]
-            mean_grad = stacked.mean(dim=0)  # E[g]
-            signal = mean_grad.norm().item() ** 2  # ||E[g]||^2
-            
-            # Noise: E[||g - E[g]||^2]
-            deviations = stacked - mean_grad.unsqueeze(0)
-            noise = (deviations.norm(dim=1) ** 2).mean().item()
-            
-            gsnr = signal / (noise + 1e-10)
-            results[layer_name] = gsnr
-            self.gsnr_per_layer_history[layer_name].append(gsnr)
-        
-        # Global GSNR
-        if len(self.global_grad_history) >= 2:
-            stacked = torch.stack(self.global_grad_history)
-            mean_grad = stacked.mean(dim=0)
-            signal = mean_grad.norm().item() ** 2
-            deviations = stacked - mean_grad.unsqueeze(0)
-            noise = (deviations.norm(dim=1) ** 2).mean().item()
-            global_gsnr = signal / (noise + 1e-10)
-            results["__global__"] = global_gsnr
-            self.gsnr_global_history.append(global_gsnr)
-        
+        try:
+            for layer_name in self.layer_names:
+                acc = self._layer_accum.get(layer_name)
+                if acc is not None and acc.n >= 1:
+                    results[layer_name] = acc.compute_fisher_info()
+            if self._global_accum.n >= 1:
+                results["__global__"] = self._global_accum.compute_fisher_info()
+        except Exception as e:
+            print(f"  [Fisher warn] compute_fisher_info failed: {e}")
         return results
 
     def get_gradient_norm_stats(self):
@@ -609,6 +704,9 @@ class ETAEstimator:
             else:
                 self.ema_step_time = self.alpha * dt + (1 - self.alpha) * self.ema_step_time
         self.step_times.append((current_step, now))
+        # Cap to prevent unbounded memory growth on long runs
+        if len(self.step_times) > 2000:
+            self.step_times = self.step_times[-1000:]
 
     def get_eta(self, current_step):
         """Get estimated time remaining."""
@@ -1318,6 +1416,11 @@ def run_single_experiment(
                 "total_runs": total_runs,
             },
         )
+        # Fix WandB step-conflict warnings: let wandb accept any step order
+        try:
+            wandb.define_metric("*", step_metric="train/global_step", step_sync=False)
+        except Exception:
+            pass
 
     print(f"\n{'='*60}")
     print(f"  LERNA Baseline: {task_name} | seed={seed} | lr={lr}")
@@ -1401,9 +1504,9 @@ def run_single_experiment(
             self._last_loss = None
             self._step_start_time = None
             # Scale GSNR interval with dataset size to avoid CPU bottleneck
-            # Small datasets (~800 steps): every ~5 steps
-            # Large datasets (~36K steps): every ~100 steps
-            self._gsnr_log_interval = max(min(eval_steps // 2, 100), 5)
+            # Small datasets (~800 steps): every ~50 steps
+            # Large datasets (~36K steps): every eval_steps
+            self._gsnr_log_interval = max(eval_steps, 200)
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
@@ -1439,12 +1542,18 @@ def run_single_experiment(
                 self.ler_tracker.capture_step_gradients(self._model)
             except Exception:
                 pass
-            
-            # Capture GSNR gradients (less frequently to save compute)
+
+            # Lightweight scalar norms every step for phase detector
+            try:
+                self.gsnr_tracker.capture_scalar_norms(self._model)
+            except Exception:
+                pass
+
+            # Full EMA-Welford GSNR update less frequently
             if self.step_count % self._gsnr_log_interval == 0:
                 try:
                     self.gsnr_tracker.capture_gradients(self._model)
-                except Exception as e:
+                except Exception:
                     pass
             return control
 
@@ -1530,15 +1639,20 @@ def run_single_experiment(
                             layer_gsnrs = {k: v for k, v in gsnr_results.items() if k != "__global__"}
                             if layer_gsnrs:
                                 sorted_layers = sorted(layer_gsnrs.items(), key=lambda x: x[1])
-                                # Bottom 3 (worst GSNR)
                                 for i, (name, val) in enumerate(sorted_layers[:3]):
                                     short = name.split(".")[-2:]
                                     log_data[f"gsnr/bottom_{i+1}_{'_'.join(short)}"] = val
-                                # Top 3 (best GSNR)
                                 for i, (name, val) in enumerate(sorted_layers[-3:]):
                                     short = name.split(".")[-2:]
                                     log_data[f"gsnr/top_{i+1}_{'_'.join(short)}"] = val
-                            
+
+                            # Fisher Information (computed from same accumulators)
+                            fisher_results = self.gsnr_tracker.compute_fisher_info()
+                            fi_global = fisher_results.get("__global__")
+                            if fi_global is not None:
+                                log_data["fisher/global"] = fi_global
+                                log_data["fisher/global_log10"] = math.log10(fi_global + 1e-10)
+
                             wandb.log(log_data, step=state.global_step)
                 except Exception:
                     pass
@@ -1825,10 +1939,14 @@ def run_single_experiment(
     # Set trainer reference in callback
     trainer_holder[0] = trainer
 
+    # Give LER tracker access to the optimizer for velocity-from-Adam
+    ler_tracker._optimizer = trainer.optimizer if hasattr(trainer, 'optimizer') else None
+
     # ── Train & evaluate ──────────────────────────────────────────────
     start_time = time.time()
     print(f"\n  Starting training: {total_steps} total steps, eval every {eval_steps} steps")
-    print(f"  ETA will be shown after first eval checkpoint\n")
+    print(f"  ETA will be shown after first eval checkpoint")
+    print(f"  Diagnostics: EMA-Welford GSNR + Fisher Info + optimizer velocity\n")
     
     train_result = trainer.train()
     total_time = time.time() - start_time
@@ -2138,3 +2256,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
