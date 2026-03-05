@@ -80,6 +80,30 @@ GLUE_TASK_CONFIG = {
     "stsb":  {"keys": ("sentence1", "sentence2"), "num_labels": 1, "metric": "pearsonr"},
 }
 
+# Per-task hyperparameter overrides for small datasets.
+# Keys override the defaults (lr=2e-5, num_epochs=3, warmup_ratio=0.1, early_stopping_patience=5).
+# Only tasks listed here get overrides; all others use the global defaults.
+TASK_HP_OVERRIDES = {
+    "rte": {
+        "learning_rate": 3e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.2,
+        "early_stopping_patience": 10,
+    },
+    "cola": {
+        "learning_rate": 3e-5,
+        "num_epochs": 5,
+        "warmup_ratio": 0.15,
+        "early_stopping_patience": 7,
+    },
+    "mrpc": {
+        "learning_rate": 3e-5,
+        "num_epochs": 5,
+        "warmup_ratio": 0.15,
+        "early_stopping_patience": 7,
+    },
+}
+
 MODEL_NAME = "answerdotai/ModernBERT-base"
 
 
@@ -1374,6 +1398,9 @@ def run_single_experiment(
     total_runs: int = 0,
     wandb_project: str = "lerna-baseline",
     wandb_group: str = "glue-baseline",
+    num_epochs: int = 3,
+    warmup_ratio: float = 0.1,
+    early_stopping_patience: int = 5,
 ):
     """Run a single GLUE fine-tuning experiment with FULL diagnostics.
 
@@ -1425,6 +1452,7 @@ def run_single_experiment(
     print(f"\n{'='*60}")
     print(f"  LERNA Baseline: {task_name} | seed={seed} | lr={lr}")
     print(f"  Profile: {profile} | Output: {output_dir}")
+    print(f"  Epochs: {num_epochs} | Warmup: {warmup_ratio} | ES patience: {early_stopping_patience}")
     if run_idx and total_runs:
         print(f"  Progress: run {run_idx}/{total_runs}")
     print(f"{'='*60}")
@@ -1461,7 +1489,6 @@ def run_single_experiment(
     print(f"  Train samples: {len(train_ds)}, Eval samples: {len(eval_ds)}")
 
     # ── Compute total steps (needed by trackers below) ───────────────
-    num_epochs = 3
     steps_per_epoch = len(train_ds) // (
         hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"]
     )
@@ -1892,7 +1919,7 @@ def run_single_experiment(
         gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
         learning_rate=lr,
         weight_decay=0.01,
-        warmup_ratio=0.1,
+        warmup_ratio=warmup_ratio,
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
@@ -1930,7 +1957,7 @@ def run_single_experiment(
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
         callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=5),
+            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
             power_callback,
             diag_callback,
         ],
@@ -2160,11 +2187,18 @@ def main():
             else:
                 print(f"\n  ═══ Run {run_idx}/{total_runs} ═══")
             
+            # Resolve per-task hyperparameters
+            task_hp = TASK_HP_OVERRIDES.get(task, {})
+            task_lr = task_hp.get("learning_rate", args.lr)
+            task_epochs = task_hp.get("num_epochs", 3)
+            task_warmup = task_hp.get("warmup_ratio", 0.1)
+            task_patience = task_hp.get("early_stopping_patience", 5)
+
             try:
                 result = run_single_experiment(
                     task_name=task,
                     seed=seed,
-                    lr=args.lr,
+                    lr=task_lr,
                     profile=profile,
                     base_output_dir=args.output_dir,
                     use_wandb=args.wandb,
@@ -2173,6 +2207,9 @@ def main():
                     total_runs=total_runs,
                     wandb_project=args.wandb_project,
                     wandb_group=wandb_group,
+                    num_epochs=task_epochs,
+                    warmup_ratio=task_warmup,
+                    early_stopping_patience=task_patience,
                 )
                 all_results.append(result)
             except Exception as e:
