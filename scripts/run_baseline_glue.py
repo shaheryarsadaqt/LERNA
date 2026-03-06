@@ -83,24 +83,39 @@ GLUE_TASK_CONFIG = {
 # Per-task hyperparameter overrides for small datasets.
 # Keys override the defaults (lr=2e-5, num_epochs=3, warmup_ratio=0.1, early_stopping_patience=5).
 # Only tasks listed here get overrides; all others use the global defaults.
+#
+# FIX: Tuned based on GLUE benchmark analysis (2026-03-06):
+#   - RTE: MNLI transfer + lower LR + more epochs (was 60.8%, target >70%)
+#   - CoLA: Lower LR + more epochs + MCC-based model selection (was 59.4 MCC, target >65)
+#   - MRPC: Lower LR + more epochs + F1-based model selection (was 86.2%, target >89%)
 TASK_HP_OVERRIDES = {
     "rte": {
-        "learning_rate": 3e-5,
-        "num_epochs": 10,
-        "warmup_ratio": 0.2,
-        "early_stopping_patience": 10,
+        "learning_rate": 2e-5,
+        "num_epochs": 20,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 15,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+        # Standard practice: initialize from MNLI-finetuned model for RTE
+        # (Devlin et al. 2019, Liu et al. 2019, Wang et al. 2019)
+        "init_from_mnli": True,
     },
     "cola": {
-        "learning_rate": 3e-5,
-        "num_epochs": 5,
-        "warmup_ratio": 0.15,
-        "early_stopping_patience": 7,
+        "learning_rate": 1e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        # CoLA uses MCC as primary metric; model selection must use MCC, not loss
+        "metric_for_best_model": "eval_matthews_correlation",
+        "greater_is_better": True,
     },
     "mrpc": {
-        "learning_rate": 3e-5,
-        "num_epochs": 5,
-        "warmup_ratio": 0.15,
-        "early_stopping_patience": 7,
+        "learning_rate": 2e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
     },
 }
 
@@ -1401,6 +1416,9 @@ def run_single_experiment(
     num_epochs: int = 3,
     warmup_ratio: float = 0.1,
     early_stopping_patience: int = 5,
+    metric_for_best_model: str = "eval_loss",
+    greater_is_better: bool = False,
+    init_from_mnli: bool = False,
 ):
     """Run a single GLUE fine-tuning experiment with FULL diagnostics.
 
@@ -1467,12 +1485,52 @@ def run_single_experiment(
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     cfg = GLUE_TASK_CONFIG[task_name]
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=cfg["num_labels"],
-        reference_compile=False,
-        attn_implementation="eager",
-    )
+    # FIX: For RTE, optionally initialize from MNLI-finetuned model
+    # This is standard practice (Devlin et al. 2019) and typically adds 10-20 points
+    model_name_or_path = MODEL_NAME
+    mnli_checkpoint_dir = os.path.join(base_output_dir, "mnli_finetuned")
+    if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
+        print(f"  [MNLI Transfer] Loading MNLI-finetuned model from {mnli_checkpoint_dir}")
+        # Load the MNLI model but replace the classifier head for the target task
+        from transformers import AutoConfig
+        mnli_model = AutoModelForSequenceClassification.from_pretrained(
+            mnli_checkpoint_dir,
+            reference_compile=False,
+            attn_implementation="eager",
+        )
+        # Create target model with correct num_labels
+        model = AutoModelForSequenceClassification.from_pretrained(
+            MODEL_NAME,
+            num_labels=cfg["num_labels"],
+            reference_compile=False,
+            attn_implementation="eager",
+        )
+        # Transfer encoder weights from MNLI model (skip classifier head)
+        encoder_state = {k: v for k, v in mnli_model.state_dict().items()
+                        if "classifier" not in k and "pooler" not in k}
+        missing, unexpected = model.load_state_dict(encoder_state, strict=False)
+        print(f"  [MNLI Transfer] Loaded encoder weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        del mnli_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif init_from_mnli and not os.path.exists(mnli_checkpoint_dir):
+        print(f"  [MNLI Transfer] WARNING: init_from_mnli=True but no MNLI checkpoint found at {mnli_checkpoint_dir}")
+        print(f"  [MNLI Transfer] Run MNLI first, then save best model to {mnli_checkpoint_dir}")
+        print(f"  [MNLI Transfer] Falling back to pretrained {MODEL_NAME}")
+        model = AutoModelForSequenceClassification.from_pretrained(
+            MODEL_NAME,
+            num_labels=cfg["num_labels"],
+            reference_compile=False,
+            attn_implementation="eager",
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            MODEL_NAME,
+            num_labels=cfg["num_labels"],
+            reference_compile=False,
+            attn_implementation="eager",
+        )
 
     if hw_cfg["gradient_checkpointing"]:
         try:
@@ -1929,9 +1987,11 @@ def run_single_experiment(
         save_steps=eval_steps,
         save_total_limit=2,
         # FIX #9: load_best_model_at_end=True to evaluate best model
+        # FIX: Use task-specific metric for model selection (not hardcoded eval_loss)
+        # CoLA -> eval_matthews_correlation, RTE/MRPC -> eval_accuracy, etc.
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model=metric_for_best_model,
+        greater_is_better=greater_is_better,
         logging_steps=max(eval_steps // 5, 1),
         report_to="wandb" if use_wandb else "none",
         run_name=run_id if use_wandb else None,
@@ -2193,6 +2253,9 @@ def main():
             task_epochs = task_hp.get("num_epochs", 3)
             task_warmup = task_hp.get("warmup_ratio", 0.1)
             task_patience = task_hp.get("early_stopping_patience", 5)
+            task_best_metric = task_hp.get("metric_for_best_model", "eval_loss")
+            task_greater_is_better = task_hp.get("greater_is_better", False)
+            task_init_mnli = task_hp.get("init_from_mnli", False)
 
             try:
                 result = run_single_experiment(
@@ -2210,6 +2273,9 @@ def main():
                     num_epochs=task_epochs,
                     warmup_ratio=task_warmup,
                     early_stopping_patience=task_patience,
+                    metric_for_best_model=task_best_metric,
+                    greater_is_better=task_greater_is_better,
+                    init_from_mnli=task_init_mnli,
                 )
                 all_results.append(result)
             except Exception as e:
