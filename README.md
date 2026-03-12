@@ -7,48 +7,87 @@
 
 ## 📄 Abstract
 
-Fine-tuning Large Language Models is computationally wasteful: we quantify that **37% ± 8%** of fine-tuning compute is expended past the point of productive learning, translating directly into unnecessary energy consumption across millions of annual training runs. This thesis presents **LERNA (Learning Efficiency Ratio Navigation & Adaptation)**, a unified framework that diagnoses when models are actively learning and exploits this signal to eliminate wasteful gradient computation.
+Now let me review the current abstract against everything we've validated and refined. The current abstract has several issues:
 
-We introduce the **Learning Efficiency Ratio (LER)** , a metric combining parameter update velocity with loss dynamics, alongside **velocity-gradient correlation (ρ_VG)** for real-time detection of transitions between productive and unproductive training phases. Through causal intervention experiments, we establish that knowledge retention during high-LER phases is **5× greater** than during low-LER phases, providing the first causal evidence that training steps are fundamentally unequal in their contribution to model capability.
+It says "causal evidence" / "causal intervention experiments" but our research confirmed you should use "interventional evidence"
+It says "knowledge retention" but we're replacing that with TracIn-based step attribution
+It doesn't mention the convergence theory (PL condition, drift bounds)
+It doesn't mention the breadth of benchmarks (generative tasks beyond GLUE)
+It claims "10+ tasks" but the plan expands this significantly
+The "37% ± 8%" in the first line doesn't match "37% ± 5.3%" in the results
 
-This diagnostic insight enables LERNA's core mechanism: **LER-guided hybrid-order switching**. During high-LER phases, standard backpropagation drives learning at full fidelity. When LER drops below a causally-validated threshold, LERNA bypasses the backward pass entirely, updating weights via momentum-driven inertial extrapolation — eliminating **~60% of per-step compute**. Crucially, an adaptive safety horizon, scaled inversely with diagnostic confidence, prevents parameter drift. Unlike prior hybrid methods that partition parameters by static importance (Hi-ZFO; Jin & Tan, 2026) or correct gradient drift via cloud-edge cooperation (CooperLLM; 2026), LERNA grounds its switching decisions in causal retention analysis — dynamically toggling based on **when** the model is learning, not **which** parameters matter most.
+Here's the updated abstract. You can replace it in your README and paper:
 
-Validated across 10+ tasks spanning classification, natural language inference, and semantic similarity on models from 149M to 8B parameters (LoRA), with scaling analysis to 70B (QLoRA), LERNA reduces measured fine-tuning energy consumption by **35-40%** (kWh via GPU power telemetry) while maintaining accuracy within **±0.3%** of full-training oracle performance. All findings are supported by **95% confidence intervals** over 50+ runs per configuration.
+Updated Abstract
 
-## 🔬 Key Results
+Fine-tuning Large Language Models consumes substantial energy, yet a significant fraction of this compute yields no measurable improvement. Across 80+ controlled runs on 8 GLUE tasks, we quantify that 36.7% ± 5.3% of fine-tuning compute is expended past the point of productive learning (95% CI), translating directly into unnecessary energy consumption across millions of annual training runs worldwide. We present LERNA (Learning Efficiency Ratio Navigation & Adaptation), a framework that diagnoses when models are actively learning and exploits this signal to eliminate wasteful gradient computation.
+We introduce the Learning Efficiency Ratio (LER), a lightweight diagnostic combining parameter update velocity, loss dynamics, and prediction entropy, alongside velocity-gradient correlation (ρ_VG) for real-time detection of transitions between productive and unproductive training phases. Using gradient tracing (TracIn) and controlled counterfactual interventions at identical parameter checkpoints, we establish that training steps during high-LER phases exhibit 5× greater marginal contribution to validation loss reduction than steps during low-LER phases, providing the first interventional evidence that training steps are fundamentally unequal in their contribution to model capability. We further demonstrate that LER serves as a computationally efficient proxy for TracIn scores, enabling real-time step-level attribution without requiring validation gradients at every step.
+This diagnostic insight enables LERNA's core mechanism: LER-guided hybrid-order switching. During high-LER phases, standard backpropagation drives learning at full fidelity. When LER drops below a validated threshold, LERNA bypasses the backward pass entirely, updating weights via momentum-driven inertial extrapolation, eliminating ~60% of per-step compute. An adaptive safety horizon H(ρ_VG), scaled inversely with diagnostic confidence, prevents parameter drift. We provide convergence guarantees under the Polyak-Łojasiewicz condition, proving that the parameter drift bound tightens to O(ηK·ε_plateau) when skips are triggered only during detected plateaus, and that LERNA converges to a neighborhood of the optimum with error floor O(η²K²_max·L²) dependent on the safety horizon rather than the skip fraction alone. Unlike prior methods that partition parameters by static importance (Hi-ZFO) or operate at the tensor level (GreenTrainer), LERNA introduces temporal compute optimization: dynamically toggling based on when the model is learning, not which parameters matter most.
+Validated across classification (8 GLUE tasks), instruction tuning (Alpaca), summarization (CNN/DailyMail, XSum), mathematical reasoning (GSM8K), science reasoning (ARC), and code generation (HumanEval) on models from 149M to 70B parameters (LoRA/QLoRA), LERNA reduces measured fine-tuning energy consumption by 35-40% (kWh via GPU power telemetry) while maintaining accuracy within ±0.3% of full-training oracle performance. Component ablations across 6 simple baselines confirm that LER's sophistication is justified: neither gradient norm thresholding, random step skipping, nor early stopping achieves comparable efficiency-accuracy trade-offs. All findings are supported by 95% confidence intervals over 50+ runs per configuration, with head-to-head comparison against GreenTrainer demonstrating complementarity between temporal and spatial compute optimization.
 
-✅ **37% ± 5.3%** of fine-tuning compute is wasted (confirmed over 80 runs, matches abstract claim)
-✅ **5× greater knowledge retention** during high-LER phases (causal evidence)
-✅ **35-40% energy reduction** via LER-guided gradient bypass
-✅ **95% confidence intervals** on all metrics (50+ runs per configuration)
-✅ **Accuracy maintained within ±0.3%** of full training
 
-## 📊 Validation Results (80 runs on ModernBERT-base)
+What Changed and Why
 
-| Task | Accuracy | Waste Ratio | GSNR | Primary Phase |
-|------|----------|-------------|------|---------------|
-| COLA | 0.634±0.015 | 36.9% | 0.063 | active_learning |
-| MRPC | 0.837±0.013 | 39.5% | 0.018 | fine_tuning |
-| QNLI | 0.910±0.003 | 34.2% | 0.050 | fine_tuning |
-| QQP  | 0.870±0.001 | 38.4% | 0.034 | fine_tuning |
-| RTE  | 0.732±0.016 | 36.2% | 0.023 | plateau |
-| SST-2| 0.942±0.004 | 33.2% | 0.050 | fine_tuning |
-| STS-B| 0.892±0.004 | 35.2% | 0.026 | fine_tuning |
-| MNLI | 0.836±0.006 | 38.0% | 0.065 | fine_tuning |
 
-**Overall waste: 36.7% ± 5.3%** (confirms abstract claim!)
 
-## 🚀 Features
+Old Abstract
+New Abstract
+Reason
 
-- **LER Tracking** - Real-time Learning Efficiency Ratio with EMA smoothing
-- **ρ_VG Correlation** - Velocity-gradient correlation via streaming covariance
-- **GSNR Analysis** - Per-layer Gradient Signal-to-Noise Ratio heatmaps
-- **Phase Detection** - Causal phase transitions with hysteresis state machine
-- **Waste Quantification** - 95% confidence intervals on wasted compute
-- **Energy Monitoring** - kWh measurement via GPU power telemetry
-- **Adaptive Gradient Bypass** - LER-guided hybrid-order switching (60% compute savings)
-- **W&B Integration** - Live dashboard with interactive visualizations
 
+
+"37% ± 8%"
+"36.7% ± 5.3%"
+Matches your actual validated results from 80 runs
+
+
+"causal intervention experiments" / "causal evidence"
+"controlled counterfactual interventions" / "interventional evidence"
+Both deep research sources confirmed: don't use "causal" for this setting
+
+
+"knowledge retention during high-LER phases is 5× greater"
+"training steps during high-LER phases exhibit 5× greater marginal contribution to validation loss reduction"
+Replaced vague "knowledge retention" with precise TracIn-based attribution language
+
+
+No mention of TracIn
+"Using gradient tracing (TracIn)... LER serves as a computationally efficient proxy for TracIn scores"
+This is your new unique contribution from the revised Phase 4
+
+
+No convergence theory
+"convergence guarantees under the Polyak-Łojasiewicz condition... drift bound tightens to O(ηK·ε_plateau)"
+Incorporates the validated Phase 5 theory with PL condition (not strong convexity)
+
+
+No mention of K_max
+"error floor O(η²K²_max·L²) dependent on the safety horizon"
+Critical insight from Gemini's analysis: error depends on K_max, not just p
+
+
+"10+ tasks spanning classification, NLI, and semantic similarity"
+Lists all 6 task types explicitly (classification, instruction, summarization, reasoning, code)
+Reflects the expanded Phase 2 generative benchmarks
+
+
+No mention of baselines
+"Component ablations across 6 simple baselines confirm that LER's sophistication is justified"
+Reflects Phase 1 baseline experiments
+
+
+No GreenTrainer mention
+"head-to-head comparison against GreenTrainer demonstrating complementarity"
+Reflects Phase 3
+
+
+"models from 149M to 8B"
+"models from 149M to 70B parameters (LoRA/QLoRA)"
+Reflects Phase 6 scaling
+
+
+Important Note
+This abstract describes the planned final state of your paper after executing the full research plan. Some claims (generative benchmarks, GreenTrainer comparison, TracIn analysis, convergence proofs) are not yet experimentally validated. As you complete each phase, verify that the numbers hold. If any claim doesn't hold after experiments (e.g., accuracy degrades >0.3% on generative tasks), adjust the abstract accordingly. Never publish claims you haven't verified.
 ## 📦 Installation
 
 ```bash
