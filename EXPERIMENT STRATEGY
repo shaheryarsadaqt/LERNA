@@ -1,0 +1,568 @@
+LERNA: Complete Research Plan
+From Current State to Top-Venue Submission
+
+Phase 0: Foundation & Cleanup (Week 1-2)
+This phase prepares your codebase and infrastructure before running any new experiments.
+0.1 Repository Cleanup (Week 1, Days 1-2)
+Delete the 5 junk files identified in the earlier codebase review:
+lerna/callbacks/efficiency_callback.py.bak2
+scripts/run_baseline_glue.py.backup2
+scripts/run_baseline_glue.pyqqq
+push_all.sh
+lerna/callbacks/switching_callback.py
+Fix the duplicate class definitions at the bottom of lerna/callbacks/efficiency_callback.py (ProbeAccuracyCallback, GradientAnalysisCallback, ComputeCostTracker are defined twice).
+0.2 Terminology Fix (Week 1, Day 2)
+Rename all references to "zeroth-order" in your codebase and paper to "gradient-free inertial update" or "momentum-driven weight extrapolation." This affects:
+lerna/callbacks/lerna_switching.py (docstrings and comments)
+lerna/callbacks/switching_callback.py (already being deleted)
+README.md
+Any paper drafts
+This prevents reviewers from unfavorably comparing your approach to MeZO/SPSA, which are actual zeroth-order methods using perturbation-based gradient estimation. Your approach uses no gradient estimation at all during skip phases.
+Also add a note to fix the runtime bugs in lerna_switching.py:
+self.accuracy_during_skip and self.accuracy_during_normal are referenced in on_evaluate and on_train_end but never initialized in __init__ (you initialized self.accuracy_before_skip and self.accuracy_after_skip instead)
+on_step_end accesses args.optimizer but HuggingFace TrainingArguments doesn't expose the optimizer there; you need to capture it from kwargs or the Trainer object
+0.3 Add MSAM and Missing Prior Art to Related Work (Week 1, Days 3-4)
+Update your paper's related work section to cite and differentiate from:
+MSAM (Momentum-SAM): Bypasses extra backward pass using momentum vector. Differentiation: MSAM uses momentum for generalization (sharpness-aware perturbation); LERNA uses momentum for compute reduction (backward pass bypass during detected plateaus).
+Weight Extrapolation & Logits Extrapolation (2025, arXiv:2601.04537): Predicts future model states using linear correlation. Differentiation: LERNA's novelty is in the conditional triggering via LER/ρ_VG, not the extrapolation itself.
+Polyak averaging / SWA: Conceptually related weight averaging. Differentiation: These are post-training techniques; LERNA operates during training.
+GreenTrainer (2023): 64% FLOPs reduction via tensor-level backprop evaluation. Differentiation: GreenTrainer operates at tensor level (which tensors to backprop through); LERNA operates at time step level (when to backprop at all).
+Frame Hi-ZFO as orthogonal, not competing: Hi-ZFO = spatial (which parameters), LERNA = temporal (when to switch). Suggest they could be combined.
+0.4 Infrastructure Setup (Week 1-2)
+Set up experiment infrastructure for the new benchmarks:
+Install and test datasets: Alpaca/OpenAssistant, CNN/DailyMail, XSum, GSM8K, ARC, HumanEval
+Prepare model configs for: Llama-2-7B (LoRA), Llama-3-8B (LoRA), Llama-2-70B (QLoRA)
+Set up W&B project for new experiment tracking
+Prepare SLURM scripts for batch runs
+Verify GreenTrainer can be reproduced on your hardware
+
+Phase 1: Simple Baselines & Ablations (Week 3-5)
+This phase proves that LER's sophistication is justified. These are the experiments that transform your novelty from "claimed" to "demonstrated."
+1.1 Implement 6 Simple Baselines (Week 3)
+Build these as HuggingFace Trainer callbacks, matching your existing LERNA callback interface:
+Baseline 1: Gradient Norm Thresholding
+Skip backward pass when ||g|| < threshold X
+Tests whether LER is better than its simplest component
+Use same skip rate as LERNA for fair comparison
+Baseline 2: Random Step Skipping
+Skip backward pass randomly at the same skip rate LERNA achieves
+Tests whether the selection matters or just the reduction
+If random skipping performs similarly, LER adds no value
+Baseline 3: Early Stopping with Optimal Patience
+Standard early stopping (oracle: stop at best validation loss)
+Tests whether LERNA captures anything beyond "stop when not learning"
+Run with patience values: 3, 5, 10, 20
+Baseline 4: Weight Freezing During Skip Phases
+When LER detects plateau, freeze weights entirely (no update at all) instead of momentum extrapolation
+Tests whether momentum extrapolation actually helps vs. doing nothing
+Baseline 5: Reduced Total Steps
+Train with fewer total steps (same compute budget as LERNA)
+Tests whether just training less achieves the same result
+Baseline 6: Cosine Annealing with Warm Restarts
+Standard cosine schedule with restarts
+Tests whether phase-aware LR scheduling captures the same benefit
+1.2 Run Simple Baselines on Current GLUE Setup (Week 4)
+Run all 6 baselines on your existing 8 GLUE tasks with the same configuration as your current LERNA experiments:
+ModernBERT-base
+10 seeds per task per baseline
+Track: accuracy, energy (kWh), waste ratio, training time
+Compare directly against LERNA's existing results
+Expected outcome: LERNA should outperform all 6 baselines. If it doesn't outperform gradient norm thresholding or random skipping, you have a problem that needs to be addressed before proceeding.
+1.3 Component Ablation Cascade (Week 5)
+Run LERNA with each component removed individually:
+Ablation
+What's Removed
+What It Tests
+LERNA - ρ_VG
+Remove ρ_VG, use LER alone for switching
+Does ρ_VG add value?
+LERNA - LER
+Use ρ_VG alone for switching
+Does LER add value?
+LERNA - Safety Horizon
+Remove adaptive safety horizon
+Does safety mechanism matter?
+LERNA - Hysteresis
+Remove re-engagement hysteresis
+Does hysteresis prevent oscillation?
+LERNA - Momentum
+Replace momentum extrapolation with weight freezing during skips
+Does extrapolation help vs. freezing?
+Full LERNA
+All components
+Baseline for comparison
+
+Run on 4 representative GLUE tasks (SST-2, MRPC, RTE, QNLI) with 5 seeds each.
+Deliverable: Table showing accuracy and energy for each ablation. This proves which components are necessary.
+
+Phase 2: Generative Benchmark Expansion (Week 5-9)
+This phase removes the #1 weakness: GLUE-only evaluation.
+2.1 Instruction Tuning (Week 5-6)
+Dataset: Alpaca-52k or OpenAssistant
+Model: Llama-2-7B with LoRA (r=16)
+Evaluation: MT-Bench or AlpacaEval for quality scoring
+Runs: 5 seeds
+Track: Quality score, energy (kWh), skip ratio, training time
+Key question: Does LER detect productive phases in instruction tuning where loss dynamics differ from classification?
+2.2 Summarization (Week 6-7)
+Dataset: CNN/DailyMail and XSum
+Model: Llama-2-7B with LoRA (r=16)
+Evaluation: ROUGE-1, ROUGE-2, ROUGE-L
+Runs: 5 seeds per dataset
+Track: ROUGE scores, energy (kWh), skip ratio
+Key question: Does LERNA maintain summarization quality while reducing energy?
+2.3 Reasoning (Week 7-8)
+Dataset: GSM8K (math reasoning) and ARC-Challenge (science reasoning)
+Model: Llama-2-7B with LoRA, Llama-3-8B with LoRA
+Evaluation: Exact match accuracy
+Runs: 5 seeds per dataset per model
+Track: Accuracy, energy (kWh), skip ratio
+Key question: Does LER work for reasoning tasks where loss dynamics may be more complex?
+2.4 Code Generation (Week 8-9)
+Dataset: CodeAlpaca or Code-Feedback
+Model: CodeLlama-7B with LoRA
+Evaluation: HumanEval pass@1
+Runs: 5 seeds
+Track: pass@1, energy (kWh), skip ratio
+Key question: Does LERNA work for code generation where output space is highly structured?
+2.5 Compile Generative Results (Week 9)
+Create comprehensive results table:
+Task Type
+Dataset
+Model
+LERNA Accuracy
+Baseline Accuracy
+Energy Saved
+Skip Ratio
+Classification
+GLUE (8 tasks)
+ModernBERT
+...
+...
+...
+...
+Instruction
+Alpaca
+Llama-2-7B
+...
+...
+...
+...
+Summarization
+CNN/DM
+Llama-2-7B
+...
+...
+...
+...
+Reasoning
+GSM8K
+Llama-2-7B
+...
+...
+...
+...
+Code
+CodeAlpaca
+CodeLlama-7B
+...
+...
+...
+...
+
+Target: Maintain ±0.3% accuracy across ALL task types with 35-40% energy reduction.
+
+Phase 3: GreenTrainer Baseline Comparison (Week 7-9, parallel with Phase 2)
+This phase addresses the most directly comparable competitor.
+3.1 Reproduce GreenTrainer (Week 7)
+Implement or obtain GreenTrainer's adaptive tensor-level backprop evaluation
+Verify reproduction on at least 2 GLUE tasks matches reported results (64% FLOPs reduction)
+If full reproduction is not feasible, implement the core mechanism (tensor importance scoring + selective backprop)
+3.2 Head-to-Head Comparison (Week 8-9)
+Run GreenTrainer vs. LERNA on:
+4 GLUE tasks (SST-2, MRPC, RTE, QNLI)
+2 generative tasks (Alpaca instruction tuning, GSM8K reasoning)
+Same model, same seeds, same hardware
+Compare on:
+Accuracy
+Energy (kWh)
+FLOPs reduction
+Memory usage
+Implementation complexity
+Key argument to make: GreenTrainer operates at tensor level (which tensors to backprop through). LERNA operates at time step level (when to backprop at all). They are complementary. Show that LERNA + GreenTrainer combined could yield even greater savings than either alone.
+
+Phase 4: Causal Methodology Formalization - MAJOR REWRITE (Week 9-12)
+This phase transforms your strongest claim from "possibly just ablation" to "rigorous causal evidence."
+Drop completely:
+Design 2 (Within-epoch matching) as a causal experiment
+Design 3 (Propensity Score Matching) entirely
+The "Knowledge Retention" ratio definition (performance_after - performance_before) / performance_before
+Replace with:
+4.1 Define Formal Causal Model (Week 9-10)
+Step 1: Draw the Causal DAG
+Define variables:
+Treatment: LER value at step t (high vs. low)
+Outcome: TracIn contribution score (marginal contribution to validation loss reduction)
+Confounders: Temporal position (epoch), gradient magnitude, loss value, learning rate at step t
+Mediators: Parameter update magnitude, loss landscape curvature
+Unmeasured confounders: Batch composition (explicitly acknowledge this limitation)
+Draw the DAG showing assumed causal relationships. This goes in the paper as a figure with TracIn as the outcome variable.
+Step 2: TracIn-Based Step Attribution
+Implement TracIn (Pruthi et al., NeurIPS 2020): Contribution_t = η · ∇L(θ_t; V) · ∇L(θ_t; X_train) computed over LoRA parameters only. Compare TracIn scores for high-LER vs. low-LER steps to prove the "5x contribution" claim.
+Step 3: LER-TracIn Correlation Analysis
+Show LER is a computationally cheap proxy for TracIn. This is a unique contribution neither deep research source identified - LER requires only loss values (O(1) cost), while TracIn requires gradient computations (O(param) cost per evaluation).
+Add new citations:
+Pruthi et al. (2020) "Estimating Training Data Influence by Tracing Gradient Descent" NeurIPS
+Koh & Liang (2017) "Understanding Black-box Predictions via Influence Functions" ICML
+Frankle & Carlin (2019) "The Lottery Ticket Hypothesis" ICLR (precedent for checkpoint forking)
+Ghorbani & Zou (2019) "Data Shapley" ICML
+Robins (1986) (cite to explain why you rejected PSM)
+4.2 Design Checkpoint Forking Experiments (Week 10-11)
+The critical confound both reports identify: early steps are both high-LER AND positionally important. You must separate these.
+Experiment Design:
+Train two identical models from the same checkpoint. At a specific step:
+Model A: Allow normal backpropagation (high-LER step)
+Model B: Replace with momentum extrapolation (simulating low-LER treatment)
+Run this intervention at 30 fork points per task, distributed evenly across training. For each fork:
+Measure validation loss difference at N=1 (immediate effect)
+Measure validation loss difference at N=50 (sustained effect)
+Repeat with 3 seeds per fork point
+4.3 Run Causal Experiments (Week 11-12)
+Run the checkpoint forking experiments on:
+4 GLUE tasks (SST-2, MRPC, RTE, QNLI)
+2 generative tasks (Alpaca, GSM8K)
+5 seeds each
+Report: TracIn score difference with 95% CIs, effect size, p-values
+Deliverable: A dedicated paper section titled "Causal Analysis of Training Step Inequality" with:
+Causal DAG figure showing TracIn as outcome
+TracIn-Based Step Attribution methodology
+Checkpoint Forking methodology
+LER as Efficient Proxy for TracIn analysis
+Results table with effect sizes and CIs showing 5× marginal contribution difference
+Sensitivity analysis (how results change with different forking criteria)
+Explicit acknowledgment of batch composition as an unmeasured confounder
+Language decision: Use "interventional evidence" for checkpoint forking results. Use "causal evidence" only if the combination of TracIn and forking shows a clear, robust effect (p < 0.01 with proper controls).
+
+Phase 5: Convergence Analysis - SIGNIFICANT UPDATES (Week 10-13, parallel with Phase 4)
+This phase adds the theoretical contribution that both reports say is missing.
+5.1 Parameter Drift Bound (Week 10-11)
+Goal: Derive a bound on how far parameters can drift from the true gradient trajectory during momentum extrapolation phases.
+Approach:
+Let θ_t be the parameters at step t. During normal backprop: θ_{t+1} = θ_t - η∇L(θ_t). During momentum extrapolation: θ_{t+1} = θ_t - ηm_t, where m_t is the momentum buffer.
+Define drift: D_t = ||θ_t^{LERNA} - θ_t^{full}|| (distance between LERNA's parameters and full backprop parameters).
+Derive bound: Show that after K consecutive skip steps with L-smoothness assumption:
+D_{t+K} ≤ ηK||m_t - ∇L(θ_t)|| + (Lη²K²/2)||m_t||
+The first term is bounded by the momentum-gradient discrepancy (which is small during plateaus where gradients are small). The second term is the accumulated second-order error.
+Add Proposition 1 (Plateau-conditional tightening): When skips trigger only during phases where ||∇L(θ_t)|| ≤ ε_plateau, drift tightens to O(ηK·ε_plateau). This is YOUR unique theoretical contribution.
+Connect to safety horizon: Show that the adaptive safety horizon H(ρ_VG) ensures D_{t+H} < ε for a chosen tolerance ε. When ρ_VG is high (parameters aligned with gradients), H can be larger. When ρ_VG is low, H must be smaller.
+5.2 Convergence Rate Analysis (Week 11-12)
+Goal: Show that LERNA's hybrid switching scheme converges to a neighborhood of the optimum, and characterize the convergence rate relative to full backpropagation.
+Approach:
+Assume L-smooth and Polyak-Łojasiewicz (PL) condition (standard assumptions, more realistic for neural networks than strong convexity).
+For full backprop under PL: E[L(θ_T) - L*] ≤ (1-μ/η)^T (L(θ_0) - L*) (linear convergence).
+For LERNA with skip fraction p (fraction of steps using momentum extrapolation):
+During backprop steps: standard convergence
+During skip steps: bounded drift (from 5.1)
+Derive corrected rate:
+E[L(θ_T) - L*] ≤ (1-μη)^T (L(θ_0) - L*) + O(η²K_max²L²)
+The error floor must depend on K_max (safety horizon), not just skip fraction p. This is critical because p=0.33 with K=1 is vastly different from p=0.33 with K=100.
+Add the cos(φ) correction: effective progress rate is η(1-p + p·cos(φ)) where φ is angle between momentum and true gradient, not just η(1-p). When cos(φ) ≈ 1 (momentum aligned with gradient), progress is nearly full. When cos(φ) ≈ 0 (momentum orthogonal), skip steps contribute almost nothing.
+Key result: When p ≈ 0.37 (matching the 37% waste finding) and ε is small (plateaus), the convergence rate is approximately 63% of full backprop but reaches a neighborhood of the same optimum. The energy savings (35-40%) exceed the convergence slowdown because skip steps cost ~0% of a full step.
+5.3 Failure Mode Characterization (Week 12-13)
+Goal: Theoretically and empirically characterize when LERNA fails.
+Theoretical failure conditions:
+False plateau detection: LER drops below threshold due to noise, not actual plateau. Momentum extrapolation during active learning causes drift.
+Saddle point traps: Momentum extrapolation at saddle points pushes parameters along the momentum direction, which may not be the escape direction.
+Sharp loss landscape: If the loss landscape has high curvature (large Hessian eigenvalues), small drift from extrapolation can cause large loss increases.
+Momentum amplifies drift in nonstationary environments: momentum's "inertia-induced penalty" can become unbounded as β approaches 1 (cite Sahu et al. 2026).
+Out-of-distribution batches during skip phases: if skip steps land on a different data distribution, momentum is entirely uncorrelated with the true loss.
+Empirical failure analysis:
+Run LERNA on all tasks and identify cases where accuracy degrades by >0.3%
+Characterize these cases: What task properties predict failure? (dataset size, loss landscape curvature, task difficulty)
+Report failure rate across all experiments
+Add new citations:
+Stich (2018) "Local SGD converges fast and communicates little" ICLR 2019 (drift bounds)
+Khaled & Richtárik (2023) "A Guide Through the Zoo of Biased SGD" NeurIPS (Biased ABC framework)
+Karimi et al. (2016) "Linear convergence under the PL condition" ECML PKDD (PL justification)
+Liu, Gao & Yin (2020) "Improved Analysis of SGDM" NeurIPS (controllable deviation of momentum)
+Feyzmahdavian & Johansson (2023) "Asynchronous Iterations" JMLR (average delay analysis)
+Lian et al. (2015) "Asynchronous parallel SGD for nonconvex optimization" NeurIPS (staleness bounds)
+Jin et al. (2017) "How to escape saddle points efficiently" ICML (saddle point failure mode)
+Sahu, Hogan & Wells (2026) "Provable Suboptimality of Momentum SGD in Nonstationary Optimization" (inertia penalty)
+Deliverable: Paper section titled "Convergence Analysis and Failure Modes" with:
+Parameter drift bound with L explicitly included (Theorem 1)
+Convergence under PL condition with K_max dependence (Theorem 2)
+Plateau-conditional tightening (Proposition 1, your unique contribution)
+Failure mode characterization (Proposition 2)
+Empirical failure analysis table
+
+Phase 6: Large-Scale Validation (Week 12-14, parallel with Phase 5)
+6.1 Scale to Larger Models (Week 12-13)
+Run LERNA on:
+Llama-2-13B with LoRA: 3 tasks (SST-2, Alpaca, GSM8K), 3 seeds each
+Llama-2-70B with QLoRA: 2 tasks (Alpaca, GSM8K), 3 seeds each
+Compare energy savings and accuracy preservation at each scale
+6.2 Verify Scaling Trends (Week 13-14)
+Create scaling analysis figure showing:
+X-axis: Model size (149M, 7B, 8B, 13B, 70B)
+Y-axis: Energy savings (%) and accuracy delta (%)
+Show that energy savings are maintained or increase with scale
+Show that accuracy preservation holds across scales
+
+Phase 7: Paper Writing & Compilation (Week 13-16)
+7.1 Paper Structure
+text
+1. Introduction
+   - Problem: 37% of fine-tuning compute is wasted
+   - Solution: LERNA framework (diagnose → validate → act)
+   - Key results: 35-40% energy reduction, ±0.3% accuracy, interventional evidence
+
+2. Related Work
+   - Training efficiency (GreenTrainer, early stopping, progressive freezing)
+   - Hybrid optimization (Hi-ZFO, CooperLLM, MeZO)
+   - Momentum methods (Nesterov, MSAM, Weight Extrapolation)
+   - Training diagnostics (GSNR, loss curvature, phase detection)
+   - Green AI (Strubell et al., Henderson et al.)
+
+3. Method
+   3.1 Learning Efficiency Ratio (LER)
+   3.2 Velocity-Gradient Correlation (ρ_VG)
+   3.3 LER-Guided Hybrid-Order Switching
+   3.4 Adaptive Safety Horizon
+   3.5 Re-engagement Hysteresis
+
+4. Theoretical Analysis
+   4.1 Parameter Drift Bound (Theorem 1)
+   4.2 Convergence Rate (Theorem 2)
+   4.3 Plateau-Conditional Tightening (Proposition 1)
+   4.4 Failure Mode Characterization (Proposition 2)
+
+5. Causal Analysis of Training Step Inequality
+   5.1 Causal Model (DAG)
+   5.2 TracIn-Based Step Attribution
+   5.3 Checkpoint Forking Experiments
+   5.4 LER as Efficient Proxy for TracIn
+   5.5 Results: 5× Marginal Contribution Difference
+
+6. Experiments
+   6.1 Setup (models, datasets, baselines, metrics)
+   6.2 Classification Results (GLUE, 8 tasks)
+   6.3 Generative Results (instruction, summarization, reasoning, code)
+   6.4 Baseline Comparisons (GreenTrainer, gradient norm, random skip,
+       early stopping, weight freezing, reduced steps, cosine annealing)
+   6.5 Component Ablation Study
+   6.6 Scaling Analysis (149M to 70B)
+   6.7 Failure Mode Analysis
+
+7. Discussion
+   - Waste quantification: beyond early stopping
+   - Complementarity with Hi-ZFO (spatial + temporal)
+   - Limitations and future work
+
+8. Conclusion
+7.2 Key Figures to Create
+Causal DAG with TracIn as outcome variable (Section 5.1)
+LER trajectory plot showing high-LER and low-LER phases with skip decisions overlaid
+Energy savings bar chart across all task types (classification, instruction, summarization, reasoning, code)
+Baseline comparison table (LERNA vs. all 6 simple baselines + GreenTrainer)
+Ablation table showing each component's contribution
+Scaling analysis figure (model size vs. energy savings and accuracy delta)
+Failure mode scatter plot (task difficulty vs. accuracy degradation)
+Convergence analysis figure showing parameter drift bound vs. actual drift
+TracIn comparison figure showing high-LER steps have 5× higher contribution scores
+LER vs. TracIn correlation plot showing LER as efficient proxy
+7.3 Writing Timeline
+Week 13: Write Sections 3 (Method) and 4 (Theory)
+Week 14: Write Sections 5 (Causal Analysis) and 6 (Experiments)
+Week 15: Write Sections 1 (Intro), 2 (Related Work), 7 (Discussion), 8 (Conclusion)
+Week 16: Revise, polish, create all figures, write abstract, supplementary material
+
+Phase 8: Optional Extensions (Week 15-20, if time permits)
+8.1 Vision Domain Extension (P3)
+Task: Fine-tune ViT-Large on CIFAR-100 or ImageNet subset with LoRA
+Goal: Show LER detects productive phases in vision fine-tuning
+Effort: 3-4 weeks
+Impact: Transforms LERNA from "NLP tool" to "general training framework"
+Novelty boost: +1.0 (proves universality of training step inequality)
+8.2 LERNA + Hi-ZFO Combined (P3)
+Goal: Show that combining temporal switching (LERNA) with spatial switching (Hi-ZFO) yields greater savings than either alone
+Effort: 3-4 weeks
+Impact: Opens a new research direction (spatiotemporal compute optimization)
+8.3 Open-Source Release (P3)
+Package LERNA as pip-installable PyTorch callback
+Compatible with HuggingFace Trainer (< 10 lines to integrate)
+Clear documentation with reproducible examples
+Benchmark on popular fine-tuning recipes
+
+Complete Timeline
+text
+Week 1-2:   Phase 0 - Foundation & Cleanup
+Week 3-5:   Phase 1 - Simple Baselines & Ablations
+Week 5-9:   Phase 2 - Generative Benchmark Expansion
+Week 7-9:   Phase 3 - GreenTrainer Comparison (parallel with Phase 2)
+Week 9-12:  Phase 4 - Causal Methodology Formalization (MAJOR REWRITE)
+Week 10-13: Phase 5 - Convergence Analysis (SIGNIFICANT UPDATES) (parallel with Phase 4)
+Week 12-14: Phase 6 - Large-Scale Validation (parallel with Phase 5)
+Week 13-16: Phase 7 - Paper Writing
+Week 15-20: Phase 8 - Optional Extensions (if time permits)
+Total core plan: 16 weeks (4 months)
+With optional extensions: 20 weeks (5 months)
+
+Expected Final Scores After Full Plan
+Dimension
+Current
+After Core Plan (16 weeks)
+After Full Plan + Extensions (20 weeks)
+Novelty
+5.5/10
+8/10
+8.5/10
+Impact
+7/10
+9/10
+9.5/10
+Readiness
+5/10
+8.5/10
+9/10
+Thesis Grade
+B+ / A-
+A
+Clear A
+Best Venue
+Workshop/Findings
+ICLR/NeurIPS competitive
+NeurIPS/ICML strong
+
+
+Risk Mitigation
+Risk
+Probability
+Impact
+Mitigation
+LER doesn't outperform gradient norm thresholding
+Low-Medium
+Critical (kills novelty claim)
+Run this experiment FIRST (Week 4). If LER doesn't win, investigate why and refine LER before proceeding.
+LERNA degrades accuracy on generative tasks
+Medium
+High
+Start with instruction tuning (most similar to classification). If it fails, analyze loss dynamics and adjust LER thresholds for generative settings.
+GreenTrainer outperforms LERNA
+Low
+High
+Pivot to "complementary" framing. Show LERNA + GreenTrainer combined beats either alone.
+TracIn scores don't differentiate high-LER vs. low-LER steps
+Medium
+High
+Fall back to checkpoint forking results alone. If forking also fails, reframe the "5x" claim as "empirical observation" rather than "interventional evidence."
+Convergence analysis assumptions too strong
+Medium
+Medium
+Present as "informal bounds under standard assumptions" with empirical verification. Acknowledge neural networks violate convexity assumptions.
+Compute budget insufficient for all experiments
+Medium
+Medium
+Prioritize: simple baselines (Week 3-4) → generative benchmarks (Week 5-9) → causal formalization (Week 9-12). Drop Phase 8 extensions if needed.
+
+
+Submission Targets
+Deadline
+Venue
+Readiness
+Strategy
+July 2026
+SustaiNLP Workshop @ ACL 2026
+Ready after Phase 1-2
+Submit workshop version to establish priority
+October 2026
+ICLR 2027
+Ready after full core plan
+Primary target
+January 2027
+EMNLP 2027
+Ready after full core plan
+Backup with Green AI framing
+February 2027
+NeurIPS 2027
+Ready after full plan + extensions
+Stretch target
+February 2027
+ICML 2027
+Ready after full plan + extensions + strong theory
+Stretch target (needs strongest theory)
+
+
+
+
+
+
+
+What "Extensions" Means
+This refers to Phase 8 (Optional Extensions) in your research plan, specifically these three items:
+Extension 1: Vision Domain (Phase 8.1) Fine-tune ViT-Large on CIFAR-100 or ImageNet with LoRA, and show that LER detects productive phases in vision tasks too. Right now, all your experiments are NLP-only (GLUE + generative text tasks). If LERNA also works for vision, your claim transforms from "an NLP efficiency tool" to "a universal principle about training dynamics." NeurIPS reviewers value generality.
+Extension 2: LERNA + Hi-ZFO Combined (Phase 8.2) Show that combining LERNA (temporal: when to compute gradients) with Hi-ZFO (spatial: which parameters to compute gradients for) yields greater savings than either alone. This opens a new research direction called "spatiotemporal compute optimization." NeurIPS loves papers that open new directions.
+Extension 3: Open-Source Release (Phase 8.3) Package LERNA as a pip-installable library with < 10 lines to integrate into any HuggingFace training loop. NeurIPS increasingly values reproducibility and practical impact.
+Why They Matter for NeurIPS vs. ICLR
+Venue
+What They Value
+Your Core Plan
+With Extensions
+ICLR 2027
+Solid methodology + good experiments
+Sufficient (strong baselines, generative benchmarks, convergence theory, interventional evidence)
+Overkill
+NeurIPS 2027
+Generality + new directions + scale
+Borderline (NLP-only, single optimization paradigm)
+Competitive (cross-domain, new spatiotemporal direction)
+ICML 2027
+Strongest theory + broadest impact
+Needs stronger formal proofs
+Competitive if theory is tight
+
+The core plan (16 weeks) gives you a competitive ICLR submission. The extensions (4 extra weeks) push you into NeurIPS territory because they demonstrate that LERNA isn't just a trick for NLP fine-tuning; it's a fundamental insight about how training compute is distributed across time.
+My Recommendation
+Don't plan for extensions now. Execute the core 16-week plan first. If everything goes smoothly and you finish by Week 14-15, then add the vision extension (highest ROI of the three). If you're running behind, submit to ICLR without extensions. It's better to have a polished ICLR paper than a rushed NeurIPS paper.
+Critical Bugs to Fix (Will Crash at Runtime)
+1. lerna/callbacks/lerna_switching.py - 3 bugs:
+Bug 1 (Line ~27 vs ~97): __init__ creates self.accuracy_before_skip and self.accuracy_after_skip, but on_evaluate and on_train_end reference self.accuracy_during_skip and self.accuracy_during_normal. Fix: rename the __init__ variables to match, or vice versa.
+
+
+Bug 2 (Line ~101): on_step_end accesses args.optimizer but HuggingFace TrainingArguments does NOT have an optimizer attribute. The optimizer lives on the Trainer object. Fix: capture the optimizer via kwargs.get('optimizer') or pass it through the callback's __init__.
+
+
+Bug 3 (Line ~101): Even if you fix the optimizer access, during skip steps param.grad will be None (because you skipped the backward pass), so the fallback param.data -= lr * param.grad will crash with TypeError. Fix: only apply momentum extrapolation when momentum_buffer exists; skip parameters that have no momentum state.
+
+
+2. scripts/run_baseline_glue.py - 1 issue:
+The file starts with cat > /ssd_xs/home/scvi383/... which is a shell heredoc wrapper, not valid Python. If you run this file directly with python scripts/run_baseline_glue.py, it will fail with a syntax error. The actual Python code starts after the first line. Fix: remove the cat > ... << 'EOF' wrapper line and the trailing EOF.
+
+Files to Delete (Phase 0 Cleanup)
+These are still in the repo and should be removed:
+lerna/callbacks/efficiency_callback.py.bak2
+scripts/run_baseline_glue.py.backup2
+scripts/run_baseline_glue.pyqqq
+push_all.sh
+lerna/callbacks/switching_callback.py
+
+No Code Changes Needed (These Are Fine)
+lerna/utils/metrics.py - LERTracker, GSNRTracker, ProbeAccuracyTracker all work correctly
+lerna/utils/plateau_ies.py - IES detector is fine
+lerna/callbacks/ies_callback.py - All callbacks work correctly
+lerna/callbacks/efficiency_callback.py - PowerTelemetryCallback and others are fine (the "duplicate class" issue mentioned in Phase 0 doesn't actually exist; the classes at the bottom are different classes, not duplicates)
+lerna/__init__.py - Exports are correct
+scripts/run_full_experiment.py - Orchestrator is production-grade and works
+configs/ - Config files are fine
+
+How to Start (Execution Order)
+Week 1, Day 1-2: Fix the bugs above, then:
+Fix the 3 bugs in lerna_switching.py
+Remove the heredoc wrapper from run_baseline_glue.py
+Delete the 5 junk files
+Run a smoke test: python scripts/run_baseline_glue.py --mode smoke to verify everything works
+Week 1, Day 2: Terminology fix
+Search and replace "zeroth-order" with "gradient-free inertial update" in lerna_switching.py docstrings and README.md
+Week 1, Day 3-4: Update related work (paper-only, no code)
+Week 2: Infrastructure setup for generative benchmarks (install datasets, prepare LoRA configs)
+Week 3: Start Phase 1 (implement the 6 simple baselines as callbacks)
