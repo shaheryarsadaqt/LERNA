@@ -52,6 +52,19 @@ from .callbacks.efficiency_callback import (
     PowerTelemetryCallback,
 )
 
+from .callbacks.simple_baselines import (
+    GradientNormSkippingCallback,
+    RandomStepSkippingCallback,
+    WeightFreezingCallback,
+    ReducedTotalStepsCallback,
+    CosineAnnealingWarmRestartsCallback,
+    create_all_baselines,
+)
+
+from .callbacks.lerna_switching import (
+    LERNASwitchingCallback,
+)
+
 # Constants
 SUPPORTED_MODELS = {
     "bert-base-uncased": {"parameters": 110_000_000, "type": "encoder"},
