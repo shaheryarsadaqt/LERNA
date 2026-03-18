@@ -1,0 +1,195 @@
+# LERNA Phase 2: LoRA/QLoRA Configurations for Generative Models
+# These configs are used by scripts/run_generative_experiment.py
+#
+# All models require a HuggingFace token with Llama access:
+#   huggingface-cli login
+#   # or set HF_TOKEN environment variable
+
+# ============================================================
+# Llama-2-7B (LoRA) - Primary generative model
+# ============================================================
+llama2_7b_lora:
+  model_name: "meta-llama/Llama-2-7b-hf"
+  model_short: "llama2-7b"
+  params: "7B"
+  mode: "lora"
+
+  # LoRA hyperparameters (standard from Hu et al. 2021)
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  # Training defaults (override per-task as needed)
+  training:
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 8   # effective batch = 32
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.03
+    num_train_epochs: 3
+    max_length: 512
+    bf16: true
+    gradient_checkpointing: true
+    optim: "adamw_torch"
+    lr_scheduler_type: "cosine"
+
+  # Hardware (RTX 5090 32GB)
+  hardware:
+    max_memory_gb: 28  # leave headroom
+    dataloader_num_workers: 4
+
+
+# ============================================================
+# Llama-3-8B (LoRA) - Cross-architecture validation
+# ============================================================
+llama3_8b_lora:
+  model_name: "meta-llama/Meta-Llama-3-8B"
+  model_short: "llama3-8b"
+  params: "8B"
+  mode: "lora"
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  training:
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 8
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.03
+    num_train_epochs: 3
+    max_length: 512
+    bf16: true
+    gradient_checkpointing: true
+    optim: "adamw_torch"
+    lr_scheduler_type: "cosine"
+
+  hardware:
+    max_memory_gb: 28
+    dataloader_num_workers: 4
+
+
+# ============================================================
+# Llama-2-13B (LoRA) - Scale validation
+# ============================================================
+llama2_13b_lora:
+  model_name: "meta-llama/Llama-2-13b-hf"
+  model_short: "llama2-13b"
+  params: "13B"
+  mode: "lora"
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  training:
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 4
+    gradient_accumulation_steps: 16  # effective batch = 32
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.03
+    num_train_epochs: 3
+    max_length: 512
+    bf16: true
+    gradient_checkpointing: true
+    optim: "adamw_torch"
+    lr_scheduler_type: "cosine"
+
+  hardware:
+    max_memory_gb: 30
+    dataloader_num_workers: 4
+
+
+# ============================================================
+# Llama-2-70B (QLoRA 4-bit) - Large-scale validation
+# ============================================================
+llama2_70b_qlora:
+  model_name: "meta-llama/Llama-2-70b-hf"
+  model_short: "llama2-70b"
+  params: "70B"
+  mode: "qlora"
+
+  # QLoRA: 4-bit quantization + LoRA
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_use_double_quant: true
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  training:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 2
+    gradient_accumulation_steps: 32  # effective batch = 32
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.03
+    num_train_epochs: 1             # fewer epochs for 70B
+    max_length: 512
+    bf16: true
+    gradient_checkpointing: true
+    optim: "paged_adamw_8bit"       # memory-efficient optimizer
+    lr_scheduler_type: "cosine"
+
+  hardware:
+    max_memory_gb: 31
+    dataloader_num_workers: 2
+
+
+# ============================================================
+# CodeLlama-7B (LoRA) - Code generation
+# ============================================================
+codellama_7b_lora:
+  model_name: "codellama/CodeLlama-7b-hf"
+  model_short: "codellama-7b"
+  params: "7B"
+  mode: "lora"
+
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  training:
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 8
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.03
+    num_train_epochs: 3
+    max_length: 1024               # longer context for code
+    bf16: true
+    gradient_checkpointing: true
+    optim: "adamw_torch"
+    lr_scheduler_type: "cosine"
+
+  hardware:
+    max_memory_gb: 28
+    dataloader_num_workers: 4

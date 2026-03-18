@@ -1,0 +1,34 @@
+# Phase 2: Generative Benchmark Dependencies
+# Install: pip install -r requirements/requirements_phase2.txt
+#
+# NOTE: Install AFTER your base environment (requirements.txt) is set up.
+# Assumes PyTorch + CUDA are already installed in conda env torch_cuda.
+
+# === LoRA / QLoRA ===
+peft>=0.11.0                  # HuggingFace PEFT (LoRA, QLoRA, adapters)
+bitsandbytes>=0.43.0          # 4-bit quantization for QLoRA
+
+# === Generative evaluation ===
+rouge-score>=0.1.2            # ROUGE metrics for summarization
+nltk>=3.8.0                   # Tokenization for ROUGE
+vllm>=0.4.0                   # Fast inference for HumanEval / MT-Bench
+
+# === Code evaluation ===
+human-eval                    # OpenAI HumanEval benchmark (pip install human-eval)
+
+# === Math evaluation ===
+sympy>=1.12                   # Symbolic math for GSM8K answer extraction
+
+# === Instruction tuning evaluation ===
+alpaca-eval>=0.6.0            # AlpacaEval for instruction quality scoring
+
+# === Tokenizers for Llama models ===
+sentencepiece>=0.2.0          # Required by Llama tokenizers
+protobuf>=4.25.0              # Required by sentencepiece
+
+# === Accelerate for multi-GPU / large models ===
+accelerate>=0.30.0            # DeepSpeed integration, device_map="auto"
+
+# === Already in base requirements but pinning minimum versions ===
+transformers>=4.40.0          # Llama-3 support requires >=4.40
+datasets>=2.18.0              # Streaming support for large datasets
