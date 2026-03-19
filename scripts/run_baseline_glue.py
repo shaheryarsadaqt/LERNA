@@ -49,12 +49,21 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 import torch
-torch._dynamo.config.disable = True
 
-# RTX 5090 Blackwell: disable flash/mem-efficient SDP kernels (cause SIGFPE)
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
+# Conditionally disable dynamo (only available in PyTorch 2.4+)
+try:
+    torch._dynamo.config.disable = True
+except AttributeError:
+    pass
+
+# Conditionally disable SDP kernels (only available on Ampere+ GPUs)
+# V100 (Volta) does not support these APIs
+try:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+except AttributeError:
+    pass
 
 from transformers import (
     AutoModelForSequenceClassification,
@@ -118,7 +127,7 @@ TASK_HP_OVERRIDES = {
     },
 }
 
-MODEL_NAME = "answerdotai/ModernBERT-base"
+MODEL_NAME = "roberta-base"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -833,12 +842,20 @@ def detect_device_profile():
 def get_training_config(profile: str):
     """Return hardware-appropriate training hyperparameters."""
     if profile == "server":
+        # Detect bf16 support: V100 (compute capability 7.x) only supports fp16
+        use_bf16 = False
+        use_fp16 = True
+        if torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability(0)
+            if cc[0] >= 8:  # Ampere+ (A100, RTX 3090, RTX 4090, RTX 5090)
+                use_bf16 = True
+                use_fp16 = False
         return {
             "per_device_train_batch_size": 32,
             "per_device_eval_batch_size": 64,
             "gradient_accumulation_steps": 1,
-            "fp16": False,
-            "bf16": True,
+            "fp16": use_fp16,
+            "bf16": use_bf16,
             "gradient_checkpointing": False,
             "dataloader_num_workers": 4,
             "max_samples": None,
@@ -1494,15 +1511,11 @@ def run_single_experiment(
         from transformers import AutoConfig
         mnli_model = AutoModelForSequenceClassification.from_pretrained(
             mnli_checkpoint_dir,
-            reference_compile=False,
-            attn_implementation="eager",
         )
         # Create target model with correct num_labels
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="eager",
         )
         # Transfer encoder weights from MNLI model (skip classifier head)
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
@@ -1520,15 +1533,11 @@ def run_single_experiment(
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="eager",
         )
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="eager",
         )
 
     if hw_cfg["gradient_checkpointing"]:
@@ -1980,7 +1989,7 @@ def run_single_experiment(
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
-        eval_strategy="steps",
+        evaluation_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
