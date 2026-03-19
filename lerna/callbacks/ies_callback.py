@@ -6,7 +6,6 @@ comprehensive monitoring, validation, and checkpoint management.
 """
 
 import torch
-import wandb
 import json
 import os
 import warnings
@@ -14,8 +13,18 @@ from typing import Dict, List, Optional, Any
 from dataclasses import asdict
 from datetime import datetime
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from transformers import TrainerCallback, TrainerState, TrainerControl, TrainingArguments
 from transformers.trainer_utils import IntervalStrategy
+
+
+def _wandb_active() -> bool:
+    """Return True only when wandb is installed AND has an active run."""
+    return wandb is not None and getattr(wandb, "run", None) is not None
 
 from ..utils.plateau_ies import IESPlateauDetector, PlateauAnalysisResult, compute_statistical_significance
 from ..utils.metrics import LERTracker, GSNRTracker
@@ -148,7 +157,7 @@ class IESCallback(TrainerCallback):
                 json.dump(config, f, indent=2)
             print(f"   Configuration saved: {config_path}")
         
-        if self.enable_wandb and wandb.run:
+        if self.enable_wandb and _wandb_active():
             wandb.config.update({"ies_config": config})
         
         return control
@@ -215,7 +224,7 @@ class IESCallback(TrainerCallback):
                 self._perform_plateau_analysis(current_step)
                 
                 # Log to W&B
-                if self.enable_wandb and wandb.run:
+                if self.enable_wandb and _wandb_active():
                     wandb.log({
                         "plateau/confirmed": True,
                         "plateau/step": self.plateau_step,
@@ -235,7 +244,7 @@ class IESCallback(TrainerCallback):
             self._save_best_checkpoint(state, metrics, current_step)
         
         # Log metrics to W&B
-        if self.enable_wandb and wandb.run:
+        if self.enable_wandb and _wandb_active():
             wandb.log(metrics_entry)
         
         return control
@@ -326,7 +335,7 @@ class IESCallback(TrainerCallback):
             print(f"📊 Plateau analysis saved: {analysis_path}")
         
         # Log to W&B
-        if self.enable_wandb and wandb.run:
+        if self.enable_wandb and _wandb_active():
             wandb.log({"plateau/analysis": analysis})
         
         # Print summary
@@ -434,7 +443,7 @@ class IESCallback(TrainerCallback):
             print(f"📁 Metrics history saved: {metrics_path}")
         
         # Log to W&B
-        if self.enable_wandb and wandb.run:
+        if self.enable_wandb and _wandb_active():
             wandb.log({"final_statistics": final_stats})
             wandb.finish()
     
@@ -591,7 +600,7 @@ class EfficiencyMonitoringCallback(TrainerCallback):
         self.metrics_history.append(metrics_entry)
         
         # Log to W&B
-        if self.wandb_enabled and wandb.run:
+        if self.wandb_enabled and _wandb_active():
             wandb.log(metrics_entry)
         
         # Save periodically
