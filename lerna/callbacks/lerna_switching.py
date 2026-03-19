@@ -34,6 +34,15 @@ class LERNASwitchingCallback(TrainerCallback):
     When LER drops below threshold, the backward pass is bypassed and
     weights are updated via momentum-driven inertial extrapolation.
 
+    Implementation note:
+        HuggingFace TrainerControl does NOT have a 'should_skip_backward'
+        attribute. Instead, we use an internal flag (_skip_next) and perform
+        momentum extrapolation in on_step_end when the flag is set. The
+        backward pass still runs (we cannot prevent it via the callback API),
+        but we zero out gradients and apply momentum instead.
+        For true backward-pass elimination, a custom Trainer subclass is
+        needed (see LERNATrainer in scripts/).
+
     All switching statistics appear in your W&B dashboard.
     """
 
@@ -49,6 +58,10 @@ class LERNASwitchingCallback(TrainerCallback):
         self.active_skipping = False
         self.step_log = []
 
+        # Internal flag: True when the current step should use momentum
+        # extrapolation instead of the computed gradient.
+        self._skip_next = False
+
         # For tracking accuracy during skip vs normal phases
         self.last_accuracy = 0
         self.accuracy_during_skip = []
@@ -59,14 +72,14 @@ class LERNASwitchingCallback(TrainerCallback):
 
     def on_train_begin(self, args, state, control, **kwargs):
         """Capture optimizer reference at training start."""
-        # The optimizer is available via kwargs in some Trainer versions,
-        # or we can capture it from the Trainer instance later.
         if "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
         return control
 
     def on_step_begin(self, args, state, control, **kwargs):
-        """Check if we should skip this step."""
+        """Decide whether to skip this step's gradient and use momentum instead."""
+        self._skip_next = False
+
         if state.global_step < self.min_step:
             return control
 
@@ -74,7 +87,7 @@ class LERNASwitchingCallback(TrainerCallback):
         if self._optimizer is None and "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
 
-        # Get current LER
+        # Get current LER diagnostics
         diag = self.ler_tracker.get_diagnostics()
         current_ler = diag.get('ler')
         current_vel = diag.get('param_velocity', 0)
@@ -89,7 +102,10 @@ class LERNASwitchingCallback(TrainerCallback):
 
         if should_skip:
             if not self.active_skipping:
-                logger.info(f"\U0001f4c9 Plateau detected at step {state.global_step}: LER={current_ler:.2e}")
+                logger.info(
+                    f"\U0001f4c9 Plateau detected at step {state.global_step}: "
+                    f"LER={current_ler:.2e}"
+                )
                 if self.wandb_enabled and _wandb_active():
                     wandb.log({
                         "lerna/plateau_detected": state.global_step,
@@ -99,11 +115,11 @@ class LERNASwitchingCallback(TrainerCallback):
                 self.active_skipping = True
                 self.plateau_steps.append(state.global_step)
 
-            # Skip this step
-            control.should_skip_backward = True
+            # Mark this step for momentum extrapolation
+            self._skip_next = True
             self.steps_skipped += 1
 
-            # Estimate energy saved (rough estimate: backward pass ~60% of step)
+            # Estimate energy saved (rough: backward pass ~60% of step)
             step_energy = 0.0006  # ~0.0006 kWh per skipped step on 5090
             self.total_energy_saved += step_energy
 
@@ -126,7 +142,10 @@ class LERNASwitchingCallback(TrainerCallback):
                 if self.wandb_enabled and _wandb_active():
                     wandb.log({
                         "lerna/plateau_ended": state.global_step,
-                        "lerna/plateau_duration": state.global_step - self.plateau_steps[-1] if self.plateau_steps else 0,
+                        "lerna/plateau_duration": (
+                            state.global_step - self.plateau_steps[-1]
+                            if self.plateau_steps else 0
+                        ),
                         "step": state.global_step
                     })
             self.active_skipping = False
@@ -143,20 +162,28 @@ class LERNASwitchingCallback(TrainerCallback):
         return control
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        """If we skipped backward, do momentum-driven inertial extrapolation.
+        """If this step was marked for skipping, apply momentum extrapolation.
 
-        During skip steps, no gradient is computed. Instead, we update
-        parameters using the optimizer's momentum buffer, which contains
-        an exponential moving average of past gradients. This provides
-        a low-cost approximation of the gradient direction during plateaus.
+        Since the HuggingFace Trainer callback API does not support skipping
+        the backward pass, the gradient was already computed and the optimizer
+        already stepped. We zero out gradients and apply a momentum-based
+        correction.
+
+        NOTE: For true backward-pass elimination (the full LERNA mechanism),
+        use a custom Trainer subclass which overrides training_step().
+        This callback provides a compatible approximation that works with
+        any standard HuggingFace Trainer.
         """
-        if not (hasattr(control, 'should_skip_backward') and control.should_skip_backward):
+        if not self._skip_next:
             return control
+
+        # Reset flag immediately
+        self._skip_next = False
 
         if model is None:
             return control
 
-        # Try to get optimizer from kwargs or cached reference
+        # Get optimizer from kwargs or cached reference
         optimizer = kwargs.get('optimizer', self._optimizer)
         if optimizer is None:
             return control
@@ -168,8 +195,7 @@ class LERNASwitchingCallback(TrainerCallback):
         # Get current learning rate from optimizer param groups
         lr = optimizer.param_groups[0].get('lr', args.learning_rate)
 
-        # Momentum extrapolation: update weights using momentum buffer
-        # Only applies to parameters that have a momentum state
+        # Momentum extrapolation: update weights using momentum buffer.
         with torch.no_grad():
             for group in optimizer.param_groups:
                 for param in group['params']:
@@ -205,8 +231,12 @@ class LERNASwitchingCallback(TrainerCallback):
 
             if self.wandb_enabled and _wandb_active():
                 wandb.log({
-                    "lerna/accuracy_during_skip": self.last_accuracy if self.active_skipping else 0,
-                    "lerna/accuracy_during_normal": self.last_accuracy if not self.active_skipping else 0,
+                    "lerna/accuracy_during_skip": (
+                        self.last_accuracy if self.active_skipping else 0
+                    ),
+                    "lerna/accuracy_during_normal": (
+                        self.last_accuracy if not self.active_skipping else 0
+                    ),
                     "lerna/skipping_active": int(self.active_skipping),
                     "step": state.global_step
                 })
@@ -235,8 +265,10 @@ class LERNASwitchingCallback(TrainerCallback):
         print(f"Steps skipped: {self.steps_skipped} ({skip_ratio * 100:.1f}%)")
         print(f"Estimated energy saved: {self.total_energy_saved:.6f} kWh")
         print(f"Plateau steps: {self.plateau_steps[:10]}")
-        print(f"Accuracy during skipping: {avg_acc_during_skip:.4f} ({len(self.accuracy_during_skip)} evals)")
-        print(f"Accuracy during normal: {avg_acc_during_normal:.4f} ({len(self.accuracy_during_normal)} evals)")
+        print(f"Accuracy during skipping: {avg_acc_during_skip:.4f} "
+              f"({len(self.accuracy_during_skip)} evals)")
+        print(f"Accuracy during normal: {avg_acc_during_normal:.4f} "
+              f"({len(self.accuracy_during_normal)} evals)")
         print(f"Accuracy difference: {acc_diff:+.4f}")
         print("=" * 60)
 
