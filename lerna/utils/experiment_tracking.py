@@ -7,11 +7,8 @@ reproducibility management.
 """
 
 import json
-import yaml
 import torch
-import wandb
 import numpy as np
-import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
@@ -19,8 +16,31 @@ from dataclasses import dataclass, asdict
 import hashlib
 import warnings
 from scipy import stats
-import matplotlib.pyplot as plt
-import seaborn as sns
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 
 
 @dataclass
