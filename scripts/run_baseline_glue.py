@@ -1574,8 +1574,22 @@ def run_single_experiment(
     gsnr_tracker = GSNRTracker(model, window_size=50)
     # min_steps_before_plateau: 10% of total steps (min 100) to prevent
     # false early plateau detection on large-dataset tasks like MNLI/QQP
-    waste_min_steps = max(100, total_steps // 10)
-    waste_quantifier = WasteQuantifier(min_steps_before_plateau=waste_min_steps)
+    # Plateau detection parameters scaled to dataset size.
+    # Previous values (patience=50, min_steps=max(100, total//10)) were too
+    # aggressive for small datasets like MRPC (~345 steps) and RTE (~234 steps),
+    # causing 0% waste detection across all seeds for those tasks.
+    #
+    # New logic:
+    #   - min_steps_before_plateau: 15% of total steps, capped at [30, 200]
+    #   - plateau_patience: 8% of total steps, capped at [20, 100]
+    #   - plateau_min_improvement: 0.0005 (was 0.001)
+    waste_min_steps = max(30, min(200, int(total_steps * 0.15)))
+    waste_patience = max(20, min(100, int(total_steps * 0.08)))
+    waste_quantifier = WasteQuantifier(
+        plateau_patience=waste_patience,
+        plateau_min_improvement=0.0005,
+        min_steps_before_plateau=waste_min_steps,
+    )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
     eta_estimator = ETAEstimator(total_steps)

@@ -164,7 +164,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
 
     def __init__(
         self,
-        grad_norm_threshold: float = 0.01,
+        grad_norm_threshold: float = 480000.0,
         min_step: int = 100,
         wandb_enabled: bool = True,
     ):
@@ -257,7 +257,7 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
 
     def __init__(
         self,
-        target_skip_rate: float = 0.33,
+        target_skip_rate: float = 0.22,
         min_step: int = 100,
         seed: int = 42,
         wandb_enabled: bool = True,
@@ -391,7 +391,7 @@ class ReducedTotalStepsCallback(TrainerCallback, _BaselineStatsMixin):
 
     def __init__(
         self,
-        reduction_fraction: float = 0.33,
+        reduction_fraction: float = 0.22,
         total_steps: int = 1000,
         wandb_enabled: bool = True,
     ):
@@ -526,8 +526,8 @@ class CosineAnnealingWarmRestartsCallback(TrainerCallback, _BaselineStatsMixin):
 
 def create_all_baselines(
     ler_tracker=None,
-    target_skip_rate: float = 0.33,
-    grad_norm_threshold: float = 0.01,
+    target_skip_rate: float = 0.22,
+    grad_norm_threshold: float = 480000.0,
     total_steps: int = 1000,
     base_lr: float = 2e-5,
     seed: int = 42,
