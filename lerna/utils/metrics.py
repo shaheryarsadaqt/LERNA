@@ -387,8 +387,24 @@ class LERTracker:
     ):
         self.loss_history.append(loss)
         
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
+        # Compute entropy: handle both classification and regression tasks
+        if logits.dim() >= 2 and logits.size(-1) > 1:
+            # Classification: use prediction entropy over class probabilities
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
+        else:
+            # Regression (num_labels=1): softmax on a single logit is always 1.0,
+            # giving entropy=0 and making LER=0 for the entire run.
+            # Instead, use prediction variance as an entropy proxy:
+            # high variance = model uncertain, low variance = model confident.
+            preds = logits.squeeze()
+            if preds.numel() > 1:
+                pred_std = preds.std().item()
+                # Normalize to a similar scale as classification entropy
+                # using log(1 + std) to keep it positive and bounded
+                entropy = float(np.log1p(pred_std))
+            else:
+                entropy = 0.1  # single-sample fallback
         self.entropy_history.append(entropy)
         
         if accuracy is not None:
