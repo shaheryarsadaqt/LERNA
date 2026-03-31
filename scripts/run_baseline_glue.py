@@ -35,7 +35,8 @@ import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["WANDB_START_METHOD"] = "thread"
-os.environ["WANDB_LOG_MODEL"] = "false"
+# NOTE: WANDB_LOG_MODEL left unset so W&B can log checkpoint artifacts
+# when explicitly requested. The orchestrator controls this via env vars.
 
 import sys
 import json
@@ -2007,7 +2008,7 @@ def run_single_experiment(
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
-        save_total_limit=2,
+        save_total_limit=3,  # Keep 3 checkpoints (warmup/active/plateau phases for TracIn)
         # FIX #9: load_best_model_at_end=True to evaluate best model
         # FIX: Use task-specific metric for model selection (not hardcoded eval_loss)
         # CoLA -> eval_matthews_correlation, RTE/MRPC -> eval_accuracy, etc.

@@ -131,18 +131,76 @@ def check_memory(logger):
 # ======================================================================
 # FIX 1 -- Checkpoint cleanup
 # ======================================================================
+def slim_checkpoints(run_dir, logger):
+    """Remove optimizer bloat from checkpoints while PRESERVING model weights.
+
+    Your research needs model.safetensors at each checkpoint for:
+      - TracIn step attribution (Phase 4)
+      - Checkpoint forking experiments (Phase 4)
+      - Post-hoc analysis of parameter drift during plateaus
+
+    What we DELETE (only needed to resume training, not for analysis):
+      - optimizer.pt          (~1GB each, the main disk hog)
+      - scheduler.pt          (~1KB)
+      - rng_state_*.pth       (~1KB each)
+
+    What we KEEP:
+      - model.safetensors     (~500MB, the actual model weights)
+      - config.json           (needed to load the model)
+      - trainer_state.json    (step/epoch metadata, tiny)
+      - training_args.bin     (hyperparameter record, tiny)
+
+    Returns bytes freed.
+    """
+    DELETABLE = {"optimizer.pt", "scheduler.pt"}
+    DELETABLE_PREFIXES = ("rng_state",)
+    freed = 0
+
+    for ckpt_dir in sorted(Path(run_dir).glob("checkpoint-*")):
+        if not ckpt_dir.is_dir():
+            continue
+        for f in ckpt_dir.iterdir():
+            if not f.is_file():
+                continue
+            should_delete = (
+                f.name in DELETABLE
+                or f.name.startswith(DELETABLE_PREFIXES)
+            )
+            if should_delete:
+                try:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    freed += sz
+                    logger.debug(f"    Removed {ckpt_dir.name}/{f.name} ({sz/1024**2:.1f}MB)")
+                except Exception as e:
+                    logger.warning(f"    Could not remove {f}: {e}")
+
+    # Also clean wandb local cache inside run dir (already uploaded to cloud)
+    for sub in ["runs", "wandb"]:
+        p = Path(run_dir) / sub
+        if p.is_dir():
+            try:
+                sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                shutil.rmtree(p); freed += sz
+            except Exception:
+                pass
+
+    if freed > 0:
+        logger.info(f"  Slimmed {freed/1024**3:.2f}GB from {Path(run_dir).name} (model weights preserved)")
+    return freed
+
+
 def cleanup_checkpoints(run_dir, logger):
-    """Delete checkpoint-* dirs inside a completed run dir. Returns bytes freed."""
+    """FULL deletion of checkpoint-* dirs. Use only if you do NOT need
+    model weights for TracIn/forking. Prefer slim_checkpoints() instead."""
     freed = 0
     for d in sorted(Path(run_dir).glob("checkpoint-*")):
         if d.is_dir():
             try:
                 sz = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
                 shutil.rmtree(d); freed += sz
-                logger.debug(f"  Removed {d.name} ({sz/1024**3:.2f}GB)")
             except Exception as e:
                 logger.warning(f"  Could not remove {d}: {e}")
-    # Also clean wandb local cache inside run dir
     for sub in ["runs", "wandb"]:
         p = Path(run_dir) / sub
         if p.is_dir():
@@ -365,8 +423,10 @@ def main():
     ap.add_argument("--timeout", type=int, default=7200)
     ap.add_argument("--script", default="scripts/run_baseline_glue.py")
     # NEW flags
+    ap.add_argument("--slim-checkpoints", action="store_true",
+                    help="Remove optimizer bloat but KEEP model weights for TracIn/forking (saves ~160GB)")
     ap.add_argument("--clean-checkpoints", action="store_true",
-                    help="Delete checkpoints after each successful run (saves 200+ GB)")
+                    help="FULL delete of checkpoints (use --slim-checkpoints instead if you need weights)")
     ap.add_argument("--min-disk-gb", type=float, default=DISK_MIN_GB,
                     help="Stop if free disk drops below this (default 15)")
     ap.add_argument("--skip-preflight", action="store_true")
@@ -402,7 +462,8 @@ def main():
     logger.info(f"  Seeds:       {seeds[0]}-{seeds[-1]} ({len(seeds)})")
     logger.info(f"  Per-task LR: { {t: f'{TASK_LR[t]:.0e}' for t in tasks} }")
     logger.info(f"  Total/Done/Pending: {total}/{len(done)}/{len(pending)}")
-    logger.info(f"  Checkpoint cleanup: {'ON' if args.clean_checkpoints else 'OFF'}")
+    cleanup_mode = "SLIM (keep weights)" if args.slim_checkpoints else ("FULL DELETE" if args.clean_checkpoints else "OFF")
+    logger.info(f"  Checkpoint cleanup: {cleanup_mode}")
     logger.info(f"  Min disk: {args.min_disk_gb}GB")
     logger.info(f"  Disk free: {disk_free_gb(args.output_dir):.1f}GB")
     if args.wandb:
@@ -468,8 +529,11 @@ def main():
                 success = True
                 tracker["done"].append((task, seed, lr))
                 tracker["durs"].append(dur)
-                # FIX 1: cleanup
-                if args.clean_checkpoints:
+                # FIX 1: disk cleanup (slim = keep model weights, clean = delete all)
+                if args.slim_checkpoints:
+                    freed = slim_checkpoints(str(Path(args.output_dir) / run_id), logger)
+                    tracker["freed_gb"] += freed / 1024**3
+                elif args.clean_checkpoints:
                     freed = cleanup_checkpoints(str(Path(args.output_dir) / run_id), logger)
                     tracker["freed_gb"] += freed / 1024**3
                 break
@@ -506,6 +570,7 @@ def main():
             "failed_runs": tracker["failed"],
             "wall_s": elapsed,
             "avg_run_s": float(np.mean(tracker["durs"])) if tracker["durs"] else 0,
+            "slim_checkpoints": args.slim_checkpoints,
             "clean_checkpoints": args.clean_checkpoints,
             "freed_gb": tracker["freed_gb"],
             "task_lr": {t: TASK_LR.get(t, DEFAULT_LR) for t in tasks},
@@ -522,7 +587,8 @@ def main():
                f"--output-dir {args.output_dir} --num-seeds {args.num_seeds} "
                f"--wandb-group {wg}")
         if args.wandb: cmd += f" --wandb --wandb-project {args.wandb_project}"
-        if args.clean_checkpoints: cmd += " --clean-checkpoints"
+        if args.slim_checkpoints: cmd += " --slim-checkpoints"
+        elif args.clean_checkpoints: cmd += " --clean-checkpoints"
         logger.info(f"\n  To resume:\n  {cmd}")
 
 
