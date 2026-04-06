@@ -1595,9 +1595,19 @@ def run_single_experiment(
     #   - plateau_min_improvement: 0.0005 (was 0.001)
     waste_min_steps = max(30, min(200, int(total_steps * 0.15)))
     waste_patience = max(20, min(100, int(total_steps * 0.08)))
+    # Regression tasks (MSE loss) need higher min_improvement threshold
+    # because MSE makes tiny numerical improvements that are meaningless
+    # for actual model quality (Pearson/Spearman) but keep resetting the
+    # patience counter. 0.5% for regression vs 0.05% for classification.
+    is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
+    waste_min_improvement = 0.005 if is_regression else 0.0005
+    # Also allow earlier plateau detection for short runs
+    if total_steps < 500:
+        waste_min_steps = max(15, int(total_steps * 0.10))
+        waste_patience = max(10, int(total_steps * 0.06))
     waste_quantifier = WasteQuantifier(
         plateau_patience=waste_patience,
-        plateau_min_improvement=0.0005,
+        plateau_min_improvement=waste_min_improvement,
         min_steps_before_plateau=waste_min_steps,
     )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
