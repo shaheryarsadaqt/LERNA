@@ -126,6 +126,15 @@ TASK_HP_OVERRIDES = {
         "metric_for_best_model": "eval_accuracy",
         "greater_is_better": True,
     },
+    "stsb": {
+        "learning_rate": 2e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        # STS-B is a regression task; model selection must use Pearson, not loss
+        "metric_for_best_model": "eval_pearson",
+        "greater_is_better": True,
+    },
 }
 
 MODEL_NAME = "roberta-base"
