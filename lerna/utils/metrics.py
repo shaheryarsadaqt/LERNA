@@ -362,6 +362,11 @@ class LERTracker:
         if task_calibration is None:
             task_calibration = self._get_default_calibration()
         self.task_calibration = task_calibration
+
+        # Allow per-task override of min_phase_duration
+        task_cal = self.task_calibration.get(self.task, {})
+        if "min_phase_duration" in task_cal:
+            self.min_phase_duration = task_cal["min_phase_duration"]
     
     def _get_default_calibration(self) -> Dict:
         """Get default calibration for different tasks."""
@@ -373,7 +378,7 @@ class LERTracker:
             "rte": {"ler_threshold": 0.015, "entropy_weight": 1.3},
             "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4},
             "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0},
-            "stsb": {"ler_threshold": 0.010, "entropy_weight": 1.5},
+            "stsb": {"ler_threshold": 5e-5, "entropy_weight": 1.5, "min_phase_duration": 3},
         }
     
     def update(
@@ -589,14 +594,22 @@ class LERTracker:
             self._cached_rho_vg = rho
     
     def get_ler(self, window: Optional[int] = None) -> Optional[float]:
-        """Get LER value over specified window."""
+        """Get LER value over specified window.
+
+        Uses an adaptive window: min(window_size, available_samples) with
+        a minimum of 2 samples. This ensures short training runs (e.g.,
+        STS-B with ~6 eval points) can compute LER instead of returning
+        None because the full window_size was never reached.
+        """
+        if len(self.ler_history) < 2:
+            return None
+
         if window is None:
             window = self.window_size
-        
-        if len(self.ler_history) < window:
-            return None
-        
-        return np.mean(self.ler_history[-window:])
+
+        # Adaptive: use what we have, up to the requested window
+        effective_window = min(window, len(self.ler_history))
+        return np.mean(self.ler_history[-effective_window:])
     
     def get_efficiency_phase(self) -> str:
         """Identify current learning phase based on LER with hysteresis.
@@ -606,10 +619,12 @@ class LERTracker:
         A candidate phase must be sustained for min_phase_duration
         consecutive calls before the transition is committed.
         """
-        if len(self.ler_history) < 10:
+        # Adaptive minimum: need at least 2 samples, use up to 10
+        if len(self.ler_history) < 2:
             return "warmup"
-        
-        recent_ler = np.array(self.ler_history[-10:])
+
+        n_recent = min(10, len(self.ler_history))
+        recent_ler = np.array(self.ler_history[-n_recent:])
         avg_ler = np.mean(recent_ler)
         std_ler = np.std(recent_ler)
         
