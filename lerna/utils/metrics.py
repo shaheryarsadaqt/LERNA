@@ -373,7 +373,7 @@ class LERTracker:
             "rte": {"ler_threshold": 0.015, "entropy_weight": 1.3},
             "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4},
             "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0},
-            "stsb": {"ler_threshold": 0.010, "entropy_weight": 0.8},
+            "stsb": {"ler_threshold": 0.010, "entropy_weight": 1.5},
         }
     
     def update(
@@ -395,14 +395,72 @@ class LERTracker:
         else:
             # Regression (num_labels=1): softmax on a single logit is always 1.0,
             # giving entropy=0 and making LER=0 for the entire run.
-            # Instead, use prediction variance as an entropy proxy:
-            # high variance = model uncertain, low variance = model confident.
+            #
+            # FIX (2026-04-06): The previous approach using log1p(pred_std)
+            # collapsed to ~0 once the model converged, because prediction
+            # variance drops to near-zero for well-trained regression models.
+            # Classification entropy for binary tasks is typically 0.5-0.7,
+            # but log1p(std) for converged regression was 0.0-0.05.
+            #
+            # New approach: Regression Prediction Spread Entropy (RPSE)
+            # Combines three signals that remain informative throughout training:
+            #   1. Prediction spread: how dispersed predictions are across the
+            #      batch (normalized by target range to be scale-invariant)
+            #   2. Prediction range utilization: what fraction of the output
+            #      space the model is actually using
+            #   3. Per-sample deviation from batch mean (analogous to how
+            #      classification entropy measures per-sample uncertainty)
+            #
+            # The result is scaled to match classification entropy magnitude
+            # (~0.3-0.8 for active learning, ~0.1-0.3 for plateau).
             preds = logits.squeeze()
             if preds.numel() > 1:
+                pred_mean = preds.mean().item()
                 pred_std = preds.std().item()
-                # Normalize to a similar scale as classification entropy
-                # using log(1 + std) to keep it positive and bounded
-                entropy = float(np.log1p(pred_std))
+                pred_range = (preds.max() - preds.min()).item()
+
+                # For STS-B, target range is [0, 5]. For general regression,
+                # estimate from prediction range or use a reasonable default.
+                # We use max(pred_range, 1.0) to avoid division by zero and
+                # to handle tasks where the model hasn't spread predictions yet.
+                effective_range = max(pred_range, 1.0)
+
+                # Component 1: Normalized spread (coefficient of variation analog)
+                # High when predictions are diverse, low when collapsed
+                spread = pred_std / (abs(pred_mean) + 1e-6)
+
+                # Component 2: Range utilization entropy
+                # Measures how much of the output space is being used
+                # Normalize predictions to [0, 1] range and compute entropy
+                preds_norm = (preds - preds.min()) / (effective_range + 1e-8)
+                # Bin into a simple histogram (10 bins) and compute entropy
+                hist_counts = torch.histc(preds_norm.float(), bins=10, min=0.0, max=1.0)
+                hist_probs = hist_counts / (hist_counts.sum() + 1e-8)
+                range_entropy = -(hist_probs * torch.log(hist_probs + 1e-10)).sum().item()
+                # Normalize: max entropy for 10 bins is log(10) ~ 2.3
+                range_entropy_norm = range_entropy / (np.log(10) + 1e-8)
+
+                # Component 3: Per-sample deviation entropy
+                # Analogous to classification per-sample entropy
+                deviations = (preds - pred_mean).abs()
+                dev_norm = deviations / (pred_std + 1e-8)
+                # Use mean absolute z-score as uncertainty measure
+                mean_abs_z = dev_norm.mean().item()
+
+                # Combine components with scaling to match classification
+                # entropy range (~0.3-0.8 during active learning)
+                # spread: typically 0.1-2.0, scale by 0.3
+                # range_entropy_norm: 0-1, scale by 0.4
+                # mean_abs_z: typically 0.5-1.5, scale by 0.15
+                entropy = float(
+                    0.3 * min(spread, 3.0)
+                    + 0.4 * range_entropy_norm
+                    + 0.15 * min(mean_abs_z, 2.0)
+                )
+                # Floor: ensure entropy never drops below 0.05 so LER
+                # remains nonzero even for highly converged models.
+                # This allows the WasteQuantifier to detect plateaus.
+                entropy = max(entropy, 0.05)
             else:
                 entropy = 0.1  # single-sample fallback
         self.entropy_history.append(entropy)
