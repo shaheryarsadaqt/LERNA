@@ -1372,7 +1372,10 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             kwhs = [r.get("energy_kwh", 0) for r in task_results]
             runtimes = [r.get("train_runtime_s", 0) for r in task_results]
             wastes = [r.get("waste_metrics", {}).get("waste_ratio", 0) for r in task_results]
-            gsnrs = [r.get("gsnr_final", {}).get("gsnr_global", 0) for r in task_results]
+            gsnrs_raw = [r.get("gsnr_final", {}).get("gsnr_global") for r in task_results]
+            # Filter None values: GSNR can be None when the tracker has
+            # insufficient gradient captures (short runs, large log interval).
+            gsnrs = [g for g in gsnrs_raw if g is not None]
 
             n = len(accs)
             mean_acc = np.mean(accs)
@@ -1386,7 +1389,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             summary_table.add_data(
                 task, n, mean_acc, std_acc, ci[0], ci[1],
                 np.mean(kwhs), np.mean(runtimes),
-                np.mean(wastes), np.mean(gsnrs),
+                np.mean(wastes), np.mean(gsnrs) if gsnrs else 0.0,
             )
 
         wandb.log({"summary/results_table": summary_table})
@@ -1595,17 +1598,31 @@ def run_single_experiment(
     #   - plateau_min_improvement: 0.0005 (was 0.001)
     waste_min_steps = max(30, min(200, int(total_steps * 0.15)))
     waste_patience = max(20, min(100, int(total_steps * 0.08)))
-    # Regression tasks (MSE loss) need higher min_improvement threshold
-    # because MSE makes tiny numerical improvements that are meaningless
-    # for actual model quality (Pearson/Spearman) but keep resetting the
-    # patience counter. 0.5% for regression vs 0.05% for classification.
+    # Regression tasks (MSE loss) need a much higher min_improvement
+    # threshold than classification. MSE makes tiny numerical improvements
+    # (0.3-0.8% relative) at every step due to SGD noise, even when the
+    # model's actual quality metric (Pearson/Spearman) has fully plateaued.
+    # This is because MSE amplifies outlier predictions quadratically,
+    # creating per-batch variance that the EMA interprets as "improvement".
+    #
+    # With 0.005 (0.5%), the smoke test showed waste_ratio=0.000 on STS-B
+    # despite 10 epochs and clear Pearson plateau after epoch 2-3.
+    # Raising to 0.015 (1.5%) ensures only genuine learning progress
+    # (not MSE noise) resets the patience counter.
+    #
+    # Classification tasks use 0.0005 (0.05%) which correctly detects
+    # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
-    waste_min_improvement = 0.005 if is_regression else 0.0005
+    waste_min_improvement = 0.015 if is_regression else 0.0005
+    # Also use a smoother EMA for regression (alpha=0.02 vs default 0.05)
+    # to reduce sensitivity to per-batch MSE variance.
+    waste_ema_alpha = 0.02 if is_regression else 0.05
     # Also allow earlier plateau detection for short runs
     if total_steps < 500:
         waste_min_steps = max(15, int(total_steps * 0.10))
         waste_patience = max(10, int(total_steps * 0.06))
     waste_quantifier = WasteQuantifier(
+        ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
         plateau_min_improvement=waste_min_improvement,
         min_steps_before_plateau=waste_min_steps,
