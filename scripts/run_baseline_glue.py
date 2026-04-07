@@ -1605,10 +1605,10 @@ def run_single_experiment(
     # This is because MSE amplifies outlier predictions quadratically,
     # creating per-batch variance that the EMA interprets as "improvement".
     #
-    # With 0.005 (0.5%), the smoke test showed waste_ratio=0.000 on STS-B
-    # despite 10 epochs and clear Pearson plateau after epoch 2-3.
-    # Raising to 0.015 (1.5%) ensures only genuine learning progress
-    # (not MSE noise) resets the patience counter.
+    # Threshold history (STS-B seed 42 smoke tests, 10 epochs / ~450 steps):
+    #   0.0005 (0.05%) -> waste=0.000 (original, never triggers)
+    #   0.005  (0.5%)  -> waste=0.000 (2026-04-06, still too sensitive)
+    #   0.015  (1.5%)  -> waste>0     (2026-04-07, correctly detects plateau)
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
