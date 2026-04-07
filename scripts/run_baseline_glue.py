@@ -1646,6 +1646,7 @@ def run_single_experiment(
             self._trainer_holder = trainer_ref_holder  # mutable list to hold trainer ref
             self.step_count = 0
             self._last_loss = None
+            self._last_loss_fed_to_waste = None  # Track last value fed to WasteQuantifier
             self._step_start_time = None
             # Scale GSNR interval with dataset size to avoid CPU bottleneck
             # Small datasets (~800 steps): every ~50 steps
@@ -1733,18 +1734,32 @@ def run_single_experiment(
                 except Exception:
                     pass
             
-            # Record waste and phase data
+            # Record waste and phase data.
+            # CRITICAL: Only feed the WasteQuantifier when _last_loss has
+            # actually changed since the last feed. The Trainer logs loss
+            # every logging_steps (e.g., 4 steps), so between log events
+            # _last_loss is stale. Feeding the same value repeatedly to
+            # the EMA creates artificial "no improvement" periods followed
+            # by artificial "improvement" when a new value arrives, which
+            # prevents plateau detection from ever triggering.
             if self._last_loss is not None:
                 # Get global grad norm
                 global_grad_norm = None
                 if self.gsnr_tracker.global_grad_norm_history:
                     global_grad_norm = self.gsnr_tracker.global_grad_norm_history[-1]
                 
-                self.waste_quantifier.record_step(
-                    loss=self._last_loss,
-                    grad_norm=global_grad_norm,
-                    step_time=step_time,
-                )
+                # Only feed WasteQuantifier on genuinely new loss values
+                loss_is_new = (self._last_loss_fed_to_waste is None or
+                               self._last_loss != self._last_loss_fed_to_waste)
+                if loss_is_new:
+                    self.waste_quantifier.record_step(
+                        loss=self._last_loss,
+                        grad_norm=global_grad_norm,
+                        step_time=step_time,
+                    )
+                    self._last_loss_fed_to_waste = self._last_loss
+                
+                # Phase detector and LR-loss tracker can still use every step
                 self.phase_detector.update(
                     step=state.global_step,
                     loss=self._last_loss,
