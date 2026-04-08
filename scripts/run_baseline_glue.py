@@ -1640,7 +1640,12 @@ def run_single_experiment(
     # Higher alpha than before (was 0.02) because we now feed fewer, more
     # meaningful data points. With only ~26 points, alpha=0.02 makes the
     # EMA too sluggish to track the rapid initial drop.
-    waste_ema_alpha = 0.05 if is_regression else 0.05
+    # Regression needs high alpha (0.5, effective window ~3) because with
+    # only ~26 unique observations, a low alpha EMA never converges to the
+    # actual loss values. With alpha=0.05, the EMA starts at 8.09 and is
+    # still at 2.53 after 26 steps, showing ~4.6% "improvement" at every
+    # step as the EMA catches up, preventing plateau detection entirely.
+    waste_ema_alpha = 0.5 if is_regression else 0.05
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
