@@ -1596,31 +1596,26 @@ def run_single_experiment(
     #   - min_steps_before_plateau: 15% of total steps, capped at [30, 200]
     #   - plateau_patience: 8% of total steps, capped at [20, 100]
     #   - plateau_min_improvement: 0.0005 (was 0.001)
-    waste_min_steps = max(30, min(200, int(total_steps * 0.15)))
-    waste_patience = max(20, min(100, int(total_steps * 0.08)))
-    # Regression tasks (MSE loss) need a much higher min_improvement
-    # threshold than classification. MSE makes tiny numerical improvements
-    # (0.3-0.8% relative) at every step due to SGD noise, even when the
+    # The WasteQuantifier is only fed when a genuinely new loss value
+    # arrives (see on_step_end). The Trainer logs loss every logging_steps,
+    # so the number of unique observations is total_steps / logging_steps.
+    # All WasteQuantifier parameters must be scaled to this observation
+    # count, not to raw training steps.
+    logging_steps = max(eval_steps // 5, 1)
+    expected_unique_obs = max(1, total_steps // logging_steps)
+    waste_min_steps = max(5, min(50, int(expected_unique_obs * 0.10)))
+    waste_patience = max(5, min(30, int(expected_unique_obs * 0.08)))
+    # Regression tasks (MSE loss) need a higher min_improvement threshold
+    # than classification. MSE makes tiny numerical improvements (0.3-0.8%
+    # relative) at every log interval due to SGD noise, even when the
     # model's actual quality metric (Pearson/Spearman) has fully plateaued.
-    # This is because MSE amplifies outlier predictions quadratically,
-    # creating per-batch variance that the EMA interprets as "improvement".
-    #
-    # Threshold history (STS-B seed 42 smoke tests, 10 epochs / ~450 steps):
-    #   0.0005 (0.05%) -> waste=0.000 (original, never triggers)
-    #   0.005  (0.5%)  -> waste=0.000 (2026-04-06, still too sensitive)
-    #   0.015  (1.5%)  -> waste>0     (2026-04-07, correctly detects plateau)
-    #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
     waste_min_improvement = 0.015 if is_regression else 0.0005
-    # Also use a smoother EMA for regression (alpha=0.02 vs default 0.05)
-    # to reduce sensitivity to per-batch MSE variance.
-    waste_ema_alpha = 0.02 if is_regression else 0.05
-    # Also allow earlier plateau detection for short runs
-    if total_steps < 500:
-        waste_min_steps = max(15, int(total_steps * 0.10))
-        waste_patience = max(10, int(total_steps * 0.06))
+    # Smoother EMA for regression (alpha=0.05 vs default 0.1) to reduce
+    # sensitivity to per-batch MSE variance.
+    waste_ema_alpha = 0.05 if is_regression else 0.1
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
