@@ -1597,14 +1597,27 @@ def run_single_experiment(
     #   - plateau_patience: 8% of total steps, capped at [20, 100]
     #   - plateau_min_improvement: 0.0005 (was 0.001)
     # CRITICAL: The stale-loss dedup fix means the WasteQuantifier only
-    # receives one data point per unique loss value (≈ total_steps / logging_steps),
-    # NOT one per training step. All parameters must be scaled to this
-    # resolution, otherwise min_steps + patience can exceed the total
-    # number of data points the WasteQuantifier will ever see.
+    # receives one data point per unique loss value, NOT one per training
+    # step. The actual number of unique observations depends on how often
+    # the training loss changes between logging intervals:
+    #   - Classification (large datasets): ~hundreds of unique values
+    #   - Regression (STS-B): only ~20-30 unique values across 450 steps
+    #     because MSE loss is averaged and changes slowly
+    #
+    # For regression tasks, use small fixed parameters since we know the
+    # data resolution is extremely low. For classification, scale to the
+    # estimated unique observations.
     logging_steps = max(eval_steps // 5, 1)  # matches TrainingArguments.logging_steps
     expected_unique_obs = max(1, total_steps // logging_steps)
-    waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
-    waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
+    if is_regression:
+        # Regression tasks produce very few unique loss values (~20-30)
+        # due to MSE averaging. Use minimal parameters to ensure plateau
+        # detection can trigger within the available data points.
+        waste_min_steps = 3
+        waste_patience = 3
+    else:
+        waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
+        waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
     # Regression tasks (MSE loss) need a much higher min_improvement
     # threshold than classification. The stale-loss dedup means each
     # unique observation spans multiple training steps, so the loss
