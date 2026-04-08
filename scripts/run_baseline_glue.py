@@ -1609,6 +1609,7 @@ def run_single_experiment(
     # estimated unique observations.
     logging_steps = max(eval_steps // 5, 1)  # matches TrainingArguments.logging_steps
     expected_unique_obs = max(1, total_steps // logging_steps)
+    is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
     if is_regression:
         # Regression tasks produce very few unique loss values (~20-30)
         # due to MSE averaging. Use minimal parameters to ensure plateau
