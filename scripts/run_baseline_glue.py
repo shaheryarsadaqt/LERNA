@@ -1614,8 +1614,12 @@ def run_single_experiment(
         # Regression tasks produce very few unique loss values (~20-30)
         # due to MSE averaging. Use minimal parameters to ensure plateau
         # detection can trigger within the available data points.
-        waste_min_steps = 3
-        waste_patience = 3
+        # patience=1 because MSE loss oscillates: it alternates between
+        # 5-7% improvements and 2-3% non-improvements, so consecutive
+        # patience >1 never triggers. patience=1 is safe because the
+        # rapid-learning phase (steps 0-9) always shows >10% improvement.
+        waste_min_steps = 5
+        waste_patience = 1
     else:
         waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
         waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
