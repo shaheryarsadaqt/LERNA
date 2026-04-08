@@ -1635,7 +1635,6 @@ def run_single_experiment(
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
-    is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
     waste_min_improvement = 0.04 if is_regression else 0.0005
     # Also use a smoother EMA for regression (alpha=0.05 vs default 0.1)
     # Higher alpha than before (was 0.02) because we now feed fewer, more
