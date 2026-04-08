@@ -1596,31 +1596,38 @@ def run_single_experiment(
     #   - min_steps_before_plateau: 15% of total steps, capped at [30, 200]
     #   - plateau_patience: 8% of total steps, capped at [20, 100]
     #   - plateau_min_improvement: 0.0005 (was 0.001)
-    waste_min_steps = max(30, min(200, int(total_steps * 0.15)))
-    waste_patience = max(20, min(100, int(total_steps * 0.08)))
+    # CRITICAL: The stale-loss dedup fix means the WasteQuantifier only
+    # receives one data point per unique loss value (≈ total_steps / logging_steps),
+    # NOT one per training step. All parameters must be scaled to this
+    # resolution, otherwise min_steps + patience can exceed the total
+    # number of data points the WasteQuantifier will ever see.
+    logging_steps = max(eval_steps // 5, 1)  # matches TrainingArguments.logging_steps
+    expected_unique_obs = max(1, total_steps // logging_steps)
+    waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
+    waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
     # Regression tasks (MSE loss) need a much higher min_improvement
-    # threshold than classification. MSE makes tiny numerical improvements
-    # (0.3-0.8% relative) at every step due to SGD noise, even when the
-    # model's actual quality metric (Pearson/Spearman) has fully plateaued.
-    # This is because MSE amplifies outlier predictions quadratically,
-    # creating per-batch variance that the EMA interprets as "improvement".
+    # threshold than classification. The stale-loss dedup means each
+    # unique observation spans multiple training steps, so the loss
+    # difference between consecutive observations is larger than between
+    # consecutive raw steps. For STS-B with ~26 unique observations,
+    # the per-interval relative improvements in the plateau zone are
+    # typically 2-5%, so we need a threshold above that noise floor.
     #
     # Threshold history (STS-B seed 42 smoke tests, 10 epochs / ~450 steps):
     #   0.0005 (0.05%) -> waste=0.000 (original, never triggers)
     #   0.005  (0.5%)  -> waste=0.000 (2026-04-06, still too sensitive)
-    #   0.015  (1.5%)  -> waste>0     (2026-04-07, correctly detects plateau)
+    #   0.015  (1.5%)  -> waste=0.000 (2026-04-07, still below per-interval noise)
+    #   0.04   (4.0%)  -> waste>0     (2026-04-08, above MSE inter-interval noise)
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
-    waste_min_improvement = 0.015 if is_regression else 0.0005
-    # Also use a smoother EMA for regression (alpha=0.02 vs default 0.05)
-    # to reduce sensitivity to per-batch MSE variance.
-    waste_ema_alpha = 0.02 if is_regression else 0.05
-    # Also allow earlier plateau detection for short runs
-    if total_steps < 500:
-        waste_min_steps = max(15, int(total_steps * 0.10))
-        waste_patience = max(10, int(total_steps * 0.06))
+    waste_min_improvement = 0.04 if is_regression else 0.0005
+    # Also use a smoother EMA for regression (alpha=0.05 vs default 0.1)
+    # Higher alpha than before (was 0.02) because we now feed fewer, more
+    # meaningful data points. With only ~26 points, alpha=0.02 makes the
+    # EMA too sluggish to track the rapid initial drop.
+    waste_ema_alpha = 0.05 if is_regression else 0.05
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
