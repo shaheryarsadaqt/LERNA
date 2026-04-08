@@ -1596,26 +1596,41 @@ def run_single_experiment(
     #   - min_steps_before_plateau: 15% of total steps, capped at [30, 200]
     #   - plateau_patience: 8% of total steps, capped at [20, 100]
     #   - plateau_min_improvement: 0.0005 (was 0.001)
-    # The WasteQuantifier is only fed when a genuinely new loss value
-    # arrives (see on_step_end). The Trainer logs loss every logging_steps,
-    # so the number of unique observations is total_steps / logging_steps.
-    # All WasteQuantifier parameters must be scaled to this observation
-    # count, not to raw training steps.
-    logging_steps = max(eval_steps // 5, 1)
-    expected_unique_obs = max(1, total_steps // logging_steps)
-    waste_min_steps = max(5, min(50, int(expected_unique_obs * 0.10)))
-    waste_patience = max(5, min(30, int(expected_unique_obs * 0.08)))
-    # Regression tasks (MSE loss) need a higher min_improvement threshold
-    # than classification. MSE makes tiny numerical improvements (0.3-0.8%
-    # relative) at every log interval due to SGD noise, even when the
-    # model's actual quality metric (Pearson/Spearman) has fully plateaued.
-    # Classification tasks use 0.0005 (0.05%) which correctly detects
-    # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
+    # WasteQuantifier parameters.
+    #
+    # For CLASSIFICATION tasks: fed from training loss (on_step_end via
+    # on_log). Training loss and accuracy are tightly coupled, so loss
+    # plateau = accuracy plateau. Parameters scaled to unique loss
+    # observations (total_steps / logging_steps).
+    #
+    # For REGRESSION tasks: fed from EVAL METRIC (Pearson correlation)
+    # in on_evaluate, NOT from training loss. MSE training loss keeps
+    # decreasing throughout training even after Pearson plateaus (the
+    # model keeps improving individual predictions without improving
+    # ranking quality). This is exactly the "waste" LERNA detects:
+    # compute that improves the loss but not the task metric.
+    #
+    # Eval-based feeding means fewer observations (one per eval_steps
+    # interval, typically ~20 per run), so parameters are scaled down.
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
-    waste_min_improvement = 0.015 if is_regression else 0.0005
-    # Smoother EMA for regression (alpha=0.05 vs default 0.1) to reduce
-    # sensitivity to per-batch MSE variance.
-    waste_ema_alpha = 0.05 if is_regression else 0.1
+    if is_regression:
+        # Fed from on_evaluate: ~total_steps/eval_steps observations
+        expected_obs = max(1, total_steps // eval_steps)
+        waste_min_steps = max(3, int(expected_obs * 0.15))
+        waste_patience = max(3, int(expected_obs * 0.15))
+        # Pearson correlation changes are small (0.001-0.01 per eval),
+        # so use a tighter improvement threshold.
+        # "No improvement" = less than 0.1% relative change in Pearson.
+        waste_min_improvement = 0.001
+        waste_ema_alpha = 0.3  # Responsive EMA for sparse eval signals
+    else:
+        # Fed from on_step_end (unique loss values only).
+        logging_steps = max(eval_steps // 5, 1)
+        expected_obs = max(1, total_steps // logging_steps)
+        waste_min_steps = max(5, min(50, int(expected_obs * 0.10)))
+        waste_patience = max(5, min(30, int(expected_obs * 0.08)))
+        waste_min_improvement = 0.0005
+        waste_ema_alpha = 0.1
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
@@ -1868,6 +1883,21 @@ def run_single_experiment(
 
             eval_loss = metrics.get("eval_loss", 0)
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
+
+            # For regression tasks, feed the WasteQuantifier from the EVAL
+            # METRIC (Pearson) instead of training loss. MSE training loss
+            # keeps decreasing even after Pearson plateaus, so training
+            # loss is the wrong signal for regression waste detection.
+            # We negate Pearson so the WasteQuantifier's "lower is better"
+            # EMA logic works correctly (higher Pearson = better = lower negated).
+            if is_regression:
+                eval_pearson = metrics.get("eval_pearson", metrics.get("eval_spearmanr"))
+                if eval_pearson is not None:
+                    self.waste_quantifier.record_step(
+                        loss=-eval_pearson,  # Negate: WQ expects lower=better
+                        grad_norm=None,
+                        step_time=None,
+                    )
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
