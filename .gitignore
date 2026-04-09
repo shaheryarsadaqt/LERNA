@@ -4,6 +4,13 @@ __pycache__/
 *$py.class
 *.so
 .Python
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
 env/
 venv/
 ENV/
