@@ -17,7 +17,7 @@ Validated across classification (8 GLUE tasks), instruction tuning (Alpaca), sum
 
 > **Note:** This abstract describes the planned final state of the paper after executing the full research plan. Claims are updated as each phase completes. See the Experimental Results section below for currently validated findings.
 
----
+---   
 
 ## Experimental Results
 
