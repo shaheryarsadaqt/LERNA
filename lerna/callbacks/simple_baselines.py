@@ -265,18 +265,33 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
             self._grad_norm_history = self._grad_norm_history[-2500:]
 
         # Calibration phase: collect norms, don't skip yet
-        if state.global_step < self.min_step + self.calibration_steps:
+        if (state.global_step < self.min_step + self.calibration_steps
+                and self._adaptive_threshold is None):
             self._record_normal(state)
-            # Calibrate once we have enough samples
-            if (state.global_step == self.min_step + self.calibration_steps - 1
-                    and self._adaptive_threshold is None):
-                self._calibrate_threshold()
-                self._last_calibration_step = state.global_step
-                print(
-                    f"  [grad_norm_skip] Initial calibration at step {state.global_step}: "
-                    f"threshold={self._adaptive_threshold:.6f}"
-                )
             return control
+
+        # First calibration: fires on the first step at or after the
+        # calibration window. Uses >= (not ==) to handle cases where
+        # gradient accumulation causes step counts to skip.
+        if self._adaptive_threshold is None:
+            self._calibrate_threshold()
+            self._last_calibration_step = state.global_step
+            if self._adaptive_threshold is not None:
+                print(
+                    f"\n  [grad_norm_skip] === CALIBRATION COMPLETE ==="
+                    f"\n  [grad_norm_skip] Step: {state.global_step}"
+                    f"\n  [grad_norm_skip] Threshold: {self._adaptive_threshold:.6f}"
+                    f"\n  [grad_norm_skip] Target skip rate: {self.target_skip_rate:.0%}"
+                    f"\n  [grad_norm_skip] Norms collected: {len(self._grad_norm_history)}"
+                    f"\n  [grad_norm_skip] Norm range: [{min(self._grad_norm_history):.6f}, "
+                    f"{max(self._grad_norm_history):.6f}]"
+                    f"\n  [grad_norm_skip] Norm median: {np.median(self._grad_norm_history):.6f}"
+                )
+            else:
+                print(f"  [grad_norm_skip] WARNING: Calibration failed at step {state.global_step} "
+                      f"(only {len(self._grad_norm_history)} norms collected, need >= 10)")
+                self._record_normal(state)
+                return control
 
         # Recalibrate periodically to handle non-stationarity
         if (self.recalibrate_every > 0
