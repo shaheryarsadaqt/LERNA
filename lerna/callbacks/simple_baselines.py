@@ -49,7 +49,8 @@ def _wandb_active() -> bool:
 class _BaselineStatsMixin:
     """Common statistics tracking for all baseline callbacks."""
 
-    def _init_stats(self, baseline_name: str, wandb_enabled: bool = True):
+    def _init_stats(self, baseline_name: str, wandb_enabled: bool = True,
+                    energy_per_skip: float = None):
         self.baseline_name = baseline_name
         self.wandb_enabled = wandb_enabled
         self.steps_skipped = 0
@@ -59,7 +60,10 @@ class _BaselineStatsMixin:
         self.accuracy_during_normal = []
         self.last_accuracy = 0.0
         self.active_skipping = False
-        self._energy_per_skip = 0.0006    # ~0.6 Wh per skipped step on RTX 5090
+        # Energy per skipped step (kWh). Default ~0.6 Wh based on RTX 5090
+        # at ~575W TDP with backward pass ~60% of step cost.
+        # Override for different hardware via energy_per_skip parameter.
+        self._energy_per_skip = energy_per_skip if energy_per_skip is not None else 0.0006
 
     def _record_skip(self, state):
         self.steps_skipped += 1
@@ -68,6 +72,26 @@ class _BaselineStatsMixin:
 
     def _record_normal(self, state):
         self.skip_decisions.append(False)
+
+    def _apply_momentum_extrapolation(self, optimizer, lr):
+        """Apply momentum-driven weight extrapolation during skip phases.
+
+        Uses the optimizer's momentum buffer (SGD) or first moment
+        estimate (Adam/AdamW) as a proxy for the gradient direction.
+        This is the same mechanism used by LERNA during plateau phases.
+        """
+        if optimizer is None:
+            return
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    if not param.requires_grad or param not in optimizer.state:
+                        continue
+                    p_state = optimizer.state[param]
+                    if "momentum_buffer" in p_state:
+                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
+                    elif "exp_avg" in p_state:
+                        param.data.add_(p_state["exp_avg"], alpha=-lr)
 
     def _log_periodic(self, state, extra: dict = None):
         if not (self.wandb_enabled and _wandb_active()):
@@ -149,31 +173,62 @@ class _BaselineStatsMixin:
 
 
 # ===================================================================
-# Baseline 1: Gradient Norm Thresholding
+# Baseline 1: Gradient Norm Thresholding (Adaptive)
 # ===================================================================
 
 class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
-    """Skip backward pass when gradient norm falls below a threshold.
+    """Skip backward pass when gradient norm falls below an adaptive threshold.
 
     Tests whether LER is better than its simplest component: just
     checking if gradients are small.
 
-    The threshold is calibrated so the overall skip rate approximately
-    matches LERNA's observed skip rate for fair comparison.
+    Uses adaptive percentile-based thresholding for fair comparison:
+    during a calibration window (first `calibration_steps` steps),
+    gradient norms are collected. The threshold is then set at the
+    percentile that produces the target skip rate. The threshold is
+    recalibrated periodically to handle non-stationarity.
+
+    This ensures the skip rate approximately matches LERNA's observed
+    rate regardless of model architecture, hardware, or grad clipping.
     """
 
     def __init__(
         self,
-        grad_norm_threshold: float = 480000.0,
-        min_step: int = 100,
+        target_skip_rate: float = 0.33,
+        calibration_steps: int = 200,
+        recalibrate_every: int = 500,
+        min_step: int = 0,
         wandb_enabled: bool = True,
+        energy_per_skip: float = None,
     ):
         super().__init__()
-        self._init_stats("grad_norm_skip", wandb_enabled)
-        self.grad_norm_threshold = grad_norm_threshold
+        self._init_stats("grad_norm_skip", wandb_enabled, energy_per_skip)
+        self.target_skip_rate = target_skip_rate
+        self.calibration_steps = calibration_steps
+        self.recalibrate_every = recalibrate_every
         self.min_step = min_step
         self._optimizer = None
         self._grad_norm_history = []
+        self._adaptive_threshold = None
+        self._last_calibration_step = 0
+
+    def _calibrate_threshold(self):
+        """Set threshold at the percentile matching target_skip_rate.
+
+        If target_skip_rate=0.33, we want to skip the bottom 33% of
+        gradient norms, so threshold = 33rd percentile of observed norms.
+        """
+        if len(self._grad_norm_history) < 10:
+            return
+        percentile = self.target_skip_rate * 100
+        self._adaptive_threshold = float(
+            np.percentile(self._grad_norm_history, percentile)
+        )
+        logger.info(
+            f"  [grad_norm_skip] Calibrated threshold={self._adaptive_threshold:.6f} "
+            f"(p{percentile:.0f} of {len(self._grad_norm_history)} norms, "
+            f"range=[{min(self._grad_norm_history):.6f}, {max(self._grad_norm_history):.6f}])"
+        )
 
     def on_train_begin(self, args, state, control, **kwargs):
         if "optimizer" in kwargs:
@@ -181,14 +236,12 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_begin(self, args, state, control, **kwargs):
-        if state.global_step < self.min_step:
-            return control
         if self._optimizer is None and "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
         return control
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step < self.min_step or model is None:
+        if model is None:
             self._record_normal(state)
             return control
 
@@ -207,7 +260,36 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         grad_norm = total_norm_sq ** 0.5
         self._grad_norm_history.append(grad_norm)
 
-        if grad_norm < self.grad_norm_threshold:
+        # Cap history to prevent unbounded memory growth
+        if len(self._grad_norm_history) > 5000:
+            self._grad_norm_history = self._grad_norm_history[-2500:]
+
+        # Calibration phase: collect norms, don't skip yet
+        if state.global_step < self.min_step + self.calibration_steps:
+            self._record_normal(state)
+            # Calibrate once we have enough samples
+            if (state.global_step == self.min_step + self.calibration_steps - 1
+                    and self._adaptive_threshold is None):
+                self._calibrate_threshold()
+                self._last_calibration_step = state.global_step
+                print(
+                    f"  [grad_norm_skip] Initial calibration at step {state.global_step}: "
+                    f"threshold={self._adaptive_threshold:.6f}"
+                )
+            return control
+
+        # Recalibrate periodically to handle non-stationarity
+        if (self.recalibrate_every > 0
+                and state.global_step - self._last_calibration_step >= self.recalibrate_every):
+            self._calibrate_threshold()
+            self._last_calibration_step = state.global_step
+
+        # No threshold yet (shouldn't happen, but be safe)
+        if self._adaptive_threshold is None:
+            self._record_normal(state)
+            return control
+
+        if grad_norm < self._adaptive_threshold:
             self._record_skip(state)
             self.active_skipping = True
 
@@ -215,22 +297,14 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
             optimizer = kwargs.get("optimizer", self._optimizer)
             if optimizer is not None:
                 lr = optimizer.param_groups[0].get("lr", args.learning_rate)
-                with torch.no_grad():
-                    for group in optimizer.param_groups:
-                        for param in group["params"]:
-                            if not param.requires_grad or param not in optimizer.state:
-                                continue
-                            p_state = optimizer.state[param]
-                            if "momentum_buffer" in p_state:
-                                param.data.add_(p_state["momentum_buffer"], alpha=-lr)
-                            elif "exp_avg" in p_state:
-                                param.data.add_(p_state["exp_avg"], alpha=-lr)
+                self._apply_momentum_extrapolation(optimizer, lr)
         else:
             self._record_normal(state)
             self.active_skipping = False
 
         self._log_periodic(state, {
             f"baseline/{self.baseline_name}/grad_norm": grad_norm,
+            f"baseline/{self.baseline_name}/threshold": self._adaptive_threshold,
         })
         return control
 
@@ -239,7 +313,12 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
-        self._on_train_end_stats(args, state)
+        stats = self._on_train_end_stats(args, state)
+        # Add calibration info to stats
+        if self._adaptive_threshold is not None:
+            print(f"  Final adaptive threshold: {self._adaptive_threshold:.6f}")
+            print(f"  Grad norm range: [{min(self._grad_norm_history):.6f}, "
+                  f"{max(self._grad_norm_history):.6f}]")
         return control
 
 
@@ -261,9 +340,10 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         min_step: int = 100,
         seed: int = 42,
         wandb_enabled: bool = True,
+        energy_per_skip: float = None,
     ):
         super().__init__()
-        self._init_stats("random_skip", wandb_enabled)
+        self._init_stats("random_skip", wandb_enabled, energy_per_skip)
         self.target_skip_rate = target_skip_rate
         self.min_step = min_step
         self._rng = random.Random(seed)
@@ -288,20 +368,10 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
             self._record_skip(state)
             self.active_skipping = True
 
-            # Momentum extrapolation
             optimizer = kwargs.get("optimizer", self._optimizer)
             if optimizer is not None:
                 lr = optimizer.param_groups[0].get("lr", args.learning_rate)
-                with torch.no_grad():
-                    for group in optimizer.param_groups:
-                        for param in group["params"]:
-                            if not param.requires_grad or param not in optimizer.state:
-                                continue
-                            p_state = optimizer.state[param]
-                            if "momentum_buffer" in p_state:
-                                param.data.add_(p_state["momentum_buffer"], alpha=-lr)
-                            elif "exp_avg" in p_state:
-                                param.data.add_(p_state["exp_avg"], alpha=-lr)
+                self._apply_momentum_extrapolation(optimizer, lr)
         else:
             self._record_normal(state)
             self.active_skipping = False
@@ -338,9 +408,10 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
         threshold: float = 1e-5,
         min_step: int = 100,
         wandb_enabled: bool = True,
+        energy_per_skip: float = None,
     ):
         super().__init__()
-        self._init_stats("weight_freeze", wandb_enabled)
+        self._init_stats("weight_freeze", wandb_enabled, energy_per_skip)
         self.ler_tracker = ler_tracker
         self.threshold = threshold
         self.min_step = min_step
@@ -394,9 +465,10 @@ class ReducedTotalStepsCallback(TrainerCallback, _BaselineStatsMixin):
         reduction_fraction: float = 0.22,
         total_steps: int = 1000,
         wandb_enabled: bool = True,
+        energy_per_skip: float = None,
     ):
         super().__init__()
-        self._init_stats("reduced_steps", wandb_enabled)
+        self._init_stats("reduced_steps", wandb_enabled, energy_per_skip)
         self.reduction_fraction = reduction_fraction
         self.total_steps = total_steps
         self.max_steps = int(total_steps * (1.0 - reduction_fraction))
@@ -450,9 +522,10 @@ class CosineAnnealingWarmRestartsCallback(TrainerCallback, _BaselineStatsMixin):
         eta_min: float = 1e-7,
         base_lr: float = 2e-5,
         wandb_enabled: bool = True,
+        energy_per_skip: float = None,
     ):
         super().__init__()
-        self._init_stats("cosine_warm_restarts", wandb_enabled)
+        self._init_stats("cosine_warm_restarts", wandb_enabled, energy_per_skip)
         self.T_0 = T_0
         self.T_mult = T_mult
         self.eta_min = eta_min
@@ -527,11 +600,11 @@ class CosineAnnealingWarmRestartsCallback(TrainerCallback, _BaselineStatsMixin):
 def create_all_baselines(
     ler_tracker=None,
     target_skip_rate: float = 0.22,
-    grad_norm_threshold: float = 480000.0,
     total_steps: int = 1000,
     base_lr: float = 2e-5,
     seed: int = 42,
     wandb_enabled: bool = True,
+    energy_per_skip: float = None,
 ) -> dict:
     """Create all 6 baseline callbacks for comparison.
 
@@ -542,18 +615,19 @@ def create_all_baselines(
     Args:
         ler_tracker: LERTracker instance (needed for weight freezing baseline).
         target_skip_rate: Target skip rate to match LERNA's observed rate.
-        grad_norm_threshold: Gradient norm threshold for baseline 1.
         total_steps: Total training steps (for reduced steps baseline).
         base_lr: Base learning rate (for cosine annealing baseline).
         seed: Random seed for reproducibility.
         wandb_enabled: Whether to log to W&B.
+        energy_per_skip: Energy per skipped step in kWh (default: 0.0006 for RTX 5090).
     """
     baselines = {}
 
-    # Baseline 1: Gradient Norm Thresholding
+    # Baseline 1: Gradient Norm Thresholding (adaptive)
     baselines["grad_norm_skip"] = GradientNormSkippingCallback(
-        grad_norm_threshold=grad_norm_threshold,
+        target_skip_rate=target_skip_rate,
         wandb_enabled=wandb_enabled,
+        energy_per_skip=energy_per_skip,
     )
 
     # Baseline 2: Random Step Skipping
@@ -561,6 +635,7 @@ def create_all_baselines(
         target_skip_rate=target_skip_rate,
         seed=seed,
         wandb_enabled=wandb_enabled,
+        energy_per_skip=energy_per_skip,
     )
 
     # Baseline 3: Weight Freezing (requires LER tracker)
@@ -568,6 +643,7 @@ def create_all_baselines(
         baselines["weight_freeze"] = WeightFreezingCallback(
             ler_tracker=ler_tracker,
             wandb_enabled=wandb_enabled,
+            energy_per_skip=energy_per_skip,
         )
 
     # Baseline 4: Reduced Total Steps
@@ -575,6 +651,7 @@ def create_all_baselines(
         reduction_fraction=target_skip_rate,
         total_steps=total_steps,
         wandb_enabled=wandb_enabled,
+        energy_per_skip=energy_per_skip,
     )
 
     # Baseline 5: Cosine Annealing with Warm Restarts
@@ -582,6 +659,7 @@ def create_all_baselines(
         T_0=max(total_steps // 10, 50),
         base_lr=base_lr,
         wandb_enabled=wandb_enabled,
+        energy_per_skip=energy_per_skip,
     )
 
     return baselines
