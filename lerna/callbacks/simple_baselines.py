@@ -208,6 +208,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self.recalibrate_every = recalibrate_every
         self.min_step = min_step
         self._optimizer = None
+        self._model = None
         self._grad_norm_history = []
         self._adaptive_threshold = None
         self._last_calibration_step = 0
@@ -224,13 +225,12 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self._adaptive_threshold = float(
             np.percentile(self._grad_norm_history, percentile)
         )
-        logger.info(
-            f"  [grad_norm_skip] Calibrated threshold={self._adaptive_threshold:.6f} "
-            f"(p{percentile:.0f} of {len(self._grad_norm_history)} norms, "
-            f"range=[{min(self._grad_norm_history):.6f}, {max(self._grad_norm_history):.6f}])"
-        )
 
     def on_train_begin(self, args, state, control, **kwargs):
+        # CRITICAL: HF Trainer passes model in on_train_begin kwargs
+        # but NOT in on_step_end. We must capture it here.
+        if "model" in kwargs:
+            self._model = kwargs["model"]
         if "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
         return control
@@ -238,9 +238,14 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
     def on_step_begin(self, args, state, control, **kwargs):
         if self._optimizer is None and "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
+        if self._model is None and "model" in kwargs:
+            self._model = kwargs["model"]
         return control
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
+    def on_step_end(self, args, state, control, **kwargs):
+        # Use stored model reference (HF Trainer does NOT pass model
+        # to on_step_end, so the old model=None kwarg was always None)
+        model = kwargs.get("model", self._model)
         if model is None:
             self._record_normal(state)
             return control
@@ -363,13 +368,17 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self.min_step = min_step
         self._rng = random.Random(seed)
         self._optimizer = None
+        self._model = None
 
     def on_train_begin(self, args, state, control, **kwargs):
+        if "model" in kwargs:
+            self._model = kwargs["model"]
         if "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
         return control
 
-    def on_step_end(self, args, state, control, model=None, **kwargs):
+    def on_step_end(self, args, state, control, **kwargs):
+        model = kwargs.get("model", self._model)
         if state.global_step < self.min_step or model is None:
             self._record_normal(state)
             return control
