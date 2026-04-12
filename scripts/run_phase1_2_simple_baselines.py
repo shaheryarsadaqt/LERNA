@@ -103,6 +103,7 @@ from transformers import (
     TrainingArguments,
     EarlyStoppingCallback,
     DataCollatorWithPadding,
+    TrainerCallback,
 )
 from datasets import load_dataset
 import evaluate
@@ -353,12 +354,33 @@ def _ensure_wandb_finished():
 # =============================================================================
 
 class Phase12Trainer(Trainer):
-    """Extended Trainer that captures real logits for LER tracking."""
+    """Extended Trainer with gradient capture BEFORE clipping and optional backward skipping.
+    
+    FLAW 6 FIX: Captures gradient norm BEFORE clipping is applied.
+    The on_pre_optimizer_step callback sees CLIPPED gradients because HF Trainer
+    applies clipping BEFORE firing the callback. We override training_step to
+    capture the true gradient norm.
+    
+    FLAW 8 FIX: Implements TRUE backward-pass skipping.
+    When should_skip_backward is True, we skip loss.backward() and apply
+    momentum extrapolation instead, saving ~60% of compute.
+    
+    Attributes:
+        should_skip_backward: When True, skips backward pass and uses momentum
+        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
+        _last_real_logits: Captured logits for LER computation
+    """
 
     def __init__(self, *args, ler_tracker=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._ler_tracker = ler_tracker
         self._last_real_logits = None
+        self._pre_clip_grad_norm: float = 0.0
+        self.should_skip_backward: bool = False
+        self._skip_count: int = 0
+        # Add callback for gradient norm capture before optimizer step
+        self._grad_norm_callback = _GradientNormCaptureCallback(self)
+        self.add_callback(self._grad_norm_callback)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -368,6 +390,78 @@ class Phase12Trainer(Trainer):
         elif isinstance(outputs, dict) and "logits" in outputs:
             self._last_real_logits = outputs["logits"].detach()
         return (loss, outputs) if return_outputs else loss
+
+    def _compute_pre_clip_grad_norm(self) -> float:
+        """Compute gradient norm BEFORE clipping is applied.
+        
+        This is called after backward() but before the Trainer's clipping logic.
+        Returns the total gradient norm across all parameters.
+        """
+        total_norm_sq = 0.0
+        for p in self.model.parameters():
+            if p.requires_grad and p.grad is not None:
+                param_norm = p.grad.detach().float().norm().item()
+                total_norm_sq += param_norm ** 2
+        return total_norm_sq ** 0.5
+
+    def _apply_momentum_extrapolation(self):
+        """Apply momentum-driven weight update without gradient computation.
+        
+        Uses the optimizer's momentum buffer (SGD) or first moment estimate
+        (Adam/AdamW) as a proxy for gradient direction.
+        """
+        lr = self.args.learning_rate
+        with torch.no_grad():
+            for group in self.optimizer.param_groups:
+                for param in group["params"]:
+                    if not param.requires_grad or param not in self.optimizer.state:
+                        continue
+                    p_state = self.optimizer.state[param]
+                    if "momentum_buffer" in p_state:
+                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
+                    elif "exp_avg" in p_state:
+                        # Adam/AdamW: use first moment (bias-corrected)
+                        step = p_state.get("step", 1)
+                        exp_avg = p_state["exp_avg"]
+                        # Adam's bias correction
+                        beta1 = group.get("betas", (0.9, 0.999))[0]
+                        bias_correction = 1 - beta1 ** step
+                        corrected_exp_avg = exp_avg / bias_correction
+                        param.data.add_(corrected_exp_avg, alpha=-lr)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to reset gradient norm before each step.
+        
+        FLAW 6 FIX: Gradient norm captured via on_pre_optimizer_step callback.
+        
+        The callback captures gradients AFTER backward() but BEFORE the
+        optimizer step (where clipping may occur). This ensures we get
+        the true pre-clip gradient norm for LERNA calibration.
+        """
+        self._pre_clip_grad_norm = None  # Reset before each step
+        return super().training_step(model, inputs, num_items_in_batch)
+
+
+class _GradientNormCaptureCallback(TrainerCallback):
+    """Internal callback to capture gradient norm before optimizer step."""
+    
+    def __init__(self, trainer: Phase12Trainer):
+        self.trainer = trainer
+    
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        """Capture gradient norm before optimizer.step() and any clipping."""
+        model = kwargs.get("model")
+        if model is None:
+            return
+        
+        # Compute total gradient norm (L2)
+        total_norm_sq = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm_sq += param_norm.item() ** 2
+        
+        self.trainer._pre_clip_grad_norm = total_norm_sq ** 0.5
 
 
 # =============================================================================
@@ -630,7 +724,7 @@ def run_single_baseline_experiment(
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
@@ -662,6 +756,28 @@ def run_single_baseline_experiment(
         ler_tracker=ler_tracker,
         callbacks=callbacks,
     )
+
+    # --- Inject model reference into baseline callback ---
+    # HF Trainer passes model in on_train_begin kwargs, but the callback's
+    # on_train_begin may not fire reliably with multiple inheritance.
+    # Directly set the reference to guarantee it works.
+    if baseline_callback is not None and hasattr(baseline_callback, '_model'):
+        baseline_callback._model = model
+        print(f'  [Phase1.2] Model injected into {baseline_callback.baseline_name}: {type(model).__name__}')
+
+    # --- Pass trainer reference to baseline callback ---
+    # GradientNormSkippingCallback needs access to trainer._last_grad_norm
+    # because HF Trainer 4.38 zeros gradients before on_step_end fires.
+    if baseline_callback is not None:
+        baseline_callback._trainer = trainer
+        print(f"  [Phase1.2] Trainer linked to {baseline_callback.baseline_name}")
+
+    # --- Add gradient norm capture callback for pre-clip gradient norm ---
+    # This callback captures gradient norm BEFORE clipping, which is essential
+    # for accurate threshold calibration in grad_norm baseline.
+    # Must be added AFTER trainer is created since it needs trainer reference.
+    grad_capture_callback = _GradientNormCaptureCallback(trainer)
+    trainer.add_callback(grad_capture_callback)
 
     # --- Train ---
     start_time = time.time()

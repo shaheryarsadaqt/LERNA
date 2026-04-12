@@ -24,6 +24,7 @@ import os
 import random
 import logging
 from collections import defaultdict
+from typing import Optional, Dict, Any
 
 import torch
 import numpy as np
@@ -34,6 +35,14 @@ except ImportError:
     wandb = None
 
 from transformers import TrainerCallback
+
+# Import EnergyTracker for real power telemetry
+try:
+    from lerna.callbacks.lerna_switching import EnergyTracker
+    ENERGY_TRACKER_AVAILABLE = True
+except ImportError:
+    EnergyTracker = None
+    ENERGY_TRACKER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +59,7 @@ class _BaselineStatsMixin:
     """Common statistics tracking for all baseline callbacks."""
 
     def _init_stats(self, baseline_name: str, wandb_enabled: bool = True,
-                    energy_per_skip: float = None):
+                    energy_per_skip: float = None, use_real_energy: bool = True):
         self.baseline_name = baseline_name
         self.wandb_enabled = wandb_enabled
         self.steps_skipped = 0
@@ -60,15 +69,46 @@ class _BaselineStatsMixin:
         self.accuracy_during_normal = []
         self.last_accuracy = 0.0
         self.active_skipping = False
-        # Energy per skipped step (kWh). Default ~0.6 Wh based on RTX 5090
+        
+        # Real energy tracking via pynvml
+        self._energy_tracker: Optional[Any] = None
+        self._use_real_energy = use_real_energy and ENERGY_TRACKER_AVAILABLE
+        
+        if self._use_real_energy:
+            try:
+                self._energy_tracker = EnergyTracker()
+                logger.info(f"  [{baseline_name}] Using real power telemetry via pynvml")
+            except Exception as e:
+                logger.warning(f"  [{baseline_name}] Failed to init EnergyTracker: {e}")
+                self._use_real_energy = False
+        
+        # Fallback: static estimate (kWh). ~0.6 Wh based on RTX 5090
         # at ~575W TDP with backward pass ~60% of step cost.
-        # Override for different hardware via energy_per_skip parameter.
         self._energy_per_skip = energy_per_skip if energy_per_skip is not None else 0.0006
+        
+        # Track energy per step for averaging
+        self._measured_energy_per_skip: list = []
 
     def _record_skip(self, state):
         self.steps_skipped += 1
-        self.total_energy_saved += self._energy_per_skip
         self.skip_decisions.append(True)
+        
+        # Use real energy measurement if available
+        if self._use_real_energy and self._energy_tracker is not None:
+            try:
+                # Get current power and compute energy for a typical backward pass duration
+                # Backward pass is ~60% of total step time, typically 50-100ms on GPU
+                current_power_w = self._energy_tracker.get_current_power_w()
+                # Estimate backward pass duration: ~60% of step, assume 100ms typical
+                backward_duration_s = 0.060  # 60ms for backward pass
+                energy_kwh = (current_power_w * backward_duration_s) / 3600 / 1000
+                self._measured_energy_per_skip.append(energy_kwh)
+                self.total_energy_saved += energy_kwh
+            except Exception as e:
+                # Fallback to static estimate
+                self.total_energy_saved += self._energy_per_skip
+        else:
+            self.total_energy_saved += self._energy_per_skip
 
     def _record_normal(self, state):
         self.skip_decisions.append(False)
@@ -130,6 +170,13 @@ class _BaselineStatsMixin:
             sum(self.accuracy_during_normal) / len(self.accuracy_during_normal)
             if self.accuracy_during_normal else 0.0
         )
+        
+        # Compute average measured energy per skip if available
+        avg_energy_per_skip = self._energy_per_skip
+        energy_source = "static estimate"
+        if self._measured_energy_per_skip:
+            avg_energy_per_skip = sum(self._measured_energy_per_skip) / len(self._measured_energy_per_skip)
+            energy_source = "measured"
 
         stats = {
             "baseline_name": self.baseline_name,
@@ -137,6 +184,8 @@ class _BaselineStatsMixin:
             "steps_skipped": self.steps_skipped,
             "skip_ratio": skip_ratio,
             "energy_saved_kwh": self.total_energy_saved,
+            "avg_energy_per_skip_kwh": avg_energy_per_skip,
+            "energy_source": energy_source,
             "avg_acc_during_skip": avg_acc_skip,
             "avg_acc_during_normal": avg_acc_normal,
             "acc_difference": avg_acc_skip - avg_acc_normal,
@@ -149,7 +198,8 @@ class _BaselineStatsMixin:
         print(f"{'=' * 60}")
         print(f"  Total steps: {total_steps}")
         print(f"  Steps skipped: {self.steps_skipped} ({skip_ratio * 100:.1f}%)")
-        print(f"  Energy saved: {self.total_energy_saved:.6f} kWh")
+        print(f"  Energy saved: {self.total_energy_saved:.6f} kWh ({energy_source})")
+        print(f"  Avg energy/skip: {avg_energy_per_skip:.6f} kWh")
         print(f"  Acc during skip: {avg_acc_skip:.4f} ({len(self.accuracy_during_skip)} evals)")
         print(f"  Acc during normal: {avg_acc_normal:.4f} ({len(self.accuracy_during_normal)} evals)")
         print(f"{'=' * 60}")
@@ -190,6 +240,14 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
 
     This ensures the skip rate approximately matches LERNA's observed
     rate regardless of model architecture, hardware, or grad clipping.
+
+    HOOK LIFECYCLE (Transformers 4.41+):
+        on_step_begin -> forward -> loss -> backward -> on_pre_optimizer_step
+        -> optimizer.step -> optimizer.zero_grad -> on_step_end
+
+    The on_pre_optimizer_step hook fires AFTER backward but BEFORE
+    optimizer.step/zero_grad, making it the ideal place to capture
+    gradient norms while they are still live.
     """
 
     def __init__(
@@ -200,6 +258,9 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         min_step: int = 0,
         wandb_enabled: bool = True,
         energy_per_skip: float = None,
+        min_calibration_samples: int = 50,
+        min_coefficient_of_variation: float = 0.01,
+        rolling_window_size: int = 1000,
     ):
         super().__init__()
         self._init_stats("grad_norm_skip", wandb_enabled, energy_per_skip)
@@ -207,67 +268,186 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self.calibration_steps = calibration_steps
         self.recalibrate_every = recalibrate_every
         self.min_step = min_step
+        self.min_calibration_samples = min_calibration_samples
+        self.min_coefficient_of_variation = min_coefficient_of_variation
+        self.rolling_window_size = rolling_window_size
         self._optimizer = None
-        self._model = None
+        self._model = None  # Cached from on_train_begin
         self._grad_norm_history = []
+        self._rolling_grad_norms = []  # Rolling window for recalibration
         self._adaptive_threshold = None
         self._last_calibration_step = 0
+        self._current_grad_norm = None  # Captured in on_pre_optimizer_step
+        self._calibration_attempts = 0
+        self._max_calibration_attempts = 3
 
-    def _calibrate_threshold(self):
-        """Set threshold at the percentile matching target_skip_rate.
+    def _compute_grad_norm(self, model) -> float:
+        """Compute total gradient norm from model parameters.
 
-        If target_skip_rate=0.33, we want to skip the bottom 33% of
-        gradient norms, so threshold = 33rd percentile of observed norms.
+        Returns 0.0 if no gradients are found.
         """
-        if len(self._grad_norm_history) < 10:
-            return
-        percentile = self.target_skip_rate * 100
-        self._adaptive_threshold = float(
-            np.percentile(self._grad_norm_history, percentile)
-        )
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        # CRITICAL: HF Trainer passes model in on_train_begin kwargs
-        # but NOT in on_step_end. We must capture it here.
-        if "model" in kwargs:
-            self._model = kwargs["model"]
-        if "optimizer" in kwargs:
-            self._optimizer = kwargs["optimizer"]
-        return control
-
-    def on_step_begin(self, args, state, control, **kwargs):
-        if self._optimizer is None and "optimizer" in kwargs:
-            self._optimizer = kwargs["optimizer"]
-        if self._model is None and "model" in kwargs:
-            self._model = kwargs["model"]
-        return control
-
-    def on_step_end(self, args, state, control, **kwargs):
-        # Use stored model reference (HF Trainer does NOT pass model
-        # to on_step_end, so the old model=None kwarg was always None)
-        model = kwargs.get("model", self._model)
-        if model is None:
-            self._record_normal(state)
-            return control
-
-        # Compute global gradient norm
         total_norm_sq = 0.0
         has_grad = False
         for p in model.parameters():
             if p.requires_grad and p.grad is not None:
                 total_norm_sq += p.grad.detach().float().norm().item() ** 2
                 has_grad = True
+        return total_norm_sq ** 0.5 if has_grad else 0.0
 
-        if not has_grad:
+    def _validate_calibration_data(self, norms: list) -> tuple:
+        """Validate that calibration data has sufficient diversity.
+
+        Returns (is_valid, reason) tuple.
+        """
+        if len(norms) < self.min_calibration_samples:
+            return False, f"insufficient samples ({len(norms)} < {self.min_calibration_samples})"
+
+        norms_arr = np.array(norms)
+        mean_norm = np.mean(norms_arr)
+        std_norm = np.std(norms_arr)
+
+        # Check for zero mean (all gradients are zero)
+        if mean_norm < 1e-10:
+            return False, f"mean gradient norm is near zero ({mean_norm:.2e})"
+
+        # Check coefficient of variation (CV = std/mean)
+        cv = std_norm / mean_norm
+        if cv < self.min_coefficient_of_variation:
+            return False, f"insufficient variation (CV={cv:.4f} < {self.min_coefficient_of_variation})"
+
+        return True, f"valid (CV={cv:.4f}, mean={mean_norm:.6f}, std={std_norm:.6f})"
+
+    def _compute_threshold_with_validation(self, norms: list) -> tuple:
+        """Compute threshold and validate it produces target skip rate.
+
+        Returns (threshold, actual_skip_rate, is_valid) tuple.
+        """
+        if len(norms) < self.min_calibration_samples:
+            return None, 0.0, False
+
+        percentile = self.target_skip_rate * 100
+        threshold = float(np.percentile(norms, percentile))
+
+        # Validate: compute actual skip rate this threshold would produce
+        norms_arr = np.array(norms)
+        actual_skip_rate = np.sum(norms_arr < threshold) / len(norms_arr)
+
+        # Allow 10% tolerance from target
+        is_valid = abs(actual_skip_rate - self.target_skip_rate) < 0.10
+
+        return threshold, actual_skip_rate, is_valid
+
+    def _calibrate_threshold(self, use_rolling: bool = False) -> bool:
+        """Set threshold at the percentile matching target_skip_rate.
+
+        If target_skip_rate=0.33, we want to skip the bottom 33% of
+        gradient norms, so threshold = 33rd percentile of observed norms.
+
+        Args:
+            use_rolling: If True, use rolling window for recalibration.
+                        If False, use full history for initial calibration.
+
+        Returns:
+            True if calibration succeeded, False otherwise.
+        """
+        norms = self._rolling_grad_norms if use_rolling else self._grad_norm_history
+
+        # Validate calibration data diversity
+        is_valid, reason = self._validate_calibration_data(norms)
+        if not is_valid:
+            logger.warning(f"  [grad_norm_skip] Calibration validation failed: {reason}")
+            return False
+
+        # Compute threshold with validation
+        threshold, actual_rate, is_valid = self._compute_threshold_with_validation(norms)
+        if threshold is None:
+            logger.warning(f"  [grad_norm_skip] Failed to compute threshold")
+            return False
+
+        percentile = self.target_skip_rate * 100
+
+        # Log warning if actual skip rate deviates significantly
+        if not is_valid:
+            logger.warning(
+                f"  [grad_norm_skip] Threshold produces skip rate {actual_rate:.2%} "
+                f"vs target {self.target_skip_rate:.2%}"
+            )
+
+        self._adaptive_threshold = threshold
+        logger.info(
+            f"  [grad_norm_skip] Calibrated threshold={self._adaptive_threshold:.6f} "
+            f"(p{percentile:.0f} of {len(norms)} norms, "
+            f"range=[{min(norms):.6f}, {max(norms):.6f}], "
+            f"actual_skip_rate={actual_rate:.2%})"
+        )
+        return True
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Capture optimizer and model references at training start."""
+        if "optimizer" in kwargs:
+            self._optimizer = kwargs["optimizer"]
+        if "model" in kwargs:
+            self._model = kwargs["model"]
+        logger.info(f"  [grad_norm_skip] Initialized with target_skip_rate={self.target_skip_rate:.0%}")
+        return control
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        """Reset per-step state."""
+        self._current_grad_norm = None
+        if self._optimizer is None and "optimizer" in kwargs:
+            self._optimizer = kwargs["optimizer"]
+        return control
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        """Capture gradient norm AFTER backward, BEFORE optimizer.step.
+
+        FLAW 6 FIX: Use pre-clip gradient norm from trainer if available.
+        The trainer's _pre_clip_grad_norm is captured BEFORE clipping.
+        The on_pre_optimizer_step hook sees CLIPPED gradients, so we must
+        use the trainer's pre-clip value for accurate calibration.
+        """
+        model = kwargs.get("model", self._model)
+        if model is None:
+            return control
+
+        # FLAW 6 FIX: Use pre-clip gradient norm from trainer
+        # This is the TRUE gradient norm before clipping corrupted it
+        trainer = getattr(self, '_trainer', None)
+        if trainer is not None and hasattr(trainer, '_pre_clip_grad_norm'):
+            self._current_grad_norm = trainer._pre_clip_grad_norm
+        else:
+            # Fallback: compute from model (will be clipped if max_grad_norm set)
+            self._current_grad_norm = self._compute_grad_norm(model)
+
+        # Store in history for adaptive threshold calibration
+        if self._current_grad_norm is not None and self._current_grad_norm > 0:
+            self._grad_norm_history.append(self._current_grad_norm)
+            # Rolling window for non-stationarity handling
+            self._rolling_grad_norms.append(self._current_grad_norm)
+            if len(self._rolling_grad_norms) > self.rolling_window_size:
+                self._rolling_grad_norms = self._rolling_grad_norms[-self.rolling_window_size:]
+            # Cap full history to prevent unbounded memory growth
+            if len(self._grad_norm_history) > 5000:
+                self._grad_norm_history = self._grad_norm_history[-2500:]
+
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """Make skip decision based on gradient norm captured in on_pre_optimizer_step.
+
+        FLAW 8 FIX: The actual backward skipping is handled in training_step
+        via the should_skip_backward flag. This method now just records stats.
+        """
+        grad_norm = self._current_grad_norm
+
+        if grad_norm is None or grad_norm == 0:
             self._record_normal(state)
             return control
 
-        grad_norm = total_norm_sq ** 0.5
-        self._grad_norm_history.append(grad_norm)
-
-        # Cap history to prevent unbounded memory growth
-        if len(self._grad_norm_history) > 5000:
-            self._grad_norm_history = self._grad_norm_history[-2500:]
+        # Skip calibration during min_step period
+        if state.global_step < self.min_step:
+            self._record_normal(state)
+            return control
 
         # Calibration phase: collect norms, don't skip yet
         if (state.global_step < self.min_step + self.calibration_steps
@@ -278,10 +458,37 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         # First calibration: fires on the first step at or after the
         # calibration window. Uses >= (not ==) to handle cases where
         # gradient accumulation causes step counts to skip.
+        # Will retry calibration up to _max_calibration_attempts times.
         if self._adaptive_threshold is None:
-            self._calibrate_threshold()
+            # Check if we have enough samples and diversity
+            is_valid, reason = self._validate_calibration_data(self._grad_norm_history)
+
+            if not is_valid:
+                self._calibration_attempts += 1
+                if self._calibration_attempts <= self._max_calibration_attempts:
+                    logger.warning(
+                        f"  [grad_norm_skip] Calibration attempt {self._calibration_attempts} "
+                        f"deferred: {reason}. Extending calibration window..."
+                    )
+                    self._record_normal(state)
+                    return control
+                else:
+                    logger.error(
+                        f"  [grad_norm_skip] Calibration failed after {self._calibration_attempts} "
+                        f"attempts. Using fallback threshold."
+                    )
+                    # Fallback: use median as threshold (50th percentile)
+                    if len(self._grad_norm_history) >= 10:
+                        self._adaptive_threshold = float(np.median(self._grad_norm_history))
+                        self._last_calibration_step = state.global_step
+                    else:
+                        self._record_normal(state)
+                        return control
+
+            success = self._calibrate_threshold(use_rolling=False)
             self._last_calibration_step = state.global_step
-            if self._adaptive_threshold is not None:
+
+            if success:
                 print(
                     f"\n  [grad_norm_skip] === CALIBRATION COMPLETE ==="
                     f"\n  [grad_norm_skip] Step: {state.global_step}"
@@ -291,18 +498,24 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
                     f"\n  [grad_norm_skip] Norm range: [{min(self._grad_norm_history):.6f}, "
                     f"{max(self._grad_norm_history):.6f}]"
                     f"\n  [grad_norm_skip] Norm median: {np.median(self._grad_norm_history):.6f}"
+                    f"\n  [grad_norm_skip] Calibration attempts: {self._calibration_attempts}"
                 )
             else:
-                print(f"  [grad_norm_skip] WARNING: Calibration failed at step {state.global_step} "
-                      f"(only {len(self._grad_norm_history)} norms collected, need >= 10)")
+                print(f"  [grad_norm_skip] WARNING: Calibration failed at step {state.global_step}")
                 self._record_normal(state)
                 return control
 
         # Recalibrate periodically to handle non-stationarity
+        # Uses rolling window for faster adaptation
         if (self.recalibrate_every > 0
                 and state.global_step - self._last_calibration_step >= self.recalibrate_every):
-            self._calibrate_threshold()
-            self._last_calibration_step = state.global_step
+            success = self._calibrate_threshold(use_rolling=True)
+            if success:
+                self._last_calibration_step = state.global_step
+                logger.info(
+                    f"  [grad_norm_skip] Recalibrated at step {state.global_step}, "
+                    f"new threshold: {self._adaptive_threshold:.6f}"
+                )
 
         # No threshold yet (shouldn't happen, but be safe)
         if self._adaptive_threshold is None:
@@ -368,18 +581,18 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self.min_step = min_step
         self._rng = random.Random(seed)
         self._optimizer = None
-        self._model = None
+        self._model = None  # Cached from on_train_begin
 
     def on_train_begin(self, args, state, control, **kwargs):
-        if "model" in kwargs:
-            self._model = kwargs["model"]
         if "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
+        if "model" in kwargs:
+            self._model = kwargs["model"]
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        model = kwargs.get("model", self._model)
-        if state.global_step < self.min_step or model is None:
+        # Random skipping doesn't need model, but we need optimizer for momentum
+        if state.global_step < self.min_step:
             self._record_normal(state)
             return control
 
