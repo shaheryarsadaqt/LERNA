@@ -430,16 +430,40 @@ class Phase12Trainer(Trainer):
                         param.data.add_(corrected_exp_avg, alpha=-lr)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to reset gradient norm before each step.
+        """Override to implement TRUE backward-pass skipping.
         
         FLAW 6 FIX: Gradient norm captured via on_pre_optimizer_step callback.
         
-        The callback captures gradients AFTER backward() but BEFORE the
-        optimizer step (where clipping may occur). This ensures we get
-        the true pre-clip gradient norm for LERNA calibration.
+        FLAW 8 FIX: When should_skip_backward is True (set by callback in
+        on_step_begin), we skip the backward pass entirely and apply momentum
+        extrapolation instead. This saves ~60% of compute per skipped step.
         """
-        self._pre_clip_grad_norm = None  # Reset before each step
-        return super().training_step(model, inputs, num_items_in_batch)
+        # Reset gradient norm before each step
+        self._pre_clip_grad_norm = None
+        
+        # Check if we should skip backward (set by callback in on_step_begin)
+        if self.should_skip_backward:
+            # Forward pass only - skip backward to save compute
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+            
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+            
+            # Apply momentum extrapolation instead of backward
+            self._apply_momentum_extrapolation()
+            self._skip_count += 1
+            
+            # Return detached loss (gradients not computed)
+            return loss.detach()
+        
+        # Normal training step with backward
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        
+        # Capture pre-clip gradient norm for calibration
+        self._pre_clip_grad_norm = self._compute_pre_clip_grad_norm()
+        
+        return loss
 
 
 class _GradientNormCaptureCallback(TrainerCallback):
@@ -487,12 +511,18 @@ def create_baseline_callback(
         - For other baselines: callback=instance, patience=None (use task default)
     """
     if baseline_name == "grad_norm":
+        # Adaptive calibration: use 20% of total steps or min 20, max 200
+        calibration_steps = max(20, min(200, total_steps // 5))
+        recalibrate_every = max(100, total_steps // 2)
+        # Adaptive min samples: 25% of calibration window or min 10
+        min_calibration_samples = max(10, calibration_steps // 4)
         return GradientNormSkippingCallback(
             target_skip_rate=target_skip_rate,
-            calibration_steps=200,
-            recalibrate_every=500,
+            calibration_steps=calibration_steps,
+            recalibrate_every=recalibrate_every,
             min_step=0,
             wandb_enabled=wandb_enabled,
+            min_calibration_samples=min_calibration_samples,
         ), None
 
     elif baseline_name == "random_skip":

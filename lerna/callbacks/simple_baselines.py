@@ -280,6 +280,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self._current_grad_norm = None  # Captured in on_pre_optimizer_step
         self._calibration_attempts = 0
         self._max_calibration_attempts = 3
+        self._predicted_skip = False  # Set in on_step_begin, read by training_step
 
     def _compute_grad_norm(self, model) -> float:
         """Compute total gradient norm from model parameters.
@@ -392,10 +393,65 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_begin(self, args, state, control, **kwargs):
-        """Reset per-step state."""
+        """Decide whether to skip backward pass BEFORE it runs.
+        
+        FLAW 8 FIX: Pre-step decision using previous gradient norm.
+        Uses the gradient norm from the PREVIOUS step to predict whether
+        the current step should skip backward. This enables TRUE backward
+        skipping (not just recording stats after the fact).
+        
+        The skip decision is stored in trainer.should_skip_backward,
+        which training_step() checks before calling backward().
+        """
         self._current_grad_norm = None
+        
+        # Capture optimizer reference if not already set
         if self._optimizer is None and "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
+        
+        # Get trainer reference for setting skip flag
+        trainer = getattr(self, '_trainer', None)
+        if trainer is None:
+            return control
+        
+        # Reset skip flag by default
+        trainer.should_skip_backward = False
+        
+        # Need calibration data before we can make predictions
+        if self._adaptive_threshold is None:
+            return control
+        
+        # Skip during min_step period
+        if state.global_step < self.min_step:
+            return control
+        
+        # Need at least one gradient norm in history to predict
+        if len(self._grad_norm_history) == 0:
+            return control
+        
+        # Skip calibration window (first N steps after min_step)
+        if state.global_step < self.min_step + self.calibration_steps:
+            return control
+        
+        # Use PREVIOUS step's gradient norm to predict skip
+        # This is the key insight: we predict based on history,
+        # not the current step's gradient (which we haven't computed yet)
+        prev_grad_norm = self._grad_norm_history[-1]
+        should_skip = prev_grad_norm < self._adaptive_threshold
+        
+        # Set the flag for training_step to check
+        trainer.should_skip_backward = should_skip
+        
+        if should_skip:
+            self._predicted_skip = True
+            # Record skip immediately (training_step will check the flag)
+            self._record_skip(state)
+            self.active_skipping = True
+        else:
+            self._predicted_skip = False
+            self._record_normal(state)
+            self.active_skipping = False
+        
         return control
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
@@ -414,10 +470,15 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         # This is the TRUE gradient norm before clipping corrupted it
         trainer = getattr(self, '_trainer', None)
         if trainer is not None and hasattr(trainer, '_pre_clip_grad_norm'):
-            self._current_grad_norm = trainer._pre_clip_grad_norm
-        else:
-            # Fallback: compute from model (will be clipped if max_grad_norm set)
-            self._current_grad_norm = self._compute_grad_norm(model)
+            # Use trainer's pre-clip value (set by _GradientNormCaptureCallback)
+            # NOTE: _GradientNormCaptureCallback runs AFTER this callback in the
+            # callback list, so we need to compute ourselves for current step
+            # but can use the trainer's value from the PREVIOUS step
+            pass  # Don't use trainer's value - it's from previous step
+        
+        # Always compute gradient norm ourselves since we run BEFORE
+        # the _GradientNormCaptureCallback that sets trainer._pre_clip_grad_norm
+        self._current_grad_norm = self._compute_grad_norm(model)
 
         # Store in history for adaptive threshold calibration
         if self._current_grad_norm is not None and self._current_grad_norm > 0:
@@ -433,26 +494,37 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        """Make skip decision based on gradient norm captured in on_pre_optimizer_step.
-
-        FLAW 8 FIX: The actual backward skipping is handled in training_step
-        via the should_skip_backward flag. This method now just records stats.
+        """Handle calibration, recalibration, and logging AFTER the step.
+        
+        FLAW 8 FIX: Skip decision is now made in on_step_begin BEFORE backward.
+        This method handles:
+        1. Running calibration once enough samples are collected
+        2. Periodic recalibration
+        3. Logging
+        
+        Note: Skip recording is done in on_step_begin, not here.
         """
-        grad_norm = self._current_grad_norm
-
-        if grad_norm is None or grad_norm == 0:
-            self._record_normal(state)
-            return control
-
+        # Debug: log step info
+        if state.global_step <= 25:
+            logger.info(
+                f"  [grad_norm_skip DEBUG] on_step_end: step={state.global_step}, "
+                f"history_len={len(self._grad_norm_history)}, "
+                f"threshold={self._adaptive_threshold}, "
+                f"calibration_steps={self.calibration_steps}, "
+                f"min_step={self.min_step}"
+            )
+        
         # Skip calibration during min_step period
         if state.global_step < self.min_step:
-            self._record_normal(state)
             return control
 
         # Calibration phase: collect norms, don't skip yet
         if (state.global_step < self.min_step + self.calibration_steps
                 and self._adaptive_threshold is None):
-            self._record_normal(state)
+            logger.info(
+                f"  [grad_norm_skip DEBUG] In calibration window: "
+                f"step={state.global_step}, need step {self.min_step + self.calibration_steps}"
+            )
             return control
 
         # First calibration: fires on the first step at or after the
@@ -470,7 +542,6 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
                         f"  [grad_norm_skip] Calibration attempt {self._calibration_attempts} "
                         f"deferred: {reason}. Extending calibration window..."
                     )
-                    self._record_normal(state)
                     return control
                 else:
                     logger.error(
@@ -482,7 +553,6 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
                         self._adaptive_threshold = float(np.median(self._grad_norm_history))
                         self._last_calibration_step = state.global_step
                     else:
-                        self._record_normal(state)
                         return control
 
             success = self._calibrate_threshold(use_rolling=False)
@@ -502,7 +572,6 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
                 )
             else:
                 print(f"  [grad_norm_skip] WARNING: Calibration failed at step {state.global_step}")
-                self._record_normal(state)
                 return control
 
         # Recalibrate periodically to handle non-stationarity
@@ -517,28 +586,14 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
                     f"new threshold: {self._adaptive_threshold:.6f}"
                 )
 
-        # No threshold yet (shouldn't happen, but be safe)
-        if self._adaptive_threshold is None:
-            self._record_normal(state)
-            return control
-
-        if grad_norm < self._adaptive_threshold:
-            self._record_skip(state)
-            self.active_skipping = True
-
-            # Momentum extrapolation (same as LERNA)
-            optimizer = kwargs.get("optimizer", self._optimizer)
-            if optimizer is not None:
-                lr = optimizer.param_groups[0].get("lr", args.learning_rate)
-                self._apply_momentum_extrapolation(optimizer, lr)
-        else:
-            self._record_normal(state)
-            self.active_skipping = False
-
-        self._log_periodic(state, {
-            f"baseline/{self.baseline_name}/grad_norm": grad_norm,
-            f"baseline/{self.baseline_name}/threshold": self._adaptive_threshold,
-        })
+        # Logging only - skip decision was made in on_step_begin
+        grad_norm = self._current_grad_norm
+        if grad_norm is not None and grad_norm > 0:
+            self._log_periodic(state, {
+                f"baseline/{self.baseline_name}/grad_norm": grad_norm,
+                f"baseline/{self.baseline_name}/threshold": self._adaptive_threshold or 0,
+                f"baseline/{self.baseline_name}/predicted_skip": self._predicted_skip,
+            })
         return control
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
