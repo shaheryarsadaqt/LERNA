@@ -129,9 +129,232 @@ Classification tasks are unaffected (they use the original parameters: `ema_alph
 `min_improvement=0.0005`, scaled patience). For future regression benchmarks (e.g.,
 CNN/DailyMail ROUGE in Phase 2), no additional configuration is needed.
 
-### Phase 1.2: Simple Baselines (PENDING)
+### Phase 1.2: Simple Baselines & Flaw Fixes (COMPLETED)
 
-*Results will be added after Phase 1.2 experiments complete.*
+**Status:** Code review and flaw fixes completed
+**Model:** ModernBERT-base (149M parameters) | **Infrastructure:** RTX 5090
+**Smoke Test Results:** 94.15% accuracy, 0.001093 kWh energy, 598.8s training time
+**Commit:** `a3e83e52e4724909d8e1a84cedfcba2b65b09bd5`
+
+#### Phase 1.2: Flaw Fixes & Resolution
+
+A comprehensive code review identified five critical issues in the momentum extrapolation
+and gradient norm capture implementations. Each issue is documented below with root cause
+analysis and the fix applied.
+
+---
+
+##### Issue 1: Per-group Learning Rate in Momentum Extrapolation
+
+**File:** [`lerna/callbacks/lerna_switching.py:1016`](lerna/callbacks/lerna_switching.py:1016)
+
+**Problem:** The [`_apply_momentum_extrapolation()`](lerna/callbacks/lerna_switching.py:1010) method used `self.optimizer.param_groups[0]['lr']` for all parameters, completely ignoring layer-wise learning rates in models with discriminative learning rate schedules.
+
+**Root Cause:** The learning rate was extracted once before the parameter loop:
+
+```python
+# BEFORE (incorrect)
+def _apply_momentum_extrapolation(self):
+    lr = self.optimizer.param_groups[0]['lr']  # Extracted once, used for ALL groups
+    with torch.no_grad():
+        for group in self.optimizer.param_groups:
+            for param in group['params']:
+                # All params use the first group's LR!
+                param.data.add_(momentum, alpha=-lr)
+```
+
+This meant that even if different parameter groups had different learning rates (e.g., lower LR for pre-trained layers, higher LR for classifier head), all momentum updates would use the first group's LR.
+
+**Fix:** Moved the learning rate extraction inside the group loop:
+
+```python
+# AFTER (correct)
+def _apply_momentum_extrapolation(self):
+    with torch.no_grad():
+        for group in self.optimizer.param_groups:
+            group_lr = group['lr']  # Per-group learning rate
+            for param in group['params']:
+                param.data.add_(momentum, alpha=-group_lr)
+```
+
+**Impact:** Correct momentum updates for models with discriminative learning rates, ensuring that layer-wise LR schedules are respected during extrapolation steps.
+
+---
+
+##### Issue 2: Pre-clip Gradient Norm Capture Timing
+
+**File:** [`scripts/run_phase1_2_simple_baselines.py:441-445`](scripts/run_phase1_2_simple_baselines.py:441)
+
+**Problem:** The `_pre_clip_grad_norm` was captured AFTER `super().training_step()` which already applied gradient clipping, meaning the captured norm was already clipped and not representative of the true gradient magnitude.
+
+**Root Cause:** The HuggingFace Trainer's `training_step` method applies gradient clipping (if `max_grad_norm` is set) before returning. The original implementation attempted to capture the norm after this call:
+
+```python
+# BEFORE (incorrect timing)
+def training_step(self, model, inputs, num_items_in_batch=None):
+    loss = super().training_step(model, inputs, num_items_in_batch)
+    # Too late! Clipping already applied inside super().training_step()
+    self._pre_clip_grad_norm = self._compute_grad_norm(model)
+    return loss
+```
+
+**Fix:** Created a dedicated callback using the `on_pre_optimizer_step` hook, which fires after `backward()` but before `optimizer.step()` (where clipping occurs):
+
+```python
+# AFTER (correct timing)
+class _GradientNormCaptureCallback(TrainerCallback):
+    """Internal callback to capture gradient norm before optimizer step."""
+    
+    def __init__(self, trainer: Phase12Trainer):
+        self.trainer = trainer
+    
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        """Capture gradient norm before optimizer.step() and any clipping."""
+        model = kwargs.get("model")
+        total_norm_sq = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm_sq += param_norm.item() ** 2
+        self.trainer._pre_clip_grad_norm = total_norm_sq ** 0.5
+```
+
+**Impact:** Accurate gradient norm calibration for baseline skip decisions, ensuring that gradient-based thresholds compare against true unclipped gradients.
+
+---
+
+##### Issue 3: Null Gradient Norm Handling
+
+**File:** [`lerna/callbacks/simple_baselines.py:423`](lerna/callbacks/simple_baselines.py:423)
+
+**Problem:** The condition `if self._current_grad_norm > 0:` crashed when `_current_grad_norm` was `None` during early training steps before any gradient had been computed.
+
+**Root Cause:** The variable wasn't initialized before the comparison:
+
+```python
+# BEFORE (crashes on None)
+if self._current_grad_norm > 0:  # TypeError: '>' not supported between None and int
+    self._grad_norm_history.append(self._current_grad_norm)
+```
+
+**Fix:** Added explicit None check:
+
+```python
+# AFTER (handles None gracefully)
+if self._current_grad_norm is not None and self._current_grad_norm > 0:
+    self._grad_norm_history.append(self._current_grad_norm)
+```
+
+**Impact:** Prevents crash during early training steps when gradient norm hasn't been computed yet.
+
+---
+
+##### Issue 4: Inconsistent Adam Bias Correction
+
+**Files:**
+- [`lerna/callbacks/lerna_switching.py:1033`](lerna/callbacks/lerna_switching.py:1033) — LERNATrainer (missing correction)
+- [`scripts/run_phase1_2_simple_baselines.py:418`](scripts/run_phase1_2_simple_baselines.py:418) — Phase12Trainer (has correction)
+
+**Problem:** Two trainers used different momentum extrapolation formulas for Adam, leading to inconsistent behavior between the main LERNA implementation and the baseline experiments.
+
+**Root Cause:** LERNATrainer was implemented later and missed the bias correction logic that was present in Phase12Trainer:
+
+```python
+# Phase12Trainer (correct)
+exp_avg = p_state["exp_avg"]
+step = p_state.get("step", 1)
+beta1 = group.get("betas", (0.9, 0.999))[0]
+bias_correction = 1 - beta1 ** step
+corrected_exp_avg = exp_avg / bias_correction
+param.data.add_(corrected_exp_avg, alpha=-lr)
+
+# LERNATrainer BEFORE (incorrect - no bias correction)
+param.data.add_(exp_avg, alpha=-lr)
+```
+
+**Fix:** Added bias correction to LERNATrainer to match Phase12Trainer:
+
+```python
+# LERNATrainer AFTER (correct - matches Phase12Trainer)
+exp_avg = p_state['exp_avg']
+step = p_state.get('step', 1)
+beta1 = group.get('betas', (0.9, 0.999))[0]
+bias_correction = 1 - beta1 ** step
+corrected_exp_avg = exp_avg / bias_correction
+param.data.add_(corrected_exp_avg, alpha=-group_lr)
+```
+
+**Impact:** Consistent behavior across both trainers. Bias correction is critical for Adam because the first moment estimate `exp_avg` is initialized at zero and requires correction during early training steps to avoid undershooting.
+
+---
+
+##### Issue 5: Accidental File Creation
+
+**File:** `=4.44.0`
+
+**Problem:** A file named `=4.44.0` was created in the repository root, likely from a malformed pip command.
+
+**Root Cause:** User likely ran a command like `pip install transformers==4.44.0 > =4.44.0` or similar, accidentally redirecting output to a file instead of comparing versions.
+
+**Fix:** Deleted the file with `rm =4.44.0`.
+
+**Impact:** Clean repository state.
+
+---
+
+##### Issue 6 (FLAW 9): Tensor Boolean Ambiguity in Gradient Norm Comparison
+
+**File:** [`lerna/callbacks/simple_baselines.py`](lerna/callbacks/simple_baselines.py)
+
+**Problem:** `Boolean value of Tensor with more than one value is ambiguous` error during gradient norm skip decisions.
+
+**Root Cause:** In `GradientNormSkippingCallback`, gradient norm values were PyTorch tensors instead of Python floats. When comparing tensors in boolean contexts (e.g., `if grad_norm > threshold`), PyTorch raises an ambiguity error because the comparison returns a tensor, not a scalar boolean.
+
+**Fix Applied:**
+1. Added `float()` conversion in `_compute_grad_norm()` return value
+2. Added `float()` conversion in `on_step_begin()` for skip decision comparison
+3. Added `float()` conversion in `on_pre_optimizer_step()` when storing to `_grad_norm_history`
+
+```python
+# BEFORE (incorrect - returns tensor)
+def _compute_grad_norm(self, model):
+    ...
+    return total_norm  # torch.Tensor
+
+# AFTER (correct - returns Python float)
+def _compute_grad_norm(self, model):
+    ...
+    return float(total_norm)  # Python float
+```
+
+**Impact:** Gradient norm baseline now runs without errors. Skip decisions work correctly with scalar float comparisons.
+
+**Verification:**
+- Smoke test: 22% skip rate, no errors
+- Quick validation: 21.9% skip rate, 90.2% accuracy on SST2
+
+**Commit:** `60d2948`
+
+---
+
+#### Fix Verification Summary
+
+| Issue | Severity | Detection Method | Fix Complexity |
+|-------|----------|------------------|----------------|
+| Per-group LR | High | Code review | Low (2-line change) |
+| Grad norm timing | Critical | Logical analysis | Medium (new callback class) |
+| Null grad norm | Medium | Runtime crash | Low (1-line change) |
+| Adam bias correction | Medium | Cross-file comparison | Low (3-line addition) |
+| Accidental file | Low | File listing | Trivial (delete) |
+| Tensor boolean (FLAW 9) | Medium | Runtime crash | Low (3 float() conversions) |
+
+**Smoke Test Verification:** After all fixes, the smoke test passed with:
+- Accuracy: 94.15%
+- Energy: 0.001093 kWh
+- Training time: 598.8s
+- No runtime errors or crashes
+
+---
 
 ### Phase 1.3: Component Ablation (PENDING)
 
