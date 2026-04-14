@@ -286,6 +286,9 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         """Compute total gradient norm from model parameters.
 
         Returns 0.0 if no gradients are found.
+        
+        NOTE: Always returns a Python float (not tensor) to avoid
+        "Boolean value of Tensor is ambiguous" errors in comparisons.
         """
         total_norm_sq = 0.0
         has_grad = False
@@ -293,7 +296,8 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
             if p.requires_grad and p.grad is not None:
                 total_norm_sq += p.grad.detach().float().norm().item() ** 2
                 has_grad = True
-        return total_norm_sq ** 0.5 if has_grad else 0.0
+        # Explicitly convert to Python float to avoid tensor boolean ambiguity
+        return float(total_norm_sq ** 0.5) if has_grad else 0.0
 
     def _validate_calibration_data(self, norms: list) -> tuple:
         """Validate that calibration data has sufficient diversity.
@@ -436,8 +440,10 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         # Use PREVIOUS step's gradient norm to predict skip
         # This is the key insight: we predict based on history,
         # not the current step's gradient (which we haven't computed yet)
-        prev_grad_norm = self._grad_norm_history[-1]
-        should_skip = prev_grad_norm < self._adaptive_threshold
+        # FLAW 9 FIX: Explicitly convert to float to avoid tensor boolean ambiguity
+        prev_grad_norm = float(self._grad_norm_history[-1])
+        threshold = float(self._adaptive_threshold)
+        should_skip = prev_grad_norm < threshold
         
         # Set the flag for training_step to check
         trainer.should_skip_backward = should_skip
@@ -481,8 +487,9 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self._current_grad_norm = self._compute_grad_norm(model)
 
         # Store in history for adaptive threshold calibration
+        # FLAW 9 FIX: Ensure we store Python float, not tensor
         if self._current_grad_norm is not None and self._current_grad_norm > 0:
-            self._grad_norm_history.append(self._current_grad_norm)
+            self._grad_norm_history.append(float(self._current_grad_norm))
             # Rolling window for non-stationarity handling
             self._rolling_grad_norms.append(self._current_grad_norm)
             if len(self._rolling_grad_norms) > self.rolling_window_size:
