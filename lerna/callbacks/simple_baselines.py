@@ -489,9 +489,11 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         # Store in history for adaptive threshold calibration
         # FLAW 9 FIX: Ensure we store Python float, not tensor
         if self._current_grad_norm is not None and self._current_grad_norm > 0:
-            self._grad_norm_history.append(float(self._current_grad_norm))
+            grad_norm_float = float(self._current_grad_norm)
+            self._grad_norm_history.append(grad_norm_float)
             # Rolling window for non-stationarity handling
-            self._rolling_grad_norms.append(self._current_grad_norm)
+            # Also store as float to avoid tensor comparison issues
+            self._rolling_grad_norms.append(grad_norm_float)
             if len(self._rolling_grad_norms) > self.rolling_window_size:
                 self._rolling_grad_norms = self._rolling_grad_norms[-self.rolling_window_size:]
             # Cap full history to prevent unbounded memory growth
