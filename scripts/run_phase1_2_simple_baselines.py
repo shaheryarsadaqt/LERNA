@@ -472,6 +472,11 @@ class Phase12Trainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        # FIX: Ensure loss is always a scalar to prevent
+        # "Boolean value of Tensor with more than one value is ambiguous"
+        # in HF Trainer's _run_epoch boolean checks.
+        if loss is not None and loss.dim() > 0:
+            loss = loss.mean()
         if hasattr(outputs, "logits"):
             self._last_real_logits = outputs.logits.detach()
         elif isinstance(outputs, dict) and "logits" in outputs:
