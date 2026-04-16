@@ -570,12 +570,10 @@ class Phase12Trainer(Trainer):
             # First, zero any existing gradients
             self.optimizer.zero_grad(set_to_none=True)
             # Create a zero scalar that requires grad and backward it
+            # Use accelerator.backward() which handles AMP/GradScaler
+            # automatically across all transformers versions.
             dummy_loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
-            # Use the same AMP context as normal training
-            if self.use_amp:
-                self.scaler.scale(dummy_loss).backward()
-            else:
-                dummy_loss.backward()
+            self.accelerator.backward(dummy_loss)
             
             # Check if this is a weight_freeze skip (no momentum) or
             # a normal skip (with momentum extrapolation)
