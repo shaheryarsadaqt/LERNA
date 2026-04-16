@@ -554,6 +554,29 @@ class Phase12Trainer(Trainer):
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
             
+            # FIX: AMP GradScaler compatibility.
+            # When using fp16/bf16 with GradScaler, the Trainer calls
+            # scaler.step(optimizer) after training_step(). The scaler
+            # asserts that inf checks were recorded during backward.
+            # If we skip backward entirely, scaler.step() crashes with:
+            #   "No inf checks were recorded for this optimizer."
+            #
+            # Solution: Do a trivial backward on a zero-valued scalar.
+            # This registers the inf checks with GradScaler (~0.1ms cost)
+            # without computing real gradients. The optimizer.step() will
+            # then see zero gradients and make no meaningful update.
+            # We then apply momentum extrapolation to get the actual update.
+            #
+            # First, zero any existing gradients
+            self.optimizer.zero_grad(set_to_none=True)
+            # Create a zero scalar that requires grad and backward it
+            dummy_loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+            # Use the same AMP context as normal training
+            if self.use_amp:
+                self.scaler.scale(dummy_loss).backward()
+            else:
+                dummy_loss.backward()
+            
             # Check if this is a weight_freeze skip (no momentum) or
             # a normal skip (with momentum extrapolation)
             freeze_no_momentum = getattr(self, '_freeze_weights_no_momentum', False)
@@ -564,12 +587,7 @@ class Phase12Trainer(Trainer):
             
             self._skip_count += 1
             
-            # FIX: Ensure loss is a SCALAR before returning.
-            # HF Trainer's _run_epoch does boolean checks on the loss
-            # (e.g., `if loss:` or NaN checks), which crash on multi-element
-            # tensors with "Boolean value of Tensor with more than one value
-            # is ambiguous". The loss from compute_loss may be per-sample
-            # or multi-GPU, so we reduce to scalar with .mean().
+            # Return scalar detached loss for logging
             if loss.dim() > 0:
                 loss = loss.mean()
             return loss.detach()
