@@ -497,24 +497,32 @@ class Phase12Trainer(Trainer):
         Uses the optimizer's momentum buffer (SGD) or first moment estimate
         (Adam/AdamW) as a proxy for gradient direction.
         """
-        lr = self.args.learning_rate
         with torch.no_grad():
             for group in self.optimizer.param_groups:
+                group_lr = group.get('lr', self.args.learning_rate)
                 for param in group["params"]:
                     if not param.requires_grad or param not in self.optimizer.state:
                         continue
                     p_state = self.optimizer.state[param]
                     if "momentum_buffer" in p_state:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
+                        param.data.add_(p_state["momentum_buffer"], alpha=-group_lr)
                     elif "exp_avg" in p_state:
                         # Adam/AdamW: use first moment (bias-corrected)
                         step = p_state.get("step", 1)
+                        # FIX: In PyTorch >= 2.1, Adam's step counter is a
+                        # tensor, not an int. Convert to Python int/float
+                        # to avoid tensor boolean ambiguity in bias_correction.
+                        if isinstance(step, torch.Tensor):
+                            step = step.item()
+                        step = max(int(step), 1)  # Ensure at least 1
                         exp_avg = p_state["exp_avg"]
-                        # Adam's bias correction
                         beta1 = group.get("betas", (0.9, 0.999))[0]
                         bias_correction = 1 - beta1 ** step
-                        corrected_exp_avg = exp_avg / bias_correction
-                        param.data.add_(corrected_exp_avg, alpha=-lr)
+                        if bias_correction > 0:
+                            corrected_exp_avg = exp_avg / bias_correction
+                        else:
+                            corrected_exp_avg = exp_avg
+                        param.data.add_(corrected_exp_avg, alpha=-group_lr)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override to implement TRUE backward-pass skipping.
@@ -551,7 +559,14 @@ class Phase12Trainer(Trainer):
             
             self._skip_count += 1
             
-            # Return detached loss (gradients not computed)
+            # FIX: Ensure loss is a SCALAR before returning.
+            # HF Trainer's _run_epoch does boolean checks on the loss
+            # (e.g., `if loss:` or NaN checks), which crash on multi-element
+            # tensors with "Boolean value of Tensor with more than one value
+            # is ambiguous". The loss from compute_loss may be per-sample
+            # or multi-GPU, so we reduce to scalar with .mean().
+            if loss.dim() > 0:
+                loss = loss.mean()
             return loss.detach()
         
         # Normal training step with backward
