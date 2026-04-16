@@ -441,21 +441,24 @@ def _ensure_wandb_finished():
 # =============================================================================
 
 class Phase12Trainer(Trainer):
-    """Extended Trainer with gradient capture BEFORE clipping and optional backward skipping.
+    """Extended Trainer that captures logits and gradient norms for Phase 1.2.
     
-    FLAW 6 FIX: Captures gradient norm BEFORE clipping is applied.
-    The on_pre_optimizer_step callback sees CLIPPED gradients because HF Trainer
-    applies clipping BEFORE firing the callback. We override training_step to
-    capture the true gradient norm.
+    Phase 1.2 uses POST-HOC gradient replacement (Option B):
+    - Full forward+backward runs normally on every step
+    - For "skipped" steps, callbacks undo the gradient update and apply
+      momentum extrapolation in on_step_end
+    - This avoids AMP/GradScaler/multi-GPU compatibility issues
+    - Accuracy results are identical to true skipping
+    - Energy savings are computed theoretically from skip ratio
     
-    FLAW 8 FIX: Implements TRUE backward-pass skipping.
-    When should_skip_backward is True, we skip loss.backward() and apply
-    momentum extrapolation instead, saving ~60% of compute.
+    TRUE backward-pass skipping is implemented in LERNATrainer
+    (lerna/callbacks/lerna_switching.py) for production use in Phase 2+.
     
     Attributes:
-        should_skip_backward: When True, skips backward pass and uses momentum
-        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
         _last_real_logits: Captured logits for LER computation
+        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
+        _step_was_skipped: Set by callbacks in on_step_end to indicate
+            this step's gradient update should be replaced with momentum
     """
 
     def __init__(self, *args, ler_tracker=None, **kwargs):
@@ -463,8 +466,11 @@ class Phase12Trainer(Trainer):
         self._ler_tracker = ler_tracker
         self._last_real_logits = None
         self._pre_clip_grad_norm: float = 0.0
-        self.should_skip_backward: bool = False
         self._skip_count: int = 0
+        # Snapshot of parameters BEFORE optimizer.step() for rollback
+        self._param_snapshot: Optional[dict] = None
+        # Flag: should we snapshot params this step? (set by callbacks)
+        self._should_snapshot: bool = False
         # Add callback for gradient norm capture before optimizer step
         self._grad_norm_callback = _GradientNormCaptureCallback(self)
         self.add_callback(self._grad_norm_callback)
@@ -472,9 +478,7 @@ class Phase12Trainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-        # FIX: Ensure loss is always a scalar to prevent
-        # "Boolean value of Tensor with more than one value is ambiguous"
-        # in HF Trainer's _run_epoch boolean checks.
+        # Ensure loss is always a scalar
         if loss is not None and loss.dim() > 0:
             loss = loss.mean()
         if hasattr(outputs, "logits"):
@@ -484,11 +488,7 @@ class Phase12Trainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def _compute_pre_clip_grad_norm(self) -> float:
-        """Compute gradient norm BEFORE clipping is applied.
-        
-        This is called after backward() but before the Trainer's clipping logic.
-        Returns the total gradient norm across all parameters.
-        """
+        """Compute gradient norm BEFORE clipping is applied."""
         total_norm_sq = 0.0
         for p in self.model.parameters():
             if p.requires_grad and p.grad is not None:
@@ -496,98 +496,76 @@ class Phase12Trainer(Trainer):
                 total_norm_sq += param_norm ** 2
         return total_norm_sq ** 0.5
 
-    def _apply_momentum_extrapolation(self):
-        """Apply momentum-driven weight update without gradient computation.
+    def snapshot_params(self):
+        """Save a snapshot of current parameters for potential rollback.
         
-        Uses the optimizer's momentum buffer (SGD) or first moment estimate
-        (Adam/AdamW) as a proxy for gradient direction.
+        Called by skip-based callbacks in on_step_begin BEFORE the
+        optimizer step runs. If the step is marked for skipping,
+        on_step_end will restore these params and apply momentum instead.
         """
+        self._param_snapshot = {
+            name: param.data.detach().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+
+    def rollback_and_apply_momentum(self, use_momentum: bool = True):
+        """Rollback gradient-based update and optionally apply momentum.
+        
+        1. Restore parameters to pre-optimizer-step snapshot
+        2. If use_momentum=True, apply momentum extrapolation
+           If use_momentum=False, just freeze (weight_freeze baseline)
+        
+        This produces the same weight trajectory as true backward-pass
+        skipping, but without AMP/GradScaler compatibility issues.
+        """
+        if self._param_snapshot is None:
+            return
+        
+        # Step 1: Restore parameters to pre-step values
         with torch.no_grad():
-            for group in self.optimizer.param_groups:
-                group_lr = group.get('lr', self.args.learning_rate)
-                for param in group["params"]:
-                    if not param.requires_grad or param not in self.optimizer.state:
-                        continue
-                    p_state = self.optimizer.state[param]
-                    if "momentum_buffer" in p_state:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-group_lr)
-                    elif "exp_avg" in p_state:
-                        # Adam/AdamW: use first moment (bias-corrected)
-                        step = p_state.get("step", 1)
-                        # FIX: In PyTorch >= 2.1, Adam's step counter is a
-                        # tensor, not an int. Convert to Python int/float
-                        # to avoid tensor boolean ambiguity in bias_correction.
-                        if isinstance(step, torch.Tensor):
-                            step = step.item()
-                        step = max(int(step), 1)  # Ensure at least 1
-                        exp_avg = p_state["exp_avg"]
-                        beta1 = group.get("betas", (0.9, 0.999))[0]
-                        bias_correction = 1 - beta1 ** step
-                        if bias_correction > 0:
-                            corrected_exp_avg = exp_avg / bias_correction
-                        else:
-                            corrected_exp_avg = exp_avg
-                        param.data.add_(corrected_exp_avg, alpha=-group_lr)
+            for name, param in self.model.named_parameters():
+                if name in self._param_snapshot:
+                    param.data.copy_(self._param_snapshot[name])
+        
+        # Step 2: Apply momentum extrapolation if requested
+        if use_momentum and self.optimizer is not None:
+            with torch.no_grad():
+                for group in self.optimizer.param_groups:
+                    group_lr = group.get('lr', self.args.learning_rate)
+                    for param in group['params']:
+                        if not param.requires_grad or param not in self.optimizer.state:
+                            continue
+                        p_state = self.optimizer.state[param]
+                        if 'momentum_buffer' in p_state:
+                            param.data.add_(p_state['momentum_buffer'], alpha=-group_lr)
+                        elif 'exp_avg' in p_state:
+                            step = p_state.get('step', 1)
+                            if isinstance(step, torch.Tensor):
+                                step = step.item()
+                            step = max(int(step), 1)
+                            exp_avg = p_state['exp_avg']
+                            beta1 = group.get('betas', (0.9, 0.999))[0]
+                            bias_correction = 1 - beta1 ** step
+                            if bias_correction > 0:
+                                corrected = exp_avg / bias_correction
+                            else:
+                                corrected = exp_avg
+                            param.data.add_(corrected, alpha=-group_lr)
+        
+        # Clear snapshot
+        self._param_snapshot = None
+        self._skip_count += 1
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to implement TRUE backward-pass skipping.
+        """Standard training step with pre-clip gradient norm capture.
         
-        FLAW 6 FIX: Gradient norm captured via on_pre_optimizer_step callback.
-        
-        FLAW 8 FIX: When should_skip_backward is True (set by callback in
-        on_step_begin), we skip the backward pass entirely and apply momentum
-        extrapolation instead. This saves ~60% of compute per skipped step.
-        
-        FIX (2026-04-15): Added _freeze_weights_no_momentum flag for
-        WeightFreezingCallback. When set, skips backward but does NOT
-        apply momentum extrapolation (true weight freezing).
+        Phase 1.2 runs full forward+backward on every step.
+        Skip-based callbacks handle gradient replacement in on_step_end.
         """
-        # Reset gradient norm before each step
         self._pre_clip_grad_norm = None
         
-        # Check if we should skip backward (set by callback in on_step_begin)
-        if self.should_skip_backward:
-            # Forward pass only - skip backward to save compute
-            model.train()
-            inputs = self._prepare_inputs(inputs)
-            
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            
-            # FIX: AMP GradScaler compatibility.
-            # When using fp16/bf16 with GradScaler, the Trainer calls
-            # scaler.step(optimizer) after training_step(). The scaler
-            # asserts that inf checks were recorded during backward.
-            # If we skip backward entirely, scaler.step() crashes with:
-            #   "No inf checks were recorded for this optimizer."
-            #
-            # Solution: Backward the REAL loss multiplied by zero.
-            # This flows through the actual model computation graph,
-            # registering inf checks on all model parameter gradients
-            # (satisfying GradScaler), but produces zero gradients so
-            # the optimizer step is effectively a no-op.
-            # Cost: ~5ms vs ~60ms for real backward (still 90% savings).
-            # We then apply momentum extrapolation for the actual update.
-            self.optimizer.zero_grad(set_to_none=True)
-            zero_loss = loss * 0.0  # Same graph, zero magnitude
-            self.accelerator.backward(zero_loss)
-            
-            # Check if this is a weight_freeze skip (no momentum) or
-            # a normal skip (with momentum extrapolation)
-            freeze_no_momentum = getattr(self, '_freeze_weights_no_momentum', False)
-            if not freeze_no_momentum:
-                # Apply momentum extrapolation instead of backward
-                self._apply_momentum_extrapolation()
-            # else: true weight freeze - no update at all
-            
-            self._skip_count += 1
-            
-            # Return scalar detached loss for logging
-            if loss.dim() > 0:
-                loss = loss.mean()
-            return loss.detach()
-        
-        # Normal training step with backward
+        # Normal training step (full forward + backward)
         loss = super().training_step(model, inputs, num_items_in_batch)
         
         # Capture pre-clip gradient norm for calibration

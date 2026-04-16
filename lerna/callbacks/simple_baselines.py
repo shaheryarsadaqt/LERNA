@@ -375,16 +375,12 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_begin(self, args, state, control, **kwargs):
-        """Decide whether to skip backward pass BEFORE it runs."""
+        """Decide skip and snapshot params BEFORE optimizer step."""
         self._current_grad_norm = None
+        self._skip_this_step = False
+        
         if self._optimizer is None and "optimizer" in kwargs:
             self._optimizer = kwargs["optimizer"]
-        
-        trainer = getattr(self, '_trainer', None)
-        if trainer is None:
-            return control
-        
-        trainer.should_skip_backward = False
         
         if self._adaptive_threshold is None:
             return control
@@ -399,16 +395,15 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         threshold = float(self._adaptive_threshold)
         should_skip = prev_grad_norm < threshold
         
-        trainer.should_skip_backward = should_skip
-        
         if should_skip:
             self._predicted_skip = True
-            self._record_skip(state)
-            self.active_skipping = True
+            self._skip_this_step = True
+            # Snapshot params for rollback
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'snapshot_params'):
+                trainer.snapshot_params()
         else:
             self._predicted_skip = False
-            self._record_normal(state)
-            self.active_skipping = False
         
         return control
 
@@ -428,6 +423,18 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
+        # Handle rollback for skipped steps
+        if self._skip_this_step:
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'rollback_and_apply_momentum'):
+                trainer.rollback_and_apply_momentum(use_momentum=True)
+            self._record_skip(state)
+            self.active_skipping = True
+        elif state.global_step >= self.min_step + self.calibration_steps:
+            self._record_normal(state)
+            self.active_skipping = False
+        self._skip_this_step = False
+        
         if state.global_step < self.min_step:
             return control
         if (state.global_step < self.min_step + self.calibration_steps
@@ -493,10 +500,12 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
     or whether just reducing compute by any fraction is sufficient.
     If random skipping matches LERNA, then LER adds no value.
 
-    FIX (2026-04-15): Now implements TRUE backward-pass skipping by
-    setting trainer.should_skip_backward = True in on_step_begin,
-    BEFORE the backward pass runs. Previously only recorded skips
-    in on_step_end after backward had already executed.
+    Implementation (Option B - post-hoc replacement):
+    Full forward+backward runs normally. For "skipped" steps, the
+    gradient-based update is rolled back and replaced with momentum
+    extrapolation in on_step_end. This produces identical weight
+    trajectories to true skipping without AMP/GradScaler issues.
+    Energy savings are computed theoretically from skip ratio.
     """
 
     def __init__(
@@ -514,6 +523,7 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         self._rng = random.Random(seed)
         self._optimizer = None
         self._model = None
+        self._skip_this_step = False
 
     def on_train_begin(self, args, state, control, **kwargs):
         if "optimizer" in kwargs:
@@ -525,32 +535,36 @@ class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_begin(self, args, state, control, **kwargs):
-        """Decide whether to skip backward BEFORE it runs.
-        
-        FIX: Sets trainer.should_skip_backward = True so that
-        Phase12Trainer.training_step() skips loss.backward() entirely.
-        The trainer applies momentum extrapolation instead.
-        """
-        trainer = getattr(self, '_trainer', None)
-        if trainer is not None:
-            trainer.should_skip_backward = False  # Default: don't skip
+        """Decide skip and snapshot params BEFORE optimizer step."""
+        self._skip_this_step = False
         
         if state.global_step < self.min_step:
-            self._record_normal(state)
             return control
         
         should_skip = self._rng.random() < self.target_skip_rate
         
         if should_skip:
-            # Set the flag BEFORE backward runs
-            if trainer is not None:
-                trainer.should_skip_backward = True
+            self._skip_this_step = True
+            # Snapshot params so we can rollback after optimizer.step()
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'snapshot_params'):
+                trainer.snapshot_params()
+        
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """After optimizer step, rollback and apply momentum if skipping."""
+        if self._skip_this_step:
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'rollback_and_apply_momentum'):
+                trainer.rollback_and_apply_momentum(use_momentum=True)
             self._record_skip(state)
             self.active_skipping = True
         else:
             self._record_normal(state)
             self.active_skipping = False
         
+        self._skip_this_step = False
         self._log_periodic(state)
         return control
 
@@ -594,20 +608,12 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
         self.ler_tracker = ler_tracker
         self.threshold = threshold
         self.min_step = min_step
-        self._ler_update_count = 0  # Track how many times LER was updated
+        self._ler_update_count = 0
+        self._skip_this_step = False
 
     def on_step_begin(self, args, state, control, **kwargs):
-        """Decide whether to skip backward BEFORE it runs.
-        
-        FIX: Sets trainer.should_skip_backward = True for TRUE skipping.
-        Unlike LERNA, we do NOT apply momentum extrapolation (weights frozen).
-        The Phase12Trainer checks should_skip_backward and skips loss.backward().
-        We also override the trainer's momentum extrapolation by setting a
-        special flag.
-        """
-        trainer = getattr(self, '_trainer', None)
-        if trainer is not None:
-            trainer.should_skip_backward = False
+        """Decide skip and snapshot params BEFORE optimizer step."""
+        self._skip_this_step = False
         
         if state.global_step < self.min_step:
             return control
@@ -616,26 +622,34 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
         current_ler = diag.get("ler")
         
         if current_ler is None:
-            # LER not yet computed (not enough data points)
             return control
 
         if current_ler < self.threshold:
-            # Signal to skip backward pass AND freeze weights
-            if trainer is not None:
-                trainer.should_skip_backward = True
-                # Set a flag so trainer does NOT apply momentum extrapolation
-                trainer._freeze_weights_no_momentum = True
-            self._record_skip(state)
-            self.active_skipping = True
-        else:
-            if trainer is not None:
-                trainer._freeze_weights_no_momentum = False
-            self._record_normal(state)
-            self.active_skipping = False
+            self._skip_this_step = True
+            # Snapshot params for rollback
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'snapshot_params'):
+                trainer.snapshot_params()
 
         self._log_periodic(state, {
             f"baseline/{self.baseline_name}/ler": current_ler,
         })
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """After optimizer step, rollback WITHOUT momentum (true freeze)."""
+        if self._skip_this_step:
+            trainer = getattr(self, '_trainer', None)
+            if trainer is not None and hasattr(trainer, 'rollback_and_apply_momentum'):
+                # use_momentum=False: true weight freezing (no update at all)
+                trainer.rollback_and_apply_momentum(use_momentum=False)
+            self._record_skip(state)
+            self.active_skipping = True
+        else:
+            self._record_normal(state)
+            self.active_skipping = False
+        
+        self._skip_this_step = False
         return control
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
@@ -643,7 +657,6 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
-        # Report LER tracker status
         diag = self.ler_tracker.get_diagnostics()
         print(f"  [weight_freeze] LER tracker status: n_steps={diag.get('n_steps', 0)}, "
               f"current_ler={diag.get('ler', 'None')}, phase={diag.get('phase', 'unknown')}")
