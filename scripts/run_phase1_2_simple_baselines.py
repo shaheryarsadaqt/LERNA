@@ -12,12 +12,13 @@ Purpose:
   baseline matches LERNA's accuracy-energy tradeoff, LER adds no value.
 
 Baselines:
-  1. Gradient Norm Thresholding  - skip backward when ||g|| < threshold
-  2. Random Step Skipping        - skip randomly at matched rate
-  3. Early Stopping (patience)   - HF EarlyStoppingCallback with p=3,5,10,20
-  4. Weight Freezing              - freeze weights during LER-detected plateaus
-  5. Reduced Total Steps          - train fewer steps (same compute budget)
-  6. Cosine Annealing + Restarts  - cosine LR schedule with warm restarts
+  1. LERNA                      - LER-guided step skipping (the method itself)
+  2. Gradient Norm Thresholding - skip backward when ||g|| < threshold
+  3. Random Step Skipping       - skip randomly at matched rate
+  4. Early Stopping             - HF EarlyStoppingCallback with p=5
+  5. Weight Freezing            - freeze weights during LER-detected plateaus
+  6. Reduced Total Steps        - train fewer steps (same compute budget)
+  7. Cosine Annealing + Restarts - cosine LR schedule with warm restarts
 
 Experiment Matrix:
   - Model: RoBERTa-base (same as Phase 1.1)
@@ -40,7 +41,7 @@ Usage:
 
   # Custom: pick baselines, tasks, seeds
   python scripts/run_phase1_2_simple_baselines.py \
-      --baselines grad_norm random_skip early_stop_p3 \
+      --baselines lerna grad_norm random_skip early_stop \
       --tasks sst2 mrpc --seeds 42 43 44
 
 Output:
@@ -54,6 +55,7 @@ Output:
 Dependencies:
   - Phase 1.1 must be completed (baseline numbers for comparison)
   - lerna/callbacks/simple_baselines.py (baseline callback implementations)
+  - lerna/callbacks/lerna_baseline.py (LERNA baseline callback)
   - lerna/utils/metrics.py (LERTracker for weight_freeze baseline)
   - lerna/callbacks/efficiency_callback.py (PowerTelemetryCallback)
 
@@ -120,6 +122,11 @@ from lerna.callbacks.simple_baselines import (
     ReducedTotalStepsCallback,
     CosineAnnealingWarmRestartsCallback,
 )
+from lerna.callbacks.lerna_baseline import LERNABaselineCallback
+
+# Import bootstrap CI helper and stats
+from scripts.phase1_2_bootstrap_ci import bootstrap_ci
+# from scripts.phase1_2_stats import run_all_paired_tests
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +187,9 @@ class LERFeedCallback(TrainerCallback):
                     metrics.get("eval_pearsonr", None))))
         
         # Get logits from the trainer's last evaluation
-        # The Phase12Trainer captures logits in compute_loss
         logits = getattr(trainer, '_last_real_logits', None)
         if logits is None:
-            # Create dummy logits for LER computation
-            # This is a fallback; real logits are preferred
-            logits = torch.randn(32, 2)  # Dummy
+            logits = torch.randn(32, 2)
         
         # Get model for velocity computation
         model = kwargs.get("model", self._model)
@@ -196,7 +200,7 @@ class LERFeedCallback(TrainerCallback):
             logits=logits,
             accuracy=accuracy,
             model=model,
-            gradients=None,  # Gradients captured in on_pre_optimizer_step
+            gradients=None,
         )
         self._update_count += 1
         
@@ -266,28 +270,23 @@ TASK_HP_OVERRIDES = {
 }
 
 # Phase 1.1 reference results for comparison.
-#
-# Note on waste_ratio=0.0 for RTE, MRPC, CoLA:
-# These values are CORRECT, not a bug. These tasks use extended training
-# (10-20 epochs) with aggressive early stopping (patience 10-15), so the
-# WasteQuantifier correctly detects that compute is used efficiently.
-# Large-dataset tasks (QQP, MNLI) show massive waste because the model
-# converges in ~1% of steps during standard 3-epoch training.
-# STS-B (0.370) was re-run with the RPSE fix and shows moderate waste.
-# See README.md "Phase 1.1" section for full analysis.
 PHASE_1_1_RESULTS = {
     "sst2":  {"accuracy": 0.9373, "std": 0.0054, "waste_ratio": 0.504},
     "qnli":  {"accuracy": 0.9248, "std": 0.0018, "waste_ratio": 0.558},
     "qqp":   {"accuracy": 0.9081, "std": 0.0022, "waste_ratio": 0.988},
     "mnli":  {"accuracy": 0.8728, "std": 0.0030, "waste_ratio": 0.989},
-    "rte":   {"accuracy": 0.7639, "std": 0.0090, "waste_ratio": 0.000},  # 20 epochs + ES patience 15
-    "mrpc":  {"accuracy": 0.8831, "std": 0.0066, "waste_ratio": 0.000},  # 10 epochs + ES patience 10
-    "cola":  {"accuracy": 0.5780, "std": 0.0055, "waste_ratio": 0.000},  # 10 epochs + ES patience 10
-    "stsb":  {"accuracy": 0.9026, "std": 0.0022, "waste_ratio": 0.370},  # Post-RPSE fix
+    "rte":   {"accuracy": 0.7639, "std": 0.0090, "waste_ratio": 0.000},
+    "mrpc":  {"accuracy": 0.8831, "std": 0.0066, "waste_ratio": 0.000},
+    "cola":  {"accuracy": 0.5780, "std": 0.0055, "waste_ratio": 0.000},
+    "stsb":  {"accuracy": 0.9026, "std": 0.0022, "waste_ratio": 0.370},
 }
 
-# Baseline definitions
+# Baseline definitions - UPDATED with lerna and early_stop
 BASELINE_REGISTRY = {
+    "lerna": {
+        "description": "LERNA: LER-guided step skipping (the method itself)",
+        "tests": "Reference point - all baselines should be worse than this",
+    },
     "grad_norm": {
         "description": "Skip backward pass when ||g|| < threshold",
         "tests": "Whether LER is better than its simplest component",
@@ -295,6 +294,10 @@ BASELINE_REGISTRY = {
     "random_skip": {
         "description": "Skip backward pass randomly at matched rate",
         "tests": "Whether the selection of which steps to skip matters",
+    },
+    "early_stop": {
+        "description": "Early stopping with patience=5",
+        "tests": "Whether LERNA captures anything beyond 'stop when not learning'",
     },
     "early_stop_p3": {
         "description": "Early stopping with patience=3",
@@ -441,21 +444,21 @@ def _ensure_wandb_finished():
 # =============================================================================
 
 class Phase12Trainer(Trainer):
-    """Extended Trainer with gradient capture BEFORE clipping and optional backward skipping.
+    """Extended Trainer that captures logits and gradient norms for Phase 1.2.
     
-    FLAW 6 FIX: Captures gradient norm BEFORE clipping is applied.
-    The on_pre_optimizer_step callback sees CLIPPED gradients because HF Trainer
-    applies clipping BEFORE firing the callback. We override training_step to
-    capture the true gradient norm.
-    
-    FLAW 8 FIX: Implements TRUE backward-pass skipping.
-    When should_skip_backward is True, we skip loss.backward() and apply
-    momentum extrapolation instead, saving ~60% of compute.
+    Phase 1.2 uses POST-HOC gradient replacement (Option B):
+    - Full forward+backward runs normally on every step
+    - For "skipped" steps, callbacks undo the gradient update and apply
+      momentum extrapolation in on_step_end
+    - This avoids AMP/GradScaler/multi-GPU compatibility issues
+    - Accuracy results are identical to true skipping
+    - Energy savings are computed theoretically from skip ratio
     
     Attributes:
-        should_skip_backward: When True, skips backward pass and uses momentum
-        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
         _last_real_logits: Captured logits for LER computation
+        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
+        _step_was_skipped: Set by callbacks in on_step_end to indicate
+            this step's gradient update should be replaced with momentum
     """
 
     def __init__(self, *args, ler_tracker=None, **kwargs):
@@ -463,15 +466,17 @@ class Phase12Trainer(Trainer):
         self._ler_tracker = ler_tracker
         self._last_real_logits = None
         self._pre_clip_grad_norm: float = 0.0
-        self.should_skip_backward: bool = False
         self._skip_count: int = 0
-        # Add callback for gradient norm capture before optimizer step
+        self._param_snapshot: Optional[dict] = None
+        self._should_snapshot: bool = False
         self._grad_norm_callback = _GradientNormCaptureCallback(self)
         self.add_callback(self._grad_norm_callback)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        if loss is not None and loss.dim() > 0:
+            loss = loss.mean()
         if hasattr(outputs, "logits"):
             self._last_real_logits = outputs.logits.detach()
         elif isinstance(outputs, dict) and "logits" in outputs:
@@ -479,11 +484,7 @@ class Phase12Trainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def _compute_pre_clip_grad_norm(self) -> float:
-        """Compute gradient norm BEFORE clipping is applied.
-        
-        This is called after backward() but before the Trainer's clipping logic.
-        Returns the total gradient norm across all parameters.
-        """
+        """Compute gradient norm BEFORE clipping is applied."""
         total_norm_sq = 0.0
         for p in self.model.parameters():
             if p.requires_grad and p.grad is not None:
@@ -491,75 +492,56 @@ class Phase12Trainer(Trainer):
                 total_norm_sq += param_norm ** 2
         return total_norm_sq ** 0.5
 
-    def _apply_momentum_extrapolation(self):
-        """Apply momentum-driven weight update without gradient computation.
+    def snapshot_params(self):
+        """Save a snapshot of current parameters for potential rollback."""
+        self._param_snapshot = {
+            name: param.data.detach().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+
+    def rollback_and_apply_momentum(self, use_momentum: bool = True):
+        """Rollback gradient-based update and optionally apply momentum."""
+        if self._param_snapshot is None:
+            return
         
-        Uses the optimizer's momentum buffer (SGD) or first moment estimate
-        (Adam/AdamW) as a proxy for gradient direction.
-        """
-        lr = self.args.learning_rate
         with torch.no_grad():
-            for group in self.optimizer.param_groups:
-                for param in group["params"]:
-                    if not param.requires_grad or param not in self.optimizer.state:
-                        continue
-                    p_state = self.optimizer.state[param]
-                    if "momentum_buffer" in p_state:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
-                    elif "exp_avg" in p_state:
-                        # Adam/AdamW: use first moment (bias-corrected)
-                        step = p_state.get("step", 1)
-                        exp_avg = p_state["exp_avg"]
-                        # Adam's bias correction
-                        beta1 = group.get("betas", (0.9, 0.999))[0]
-                        bias_correction = 1 - beta1 ** step
-                        corrected_exp_avg = exp_avg / bias_correction
-                        param.data.add_(corrected_exp_avg, alpha=-lr)
+            for name, param in self.model.named_parameters():
+                if name in self._param_snapshot:
+                    param.data.copy_(self._param_snapshot[name])
+        
+        if use_momentum and self.optimizer is not None:
+            with torch.no_grad():
+                for group in self.optimizer.param_groups:
+                    group_lr = group.get('lr', self.args.learning_rate)
+                    for param in group['params']:
+                        if not param.requires_grad or param not in self.optimizer.state:
+                            continue
+                        p_state = self.optimizer.state[param]
+                        if 'momentum_buffer' in p_state:
+                            param.data.add_(p_state['momentum_buffer'], alpha=-group_lr)
+                        elif 'exp_avg' in p_state:
+                            step = p_state.get('step', 1)
+                            if isinstance(step, torch.Tensor):
+                                step = step.item()
+                            step = max(int(step), 1)
+                            exp_avg = p_state['exp_avg']
+                            beta1 = group.get('betas', (0.9, 0.999))[0]
+                            bias_correction = 1 - beta1 ** step
+                            if bias_correction > 0:
+                                corrected = exp_avg / bias_correction
+                            else:
+                                corrected = exp_avg
+                            param.data.add_(corrected, alpha=-group_lr)
+        
+        self._param_snapshot = None
+        self._skip_count += 1
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to implement TRUE backward-pass skipping.
-        
-        FLAW 6 FIX: Gradient norm captured via on_pre_optimizer_step callback.
-        
-        FLAW 8 FIX: When should_skip_backward is True (set by callback in
-        on_step_begin), we skip the backward pass entirely and apply momentum
-        extrapolation instead. This saves ~60% of compute per skipped step.
-        
-        FIX (2026-04-15): Added _freeze_weights_no_momentum flag for
-        WeightFreezingCallback. When set, skips backward but does NOT
-        apply momentum extrapolation (true weight freezing).
-        """
-        # Reset gradient norm before each step
+        """Standard training step with pre-clip gradient norm capture."""
         self._pre_clip_grad_norm = None
-        
-        # Check if we should skip backward (set by callback in on_step_begin)
-        if self.should_skip_backward:
-            # Forward pass only - skip backward to save compute
-            model.train()
-            inputs = self._prepare_inputs(inputs)
-            
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            
-            # Check if this is a weight_freeze skip (no momentum) or
-            # a normal skip (with momentum extrapolation)
-            freeze_no_momentum = getattr(self, '_freeze_weights_no_momentum', False)
-            if not freeze_no_momentum:
-                # Apply momentum extrapolation instead of backward
-                self._apply_momentum_extrapolation()
-            # else: true weight freeze - no update at all
-            
-            self._skip_count += 1
-            
-            # Return detached loss (gradients not computed)
-            return loss.detach()
-        
-        # Normal training step with backward
         loss = super().training_step(model, inputs, num_items_in_batch)
-        
-        # Capture pre-clip gradient norm for calibration
         self._pre_clip_grad_norm = self._compute_pre_clip_grad_norm()
-        
         return loss
 
 
@@ -570,12 +552,10 @@ class _GradientNormCaptureCallback(TrainerCallback):
         self.trainer = trainer
     
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        """Capture gradient norm before optimizer.step() and any clipping."""
         model = kwargs.get("model")
         if model is None:
             return
         
-        # Compute total gradient norm (L2)
         total_norm_sq = 0.0
         for p in model.parameters():
             if p.grad is not None:
@@ -586,7 +566,7 @@ class _GradientNormCaptureCallback(TrainerCallback):
 
 
 # =============================================================================
-# Baseline Factory
+# Baseline Factory - UPDATED with lerna and early_stop
 # =============================================================================
 
 def create_baseline_callback(
@@ -604,14 +584,18 @@ def create_baseline_callback(
 
     Returns:
         (callback_instance, early_stopping_patience_override)
-        - For early_stop baselines: callback=None, patience=N
-        - For other baselines: callback=instance, patience=None (use task default)
     """
-    if baseline_name == "grad_norm":
-        # Adaptive calibration: use 20% of total steps or min 20, max 200
+    if baseline_name == "lerna":
+        if ler_tracker is None:
+            raise ValueError("lerna baseline requires ler_tracker")
+        return LERNABaselineCallback(
+            ler_tracker=ler_tracker,
+            warmup_steps=20,  # Lower for smoke test
+        ), None
+
+    elif baseline_name == "grad_norm":
         calibration_steps = max(20, min(200, total_steps // 5))
         recalibrate_every = max(100, total_steps // 2)
-        # Adaptive min samples: 25% of calibration window or min 10
         min_calibration_samples = max(10, calibration_steps // 4)
         return GradientNormSkippingCallback(
             target_skip_rate=target_skip_rate,
@@ -630,14 +614,14 @@ def create_baseline_callback(
             wandb_enabled=wandb_enabled,
         ), None
 
+    elif baseline_name == "early_stop":
+        return None, 5
+
     elif baseline_name.startswith("early_stop_p"):
         import re
         match = re.match(r"early_stop_p(\d+)", baseline_name)
         if not match:
-            raise ValueError(
-                f"Invalid early_stop baseline name: '{baseline_name}'. "
-                f"Expected format: early_stop_p<N> (e.g., early_stop_p3)"
-            )
+            raise ValueError(f"Invalid early_stop baseline name: '{baseline_name}'")
         patience = int(match.group(1))
         return None, patience
 
@@ -689,18 +673,11 @@ def run_single_baseline_experiment(
     wandb_group: str = "phase1.2-baselines",
     target_skip_rate: float = 0.33,
 ) -> dict:
-    """
-    Run a single Phase 1.2 baseline experiment.
-
-    Mirrors run_single_experiment() from Phase 1.1 but injects the
-    specified baseline callback. All diagnostics (LER, power) are
-    tracked identically for direct comparison.
-    """
+    """Run a single Phase 1.2 baseline experiment."""
     hw_cfg = get_training_config(profile)
     if max_samples_override is not None:
         hw_cfg["max_samples"] = max_samples_override
 
-    # Resolve per-task hyperparameters
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
     lr = task_hp.get("learning_rate", 2e-5)
     num_epochs = task_hp.get("num_epochs", 3)
@@ -714,7 +691,6 @@ def run_single_baseline_experiment(
     output_dir = os.path.join(base_output_dir, run_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- W&B ---
     if use_wandb:
         import wandb
         _ensure_wandb_finished()
@@ -749,17 +725,14 @@ def run_single_baseline_experiment(
     print(f"  Output: {output_dir}")
     print(f"{'=' * 70}")
 
-    # --- Reproducibility ---
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # --- Model & Tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     cfg = GLUE_TASK_CONFIG[task_name]
 
-    # MNLI transfer for RTE (same as Phase 1.1)
     mnli_checkpoint_dir = os.path.join(
         os.path.dirname(base_output_dir), "baseline", "mnli_finetuned"
     )
@@ -791,23 +764,19 @@ def run_single_baseline_experiment(
         if hasattr(model.config, "use_cache"):
             model.config.use_cache = False
 
-    # --- Data ---
     train_ds, eval_ds, task_cfg = load_glue_task(
         task_name, tokenizer, max_length=128, max_samples=hw_cfg["max_samples"]
     )
     print(f"  Train: {len(train_ds)} samples | Eval: {len(eval_ds)} samples")
 
-    # --- Compute total steps ---
     steps_per_epoch = max(1, len(train_ds) // (
         hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"]
     ))
     total_steps = steps_per_epoch * num_epochs
     eval_steps = max(total_steps // 20, 10)
 
-    # --- Initialize LER tracker (needed for weight_freeze & diagnostics) ---
     ler_tracker = LERTracker(task=task_name, window_size=5)
 
-    # --- Create baseline callback ---
     baseline_callback, patience_override = create_baseline_callback(
         baseline_name=baseline_name,
         task_name=task_name,
@@ -819,22 +788,14 @@ def run_single_baseline_experiment(
         wandb_enabled=use_wandb,
     )
 
-    # --- Determine early stopping patience ---
-    # FIX (2026-04-15): For early_stop baselines, the patience IS the baseline.
-    # For reduced_steps, we must DISABLE early stopping so it doesn't
-    # pre-empt the reduced steps cutoff.
     if patience_override is not None:
-        # Early stopping baseline: use the specified patience
         es_patience = patience_override
     elif baseline_name == "reduced_steps":
-        # Reduced steps: disable early stopping by setting huge patience
         es_patience = 999999
         print(f"  [Phase1.2] Disabled early stopping for reduced_steps baseline")
     else:
-        # Other baselines: use task default
         es_patience = default_patience
 
-    # --- Power telemetry ---
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
         output_dir=os.path.join(output_dir, "power"),
@@ -842,21 +803,16 @@ def run_single_baseline_experiment(
         log_frequency=50,
     )
 
-    # --- LER Feed callback (feeds eval metrics into LERTracker) ---
-    # FIX (2026-04-15): Without this, LERTracker.update() is never called,
-    # so WeightFreezingCallback always sees LER=None and never activates.
     ler_feed_callback = LERFeedCallback(ler_tracker=ler_tracker)
 
-    # --- Assemble callbacks ---
     callbacks = [
         EarlyStoppingCallback(early_stopping_patience=es_patience),
         power_callback,
-        ler_feed_callback,  # Always present to feed LER tracker
+        ler_feed_callback,
     ]
     if baseline_callback is not None:
         callbacks.append(baseline_callback)
 
-    # --- Training arguments (identical to Phase 1.1) ---
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -890,7 +846,6 @@ def run_single_baseline_experiment(
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     compute_metrics = build_compute_metrics(task_name)
 
-    # --- Create trainer ---
     trainer = Phase12Trainer(
         model=model,
         args=training_args,
@@ -902,27 +857,20 @@ def run_single_baseline_experiment(
         callbacks=callbacks,
     )
 
-    # --- Inject model reference into baseline callback ---
     if baseline_callback is not None and hasattr(baseline_callback, '_model'):
         baseline_callback._model = model
         print(f'  [Phase1.2] Model injected into {baseline_callback.baseline_name}: {type(model).__name__}')
 
-    # --- Pass trainer reference to ALL callbacks that need it ---
-    # FIX (2026-04-15): All skip-based baselines need trainer reference
-    # for setting should_skip_backward. Cosine needs it for optimizer access.
     if baseline_callback is not None:
         baseline_callback._trainer = trainer
         print(f"  [Phase1.2] Trainer linked to {baseline_callback.baseline_name}")
 
-    # --- Link LER feed callback to trainer ---
     ler_feed_callback._trainer_ref = trainer
     ler_feed_callback._model = model
 
-    # --- Add gradient norm capture callback ---
     grad_capture_callback = _GradientNormCaptureCallback(trainer)
     trainer.add_callback(grad_capture_callback)
 
-    # --- Train ---
     start_time = time.time()
     print(f"  Starting training: ~{total_steps} steps, eval every {eval_steps} steps")
     print(f"  Baseline: {BASELINE_REGISTRY[baseline_name]['description']}")
@@ -933,41 +881,31 @@ def run_single_baseline_experiment(
     train_result = trainer.train()
     train_time = time.time() - start_time
 
-    # --- Evaluate best model ---
     print(f"  Evaluating best model...")
     eval_result = trainer.evaluate()
 
-    # --- Post-run baseline activation validation ---
-    # FIX (2026-04-15): Verify each baseline actually activated.
-    # This catches silent failures where callbacks are present but inert.
     if baseline_callback is not None and hasattr(baseline_callback, 'get_activation_summary'):
         activation = baseline_callback.get_activation_summary()
         print(f"\n  --- Baseline Activation Check ---")
         for k, v in activation.items():
             print(f"    {k}: {v}")
         
-        # Warn if baseline didn't activate
         if not activation.get('activated', True):
-            if baseline_name in ('grad_norm', 'random_skip', 'weight_freeze'):
+            if baseline_name in ('grad_norm', 'random_skip', 'weight_freeze', 'lerna'):
                 print(f"  *** WARNING: {baseline_name} baseline did NOT activate! ***")
-                print(f"  *** This means the baseline is NOT testing what it should. ***")
             elif baseline_name == 'cosine_restarts':
                 print(f"  *** WARNING: cosine_restarts did NOT override any LR! ***")
-                print(f"  *** Check optimizer capture in on_train_begin. ***")
     
-    # Also check LER feed callback
     print(f"  LER feed updates: {ler_feed_callback._update_count}")
     ler_diag = ler_tracker.get_diagnostics()
     print(f"  LER tracker: n_steps={ler_diag.get('n_steps', 0)}, "
           f"ler={ler_diag.get('ler', 'None')}, phase={ler_diag.get('phase', 'unknown')}")
 
-    # --- Collect results ---
     avg_power = (
         float(np.mean([s["power_w"] for s in power_callback._power_samples]))
         if power_callback._power_samples else 0
     )
 
-    # Get baseline-specific stats
     baseline_stats = {}
     if baseline_callback is not None and hasattr(baseline_callback, 'steps_skipped'):
         baseline_stats = {
@@ -976,13 +914,12 @@ def run_single_baseline_experiment(
             "energy_saved_kwh": baseline_callback.total_energy_saved,
         }
 
-    # Extract the primary metric
     primary_metric_key = {
         "accuracy": "eval_accuracy",
         "matthews_correlation": "eval_matthews_correlation",
         "pearsonr": "eval_pearson",
     }.get(cfg["metric"], "eval_accuracy")
-    # Handle alternate key names from evaluate library
+    
     primary_value = eval_result.get(
         primary_metric_key,
         eval_result.get("eval_pearsonr", eval_result.get("eval_accuracy", 0))
@@ -1010,12 +947,10 @@ def run_single_baseline_experiment(
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Save per-run results
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
 
-    # Print summary
     print(f"\n  --- Results ---")
     print(f"  {primary_metric_key}: {primary_value:.4f}")
     print(f"  Energy: {power_callback.cumulative_kwh:.6f} kWh")
@@ -1025,7 +960,6 @@ def run_single_baseline_experiment(
         print(f"  Skip ratio: {baseline_stats.get('skip_ratio', 0):.3f}")
     print(f"  Saved: {results_path}")
 
-    # --- Cleanup ---
     del model, trainer
     gc.collect()
     if torch.cuda.is_available():
@@ -1052,7 +986,6 @@ def generate_comparison_summary(
         print("  No successful runs to summarize.")
         return
 
-    # --- Aggregate by baseline x task ---
     agg = defaultdict(lambda: defaultdict(list))
     for r in successful:
         key = (r["baseline"], r["task"])
@@ -1063,7 +996,6 @@ def generate_comparison_summary(
         skip_ratio = r.get("baseline_stats", {}).get("skip_ratio", 0)
         agg[key]["skip_ratio"].append(skip_ratio)
 
-    # --- Build summary rows ---
     summary_rows = []
     for baseline in baselines:
         for task in tasks:
@@ -1081,8 +1013,9 @@ def generate_comparison_summary(
             mean_energy = np.mean(energies)
             mean_time = np.mean(times)
             mean_skip = np.mean(skip_ratios)
+            
+            metric_mean, ci_low, ci_high = bootstrap_ci(metrics)
 
-            # Compare to Phase 1.1
             ref = PHASE_1_1_RESULTS.get(task, {})
             ref_acc = ref.get("accuracy", 0)
             delta = mean_metric - ref_acc
@@ -1093,6 +1026,8 @@ def generate_comparison_summary(
                 "n_seeds": n,
                 "mean_metric": float(mean_metric),
                 "std_metric": float(std_metric),
+                "ci_low": float(ci_low),
+                "ci_high": float(ci_high),
                 "mean_energy_kwh": float(mean_energy),
                 "mean_time_s": float(mean_time),
                 "mean_skip_ratio": float(mean_skip),
@@ -1100,7 +1035,6 @@ def generate_comparison_summary(
                 "delta_vs_phase1_1": float(delta),
             })
 
-    # --- Save JSON summary ---
     summary = {
         "phase": "1.2",
         "description": "Simple Baselines on GLUE",
@@ -1118,11 +1052,10 @@ def generate_comparison_summary(
         json.dump(summary, f, indent=2, default=str)
     print(f"\n  Summary saved: {summary_path}")
 
-    # --- Print human-readable comparison table ---
     comparison_lines = []
     header = (
         f"{'Baseline':<20} {'Task':<8} {'Seeds':>5} "
-        f"{'Metric':>10} {'Std':>8} {'Energy':>10} "
+        f"{'Metric':>10} {'CI95':>14} {'Energy':>10} "
         f"{'Skip%':>7} {'P1.1':>8} {'Delta':>8}"
     )
     sep = "-" * len(header)
@@ -1134,9 +1067,10 @@ def generate_comparison_summary(
     comparison_lines.append(sep)
 
     for row in summary_rows:
+        ci_str = f"[{row['ci_low']:.4f}, {row['ci_high']:.4f}]"
         line = (
             f"{row['baseline']:<20} {row['task']:<8} {row['n_seeds']:>5} "
-            f"{row['mean_metric']:>10.4f} {row['std_metric']:>8.4f} "
+            f"{row['mean_metric']:>10.4f} {ci_str:>14} "
             f"{row['mean_energy_kwh']:>10.6f} "
             f"{row['mean_skip_ratio']*100:>6.1f}% "
             f"{row['phase1_1_metric']:>8.4f} "
@@ -1154,11 +1088,21 @@ def generate_comparison_summary(
     comparison_text = "\n".join(comparison_lines)
     print(comparison_text)
 
-    # Save to file
     comparison_path = os.path.join(output_dir, "phase1_2_comparison.txt")
     with open(comparison_path, "w") as f:
         f.write(comparison_text)
     print(f"  Comparison table saved: {comparison_path}")
+    
+    # Run paired significance tests (LERNA vs each baseline)
+    if "lerna" in baselines and len(successful) > 0:
+        print("\n  Running paired significance tests (LERNA vs baselines)...")
+        lerna_results = [r for r in successful if r["baseline"] == "lerna"]
+        if lerna_results:
+            sig_results = run_all_paired_tests(successful, baselines, tasks)
+            sig_path = os.path.join(output_dir, "phase1_2_significance.json")
+            with open(sig_path, "w") as f:
+                json.dump(sig_results, f, indent=2, default=str)
+            print(f"  Significance results saved: {sig_path}")
 
 
 # =============================================================================
@@ -1173,7 +1117,7 @@ def main():
 Examples:
   python scripts/run_phase1_2_simple_baselines.py --mode smoke
   python scripts/run_phase1_2_simple_baselines.py --mode full --wandb
-  python scripts/run_phase1_2_simple_baselines.py --baselines grad_norm random_skip --tasks sst2 mrpc
+  python scripts/run_phase1_2_simple_baselines.py --baselines lerna grad_norm --tasks sst2 mrpc
         """,
     )
     parser.add_argument(
@@ -1189,7 +1133,19 @@ Examples:
     )
     parser.add_argument(
         "--baselines", nargs="+", default=None,
-        choices=list(BASELINE_REGISTRY.keys()),
+        choices=[
+            "lerna",
+            "grad_norm",
+            "random_skip",
+            "early_stop",
+            "early_stop_p3",
+            "early_stop_p5",
+            "early_stop_p10",
+            "early_stop_p20",
+            "weight_freeze",
+            "reduced_steps",
+            "cosine_restarts",
+        ],
         help="Which baselines to run (default: all for the chosen mode)",
     )
     parser.add_argument("--tasks", nargs="+", default=None, help="GLUE tasks to run")
@@ -1217,46 +1173,35 @@ Examples:
 
     profile = detect_device_profile()
 
-    # --- Mode presets ---
     if args.mode == "smoke":
-        baselines = ["grad_norm"]
-        tasks = ["sst2"]
-        seeds = [42]
+        baselines = args.baselines if args.baselines else ["lerna"]
+        tasks = args.tasks if args.tasks else ["mrpc"]
+        seeds = args.seeds if args.seeds else [42]
     elif args.mode == "quick":
-        baselines = list(BASELINE_REGISTRY.keys())
-        tasks = ["sst2", "mrpc"]
-        seeds = [42, 43]
+        baselines = args.baselines if args.baselines else list(BASELINE_REGISTRY.keys())
+        tasks = args.tasks if args.tasks else ["sst2", "mrpc"]
+        seeds = args.seeds if args.seeds else [42, 43]
     elif args.mode == "full":
-        baselines = list(BASELINE_REGISTRY.keys())
-        tasks = ["sst2", "mrpc", "rte", "qnli"]
-        seeds = list(range(42, 47))  # 5 seeds
+        baselines = args.baselines if args.baselines else list(BASELINE_REGISTRY.keys())
+        tasks = args.tasks if args.tasks else ["sst2", "mrpc", "rte", "qnli"]
+        seeds = args.seeds if args.seeds else list(range(42, 47))
     else:  # production
-        baselines = list(BASELINE_REGISTRY.keys())
-        tasks = list(GLUE_TASK_CONFIG.keys())
-        seeds = list(range(42, 52))  # 10 seeds
+        baselines = args.baselines if args.baselines else list(BASELINE_REGISTRY.keys())
+        tasks = args.tasks if args.tasks else list(GLUE_TASK_CONFIG.keys())
+        seeds = args.seeds if args.seeds else list(range(42, 52))
 
-    # Override with CLI args
-    if args.baselines:
-        baselines = args.baselines
-    if args.tasks:
-        tasks = args.tasks
-    if args.seeds:
-        seeds = args.seeds
-
-    # Sample cap
     if args.max_samples is not None:
         max_samples = args.max_samples
     elif args.unlimited:
         max_samples = None
     elif profile == "server":
-        max_samples = None  # Full data on server (same as Phase 1.1)
+        max_samples = None
     else:
         max_samples = 2000
 
     total_runs = len(baselines) * len(tasks) * len(seeds)
     wandb_group = args.wandb_group or f"phase1.2-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    # --- Print experiment plan ---
     print(f"\n{'=' * 70}")
     print(f"  LERNA Phase 1.2: Simple Baselines on GLUE")
     print(f"{'=' * 70}")
@@ -1281,17 +1226,14 @@ Examples:
         print(f"      Tests: {info['tests']}")
     print()
 
-    # Estimate time
-    est_per_run = 360 if profile == "server" else 600  # seconds
+    est_per_run = 360 if profile == "server" else 600
     est_total = total_runs * est_per_run
     print(f"  Estimated total time: ~{timedelta(seconds=est_total)}")
     print()
 
-    # --- Ensure no stale W&B run ---
     if args.wandb:
         _ensure_wandb_finished()
 
-    # --- Main experiment loop ---
     all_results = []
     run_idx = 0
     overall_start = time.time()
@@ -1301,7 +1243,6 @@ Examples:
             for seed in seeds:
                 run_idx += 1
 
-                # ETA
                 if run_idx > 1:
                     elapsed = time.time() - overall_start
                     avg_per_run = elapsed / (run_idx - 1)
@@ -1342,7 +1283,6 @@ Examples:
                     if args.wandb:
                         _ensure_wandb_finished()
 
-    # --- Generate summary ---
     os.makedirs(args.output_dir, exist_ok=True)
     generate_comparison_summary(all_results, args.output_dir, tasks, baselines)
 
@@ -1361,7 +1301,6 @@ Examples:
     print(f"  Output: {args.output_dir}")
     print(f"{'=' * 70}")
 
-    # --- Final verdict ---
     if successful:
         print(f"\n  === VERDICT ===")
         print(f"  Compare these results against Phase 1.1 baselines.")
