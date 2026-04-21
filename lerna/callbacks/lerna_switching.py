@@ -24,6 +24,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
+from lerna.utils.momentum import apply_momentum_extrapolation as _apply_momentum_extrapolation
+
 try:
     import wandb
 except ImportError:
@@ -188,150 +190,101 @@ class SafetyHorizon:
 
 
 # =============================================================================
-# FLAW 2 FIX: Real energy measurement via power telemetry integration
+# FIX #3: Real energy measurement via NVML TOTAL_ENERGY_CONSUMPTION
 # =============================================================================
 
 class EnergyTracker:
-    """Track actual energy consumption using power telemetry.
-    
-    Replaces the static 0.0006 kWh estimate with real measurements
-    from nvidia-smi or pynvml.
+    """Cumulative energy from NVML TOTAL_ENERGY_CONSUMPTION counter (mJ).
+
+    This reads a hardware monotonic counter — no subprocess per step, no
+    hardcoded 'backward_fraction'. Energy saved is computed by diffing the
+    counter between a LERNA run and a paired baseline run, NOT by any
+    per-step formula. The per-step delta is exposed for sanity plots only.
+
+    Requires: pynvml (>= 11.5) and driver >= R460.
     """
-    
-    def __init__(
-        self,
-        gpu_id: int = 0,
-        use_pynvml: bool = True,
-        sample_interval_s: float = 0.1,
-        tdp_fallback_w: float = 300.0,  # Default TDP for estimation
-    ):
+
+    _POLL_FALLBACK_HZ = 10.0  # only used if TOTAL_ENERGY_CONSUMPTION missing
+
+    def __init__(self, gpu_id: int = 0):
         self.gpu_id = gpu_id
-        self.use_pynvml = use_pynvml
-        self.sample_interval_s = sample_interval_s
-        self.tdp_fallback_w = tdp_fallback_w
-        
-        self._pynvml_handle = None
-        self._power_samples: List[float] = []
-        self._total_energy_joules: float = 0.0
-        self._step_start_time: Optional[float] = None
-        self._step_power_start: Optional[float] = None
-        
-        # Initialize pynvml if available
-        if use_pynvml:
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                self._pynvml_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-                logger.info(f"[EnergyTracker] Initialized pynvml for GPU {gpu_id}")
-            except (ImportError, Exception) as e:
-                logger.warning(f"[EnergyTracker] pynvml not available: {e}. Using nvidia-smi fallback.")
-                self._pynvml_handle = None
-    
-    def _read_power_w(self) -> float:
-        """Read current GPU power draw in Watts."""
-        if self._pynvml_handle is not None:
-            try:
-                import pynvml
-                power_mw = pynvml.nvmlDeviceGetPowerUsage(self._pynvml_handle)
-                return power_mw / 1000.0  # mW to W
-            except Exception:
-                pass
-        
-        # Fallback: nvidia-smi
+        self._handle = None
+        self._supports_counter = False
+        self._energy_j_at_begin = 0.0
+        self._energy_j_step_begin = 0.0
+        self._total_energy_j = 0.0
+        self._per_step_energy_j: List[float] = []
+
         try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", f"--id={self.gpu_id}", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2
-            )
-            if result.returncode == 0:
-                return float(result.stdout.strip().split()[0])
+            import pynvml
+            pynvml.nvmlInit()
+            self._pynvml = pynvml
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            # Probe for the hardware energy counter
+            try:
+                mj = pynvml.nvmlDeviceGetTotalEnergyConsumption(self._handle)
+                self._energy_j_at_begin = mj / 1000.0
+                self._supports_counter = True
+                logger.info(
+                    f"[EnergyTracker] NVML TOTAL_ENERGY_CONSUMPTION available "
+                    f"on GPU {gpu_id} (start={self._energy_j_at_begin:.1f} J)."
+                )
+            except Exception:
+                logger.warning(
+                    "[EnergyTracker] NVML energy counter unavailable; falling back "
+                    "to integrated power samples. Do NOT publish these numbers."
+                )
+                self._supports_counter = False
+        except Exception as e:
+            logger.error(f"[EnergyTracker] pynvml init failed: {e}")
+            self._pynvml = None
+
+    # ---- counter access ------------------------------------------------
+    def _read_counter_j(self) -> float:
+        if self._supports_counter:
+            return self._pynvml.nvmlDeviceGetTotalEnergyConsumption(self._handle) / 1000.0
+        # Fallback: instantaneous power (WATTS) — not publishable
+        try:
+            return self._pynvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0
         except Exception:
-            pass
-        
-        # Final fallback: TDP estimate
-        return self.tdp_fallback_w
-    
+            return 0.0
+
+    # ---- step lifecycle ------------------------------------------------
     def step_begin(self):
-        """Mark the beginning of a training step."""
-        import time
-        self._step_start_time = time.time()
-        self._step_power_start = self._read_power_w()
-    
+        self._energy_j_step_begin = self._read_counter_j()
+
     def step_end(self, skipped_backward: bool = False) -> float:
-        """Mark the end of a training step and compute energy.
-        
-        Args:
-            skipped_backward: Whether the backward pass was skipped
-        
-        Returns:
-            Energy consumed during the step in kWh
-        """
-        import time
-        if self._step_start_time is None:
-            return 0.0
-        
-        duration_s = time.time() - self._step_start_time
-        
-        # Sample power during step (simplified - use start/end average)
-        power_end = self._read_power_w()
-        avg_power_w = (self._step_power_start + power_end) / 2
-        
-        # Energy = Power × Time (J = W × s)
-        energy_joules = avg_power_w * duration_s
-        energy_kwh = energy_joules / 3_600_000  # J to kWh
-        
-        self._total_energy_joules += energy_joules
-        self._power_samples.append(avg_power_w)
-        
-        # Reset step state
-        self._step_start_time = None
-        self._step_power_start = None
-        
-        return energy_kwh
-    
-    def estimate_energy_saved(self, skipped_backward: bool) -> float:
-        """Estimate energy saved by skipping backward pass.
-        
-        Based on empirical measurements:
-        - Backward pass typically accounts for 55-65% of step energy
-        - Forward pass + optimizer step accounts for 35-45%
-        
-        Returns:
-            Estimated energy saved in kWh (0 if not skipped)
-        """
-        if not skipped_backward:
-            return 0.0
-        
-        # Use recent average power if available
-        if len(self._power_samples) >= 5:
-            avg_power = np.mean(self._power_samples[-10:])
-        else:
-            avg_power = self.tdp_fallback_w
-        
-        # Assume backward pass takes ~60% of step time
-        # Typical step: forward (30%), backward (60%), optimizer (10%)
-        backward_fraction = 0.60
-        
-        # Estimate step duration from recent history (assume ~0.5s per step)
-        step_duration_s = 0.5  # Could be measured more accurately
-        
-        # Energy saved = fraction × power × time
-        energy_saved_j = backward_fraction * avg_power * step_duration_s
-        return energy_saved_j / 3_600_000  # J to kWh
-    
+        if not self._supports_counter:
+            return 0.0  # refuse to return misleading numbers
+        now_j = self._read_counter_j()
+        delta = max(0.0, now_j - self._energy_j_step_begin)
+        self._total_energy_j += delta
+        self._per_step_energy_j.append(delta)
+        return delta / 3_600_000.0  # kWh
+
     def get_total_energy_kwh(self) -> float:
-        """Get total energy consumed so far in kWh."""
-        return self._total_energy_joules / 3_600_000
-    
+        return self._total_energy_j / 3_600_000.0
+
+    # ---- reporting -----------------------------------------------------
     def get_diagnostics(self) -> Dict[str, Any]:
-        """Return diagnostic information."""
         return {
+            "supports_hw_counter": self._supports_counter,
             "total_energy_kwh": self.get_total_energy_kwh(),
-            "avg_power_w": np.mean(self._power_samples) if self._power_samples else 0,
-            "peak_power_w": max(self._power_samples) if self._power_samples else 0,
-            "n_samples": len(self._power_samples),
+            "n_steps": len(self._per_step_energy_j),
+            "median_step_j": float(np.median(self._per_step_energy_j))
+                             if self._per_step_energy_j else 0.0,
         }
+
+    # ---- deprecated: do NOT use for publication ------------------------
+    def estimate_energy_saved(self, skipped_backward: bool) -> float:
+        """DEPRECATED. Returns 0.0 by design.
+
+        Energy saved must be computed OFFLINE by differencing the
+        TOTAL_ENERGY_CONSUMPTION counter between paired LERNA and
+        baseline runs (same seed, same model, same data). See
+        scripts/compute_paired_energy.py.
+        """
+        return 0.0
 
 
 # =============================================================================
@@ -378,6 +331,7 @@ class LERNASwitchingCallback(TrainerCallback):
         use_safety_horizon: bool = True,
         use_real_energy: bool = True,
         gpu_id: int = 0,
+        apply_momentum: bool = False,
     ):
         """Initialize LERNA switching callback.
         
@@ -389,7 +343,13 @@ class LERNASwitchingCallback(TrainerCallback):
             use_safety_horizon: Enable PL-based safety horizon (FLAW 5 FIX)
             use_real_energy: Use real power telemetry for energy (FLAW 2 FIX)
             gpu_id: GPU index for power monitoring
+            apply_momentum: If True, raises RuntimeError (callback cannot skip backward)
         """
+        if apply_momentum:
+            raise RuntimeError(
+                "LERNASwitchingCallback cannot skip backward(); enabling momentum "
+                "extrapolation here causes a double-step. Use LERNATrainer instead."
+            )
         # FLAW 4 FIX: Version check
         if not TRANSFORMERS_VERSION_OK:
             raise RuntimeError(
@@ -629,69 +589,26 @@ class LERNASwitchingCallback(TrainerCallback):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        """If this step was marked for skipping, apply momentum extrapolation.
+        """Diagnostic-only: record decisions made in on_pre_optimizer_step.
 
-        Since the HuggingFace Trainer callback API does not support skipping
-        the backward pass, the gradient was already computed and the optimizer
-        already stepped. We apply a momentum-based correction to simulate
-        what would have happened if we had skipped the gradient computation.
-
-        NOTE: For true backward-pass elimination (the full LERNA mechanism),
-        use LERNATrainer (below) which overrides training_step().
-        This callback provides a compatible approximation that works with
-        any standard HuggingFace Trainer.
+        IMPORTANT: We do NOT apply a momentum correction here. HuggingFace
+        callbacks fire *after* backward() and *after* optimizer.step(); any
+        extra parameter update at this point is additive compute, not
+        savings. For true backward-pass elimination use LERNATrainer.
         """
-        # FLAW 2 FIX: Track energy at step end
         if self.energy_tracker:
-            self.energy_tracker.step_end(skipped_backward=self._skip_next)
-        
-        if not self._skip_next:
-            return control
-
-        # Reset flag immediately
+            self.energy_tracker.step_end(skipped_backward=False)  # callback never actually skips
+        # record the diagnostic flag so analysis scripts can separate
+        # "would-have-skipped" from "did-skip"
+        if self._skip_next:
+            self.step_log.append({
+                "step": state.global_step,
+                "ler": self._current_ler,
+                "rho_vg": self._current_rho_vg,
+                "grad_norm": self._current_grad_norm,
+                "decision": "would_skip_diagnostic_only",
+            })
         self._skip_next = False
-
-        # Model is NOT passed in on_step_end kwargs - use cached reference
-        model = self._model
-        if model is None:
-            return control
-
-        # Get optimizer from kwargs or cached reference
-        optimizer = kwargs.get('optimizer', self._optimizer)
-        if optimizer is None:
-            return control
-
-        # Cache for future use
-        if self._optimizer is None:
-            self._optimizer = optimizer
-
-        # Get current learning rate from optimizer param groups
-        lr = optimizer.param_groups[0].get('lr', args.learning_rate)
-
-        # Momentum extrapolation: update weights using momentum buffer.
-        # This corrects the parameter update to use momentum direction
-        # instead of the computed gradient direction.
-        with torch.no_grad():
-            for group in optimizer.param_groups:
-                for param in group['params']:
-                    if not param.requires_grad:
-                        continue
-                    if param not in optimizer.state:
-                        continue
-                    p_state = optimizer.state[param]
-                    # SGD-style momentum buffer
-                    if 'momentum_buffer' in p_state:
-                        momentum = p_state['momentum_buffer']
-                        param.data.add_(momentum, alpha=-lr)
-                    # Adam-style: use exp_avg (first moment) as momentum proxy
-                    elif 'exp_avg' in p_state:
-                        exp_avg = p_state['exp_avg']
-                        param.data.add_(exp_avg, alpha=-lr)
-                    # No momentum state available for this param; skip it
-
-        # Clear any stale gradients
-        optimizer.zero_grad(set_to_none=True)
-
         return control
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -967,7 +884,7 @@ class LERNATrainer(Trainer):
             loss_value = loss.detach()
             
             # Apply momentum extrapolation directly
-            self._apply_momentum_extrapolation()
+            _apply_momentum_extrapolation(self.optimizer)
             
             # Track energy saved
             energy_saved = self.energy_tracker.estimate_energy_saved(skipped_backward=True)
@@ -1006,44 +923,6 @@ class LERNATrainer(Trainer):
             self.energy_tracker.step_end(skipped_backward=False)
             
             return loss.detach()
-    
-    def _apply_momentum_extrapolation(self):
-        """Apply momentum-based weight update without gradient computation.
-        
-        Uses the optimizer's momentum buffer (SGD) or first moment (Adam)
-        to update weights in the direction of accumulated momentum.
-        
-        Note: Each parameter group uses its own learning rate to support
-        layer-wise LR schedules and discriminative learning rates.
-        
-        For Adam/AdamW, we apply bias correction to the first moment estimate
-        to match the optimizer's effective update direction.
-        """
-        with torch.no_grad():
-            for group in self.optimizer.param_groups:
-                group_lr = group['lr']  # Use per-group learning rate
-                
-                for param in group['params']:
-                    if not param.requires_grad:
-                        continue
-                    if param not in self.optimizer.state:
-                        continue
-                    
-                    p_state = self.optimizer.state[param]
-                    
-                    # SGD momentum buffer
-                    if 'momentum_buffer' in p_state:
-                        momentum = p_state['momentum_buffer']
-                        param.data.add_(momentum, alpha=-group_lr)
-                    
-                    # Adam/AdamW: use exp_avg as momentum proxy (bias-corrected)
-                    elif 'exp_avg' in p_state:
-                        exp_avg = p_state['exp_avg']
-                        step = p_state.get('step', 1)
-                        beta1 = group.get('betas', (0.9, 0.999))[0]
-                        bias_correction = 1 - beta1 ** step
-                        corrected_exp_avg = exp_avg / bias_correction
-                        param.data.add_(corrected_exp_avg, alpha=-group_lr)
     
     def _get_logs_for_metrics(self, metrics: Dict) -> Dict:
         """Add LERNA stats to logged metrics."""

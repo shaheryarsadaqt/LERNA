@@ -20,6 +20,21 @@ from scipy import stats
 import pandas as pd
 
 
+def _detect_plateau_step(losses: np.ndarray, threshold: float,
+                         window_size: int, patience: int) -> Optional[int]:
+    """Standalone plateau detector used by bootstrap/sensitivity paths."""
+    if len(losses) < window_size + 2:
+        return None
+    second = np.diff(losses, n=2)
+    below = np.abs(second) < threshold
+    run = 0
+    for i, b in enumerate(below):
+        run = run + 1 if b else 0
+        if run >= patience:
+            return i + 2 - patience
+    return None
+
+
 @dataclass
 class PlateauAnalysisResult:
     """Comprehensive plateau analysis results with statistical validation."""
@@ -227,8 +242,8 @@ class IESPlateauDetector:
         # Comparison with baseline
         comparison = self._compare_with_baseline(plateau_step, baseline_step)
         
-        # Quality metrics
-        quality = self._compute_detection_quality()
+        # Robustness score from sensitivity analysis
+        robustness = self._compute_robustness_score(sensitivity)
         
         return PlateauAnalysisResult(
             plateau_step=plateau_step,
@@ -242,172 +257,91 @@ class IESPlateauDetector:
             improvement_pct=comparison["improvement_pct"],
             significance_vs_baseline=comparison["significant"],
             hyperparameter_sensitivity=sensitivity,
-            robustness_score=self._compute_robustness_score(sensitivity),
-            detection_confidence=quality["confidence"],
-            false_positive_rate=quality["fp_rate"],
-            false_negative_rate=quality["fn_rate"],
+            robustness_score=robustness,
+            detection_confidence=robustness,  # Use robustness as confidence proxy
+            false_positive_rate=0.0,  # Not computable without labeled validation set
+            false_negative_rate=0.0,  # Not computable without labeled validation set
         )
     
     def _compute_statistical_validation(self, plateau_step: int) -> Dict:
-        """Compute statistical validation of plateau detection."""
+        """Two-sample test on before/after second-order differences.
+
+        Returns only quantities that are actually computed from data. The
+        CI on waste-% is obtained by BLOCK BOOTSTRAP on the loss sequence,
+        not by SEM of after_diffs (which has incompatible units).
+        """
         if len(self.second_order_diffs) < 10:
-            return {
-                "confidence_interval": (0, 0),
-                "p_value": 1.0,
-                "effect_size": 0.0,
-                "power": 0.0,
-            }
-        
-        # Split into before and after plateau
-        before_idx = min(plateau_step, len(self.second_order_diffs))
-        before_diffs = np.array(self.second_order_diffs[:before_idx])
-        after_diffs = np.array(self.second_order_diffs[before_idx:])
-        
-        if len(before_diffs) < 5 or len(after_diffs) < 5:
-            return {
-                "confidence_interval": (0, 0),
-                "p_value": 1.0,
-                "effect_size": 0.0,
-                "power": 0.0,
-            }
-        
-        # One-sample t-test: H0: mean_after = 0
-        t_stat, p_value = stats.ttest_1samp(after_diffs, 0)
-        
-        # Effect size (Cohen's d)
-        pooled_std = np.sqrt(
-            (np.std(before_diffs, ddof=1)**2 + np.std(after_diffs, ddof=1)**2) / 2
-        )
-        effect_size = (np.mean(before_diffs) - np.mean(after_diffs)) / (pooled_std + 1e-10)
-        
-        # Confidence interval for waste percentage
-        waste_pct = (len(self.loss_history) - plateau_step) / len(self.loss_history) * 100
-        sem = stats.sem(after_diffs) if len(after_diffs) > 1 else 0
-        ci_lower = waste_pct - 1.96 * sem
-        ci_upper = waste_pct + 1.96 * sem
-        
-        # Statistical power (simplified)
-        power = self._compute_statistical_power(before_diffs, after_diffs)
-        
+            return {"confidence_interval": None, "p_value": 1.0,
+                    "effect_size": 0.0, "n_before": 0, "n_after": 0}
+
+        before = np.asarray(self.second_order_diffs[:plateau_step])
+        after  = np.asarray(self.second_order_diffs[plateau_step:])
+        if len(before) < 5 or len(after) < 5:
+            return {"confidence_interval": None, "p_value": 1.0,
+                    "effect_size": 0.0, "n_before": len(before), "n_after": len(after)}
+
+        # Welch's t-test (unequal variances)
+        t_stat, p_value = stats.ttest_ind(before, after, equal_var=False)
+
+        pooled_sd = np.sqrt((before.var(ddof=1) + after.var(ddof=1)) / 2)
+        cohens_d = (before.mean() - after.mean()) / (pooled_sd + 1e-12)
+
+        # Block bootstrap CI on waste-% (correct units)
+        ci = self._bootstrap_waste_ci(block_size=max(5, len(self.loss_history) // 50),
+                                      n_boot=2000)
+
         return {
-            "confidence_interval": (ci_lower, ci_upper),
+            "confidence_interval": ci,
             "p_value": float(p_value),
-            "effect_size": float(effect_size),
-            "power": float(power),
+            "effect_size": float(cohens_d),
+            "n_before": int(len(before)),
+            "n_after":  int(len(after)),
+            "test":     "welch_t_2sample",
+            "power":    0.0,  # Not directly computable without labeled validation set
         }
-    
-    def _compute_statistical_power(
-        self, 
-        before_diffs: np.ndarray, 
-        after_diffs: np.ndarray
-    ) -> float:
-        """Compute statistical power of plateau detection."""
-        if len(before_diffs) < 5 or len(after_diffs) < 5:
-            return 0.0
-        
-        # Simplified power calculation
-        effect_size = abs(np.mean(before_diffs) - np.mean(after_diffs)) / (
-            np.std(np.concatenate([before_diffs, after_diffs])) + 1e-10
-        )
-        
-        # Cohen's convention: 0.2=small, 0.5=medium, 0.8=large
-        if effect_size < 0.2:
-            return 0.3  # Low power for small effects
-        elif effect_size < 0.5:
-            return 0.6  # Medium power
-        elif effect_size < 0.8:
-            return 0.8  # Good power
-        else:
-            return 0.95  # High power for large effects
-    
+
+    def _bootstrap_waste_ci(self, block_size: int, n_boot: int = 2000,
+                            alpha: float = 0.05, seed: int = 0) -> Tuple[float, float]:
+        """Block bootstrap 95% CI for waste percentage."""
+        rng = np.random.default_rng(seed)
+        losses = np.asarray(self.loss_history)
+        n = len(losses)
+        if n < 3 * block_size:
+            return (0.0, 0.0)
+        n_blocks = n // block_size
+        waste_draws = np.empty(n_boot)
+        for i in range(n_boot):
+            starts = rng.integers(0, n - block_size + 1, size=n_blocks)
+            resample = np.concatenate([losses[s:s + block_size] for s in starts])
+            # re-run the DETECTOR on the resample; reuse a cheap copy
+            plateau = _detect_plateau_step(resample, self.threshold,
+                                           self.window_size, self.patience)
+            waste_draws[i] = 0.0 if plateau is None else max(0.0, (len(resample) - plateau) / len(resample) * 100)
+        return (float(np.percentile(waste_draws, 100 * alpha / 2)),
+                float(np.percentile(waste_draws, 100 * (1 - alpha / 2))))
+
     def _analyze_hyperparameter_sensitivity(self) -> Dict[str, float]:
-        """Analyze sensitivity to hyperparameter changes."""
-        if len(self.second_order_diffs) < 20:
+        """Real sensitivity: re-run detector with each variant on stored losses."""
+        if len(self.loss_history) < 20:
             return {"threshold": 0.0, "window": 0.0, "patience": 0.0}
-        
-        # Analyze threshold sensitivity
-        threshold_variants = [self.threshold * 0.5, self.threshold, self.threshold * 2]
-        threshold_sensitivity = self._compute_sensitivity_for_parameter(
-            "threshold", threshold_variants
-        )
-        
-        # Analyze window sensitivity
-        window_variants = [max(1, self.window_size - 2), self.window_size, self.window_size + 2]
-        window_sensitivity = self._compute_sensitivity_for_parameter(
-            "window", window_variants
-        )
-        
-        # Analyze patience sensitivity
-        patience_variants = [max(1, self.patience // 2), self.patience, self.patience * 2]
-        patience_sensitivity = self._compute_sensitivity_for_parameter(
-            "patience", patience_variants
-        )
-        
+        losses = np.asarray(self.loss_history)
+
+        def _cv(variants, kw):
+            wastes = []
+            for v in variants:
+                kwargs = {"threshold": self.threshold, "window_size": self.window_size,
+                          "patience": self.patience}
+                kwargs[kw] = v
+                p = _detect_plateau_step(losses, **kwargs)
+                wastes.append(0.0 if p is None else (len(losses) - p) / len(losses) * 100)
+            wastes = np.asarray(wastes)
+            return float(wastes.std() / (wastes.mean() + 1e-12))
+
         return {
-            "threshold": threshold_sensitivity,
-            "window": window_sensitivity,
-            "patience": patience_sensitivity,
+            "threshold": _cv([self.threshold * 0.5, self.threshold, self.threshold * 2], "threshold"),
+            "window":    _cv([max(1, self.window_size - 2), self.window_size, self.window_size + 2], "window_size"),
+            "patience":  _cv([max(1, self.patience // 2), self.patience, self.patience * 2], "patience"),
         }
-    
-    def _compute_sensitivity_for_parameter(
-        self, 
-        param_name: str, 
-        variants: List
-    ) -> float:
-        """Compute sensitivity for a specific parameter."""
-        baseline_waste = self._estimate_waste_percentage()
-        
-        waste_values = []
-        for variant in variants:
-            # Simulate with different parameter
-            simulated_waste = self._simulate_with_parameter(param_name, variant)
-            waste_values.append(simulated_waste)
-        
-        # Compute coefficient of variation
-        if len(waste_values) > 1 and np.mean(waste_values) > 0:
-            cv = np.std(waste_values) / np.mean(waste_values)
-        else:
-            cv = 0.0
-        
-        # Convert to sensitivity score (lower is better)
-        sensitivity_score = min(1.0, cv * 10)  # Scale to [0, 1]
-        
-        return sensitivity_score
-    
-    def _estimate_waste_percentage(self) -> float:
-        """Estimate waste percentage from current detection."""
-        if not self.plateau_candidates:
-            return 0.0
-        
-        plateau_step = self.plateau_candidates[0]
-        total_steps = len(self.loss_history)
-        
-        return max(0, (total_steps - plateau_step) / total_steps * 100)
-    
-    def _simulate_with_parameter(
-        self, 
-        param_name: str, 
-        value: Union[float, int]
-    ) -> float:
-        """Simulate waste percentage with different parameter value."""
-        # Simplified simulation - in practice would re-run detection
-        current_waste = self._estimate_waste_percentage()
-        
-        # Add some noise based on parameter change
-        if param_name == "threshold":
-            change_factor = abs(np.log10(value / self.threshold + 1e-10))
-            noise = np.random.normal(0, change_factor * 5)
-        elif param_name == "window":
-            change_factor = abs(value - self.window_size) / self.window_size
-            noise = np.random.normal(0, change_factor * 3)
-        elif param_name == "patience":
-            change_factor = abs(value - self.patience) / self.patience
-            noise = np.random.normal(0, change_factor * 2)
-        else:
-            noise = 0
-        
-        simulated_waste = current_waste + noise
-        return max(0, min(100, simulated_waste))
     
     def _compare_with_baseline(
         self, 
@@ -436,33 +370,6 @@ class IESPlateauDetector:
             "baseline_step": baseline_step,
             "improvement_pct": improvement_pct,
             "significant": significant,
-        }
-    
-    def _compute_detection_quality(self) -> Dict[str, float]:
-        """Compute detection quality metrics."""
-        # Simplified quality metrics
-        # In practice would use validation set with known plateaus
-        
-        if len(self.second_order_diffs) < 10:
-            return {
-                "confidence": 0.0,
-                "fp_rate": 0.0,
-                "fn_rate": 0.0,
-            }
-        
-        # Confidence based on consistency
-        recent_diffs = self.second_order_diffs[-10:]
-        consistency = 1.0 - (np.std(recent_diffs) / (np.mean(recent_diffs) + 1e-10))
-        confidence = max(0, min(1, consistency))
-        
-        # Estimate false positive/negative rates (simplified)
-        fp_rate = max(0, 0.1 - confidence * 0.1)  # Better confidence → lower FP
-        fn_rate = max(0, 0.05 - confidence * 0.05)  # Better confidence → lower FN
-        
-        return {
-            "confidence": float(confidence),
-            "fp_rate": float(fp_rate),
-            "fn_rate": float(fn_rate),
         }
     
     def _compute_robustness_score(self, sensitivity: Dict[str, float]) -> float:
@@ -800,3 +707,71 @@ def create_executive_summary(task_analysis: Dict, stats: Dict) -> str:
         f"({task_analysis['waste_ratio']:.2f} ratio). "
         f"Detection confidence: {task_analysis['detection_confidence']:.2f}."
     )
+
+
+# =============================================================================
+# FIX #8: Pre-registered waste quantifier (non-circular)
+# =============================================================================
+
+class PreRegisteredWasteQuantifier:
+    """Pre-committed protocol for quantifying training waste.
+
+    Avoids the circular "re-run full training then label the tail as wasted"
+    pattern by committing to hyperparameters BEFORE looking at test data.
+
+    Protocol:
+        1. For each (task, seed), split training trajectory into
+           [train-early | holdout] by step index fixed in advance.
+        2. Fit detector (threshold, window, patience) on (task, held-out
+           SEEDS), not on the same seeds we later evaluate.
+        3. Report waste as the fraction of compute after the DETECTED
+           plateau that did NOT improve EARLY-STOPPING validation
+           metric beyond ε (pre-registered ε = 0.1 pp for classification,
+           0.2 pp for STS-B).
+
+    All hyperparameters (ε, detector params, splits) must be committed
+    to git BEFORE any evaluation runs. We hash the pre-registration
+    file and require the hash to match.
+    """
+
+    def __init__(self, preregistration_path: str, expected_hash: str):
+        import hashlib
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+        data = open(preregistration_path, "rb").read()
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected_hash:
+            raise RuntimeError(
+                f"Pre-registration tampered: expected {expected_hash}, got {actual}"
+            )
+        if yaml is None:
+            raise ImportError("PyYAML required for pre-registration")
+        self.cfg = yaml.safe_load(data)
+
+    def quantify(self, trajectory, task: str, seed: int,
+                 metric_history: List[float]) -> Dict:
+        cfg = self.cfg["tasks"][task]
+        plateau = _detect_plateau_step(
+            np.asarray(trajectory.losses),
+            threshold=cfg["threshold"], window_size=cfg["window"],
+            patience=cfg["patience"])
+        if plateau is None:
+            return {"waste_pct": 0.0, "plateau_step": None}
+        post_best = max(metric_history[plateau:], default=metric_history[-1])
+        pre_best  = max(metric_history[:plateau], default=metric_history[0])
+        epsilon = self.cfg["epsilon"][task]
+        improved = (post_best - pre_best) > epsilon
+        waste_pct = 0.0 if improved else (len(trajectory.losses) - plateau) / len(trajectory.losses) * 100
+        return {"waste_pct": float(waste_pct),
+                "plateau_step": int(plateau),
+                "improved_after_plateau": bool(improved),
+                "epsilon": float(epsilon)}
+
+
+# Helper for type hints (avoid circular imports)
+class LossTrajectory:
+    """Simple container for loss history."""
+    def __init__(self, losses: List[float]):
+        self.losses = losses

@@ -54,6 +54,9 @@ except ImportError:
     EnergyTracker = None
     ENERGY_TRACKER_AVAILABLE = False
 
+# Import single source of truth for momentum extrapolation
+from lerna.utils.momentum import apply_momentum_extrapolation
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,30 +130,11 @@ class _BaselineStatsMixin:
 
         Uses the optimizer's momentum buffer (SGD) or first moment
         estimate (Adam/AdamW) as a proxy for the gradient direction.
-        This is the same mechanism used by LERNA during plateau phases.
+        Delegates to single source of truth in lerna.utils.momentum.
         """
         if optimizer is None:
             return
-        with torch.no_grad():
-            for group in optimizer.param_groups:
-                group_lr = group.get('lr', lr)  # Per-group LR
-                for param in group["params"]:
-                    if not param.requires_grad or param not in optimizer.state:
-                        continue
-                    p_state = optimizer.state[param]
-                    if "momentum_buffer" in p_state:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-group_lr)
-                    elif "exp_avg" in p_state:
-                        # Adam/AdamW: use bias-corrected first moment
-                        exp_avg = p_state['exp_avg']
-                        step = p_state.get('step', 1)
-                        beta1 = group.get('betas', (0.9, 0.999))[0]
-                        bias_correction = 1 - beta1 ** (step if isinstance(step, int) else step.item())
-                        if bias_correction > 0:
-                            corrected = exp_avg / bias_correction
-                        else:
-                            corrected = exp_avg
-                        param.data.add_(corrected, alpha=-group_lr)
+        apply_momentum_extrapolation(optimizer)
 
     def _log_periodic(self, state, extra: dict = None):
         if not (self.wandb_enabled and _wandb_active()):

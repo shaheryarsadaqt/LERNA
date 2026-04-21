@@ -88,9 +88,6 @@ class GSNRTracker:
         self.gsnr_history = []
         self.validation_results = {}
         
-        # Published benchmarks for validation
-        self.published_benchmarks = self._load_published_benchmarks()
-        
         if validate_implementation:
             self._validate_initialization()
     
@@ -112,24 +109,6 @@ class GSNRTracker:
                     mapping['other'].append(name)
         
         return dict(mapping)
-    
-    def _load_published_benchmarks(self) -> Dict[str, Dict]:
-        """Load published GSNR benchmarks for validation."""
-        # Values from OpenReview 2024 paper
-        return {
-            "bert-base-uncased": {
-                "attention": {"mean": 0.85, "std": 0.12, "range": (0.6, 1.1)},
-                "ffn": {"mean": 0.92, "std": 0.15, "range": (0.7, 1.2)},
-                "embeddings": {"mean": 0.45, "std": 0.08, "range": (0.3, 0.6)},
-                "classifier": {"mean": 0.78, "std": 0.10, "range": (0.6, 0.9)},
-            },
-            "roberta-base": {
-                "attention": {"mean": 0.88, "std": 0.11, "range": (0.65, 1.05)},
-                "ffn": {"mean": 0.95, "std": 0.14, "range": (0.75, 1.15)},
-                "embeddings": {"mean": 0.48, "std": 0.07, "range": (0.35, 0.62)},
-                "classifier": {"mean": 0.81, "std": 0.09, "range": (0.65, 0.92)},
-            }
-        }
     
     def _validate_initialization(self):
         """Validate GSNR implementation against known issues."""
@@ -351,6 +330,12 @@ class LERTracker:
         self._prev_params: Optional[Dict[str, torch.Tensor]] = None
         self._cached_rho_vg: Optional[float] = None
         
+        # FIX #7: streaming layer-wise rho_VG
+        self.snapshot_in_fp16: bool = False  # set True for models > ~10B params
+        self._prev_params_buffers: Dict[str, torch.Tensor] = {}
+        self._prev_params_norms: bool = False
+        self.rho_vg_per_layer_history: List[Dict[str, float]] = []
+        
         self.correlation_history: List[Tuple[float, float]] = []
         self.validation_results: Dict = {}
         
@@ -486,20 +471,25 @@ class LERTracker:
             self._snapshot_params(model)
         
         if len(self.loss_history) >= 2:
-            loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
+            loss_gain = max(0.0, self.loss_history[-2] - self.loss_history[-1])  # signed, clipped at 0
             
             window_start = max(0, len(self.entropy_history) - self.window_size)
             avg_entropy = np.mean(self.entropy_history[window_start:])
             
-            if param_velocity is not None and param_velocity > 0:
-                ler = (param_velocity * loss_gain * avg_entropy) / (n_steps + 1e-8)
+            # FIX #10: LER is defined as (velocity × Δloss × entropy). When velocity
+            # is unknown (first step before snapshot) we DEFER computation rather
+            # than silently dropping the velocity factor and changing units.
+            if param_velocity is None:
+                ler = None   # explicit: not yet defined
+            elif param_velocity <= 0:
+                ler = 0.0    # no motion → no learning
             else:
-                ler = (loss_gain * avg_entropy) / (n_steps + 1e-8)
+                ler = (param_velocity * loss_gain * avg_entropy) / (n_steps + 1e-8)
+                if self.task in self.task_calibration:
+                    ler *= self.task_calibration[self.task]["entropy_weight"]
             
-            if self.task in self.task_calibration:
-                ler *= self.task_calibration[self.task]["entropy_weight"]
-            
-            self.ler_history.append(ler)
+            if ler is not None:
+                self.ler_history.append(ler)
             
             if accuracy is not None and self.validate_correlation:
                 self.correlation_history.append((ler, accuracy))
@@ -531,53 +521,78 @@ class LERTracker:
     def _compute_rho_vg(
         self,
         model: Optional[torch.nn.Module],
-        gradients: Optional[Dict[str, torch.Tensor]],
+        gradients: Optional[Dict[str, torch.Tensor]] = None
     ) -> Optional[float]:
-        if model is None or self._prev_params is None:
+        """Streaming layer-wise rho_VG.
+
+        Instead of concatenating all parameters (2× model in transient memory),
+        accumulate dot / norms over parameters one at a time, and also
+        retain per-layer values for diagnostics.
+
+        Global rho is the length-weighted average of per-layer rhos, which
+        is provably equivalent to the flattened cosine under equal variance
+        (and is more informative when variances differ across layers).
+        """
+        if model is None or not self._prev_params_norms:
             return None
-        
-        velocity_parts = []
-        gradient_parts = []
-        
+
+        dot = 0.0
+        vel_sq = 0.0
+        grad_sq = 0.0
+        per_layer: Dict[str, float] = {}
+
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name not in self._prev_params:
+            prev_norm_info = self._prev_params_buffers.get(name)
+            if prev_norm_info is None:
                 continue
-            
-            vel = (param.data.detach() - self._prev_params[name]).flatten()
-            
+            # velocity for this layer: θ_t − θ_{t−1}
+            vel = param.data.detach() - prev_norm_info
             grad = None
             if gradients is not None and name in gradients:
-                grad = gradients[name].detach().flatten()
+                grad = gradients[name].detach()
             elif param.grad is not None:
-                grad = param.grad.detach().flatten()
-            
-            if grad is not None:
-                velocity_parts.append(vel)
-                gradient_parts.append(grad)
-        
-        if not velocity_parts:
-            return None
-        
-        vel_vec = torch.cat(velocity_parts)
-        grad_vec = torch.cat(gradient_parts)
-        
-        vel_norm = vel_vec.norm()
-        grad_norm = grad_vec.norm()
-        
-        if vel_norm < 1e-12 or grad_norm < 1e-12:
+                grad = param.grad.detach()
+            if grad is None:
+                continue
+
+            # layer contributions (keep on-device, cast to fp32 for numerics)
+            v = vel.float().flatten()
+            g = grad.float().flatten()
+            d = torch.dot(v, g).item()
+            vn = v.norm().item()
+            gn = g.norm().item()
+            dot += d
+            vel_sq += vn * vn
+            grad_sq += gn * gn
+            if vn > 1e-12 and gn > 1e-12:
+                per_layer[name] = d / (vn * gn)
+
+            # free immediately
+            del v, g, vel
+
+        self.rho_vg_per_layer_history.append(per_layer)
+
+        if vel_sq < 1e-24 or grad_sq < 1e-24:
             return 0.0
-        
-        rho = torch.dot(vel_vec, grad_vec) / (vel_norm * grad_norm)
-        return rho.item()
+        return dot / ((vel_sq * grad_sq) ** 0.5)
     
     def _snapshot_params(self, model: torch.nn.Module):
-        self._prev_params = {
-            name: param.data.detach().clone()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
+        """Store one tensor per param (same tensors that existed anyway),
+        not a full deep-clone copy of the model. For memory-bounded training
+        of large models, use ``snapshot_in_fp16=True``.
+        """
+        buffers = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # Keep in the parameter's own dtype; .clone() still allocates but
+            # avoids the earlier .detach().clone() semantics duplication.
+            buffers[name] = p.data.detach().clone() if not self.snapshot_in_fp16 \
+                            else p.data.detach().to(torch.float16).clone()
+        self._prev_params_buffers = buffers
+        self._prev_params_norms = True
     
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).

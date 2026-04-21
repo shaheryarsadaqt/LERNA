@@ -3,6 +3,11 @@
 
 version: "wandb-1.0"
 
+wandb:
+  entity: ${WANDB_ENTITY:-}   # must be set via env var; no default
+  project: ${WANDB_PROJECT:-lerna}
+  mode: ${WANDB_MODE:-online}
+
 # Connection Settings
 connection:
   api_key: ${WANDB_API_KEY}  # Load from environment
@@ -12,8 +17,8 @@ connection:
 
 # Project Structure
 project:
-  name: "lerna-2026"
-  entity: "shaheryarsadaqat-jxt-harbin-institute-of-technology"
+  name: "lerna"
+  entity: "${WANDB_ENTITY:-}"  # must be set via env var
   description: "LERNA: Energy-Efficient Fine-Tuning via Causal Learning Diagnostics and Adaptive Gradient Bypassing"
   access: "public"  # Public for academic collaboration
 
