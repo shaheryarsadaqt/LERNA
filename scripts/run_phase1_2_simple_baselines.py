@@ -79,6 +79,7 @@ import time
 import argparse
 import gc
 import logging
+import pathlib
 import numpy as np
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -126,7 +127,14 @@ from lerna.callbacks.lerna_baseline import LERNABaselineCallback
 
 # Import bootstrap CI helper and stats
 from scripts.phase1_2_bootstrap_ci import bootstrap_ci
-# from scripts.phase1_2_stats import run_all_paired_tests
+
+# Make scripts/ importable for phase1_2_stats
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+try:
+    from phase1_2_stats import run_all_paired_tests
+except ImportError:
+    run_all_paired_tests = None
 
 logger = logging.getLogger(__name__)
 
@@ -1095,14 +1103,14 @@ def generate_comparison_summary(
     
     # Run paired significance tests (LERNA vs each baseline)
     if "lerna" in baselines and len(successful) > 0:
-        print("\n  Running paired significance tests (LERNA vs baselines)...")
-        lerna_results = [r for r in successful if r["baseline"] == "lerna"]
-        if lerna_results:
-            sig_results = run_all_paired_tests(successful, baselines, tasks)
-            sig_path = os.path.join(output_dir, "phase1_2_significance.json")
-            with open(sig_path, "w") as f:
-                json.dump(sig_results, f, indent=2, default=str)
-            print(f"  Significance results saved: {sig_path}")
+        sig_results = {}
+        baselines_with_data = [b for b in baselines
+                               if sum(1 for r in successful if r.get("baseline") == b) >= 2]
+        if run_all_paired_tests is not None and len(baselines_with_data) >= 2:
+            sig_results = run_all_paired_tests(successful, baselines_with_data, tasks)
+        sig_path = os.path.join(output_dir, "phase1_2_significance.json")
+        with open(sig_path, "w") as f:
+            json.dump(sig_results, f, indent=2, default=str)
 
 
 # =============================================================================
@@ -1169,6 +1177,10 @@ Examples:
         "--target-skip-rate", type=float, default=0.33,
         help="Target skip rate for baselines that need it (default: 0.33)",
     )
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Allow LERNA to not activate without failing")
+    parser.add_argument("--lerna-warmup-steps", type=int, default=None,
+                        help="Override LERNA warmup_steps")
     args = parser.parse_args()
 
     profile = detect_device_profile()
