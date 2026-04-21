@@ -1,0 +1,20 @@
+version: 1
+commit_before: "phase1_2_evaluation"
+epsilon:
+  mnli: 0.1
+  qqp: 0.1
+  qnli: 0.1
+  sst2: 0.1
+  cola: 0.2    # MCC
+  rte: 0.2
+  mrpc: 0.2
+  stsb: 0.2    # Pearson
+tasks:
+  mnli: {threshold: 1.0e-4, window: 50,  patience: 100}
+  qqp:  {threshold: 1.0e-4, window: 50,  patience: 100}
+  qnli: {threshold: 1.0e-4, window: 30,  patience: 50}
+  sst2: {threshold: 1.0e-4, window: 30,  patience: 50}
+  cola: {threshold: 5.0e-5, window: 20,  patience: 30}
+  rte:  {threshold: 5.0e-5, window: 20,  patience: 30}
+  mrpc: {threshold: 5.0e-5, window: 20,  patience: 30}
+  stsb: {threshold: 5.0e-5, window: 20,  patience: 30}

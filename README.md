@@ -362,6 +362,26 @@ def _compute_grad_norm(self, model):
 
 ---
 
+## Pre-Registration Protocol
+
+To ensure scientific integrity and prevent p-hacking, all waste quantification analysis is pre-registered before running experiments.
+
+**Config Hash (SHA-256):** `ef3cb23a9619d7e05ad8a076e3d449c83dc1b35cb8c6dc9be09a93759cb8958d`
+
+This hash corresponds to `configs/preregistration.yaml` which specifies:
+- Primary metric: waste_ratio with block bootstrap 95% CI
+- Detection threshold: LER < 0.15 triggers momentum extrapolation
+- Safety horizon: H(rho_VG) = base_horizon * (1 - |rho_VG|)
+- Ablation configurations: 6 baselines (gradient norm, random skip, early stopping, etc.)
+- Analysis protocol: paired energy delta comparison with same random seed
+
+The pre-registration ensures that:
+1. Waste detection thresholds are not tuned on the results
+2. Ablation choices are justified a priori
+3. Statistical methods (block bootstrap) are committed before seeing data
+
+---
+
 ## Installation
 
 ```bash
