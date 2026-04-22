@@ -609,9 +609,9 @@ class LERTracker:
 
     def record_step_update(self, loss: float, model: torch.nn.Module):
         # DEBUG: confirm firing each step
-        print(f"[DEBUG record_step] model={'set' if model is not None else 'None'}, loss={loss:.4f}, _prev_params={'set' if self._prev_params is not None else 'None'}")
+        print(f"[DEBUG record_step] model={'set' if model is not None else 'None'}, loss={loss:.4f}, _prev_params_buffers={'set' if self._prev_params_buffers else 'None/empty'}")
         self.loss_history.append(float(loss))
-        if self._prev_params is None:
+        if not self._prev_params_buffers:  # empty dict = needs priming
             self._snapshot_params(model)
             return  # first call: prime only, no velocity yet
         # compute BEFORE re-snapshotting
@@ -626,10 +626,10 @@ class LERTracker:
 
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
         # DEBUG: entry trace
-        print(f"[DEBUG velocity ENTRY] prev_params={'set' if self._prev_params else 'None/empty'}, len={len(self._prev_params) if self._prev_params else 0}")
+        print(f"[DEBUG velocity ENTRY] _prev_params_buffers={'set' if self._prev_params_buffers else 'None/empty'}, len={len(self._prev_params_buffers) if self._prev_params_buffers else 0}")
         if model is None:
             return None
-        if self._prev_params is None:
+        if not self._prev_params_buffers:  # empty dict = needs priming
             # Seed snapshot on first call so velocity can be computed on next call
             self._snapshot_params(model)
             return None
@@ -641,7 +641,7 @@ class LERTracker:
             if not param.requires_grad:
                 continue
             if name in self._prev_params:
-                delta = param.data.detach() - self._prev_params[name]
+                delta = param.data.detach() - self._prev_params_buffers[name]
                 total_delta_sq += delta.pow(2).sum().item()
                 total_params += param.numel()
         
@@ -719,6 +719,18 @@ class LERTracker:
         not a full deep-clone copy of the model. For memory-bounded training
         of large models, use ``snapshot_in_fp16=True``.
         """
+        # DEBUG: diagnose snapshot
+        total = 0
+        trainable = 0
+        sample_names = []
+        for name, param in model.named_parameters():
+            total += 1
+            if param.requires_grad:
+                trainable += 1
+                if len(sample_names) < 3:
+                    sample_names.append(name)
+        print(f"[DEBUG snapshot] total={total}, trainable={trainable}, samples={sample_names}")
+        
         buffers = {}
         for name, p in model.named_parameters():
             if not p.requires_grad:
@@ -729,6 +741,7 @@ class LERTracker:
                             else p.data.detach().to(torch.float16).clone()
         self._prev_params_buffers = buffers
         self._prev_params_norms = True
+        print(f"[DEBUG snapshot] _prev_params size={len(self._prev_params_buffers)}")
     
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).
