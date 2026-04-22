@@ -607,45 +607,20 @@ class LERTracker:
                 if len(self.correlation_history) % 50 == 0:
                     self._validate_correlation()
 
-    def record_step_update(
-        self,
-        loss: Optional[float],
-        model: Optional[torch.nn.Module],
-    ) -> Optional[float]:
-        """Lightweight per-step update — no logits required.
-
-        Keeps LER / velocity populated every training step. The heavy
-        update() path still runs at eval to refresh entropy with real logits.
-        Requires _prev_params to be primed (call _snapshot_params in on_train_begin).
-        """
-        if loss is None or model is None:
-            return None
-
+    def record_step_update(self, loss: float, model: torch.nn.Module):
         self.loss_history.append(float(loss))
-
-        param_velocity = self._compute_param_velocity(model)
+        if self._prev_params is None:
+            self._snapshot_params(model)
+            return  # first call: prime only, no velocity yet
+        # compute BEFORE re-snapshotting
+        velocity = self._compute_param_velocity(model)  # appends to velocity_history
         self._snapshot_params(model)
-
-        if self.entropy_history:
-            window_start = max(0, len(self.entropy_history) - self.window_size)
-            avg_entropy = float(np.mean(self.entropy_history[window_start:]))
-        else:
-            avg_entropy = 0.1
-
-        if len(self.loss_history) < 2:
-            return None
-
-        loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
-        if param_velocity is not None and param_velocity > 0:
-            ler = (param_velocity * loss_gain * avg_entropy)
-        else:
-            ler = (loss_gain * avg_entropy)
-
-        if self.task in self.task_calibration:
-            ler *= self.task_calibration[self.task]["entropy_weight"]
-
-        self.ler_history.append(ler)
-        return ler
+        # cheap LER: reuse last entropy if any, else 1.0
+        entropy = self.entropy_history[-1] if self.entropy_history else 1.0
+        if len(self.loss_history) >= 2 and velocity is not None:
+            loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
+            ler = (velocity * loss_gain * entropy) / (len(self.loss_history) + 1e-8)
+            self.ler_history.append(ler)
 
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
         if model is None:
