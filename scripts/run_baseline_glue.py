@@ -48,6 +48,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
+from typing import Optional
 
 import torch
 
@@ -1412,18 +1413,25 @@ class LERNATrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._ler_tracker = ler_tracker
         self._last_real_logits = None
+        self._last_real_loss = None
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Override to capture real logits."""
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-        
+
         # Capture real logits for LER tracker
         if hasattr(outputs, "logits"):
             self._last_real_logits = outputs.logits.detach()
         elif isinstance(outputs, dict) and "logits" in outputs:
             self._last_real_logits = outputs["logits"].detach()
-        
+
+        # NEW: capture loss paired with logits (same forward pass) for per-step LER.
+        try:
+            self._last_real_loss = float(loss.detach().item())
+        except Exception:
+            self._last_real_loss = None
+
         return (loss, outputs) if return_outputs else loss
 
 
@@ -1448,6 +1456,7 @@ def run_single_experiment(
     metric_for_best_model: str = "eval_loss",
     greater_is_better: bool = False,
     init_from_mnli: bool = False,
+    extra_callbacks: Optional[list] = None,
 ):
     """Run a single GLUE fine-tuning experiment with FULL diagnostics.
 
@@ -1870,6 +1879,29 @@ def run_single_experiment(
                 except Exception:
                     pass
             
+            # ── Per-step LER update ──────────────────────────────────────────
+            # Fixes "LER samples: 5" regression: previously update() only fired on
+            # on_log/on_evaluate boundaries. We call it every step with fresh
+            # loss + logits captured by CapturingTrainer, which also feeds
+            # _snapshot_params(model) for param_velocity.
+            try:
+                trainer = self._trainer_holder[0] if self._trainer_holder else None
+                if trainer is not None and self._model is not None:
+                    real_logits = getattr(trainer, "_last_real_logits", None)
+                    real_loss   = getattr(trainer, "_last_real_loss", None)
+                    if real_logits is not None and real_loss is not None:
+                        self.ler_tracker.update(
+                            loss=real_loss,
+                            logits=real_logits,
+                            accuracy=None,                     # set via on_evaluate path
+                            n_steps=state.global_step,
+                            model=self._model,
+                            gradients=None,                    # captured via capture_step_gradients
+                        )
+            except Exception as e:
+                if os.environ.get("LERNA_DEBUG"):
+                    print(f"[LER per-step update failed step={state.global_step}] {e}")
+
             return control
 
         def on_substep_end(self, args, state, control, **kwargs):
@@ -2084,7 +2116,7 @@ def run_single_experiment(
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
@@ -2111,6 +2143,14 @@ def run_single_experiment(
     compute_metrics = build_compute_metrics(task_name)
 
     # Use custom trainer that captures real logits (FIX #4)
+    callbacks = [
+        EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
+        power_callback,
+        diag_callback,
+    ]
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
+    
     trainer = LERNATrainer(
         model=model,
         args=training_args,
@@ -2119,11 +2159,7 @@ def run_single_experiment(
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
-        callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
-            power_callback,
-            diag_callback,
-        ],
+        callbacks=callbacks,
     )
     
     # Set trainer reference in callback

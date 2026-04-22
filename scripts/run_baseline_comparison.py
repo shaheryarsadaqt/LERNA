@@ -95,6 +95,26 @@ BASELINE_CONFIGS = {
 }
 
 
+def build_baseline_callback(baseline_name: str, config: dict):
+    """Build a baseline callback instance from config.
+    
+    Used by both run_baseline_comparison.py and run_phase1_2_simple_baselines.py.
+    """
+    from lerna.utils.metrics import LERTracker
+    import torch.nn as nn
+    
+    callback_class = config["class"]
+    params = config.get("params", {})
+    
+    # Some callbacks need additional setup
+    if baseline_name == "weight_freeze":
+        # WeightFreezingCallback needs a dummy model/ler_tracker
+        # It will be updated when attached to trainer
+        return callback_class(ler_tracker=None, **params)
+    
+    return callback_class(**params)
+
+
 def main():
     parser = argparse.ArgumentParser(description="LERNA Phase 1: Baseline Comparison")
     parser.add_argument(
@@ -175,33 +195,39 @@ def main():
                 print(f"  Baseline: {baseline_name} | Task: {task} | Seed: {seed}")
 
                 try:
-                    # The actual experiment uses run_single_experiment from
-                    # run_baseline_glue.py. The baseline callback is injected
-                    # as an additional callback. For now, we log the config
-                    # and note that integration requires modifying
-                    # run_single_experiment to accept extra callbacks.
-                    #
-                    # TODO: Add --extra-callback parameter to run_single_experiment
-                    # For now, record the configuration for manual runs.
-
-                    result = {
+                    from scripts.run_baseline_glue import run_single_experiment
+                    # run_single_experiment must accept extra_callbacks; see §3b below.
+                    result = run_single_experiment(
+                        task_name=task,
+                        seed=seed,
+                        lr=BASELINE_CONFIGS[baseline_name]["params"].get("lr", 2e-5),
+                        profile=profile,
+                        base_output_dir=str(output_dir / baseline_name / task / f"seed{seed}"),
+                        use_wandb=args.wandb,
+                        extra_callbacks=[
+                            build_baseline_callback(baseline_name, BASELINE_CONFIGS[baseline_name])
+                        ],
+                    )
+                    result.update({
                         "baseline": baseline_name,
                         "task": task,
                         "seed": seed,
-                        "config": BASELINE_CONFIGS[baseline_name]["params"],
-                        "description": BASELINE_CONFIGS[baseline_name]["description"],
-                        "status": "configured",
+                        "status": "completed",
                         "timestamp": datetime.now().isoformat(),
-                    }
+                    })
                     all_results.append(result)
 
                 except Exception as e:
-                    print(f"  FAILED: {e}")
+                    # Do NOT swallow silently; log and record failure but continue sweep.
+                    import traceback
+                    traceback.print_exc()
                     all_results.append({
                         "baseline": baseline_name,
                         "task": task,
                         "seed": seed,
+                        "status": "failed",
                         "error": str(e),
+                        "timestamp": datetime.now().isoformat(),
                     })
 
     # Save summary

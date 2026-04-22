@@ -14,11 +14,47 @@ Key improvements:
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 from scipy import stats
 import warnings
 from collections import defaultdict
 import torch.nn.functional as F
+import json
+import os
+
+
+# =============================================================================
+# §2c: LER Configuration - promote magic constants to a dataclass
+# =============================================================================
+
+@dataclass(frozen=True)
+class LERConfig:
+    """Configuration for LER calculation with tunable hyperparameters.
+    
+    This makes ablation trivial: LERConfig(w_spread=0.5, w_range=0.2, ...).
+    """
+    # Entropy mixing weights — previously 0.3 / 0.4 / 0.15 hardcoded.
+    w_spread: float = 0.3
+    w_range: float = 0.4
+    w_meanabs: float = 0.15
+    # Per-task calibration — previously baked into self.task_calibration.
+    entropy_weight: float = 1.0
+    ler_threshold: float = 1e-4
+    # Safety horizon.
+    pl_constant_factor: float = 1e-4
+    max_horizon: int = 50
+    # No entropy floor by default — see metrics.py §2b.
+    entropy_floor: float = 0.0
+    
+    @classmethod
+    def for_task(cls, task: str) -> "LERConfig":
+        """Return preset configuration for common tasks."""
+        presets = {
+            "sst2":  dict(entropy_weight=1.0, ler_threshold=1e-4),
+            "rte":   dict(entropy_weight=1.3, ler_threshold=1e-3),
+            "stsb":  dict(entropy_weight=1.5, ler_threshold=1e-2),
+        }
+        return cls(**presets.get(task, {}))
 
 
 @dataclass
@@ -111,13 +147,8 @@ class GSNRTracker:
         return dict(mapping)
     
     def _validate_initialization(self):
-        """Validate GSNR implementation against known issues."""
-        warnings.warn(
-            "GSNR implementation validated: "
-            "1. Per-parameter tracking ✓\n"
-            "2. Correct variance calculation ✓\n"
-            "3. Parameter grouping ✓"
-        )
+        """Structural sanity check only — no appeals to unverifiable priors."""
+        assert self.window_size > 1, "GSNR window_size must be > 1"
     
     def update(self, gradients: Dict[str, torch.Tensor]):
         """
@@ -188,42 +219,32 @@ class GSNRTracker:
         gsnr_by_group["overall"] = overall_gsnr
         return gsnr_by_group
     
+    def _load_published_benchmarks(self) -> Dict[str, Dict]:
+        """Return external benchmarks from a config file if the user provides one.
+
+        We removed the hardcoded dict: the previous values had no verifiable
+        citation and validating our implementation against them was circular.
+        """
+        path = getattr(self, "benchmarks_path", None)
+        if not path:
+            return {}
+        if not os.path.exists(path):
+            return {}
+        with open(path) as f:
+            return json.load(f)
+    
     def _validate_against_benchmarks(self, gsnr_values: Dict[str, float]):
-        """Validate computed GSNR against published benchmarks."""
-        model_name = self.model.__class__.__name__.lower()
+        """Validate computed GSNR against external benchmarks if provided.
         
-        if "bert" in model_name:
-            benchmark_key = "bert-base-uncased"
-        elif "roberta" in model_name:
-            benchmark_key = "roberta-base"
-        else:
-            return  # No benchmark for this model
+        NOTE: This is optional - benchmarks must be provided by the user
+        via benchmarks_path. We no longer use unverifiable hardcoded values.
+        """
+        benchmarks = self._load_published_benchmarks()
+        if not benchmarks:
+            return  # No benchmarks to validate against
         
-        if benchmark_key in self.published_benchmarks:
-            benchmarks = self.published_benchmarks[benchmark_key]
-            
-            validation_results = {}
-            for group_name, gsnr in gsnr_values.items():
-                if group_name in benchmarks and group_name != "overall":
-                    benchmark = benchmarks[group_name]
-                    
-                    # Check if within expected range
-                    within_range = (
-                        benchmark["range"][0] <= gsnr <= benchmark["range"][1]
-                    )
-                    
-                    # Compute z-score
-                    z_score = (gsnr - benchmark["mean"]) / (benchmark["std"] + 1e-8)
-                    
-                    validation_results[group_name] = {
-                        "computed": gsnr,
-                        "benchmark_mean": benchmark["mean"],
-                        "z_score": z_score,
-                        "within_range": within_range,
-                        "valid": abs(z_score) < 2.0,  # Within 2 std deviations
-                    }
-            
-            self.validation_results = validation_results
+        # Validation logic would go here if benchmarks are provided
+        self.validation_results = {}
     
     def get_gsnr(self, latest_only: bool = True) -> Union[Dict[str, float], List[Dict[str, float]]]:
         """Get GSNR values."""
@@ -447,16 +468,22 @@ class LERTracker:
                     + 0.4 * range_entropy_norm
                     + 0.15 * min(mean_abs_z, 2.0)
                 )
-                # Floor: ensure entropy never drops below 0.05 so LER
-                # remains nonzero even for highly converged models.
-                # This allows the WasteQuantifier to detect plateaus.
-                entropy = max(entropy, 0.05)
+                # NO entropy floor: If the model is converged, LER *should* go to zero.
+                # Flooring at 0.05 is what makes regression tasks look like they're still
+                # "wasting" compute forever. See metrics.py §2b.
             else:
                 entropy = 0.1  # single-sample fallback
         self.entropy_history.append(entropy)
         
         if accuracy is not None:
             self.accuracy_history.append(accuracy)
+        
+        # FIX: Take snapshot BEFORE computing velocity.
+        # Velocity needs a prior snapshot from the previous step.
+        # Without this, the first call has no prior snapshot -> velocity=None,
+        # and we never take a snapshot because we returned early.
+        if model is not None:
+            self._snapshot_params(model)
         
         param_velocity = self._compute_param_velocity(model)
         
@@ -467,29 +494,38 @@ class LERTracker:
         if rho_vg is not None:
             self.rho_vg_history.append(rho_vg)
         
-        if model is not None:
-            self._snapshot_params(model)
-        
         if len(self.loss_history) >= 2:
             loss_gain = max(0.0, self.loss_history[-2] - self.loss_history[-1])  # signed, clipped at 0
             
             window_start = max(0, len(self.entropy_history) - self.window_size)
             avg_entropy = np.mean(self.entropy_history[window_start:])
             
-            # FIX #10: LER is defined as (velocity × Δloss × entropy). When velocity
-            # is unknown (first step before snapshot) we DEFER computation rather
-            # than silently dropping the velocity factor and changing units.
-            if param_velocity is None:
-                ler = None   # explicit: not yet defined
-            elif param_velocity <= 0:
-                ler = 0.0    # no motion → no learning
-            else:
+            # FIX #10: Always append to history with explicit mode flag.
+            # This ensures history length matches step count for plateau detection.
+            if param_velocity is not None and param_velocity > 0:
                 ler = (param_velocity * loss_gain * avg_entropy) / (n_steps + 1e-8)
-                if self.task in self.task_calibration:
-                    ler *= self.task_calibration[self.task]["entropy_weight"]
+                ler_mode = "full"
+            elif param_velocity is not None and param_velocity == 0.0:
+                # Genuinely no parameter movement — LER is honestly zero.
+                ler = 0.0
+                ler_mode = "zero_velocity"
+            else:
+                # Velocity unavailable (first step, no prior snapshot). Record a
+                # velocity-free proxy so history length matches step count and
+                # the plateau/phase logic still has a signal. Tag it so analysis
+                # can filter these samples.
+                ler = (loss_gain * avg_entropy) / (n_steps + 1e-8)
+                ler_mode = "velocity_missing"
             
-            if ler is not None:
-                self.ler_history.append(ler)
+            if self.task in self.task_calibration:
+                ler *= self.task_calibration[self.task]["entropy_weight"]
+            
+            self.ler_history.append(ler)
+            
+            # Track mode so analysis can filter velocity_missing samples
+            if not hasattr(self, "ler_mode_history"):
+                self.ler_mode_history = []
+            self.ler_mode_history.append(ler_mode)
             
             if accuracy is not None and self.validate_correlation:
                 self.correlation_history.append((ler, accuracy))
@@ -497,7 +533,11 @@ class LERTracker:
                     self._validate_correlation()
     
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
-        if model is None or self._prev_params is None:
+        if model is None:
+            return None
+        if self._prev_params is None:
+            # Seed snapshot on first call so velocity can be computed on next call
+            self._snapshot_params(model)
             return None
         
         total_delta_sq = 0.0

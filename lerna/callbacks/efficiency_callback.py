@@ -151,6 +151,31 @@ class EfficiencyMetricsCallback(TrainerCallback):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
+        # Capture gradients BEFORE optimizer zeroes them
+        model = kwargs.get("model")
+        gradients = kwargs.get("gradients")
+        
+        # Update GSNR tracker BEFORE zero_grad (gradients are still available)
+        if self.gsnr_tracker and gradients:
+            self.gsnr_tracker.update(gradients)
+        
+        # Update LER tracker with model (required for param_velocity snapshot)
+        if self.ler_tracker and model is not None:
+            # Get loss from log history if available
+            loss = None
+            if state.log_history:
+                last_log = state.log_history[-1]
+                loss = last_log.get("loss")
+            
+            self.ler_tracker.update(
+                loss=loss,
+                logits=None,  # filled on on_evaluate
+                accuracy=None,  # filled on on_evaluate
+                model=model,
+                gradients=gradients,
+            )
+        
+        # Track step timing
         if self.step_start_time is not None:
             step_time = time.time() - self.step_start_time
             self.step_times.append(step_time)

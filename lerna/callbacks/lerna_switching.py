@@ -17,6 +17,7 @@ FLAW FIXES (2026-04-12):
 import math
 import logging
 import warnings
+import time
 from typing import Optional, Dict, List, Tuple, Any
 
 import torch
@@ -24,7 +25,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
-from lerna.utils.momentum import apply_momentum_extrapolation as _apply_momentum_extrapolation
+# Use the shared momentum extrapolation helper
+from lerna.utils.momentum_extrapolation import apply_momentum_extrapolation as _apply_momentum_extrapolation
 
 try:
     import wandb
@@ -196,10 +198,12 @@ class SafetyHorizon:
 class EnergyTracker:
     """Cumulative energy from NVML TOTAL_ENERGY_CONSUMPTION counter (mJ).
 
-    This reads a hardware monotonic counter — no subprocess per step, no
-    hardcoded 'backward_fraction'. Energy saved is computed by diffing the
-    counter between a LERNA run and a paired baseline run, NOT by any
-    per-step formula. The per-step delta is exposed for sanity plots only.
+    This reads a hardware monotonic counter — no subprocess per step.
+    Energy saved is computed by diffing the counter between a LERNA run
+    and a paired baseline run, NOT by any per-step formula.
+    
+    For callback-only mode (diagnostic), we estimate counterfactual savings
+    using measured step durations and backward fractions.
 
     Requires: pynvml (>= 11.5) and driver >= R460.
     """
@@ -215,6 +219,26 @@ class EnergyTracker:
         self._total_energy_j = 0.0
         self._per_step_energy_j: List[float] = []
 
+        # --- §1a: Real step timing (wall-clock) ---
+        self._step_start_time: Optional[float] = None
+        self._step_durations: List[float] = []  # seconds, rolling
+        self._max_step_history = 200
+
+        # --- §1a: Measured backward fraction ---
+        # Observed fraction of step spent in backward — measured once at warm-up,
+        # NOT hardcoded. Falls back to 0.60 only if measurement unavailable.
+        self._backward_fraction: Optional[float] = None
+        self._fwd_bwd_samples: List[Tuple[float, float]] = []  # (fwd_s, bwd_s)
+        
+        # Power samples for energy estimation
+        self._power_samples: List[float] = []  # watts
+        
+        # TDP fallback for energy estimation (watts)
+        self.tdp_fallback_w = 300.0  # reasonable default
+
+        # Energy saved accumulator (for callback mode estimates)
+        self._energy_saved_joules: float = 0.0
+
         try:
             import pynvml
             pynvml.nvmlInit()
@@ -229,6 +253,12 @@ class EnergyTracker:
                     f"[EnergyTracker] NVML TOTAL_ENERGY_CONSUMPTION available "
                     f"on GPU {gpu_id} (start={self._energy_j_at_begin:.1f} J)."
                 )
+                # Get TDP for fallback
+                try:
+                    info = pynvml.nvmlDeviceGetPowerManagementLimitInfo(self._handle)
+                    self.tdp_fallback_w = info / 1000.0  # mW -> W
+                except Exception:
+                    pass
             except Exception:
                 logger.warning(
                     "[EnergyTracker] NVML energy counter unavailable; falling back "
@@ -249,17 +279,89 @@ class EnergyTracker:
         except Exception:
             return 0.0
 
+    def _read_power_w(self) -> float:
+        """Read current power draw in watts."""
+        try:
+            return self._pynvml.nvmlDeviceGetPowerUsage(self._handle) / 1000.0
+        except Exception:
+            return 0.0
+
     # ---- step lifecycle ------------------------------------------------
-    def step_begin(self):
+    def step_begin(self) -> None:
+        """Call at the start of every training step."""
+        # Energy counter
         self._energy_j_step_begin = self._read_counter_j()
+        
+        # Wall-clock timing for step duration
+        self._step_start_time = time.perf_counter()
+        
+        # Sample power
+        power_w = self._read_power_w()
+        if power_w > 0:
+            self._power_samples.append(power_w)
+            if len(self._power_samples) > 100:
+                self._power_samples.pop(0)
+
+    def record_backward_fraction(self, fwd_s: float, bwd_s: float) -> None:
+        """Optionally feed measured forward/backward times from LERNATrainer."""
+        if fwd_s > 0 and bwd_s > 0:
+            self._fwd_bwd_samples.append((fwd_s, bwd_s))
+            if len(self._fwd_bwd_samples) >= 20:
+                total = sum(f + b for f, b in self._fwd_bwd_samples)
+                bwd_total = sum(b for _, b in self._fwd_bwd_samples)
+                # Include optimizer overhead implicitly: use measured bwd share of step.
+                self._backward_fraction = bwd_total / total
+
+    def estimate_energy_saved(self, skipped_backward: bool) -> float:
+        """Estimate energy saved for a skipped backward pass.
+        
+        NOTE (callback-only mode): This reports COUNTERFACTUAL savings —
+        the backward ran, but we report what would have been saved had it
+        been skipped. Do not headline callback-mode numbers as measured savings.
+        
+        For true measurement, use paired energy comparison (compute_paired_energy.py).
+        """
+        if not skipped_backward:
+            return 0.0
+
+        avg_power = (np.mean(self._power_samples[-10:])
+                     if len(self._power_samples) >= 5 else self.tdp_fallback_w)
+
+        # Measured step duration (median is robust to stragglers / eval steps)
+        if self._step_durations:
+            step_duration_s = float(np.median(self._step_durations[-50:]))
+        else:
+            # No measurement yet — return 0 rather than fabricate a number.
+            return 0.0
+
+        bwd_frac = self._backward_fraction if self._backward_fraction is not None else 0.60
+        energy_saved_j = bwd_frac * avg_power * step_duration_s
+        return energy_saved_j / 3_600_000
 
     def step_end(self, skipped_backward: bool = False) -> float:
+        """Complete step timing and record energy."""
+        # Wall-clock duration
+        if self._step_start_time is not None:
+            dur = time.perf_counter() - self._step_start_time
+            self._step_durations.append(dur)
+            if len(self._step_durations) > self._max_step_history:
+                self._step_durations.pop(0)
+            self._step_start_time = None
+        
+        # Energy counter
         if not self._supports_counter:
-            return 0.0  # refuse to return misleading numbers
+            return 0.0
         now_j = self._read_counter_j()
         delta = max(0.0, now_j - self._energy_j_step_begin)
         self._total_energy_j += delta
         self._per_step_energy_j.append(delta)
+        
+        # For callback mode: estimate counterfactual savings
+        if skipped_backward:
+            self._energy_saved_joules += (
+                self.estimate_energy_saved(True) * 3_600_000
+            )
+        
         return delta / 3_600_000.0  # kWh
 
     def get_total_energy_kwh(self) -> float:
@@ -273,18 +375,13 @@ class EnergyTracker:
             "n_steps": len(self._per_step_energy_j),
             "median_step_j": float(np.median(self._per_step_energy_j))
                              if self._per_step_energy_j else 0.0,
+            # Measured timing
+            "median_step_duration_s": float(np.median(self._step_durations))
+                                      if self._step_durations else 0.0,
+            "backward_fraction": self._backward_fraction,
+            # Estimated counterfactual savings (callback mode)
+            "estimated_energy_saved_kwh": self._energy_saved_joules / 3_600_000,
         }
-
-    # ---- deprecated: do NOT use for publication ------------------------
-    def estimate_energy_saved(self, skipped_backward: bool) -> float:
-        """DEPRECATED. Returns 0.0 by design.
-
-        Energy saved must be computed OFFLINE by differencing the
-        TOTAL_ENERGY_CONSUMPTION counter between paired LERNA and
-        baseline runs (same seed, same model, same data). See
-        scripts/compute_paired_energy.py.
-        """
-        return 0.0
 
 
 # =============================================================================
@@ -778,6 +875,7 @@ class LERNATrainer(Trainer):
         lerna_threshold: float = 1e-5,
         lerna_min_step: int = 100,
         use_safety_horizon: bool = True,
+        adam_use_second_moment: bool = True,
         **kwargs
     ):
         """Initialize LERNA Trainer.
@@ -789,6 +887,8 @@ class LERNATrainer(Trainer):
             lerna_threshold: LER threshold for plateau detection
             lerna_min_step: Minimum step before considering skipping
             use_safety_horizon: Enable PL-based safety horizon
+            adam_use_second_moment: Use Adam v_t (second moment) in extrapolation.
+                If False, uses momentum-only proxy (for ablation).
             **kwargs: Additional arguments passed to Trainer
         """
         super().__init__(model=model, args=args, **kwargs)
@@ -799,6 +899,7 @@ class LERNATrainer(Trainer):
         self.ler_tracker = ler_tracker
         self.lerna_threshold = lerna_threshold
         self.lerna_min_step = lerna_min_step
+        self.adam_use_second_moment = adam_use_second_moment
         
         # Safety horizon for bounded skipping
         self.safety_horizon = SafetyHorizon() if use_safety_horizon else None
@@ -863,8 +964,11 @@ class LERNATrainer(Trainer):
                     if self._consecutive_skips >= max_skips:
                         should_skip = False
         
-        # Start energy tracking
+        # Start energy tracking and timing
         self.energy_tracker.step_begin()
+        
+        # Track forward/backward timing for backward fraction measurement
+        step_start = time.perf_counter()
         
         if should_skip:
             # === LERNA SKIPPED STEP ===
@@ -877,14 +981,23 @@ class LERNATrainer(Trainer):
                 self._active_skipping = True
                 self.lerna_plateau_steps.append(step)
             
+            fwd_start = time.perf_counter()
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
+            fwd_time = time.perf_counter() - fwd_start
             
             # Detach loss - no gradient computation
             loss_value = loss.detach()
             
-            # Apply momentum extrapolation directly
-            _apply_momentum_extrapolation(self.optimizer)
+            # Apply momentum extrapolation directly (use Adam second moment)
+            _apply_momentum_extrapolation(
+                self.optimizer,
+                adam_use_second_moment=getattr(self, 'adam_use_second_moment', True),
+            )
+            
+            # Record measured forward time, backward is 0 for skipped
+            if step >= self.lerna_min_step + 10:  # Warm up first
+                self.energy_tracker.record_backward_fraction(fwd_time, 0.0)
             
             # Track energy saved
             energy_saved = self.energy_tracker.estimate_energy_saved(skipped_backward=True)
@@ -900,8 +1013,10 @@ class LERNATrainer(Trainer):
             self._active_skipping = False
             
             # Standard forward + backward
+            fwd_start = time.perf_counter()
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
+            fwd_time = time.perf_counter() - fwd_start
             
             if self.args.n_gpu > 1:
                 loss = loss.mean()
@@ -911,11 +1026,17 @@ class LERNATrainer(Trainer):
                 loss = loss / self.args.gradient_accumulation_steps
             
             # Backward pass
+            bwd_start = time.perf_counter()
             if self.use_apex:
                 with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 self.accelerator.backward(loss)
+            bwd_time = time.perf_counter() - bwd_start
+            
+            # Record measured forward/backward time for backward fraction
+            if step >= self.lerna_min_step + 10:  # Warm up first 10 steps
+                self.energy_tracker.record_backward_fraction(fwd_time, bwd_time)
             
             # Track loss for PL estimation
             self._loss_history.append(loss.item())

@@ -196,7 +196,7 @@ def run_experiment(config: ExperimentConfig) -> Dict[str, Any]:
         # Set up training arguments
         training_args = TrainingArguments(
             output_dir=str(output_dir / "checkpoints"),
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             eval_steps=50,
             save_strategy="steps",
             save_steps=100,
