@@ -1686,16 +1686,22 @@ def run_single_experiment(
             self._last_loss = None
             self._last_loss_fed_to_waste = None  # Track last value fed to WasteQuantifier
             self._step_start_time = None
-            # Scale GSNR interval with dataset size to avoid CPU bottleneck
-            # Small datasets (~800 steps): every ~50 steps
-            # Large datasets (~36K steps): every eval_steps
-            self._gsnr_log_interval = max(eval_steps, 200)
+            # GSNR EMA must fire often enough on short runs to accumulate
+            # stats before training ends. Old `max(eval_steps, 200)` meant a
+            # 189-step run never triggered and GSNR stayed N/A.
+            self._gsnr_log_interval = max(10, min(100, eval_steps))
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
             return control
 
         def on_train_begin(self, args, state, control, **kwargs):
+            # Prime LER snapshot so the first step can compute velocity.
+            try:
+                if self._model is not None:
+                    self.ler_tracker._snapshot_params(self._model)
+            except Exception as e:
+                print(f"  [LER warn] initial snapshot failed: {e}")
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
@@ -1806,7 +1812,15 @@ def run_single_experiment(
                 )
                 if current_lr is not None:
                     self.lr_loss_tracker.update(current_lr, self._last_loss)
-            
+
+                # Per-step LER + velocity. Heavy update() still runs at eval
+                # for entropy refresh from real logits.
+                try:
+                    self.ler_tracker.record_step_update(self._last_loss, self._model)
+                except Exception as e:
+                    if state.global_step % 50 == 0:
+                        print(f"  [LER step warn] {e}")
+
             # Periodic ETA print
             if state.global_step % max(eval_steps, 10) == 0 and state.global_step > 0:
                 eta = self.eta_estimator.get_eta(state.global_step)

@@ -119,11 +119,20 @@ class GSNRTracker:
         # Gradient history
         self.gradient_history = defaultdict(list)
         self.parameter_mapping = self._create_parameter_mapping()
-        
+
         # Statistics
         self.gsnr_history = []
         self.validation_results = {}
-        
+
+        # Per-step scalar gradient-norm history (populated by capture_scalar_norms).
+        self.global_grad_norm_history: List[float] = []
+
+        # EMA-Welford accumulators for incremental GSNR / Fisher Information.
+        self._ema_alpha: float = 0.1
+        self._ema_mean: Dict[str, torch.Tensor] = {}
+        self._ema_m2: Dict[str, torch.Tensor] = {}
+        self._ema_count: int = 0
+
         if validate_implementation:
             self._validate_initialization()
     
@@ -174,7 +183,73 @@ class GSNRTracker:
             # Validate against benchmarks
             if self.validate_implementation:
                 self._validate_against_benchmarks(gsnr)
-    
+
+    def capture_scalar_norms(self, model: torch.nn.Module):
+        """Lightweight per-step capture: global gradient L2 norm only."""
+        total_sq = 0.0
+        any_grad = False
+        for p in model.parameters():
+            if p.requires_grad and p.grad is not None:
+                total_sq += float(p.grad.detach().pow(2).sum().item())
+                any_grad = True
+        if any_grad:
+            self.global_grad_norm_history.append(total_sq ** 0.5)
+
+    def capture_gradients(self, model: torch.nn.Module):
+        """Full EMA-Welford update from current live gradients."""
+        self._ema_count += 1
+        alpha = self._ema_alpha
+        for name, p in model.named_parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad.detach().float().cpu()
+            if name not in self._ema_mean:
+                self._ema_mean[name] = g.clone()
+                self._ema_m2[name] = torch.zeros_like(g)
+                continue
+            prev_mean = self._ema_mean[name]
+            new_mean = (1 - alpha) * prev_mean + alpha * g
+            self._ema_m2[name] = (
+                (1 - alpha) * (self._ema_m2[name] + (g - prev_mean) * (g - new_mean))
+            )
+            self._ema_mean[name] = new_mean
+
+    def compute_gsnr(self) -> Dict[str, float]:
+        """Public GSNR readout from EMA accumulators. Includes '__global__'."""
+        if self._ema_count < 2 or not self._ema_mean:
+            return {}
+        results: Dict[str, float] = {}
+        weighted_sum = 0.0
+        total_numel = 0
+        for name, mean in self._ema_mean.items():
+            var = self._ema_m2[name]
+            gsnr_elem = (mean.pow(2)) / (var + 1e-8)
+            g = float(gsnr_elem.mean().item())
+            results[name] = g
+            n = mean.numel()
+            weighted_sum += g * n
+            total_numel += n
+        if total_numel > 0:
+            results["__global__"] = weighted_sum / total_numel
+        return results
+
+    def compute_fisher_info(self) -> Dict[str, float]:
+        """Diagonal empirical Fisher from EMA mean gradients: E[g]^2."""
+        if not self._ema_mean:
+            return {}
+        results: Dict[str, float] = {}
+        weighted_sum = 0.0
+        total_numel = 0
+        for name, mean in self._ema_mean.items():
+            fi = float(mean.pow(2).mean().item())
+            results[name] = fi
+            n = mean.numel()
+            weighted_sum += fi * n
+            total_numel += n
+        if total_numel > 0:
+            results["__global__"] = weighted_sum / total_numel
+        return results
+
     def _compute_gsnr(self) -> Dict[str, float]:
         """Compute GSNR for each parameter group."""
         gsnr_by_group = {}
@@ -531,7 +606,47 @@ class LERTracker:
                 self.correlation_history.append((ler, accuracy))
                 if len(self.correlation_history) % 50 == 0:
                     self._validate_correlation()
-    
+
+    def record_step_update(
+        self,
+        loss: Optional[float],
+        model: Optional[torch.nn.Module],
+    ) -> Optional[float]:
+        """Lightweight per-step update — no logits required.
+
+        Keeps LER / velocity populated every training step. The heavy
+        update() path still runs at eval to refresh entropy with real logits.
+        Requires _prev_params to be primed (call _snapshot_params in on_train_begin).
+        """
+        if loss is None or model is None:
+            return None
+
+        self.loss_history.append(float(loss))
+
+        param_velocity = self._compute_param_velocity(model)
+        self._snapshot_params(model)
+
+        if self.entropy_history:
+            window_start = max(0, len(self.entropy_history) - self.window_size)
+            avg_entropy = float(np.mean(self.entropy_history[window_start:]))
+        else:
+            avg_entropy = 0.1
+
+        if len(self.loss_history) < 2:
+            return None
+
+        loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
+        if param_velocity is not None and param_velocity > 0:
+            ler = (param_velocity * loss_gain * avg_entropy)
+        else:
+            ler = (loss_gain * avg_entropy)
+
+        if self.task in self.task_calibration:
+            ler *= self.task_calibration[self.task]["entropy_weight"]
+
+        self.ler_history.append(ler)
+        return ler
+
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
         if model is None:
             return None
