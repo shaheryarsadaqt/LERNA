@@ -625,6 +625,8 @@ class LERTracker:
             self.ler_history.append(ler)
 
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
+        # DEBUG: entry trace
+        print(f"[DEBUG velocity ENTRY] prev_params={'set' if self._prev_params else 'None/empty'}, len={len(self._prev_params) if self._prev_params else 0}")
         if model is None:
             return None
         if self._prev_params is None:
