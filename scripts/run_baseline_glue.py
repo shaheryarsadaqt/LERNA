@@ -1696,9 +1696,11 @@ def run_single_experiment(
             return control
 
         def on_train_begin(self, args, state, control, **kwargs):
-            # Prime LER snapshot so the first step can compute velocity.
+            # Force fresh snapshot after LoRA wrapping - previous snapshot
+            # may have captured base model (frozen) before PEFT adapter attached.
             try:
                 if self._model is not None:
+                    self.ler_tracker._prev_params = None  # force fresh snapshot
                     self.ler_tracker._snapshot_params(self._model)
             except Exception as e:
                 print(f"  [LER warn] initial snapshot failed: {e}")
