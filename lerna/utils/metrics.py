@@ -647,6 +647,8 @@ class LERTracker:
             return None
         
         velocity = (total_delta_sq ** 0.5) / (total_params ** 0.5)
+        # DEBUG: confirm velocity computed
+        print(f"[DEBUG velocity] vel={velocity:.6f}, params={total_params}")
         self.velocity_history.append(velocity)
         return velocity
     
