@@ -1695,7 +1695,9 @@ def run_single_experiment(
         def on_init_end(self, args, state, control, **kwargs):
             return control
 
-        def on_train_begin(self, args, state, control, **kwargs):
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            # Capture model for later hooks (on_step_end, etc.)
+            self._model = model
             # Force fresh snapshot after LoRA wrapping - previous snapshot
             # may have captured base model (frozen) before PEFT adapter attached.
             try:

@@ -609,7 +609,7 @@ class LERTracker:
 
     def record_step_update(self, loss: float, model: torch.nn.Module):
         # DEBUG: confirm firing each step
-        print(f"[DEBUG record_step] loss={loss:.4f}, _prev_params={'set' if self._prev_params is not None else 'None'}")
+        print(f"[DEBUG record_step] model={'set' if model is not None else 'None'}, loss={loss:.4f}, _prev_params={'set' if self._prev_params is not None else 'None'}")
         self.loss_history.append(float(loss))
         if self._prev_params is None:
             self._snapshot_params(model)
