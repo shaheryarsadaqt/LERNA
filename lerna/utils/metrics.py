@@ -640,7 +640,7 @@ class LERTracker:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name in self._prev_params:
+            if name in self._prev_params_buffers:
                 delta = param.data.detach() - self._prev_params_buffers[name]
                 total_delta_sq += delta.pow(2).sum().item()
                 total_params += param.numel()
@@ -749,7 +749,7 @@ class LERTracker:
         Computes rho_VG using current gradients and caches the result
         so the next update() call can use it.
         """
-        if self._prev_params is None:
+        if not self._prev_params_buffers:
             self._snapshot_params(model)
             return
         
