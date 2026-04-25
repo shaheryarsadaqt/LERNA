@@ -1885,6 +1885,13 @@ def run_single_experiment(
             if metrics is None:
                 return control
 
+            # FIX: Skip LER update on post-load_best_model_at_end eval (velocity collision bug)
+            # When global_step == max_steps, the model was reloaded to best checkpoint,
+            # causing velocity to appear zero because _prev_params was snapshotted from same weights
+            if state.global_step == state.max_steps:
+                print(f"  [LERNA] Skipping post-reload eval at step {state.global_step}")
+                return control
+
             eval_loss = metrics.get("eval_loss", 0)
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
 
@@ -2266,6 +2273,8 @@ def main():
                         help="Use full dataset without sample cap (server only)")
     parser.add_argument("--num-seeds", type=int, default=None,
                         help="Override number of seeds in full mode (default: 10)")
+    parser.add_argument("--num-epochs", type=int, default=None,
+                        help="Override num_train_epochs for all tasks (default: task-specific)")
     args = parser.parse_args()
 
     profile = detect_device_profile()
@@ -2347,7 +2356,7 @@ def main():
             # Resolve per-task hyperparameters
             task_hp = TASK_HP_OVERRIDES.get(task, {})
             task_lr = task_hp.get("learning_rate", args.lr)
-            task_epochs = task_hp.get("num_epochs", 3)
+            task_epochs = args.num_epochs if args.num_epochs is not None else task_hp.get("num_epochs", 3)
             task_warmup = task_hp.get("warmup_ratio", 0.1)
             task_patience = task_hp.get("early_stopping_patience", 5)
             task_best_metric = task_hp.get("metric_for_best_model", "eval_loss")
