@@ -1809,7 +1809,7 @@ def run_single_experiment(
             # which comes from on_log and fires at HF's log cadence
             # (eval_steps on this config, giving only ~25 feeds per 588
             # steps — far too sparse for plateau detection).
-trainer = self._trainer_holder[0] if self._trainer_holder else None
+            trainer = self._trainer_holder[0] if self._trainer_holder else None
             fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
 
             if fresh_loss is None:
