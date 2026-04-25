@@ -134,14 +134,34 @@ CNN/DailyMail ROUGE in Phase 2), no additional configuration is needed.
 
 **Problem:** The WasteQuantifier reported `waste_ratio=0` (CI: [0, 0]) even when training clearly reached a plateau. This affected runs with both 3 epochs and 10 epochs.
 
+**Conceptual Foundation:**
+
+> **Train-loss plateau ≠ compute waste. Eval-loss plateau = compute waste.**
+
+During over-training, train loss keeps decreasing (model memorizes training data) while eval loss becomes flat or worsens (model stops generalizing). The WasteQuantifier was reading train loss — the wrong signal. Eval loss reflects true generalization and correctly identifies when compute is being wasted.
+
+**Debugging Methodology (Priority Order):**
+1. **Negative control** — well-tuned 3-epoch SST-2 should report waste≈0 (true negative)
+2. **Positive control** — over-trained 10-epoch SST-2 should report waste>0 (true positive)
+3. **Fix bugs** — don't tune thresholds to "make waste appear" (p-hacking)
+
 **Root Cause Analysis:**
 
 | # | Issue | Root Cause | Fix |
 |---|-------|-----------|-----|
+| 0 | **Velocity=0 post-reload** | `load_best_model_at_end=True` reloads checkpoint matching `_prev_params`. Final eval diffs same checkpoint → delta=0 | Skip post-reload eval using `_train_ended` flag set in `on_train_end` |
 | 1 | **Unit mismatch** | `_last_loss` only updated in `on_log` (every 19 steps for 1960-step run). `record_step` fired only ~103 times instead of 1960 times. `_total_steps_seen` max was ~103 but threshold was 100 — gate never opened | Feed `trainer._last_real_loss` directly on every training step, remove dedup |
-| 2 | **Wrong plateau signal** | Train-loss plateau ≠ compute waste. Train loss can keep decreasing while eval loss plateaus | Add eval-loss based plateau detection (`record_eval()`) with `plateau_eval_patience=3`, `plateau_eval_min_improvement=0.005` |
+| 2 | **Wrong plateau signal** | Train loss keeps decreasing (0.03692 at step 1560) while eval loss is flat/worsening (~0.298 vs ~0.18 early). Model is overfitting — train-loss plateau never fires | Add eval-loss based plateau detection (`record_eval()`) with `plateau_eval_patience=3`, `plateau_eval_min_improvement=0.005` |
 | 3 | **Eval loss filtered** | `if eval_loss > 0:` filtered out valid 0.0 eval losses | Changed to `if eval_loss is not None:` |
 | 4 | **Eval blocked** | `record_eval()` called AFTER `_train_ended` check, blocking training evals | Moved `record_eval()` BEFORE `_train_ended` check |
+
+**Evidence of Overfitting (SST-2, 10 epochs):**
+```
+Step 1560 (80% through training):
+  train_loss:  0.03692  (still decreasing)
+  eval_loss:   0.2982   (vs early ~0.18-0.20 — flat/worsening)
+  eval_acc:    0.9381   (matches 3-epoch result — no improvement from extra epochs)
+```
 
 **Key Code Changes:**
 
@@ -159,10 +179,27 @@ def on_step_end(...):
 ```
 
 ```python
+# Skip post-reload eval to avoid velocity collision
+def on_train_end(self, args, state, control, **kwargs):
+    self._train_ended = True
+    return control
+
+def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+    if metrics is None:
+        return control
+    if self._train_ended:
+        return control  # Skip post-reload eval
+    # ... process eval ...
+```
+
+```python
 # Add eval-loss plateau detection
 def record_eval(self, eval_loss, current_step):
     self.eval_loss_history.append((current_step, eval_loss))
-    if eval_loss < self._best_eval_loss * (1 - self.plateau_eval_min_improvement):
+    if self._best_eval_loss is None:
+        self._best_eval_loss = eval_loss
+        self._evals_since_improvement = 0
+    elif eval_loss < self._best_eval_loss * (1 - self.plateau_eval_min_improvement):
         self._best_eval_loss = eval_loss
         self._evals_since_improvement = 0
     else:
@@ -170,7 +207,9 @@ def record_eval(self, eval_loss, current_step):
     
     if (self._plateau_eval_step is None 
         and self._evals_since_improvement >= self.plateau_eval_patience):
-        self._plateau_eval_step = current_step - self.plateau_eval_patience * eval_interval
+        idx = len(self.eval_loss_history) - self.plateau_eval_patience
+        if idx >= 0:
+            self._plateau_eval_step = self.eval_loss_history[idx][0]
 ```
 
 **Results:**
