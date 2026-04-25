@@ -1457,20 +1457,15 @@ class CapturingTrainer(Trainer):
 
         return loss
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Override to capture real logits."""
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-        logits = outputs.logits if hasattr(outputs, "logits") else (
-            outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
-        )
+        logits = outputs.logits if hasattr(outputs, "logits") else None
 
-        # Always capture fresh per-step values
-        try:
-            self._last_real_loss = float(loss.detach().item())
-        except Exception:
-            self._last_real_loss = None
+        self._last_real_loss = float(loss.mean().detach().item()) if loss.numel() > 1 else float(loss.detach().item())
         self._last_real_logits = logits.detach() if logits is not None else None
+        print(f"[DBG compute_loss] set _last_real_loss={self._last_real_loss}")  # ADD THIS
+        print(f"[DBG compute_loss] self id={id(self)}")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -1810,6 +1805,13 @@ def run_single_experiment(
             # Feed from trainer._last_real_loss (captured in CapturingTrainer.compute_loss)
             # Use explicit binding first, fallback to holder
             trainer = self._trainer if self._trainer is not None else (self._trainer_holder[0] if self._trainer_holder else None)
+            
+            # ADD DEBUG: show trainer id and loss value
+            if trainer is not None:
+                print(f"[DBG step_end] trainer id={id(trainer)} "
+                      f"has_attr={hasattr(trainer, '_last_real_loss')} "
+                      f"val={getattr(trainer, '_last_real_loss', 'MISSING')}")
+            
             fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
 
             if fresh_loss is None:
