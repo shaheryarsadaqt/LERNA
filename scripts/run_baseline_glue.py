@@ -1532,6 +1532,8 @@ def run_single_experiment(
     """
     from lerna.utils.metrics import LERTracker
     from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
+    from lerna.utils.checkpoint_compat import safe_load_state_dict
+    from lerna.utils.sanity import assert_layernorm_trained
 
     hw_cfg = get_training_config(profile)
     if max_samples_override is not _UNSET:
@@ -1608,8 +1610,8 @@ def run_single_experiment(
         # Transfer encoder weights from MNLI model (skip classifier head)
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                         if "classifier" not in k and "pooler" not in k}
-        missing, unexpected = model.load_state_dict(encoder_state, strict=False)
-        print(f"  [MNLI Transfer] Loaded encoder weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        missing, unexpected = safe_load_state_dict(model, encoder_state, strict=False)
+        print(f"  [MNLI Transfer] missing={len(missing)}, unexpected={len(unexpected)}")
         del mnli_model
         gc.collect()
         if torch.cuda.is_available():
@@ -2115,6 +2117,7 @@ def run_single_experiment(
         save_strategy="steps",
         save_steps=eval_steps,
         save_total_limit=3,  # Keep 3 checkpoints (warmup/active/plateau phases for TracIn)
+        save_safetensors=True,
         # FIX #9: load_best_model_at_end=True to evaluate best model
         # FIX: Use task-specific metric for model selection (not hardcoded eval_loss)
         # CoLA -> eval_matthews_correlation, RTE/MRPC -> eval_accuracy, etc.
@@ -2173,6 +2176,9 @@ def run_single_experiment(
     
     train_result = trainer.train()
     total_time = time.time() - start_time
+
+    # Verify load_best_model_at_end did not corrupt LayerNorm parameters.
+    assert_layernorm_trained(model)
 
     # FIX #9: Now evaluating the BEST model (loaded automatically)
     print(f"\n  Evaluating best model (loaded via load_best_model_at_end=True)...")

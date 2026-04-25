@@ -108,12 +108,19 @@ class _BaselineStatsMixin:
     def _record_skip(self, state):
         self.steps_skipped += 1
         self.skip_decisions.append(True)
-        
-        # Use real energy measurement if available
+        # Defer energy measurement to on_step_end so we sample power
+        # AFTER forward pass (during which GPU is fully loaded).
+        self._pending_skip_record = True
+
+    def _flush_pending_energy(self):
+        """Call from on_step_end to actually record energy for a deferred skip."""
+        if not getattr(self, "_pending_skip_record", False):
+            return
+        self._pending_skip_record = False
         if self._use_real_energy and self._energy_tracker is not None:
             try:
                 current_power_w = self._energy_tracker.get_current_power_w()
-                backward_duration_s = 0.060  # 60ms for backward pass
+                backward_duration_s = 0.060
                 energy_kwh = (current_power_w * backward_duration_s) / 3600 / 1000
                 self._measured_energy_per_skip.append(energy_kwh)
                 self.total_energy_saved += energy_kwh
@@ -154,12 +161,23 @@ class _BaselineStatsMixin:
         wandb.log(data)
 
     def _on_evaluate_stats(self, metrics, state):
-        if metrics and "eval_accuracy" in metrics:
-            self.last_accuracy = metrics["eval_accuracy"]
-            if self.active_skipping:
-                self.accuracy_during_skip.append(self.last_accuracy)
-            else:
-                self.accuracy_during_normal.append(self.last_accuracy)
+        """Track primary metric, regardless of task. Handles eval_accuracy
+        (most tasks), eval_matthews_correlation (CoLA), eval_pearson (STS-B)."""
+        if not metrics:
+            return
+        metric_value = (
+            metrics.get("eval_accuracy")
+            or metrics.get("eval_matthews_correlation")
+            or metrics.get("eval_pearson")
+            or metrics.get("eval_pearsonr")
+        )
+        if metric_value is None:
+            return
+        self.last_accuracy = metric_value
+        if self.active_skipping:
+            self.accuracy_during_skip.append(metric_value)
+        else:
+            self.accuracy_during_normal.append(metric_value)
 
     def get_activation_summary(self) -> Dict[str, Any]:
         """Return a summary of whether this baseline actually activated.
@@ -412,6 +430,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
+        self._flush_pending_energy()
         if state.global_step < self.min_step:
             return control
         if (state.global_step < self.min_step + self.calibration_steps
@@ -467,7 +486,53 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
 
 
 # ===================================================================
-# Baseline 2: Random Step Skipping (TRUE backward-pass skipping)
+# Baseline 2: Random Step Skipping
+# ===================================================================
+
+class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
+    """Skip backward pass randomly at a target skip rate.
+
+    Tests whether the *selection* of which steps to skip matters,
+    or whether just reducing compute by any fraction is sufficient.
+    If random skipping matches LERNA, then LER adds no value.
+
+    FIX (2026-04-15): Now implements TRUE backward-pass skipping by
+    setting trainer.should_skip_backward = True in on_step_begin,
+    BEFORE the backward pass runs. Previously only recorded skips
+    in on_step_end after backward had already executed.
+    """
+
+    def __init__(
+        self,
+        target_skip_rate: float = 0.22,
+        min_step: int = 100,
+        seed: int = 42,
+        wandb_enabled: bool = True,
+        energy_per_skip: float = None,
+    ):
+        super().__init__()
+        self._init_stats("random_skip", wandb_enabled, energy_per_skip)
+        self.target_skip_rate = target_skip_rate
+        self.min_step = min_step
+        self._rng = random.Random(seed)
+        self._optimizer = None
+        self._model = None
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._flush_pending_energy()
+        return control
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        self._on_evaluate_stats(metrics, state)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._on_train_end_stats(args, state)
+        return control
+
+
+# ===================================================================
+# Baseline 3: Weight Freezing During Skip Phases (TRUE backward skip)
 # ===================================================================
 
 class RandomStepSkippingCallback(TrainerCallback, _BaselineStatsMixin):
@@ -568,7 +633,7 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
     def __init__(
         self,
         ler_tracker,
-        threshold: float = 1e-5,
+        threshold: float = None,   # falls back to ler_tracker.task_calibration
         min_step: int = 100,
         wandb_enabled: bool = True,
         energy_per_skip: float = None,
@@ -603,7 +668,12 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
             # LER not yet computed (not enough data points)
             return control
 
-        if current_ler < self.threshold:
+        # Use task-calibrated threshold (consistent with phase detector).
+        task_threshold = self.ler_tracker.task_calibration.get(
+            self.ler_tracker.task, {}
+        ).get("ler_threshold", self.threshold)
+
+        if current_ler < task_threshold:
             # Signal to skip backward pass AND freeze weights
             if trainer is not None:
                 trainer.should_skip_backward = True
@@ -632,6 +702,10 @@ class WeightFreezingCallback(TrainerCallback, _BaselineStatsMixin):
         print(f"  [weight_freeze] LER tracker status: n_steps={diag.get('n_steps', 0)}, "
               f"current_ler={diag.get('ler', 'None')}, phase={diag.get('phase', 'unknown')}")
         self._on_train_end_stats(args, state)
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._flush_pending_energy()
         return control
 
 
@@ -725,12 +799,12 @@ class CosineAnnealingWarmRestartsCallback(TrainerCallback, _BaselineStatsMixin):
         self._lr_overrides_applied = 0
 
     def _compute_lr(self, step: int) -> float:
-        """Compute LR using SGDR (cosine annealing with warm restarts)."""
+        """SGDR: cosine annealing with warm restarts."""
         T_cur = step
         T_i = self.T_0
         while T_cur >= T_i:
             T_cur -= T_i
-            T_i = int(T_i * self.T_mult)
+            T_i = max(int(T_i * self.T_mult), T_i + 1)  # guarantee growth even if T_mult==1
         lr = self.eta_min + 0.5 * (self.base_lr - self.eta_min) * (
             1 + math.cos(math.pi * T_cur / T_i)
         )

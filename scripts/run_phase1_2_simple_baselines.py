@@ -124,6 +124,8 @@ from lerna.callbacks.simple_baselines import (
     CosineAnnealingWarmRestartsCallback,
 )
 from lerna.callbacks.lerna_baseline import LERNABaselineCallback
+from lerna.utils.checkpoint_compat import safe_load_state_dict
+from lerna.utils.sanity import assert_layernorm_trained
 
 # Import bootstrap CI helper and stats
 from scripts.phase1_2_bootstrap_ci import bootstrap_ci
@@ -174,6 +176,44 @@ class LERFeedCallback(TrainerCallback):
         if model is not None:
             self.ler_tracker.capture_step_gradients(model)
         return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """Sample LER every 20 training steps (not just at eval time).
+
+        Without this, LER is updated only at eval boundaries (~20 samples
+        per run), which is too coarse for hysteresis-based phase detection
+        and for paper plots.
+        """
+        if state.global_step % 20 != 0:
+            return control
+
+        trainer = self._trainer_ref
+        if trainer is None:
+            return control
+
+        logits = getattr(trainer, '_last_real_logits', None)
+        if logits is None:
+            return control
+
+        # Get most recent training loss from trainer state.log_history.
+        last_loss = None
+        for entry in reversed(trainer.state.log_history):
+            if 'loss' in entry:
+                last_loss = entry['loss']
+                break
+        if last_loss is None:
+            return control
+
+        model = kwargs.get("model", self._model)
+        self.ler_tracker.update(
+            loss=last_loss,
+            logits=logits,
+            accuracy=None,
+            model=model,
+            gradients=None,
+        )
+        self._update_count += 1
+        return control
     
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         """Feed evaluation metrics into LERTracker."""
@@ -194,10 +234,12 @@ class LERFeedCallback(TrainerCallback):
                     metrics.get("eval_pearson",
                     metrics.get("eval_pearsonr", None))))
         
-        # Get logits from the trainer's last evaluation
+        # Get logits captured by Phase12Trainer.compute_loss.
         logits = getattr(trainer, '_last_real_logits', None)
         if logits is None:
-            logits = torch.randn(32, 2)
+            print(f"  [LERFeed] Skipping update at step {state.global_step}: "
+                  f"no logits captured (would have used random fallback).")
+            return control
         
         # Get model for velocity computation
         model = kwargs.get("model", self._model)
@@ -474,7 +516,10 @@ class Phase12Trainer(Trainer):
         self._ler_tracker = ler_tracker
         self._last_real_logits = None
         self._pre_clip_grad_norm: float = 0.0
+        self.should_skip_backward: bool = False
         self._skip_count: int = 0
+        self._freeze_weights_no_momentum: bool = False  # reset by callbacks each step
+        self._microbatch_count: int = 0                  # for grad accumulation gating
         self._param_snapshot: Optional[dict] = None
         self._should_snapshot: bool = False
         self._grad_norm_callback = _GradientNormCaptureCallback(self)
@@ -546,8 +591,41 @@ class Phase12Trainer(Trainer):
         self._skip_count += 1
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Standard training step with pre-clip gradient norm capture."""
+        """Override to implement true backward-pass skipping.
+
+        FIX: skip path now (a) normalizes loss by gradient_accumulation_steps
+        to match the parent class, and (b) only applies momentum
+        extrapolation once per accumulation window (i.e. on real
+        optimizer-step boundaries), not once per microbatch.
+        """
         self._pre_clip_grad_norm = None
+
+        if self.should_skip_backward:
+            model.train()
+            inputs = self._prepare_inputs(inputs)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+
+            # Match HF Trainer's loss normalization for grad accumulation.
+            accum = max(1, self.args.gradient_accumulation_steps)
+            if accum > 1:
+                loss = loss / accum
+
+            # Only extrapolate on the LAST microbatch of the accumulation
+            # window — that's when a real optimizer step would have run.
+            self._microbatch_count += 1
+            on_optimizer_boundary = (self._microbatch_count % accum == 0)
+
+            if on_optimizer_boundary:
+                if not self._freeze_weights_no_momentum:
+                    self._apply_momentum_extrapolation()
+                self._skip_count += 1
+
+            return loss.detach()
+
+        # Normal training path
+        self._microbatch_count += 1
         loss = super().training_step(model, inputs, num_items_in_batch)
         self._pre_clip_grad_norm = self._compute_pre_clip_grad_norm()
         return loss
@@ -636,9 +714,11 @@ def create_baseline_callback(
     elif baseline_name == "weight_freeze":
         if ler_tracker is None:
             raise ValueError("weight_freeze baseline requires ler_tracker")
+        # Don't pass threshold — WeightFreezingCallback now reads it from
+        # ler_tracker.task_calibration so it stays in sync with the
+        # phase detector.
         return WeightFreezingCallback(
             ler_tracker=ler_tracker,
-            threshold=1e-5,
             min_step=100,
             wandb_enabled=wandb_enabled,
         ), None
@@ -752,7 +832,7 @@ def run_single_baseline_experiment(
         )
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                          if "classifier" not in k and "pooler" not in k}
-        model.load_state_dict(encoder_state, strict=False)
+        safe_load_state_dict(model, encoder_state, strict=False)
         del mnli_model
         gc.collect()
         if torch.cuda.is_available():
@@ -838,6 +918,7 @@ def run_single_baseline_experiment(
         save_strategy="steps",
         save_steps=eval_steps,
         save_total_limit=2,
+        save_safetensors=True,
         load_best_model_at_end=True,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=greater_is_better,
@@ -876,9 +957,6 @@ def run_single_baseline_experiment(
     ler_feed_callback._trainer_ref = trainer
     ler_feed_callback._model = model
 
-    grad_capture_callback = _GradientNormCaptureCallback(trainer)
-    trainer.add_callback(grad_capture_callback)
-
     start_time = time.time()
     print(f"  Starting training: ~{total_steps} steps, eval every {eval_steps} steps")
     print(f"  Baseline: {BASELINE_REGISTRY[baseline_name]['description']}")
@@ -888,6 +966,9 @@ def run_single_baseline_experiment(
 
     train_result = trainer.train()
     train_time = time.time() - start_time
+
+    # Verify load_best_model_at_end did not corrupt LayerNorm parameters.
+    assert_layernorm_trained(model)
 
     print(f"  Evaluating best model...")
     eval_result = trainer.evaluate()

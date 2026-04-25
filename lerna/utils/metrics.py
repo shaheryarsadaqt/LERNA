@@ -410,7 +410,7 @@ class LERTracker:
         window_size: int = 50,
         validate_correlation: bool = True,
         task_calibration: Optional[Dict] = None,
-        min_phase_duration: int = 20,
+        min_phase_duration: int = 3,
     ):
         self.task = task
         self.window_size = window_size
@@ -429,7 +429,6 @@ class LERTracker:
         
         # FIX #7: streaming layer-wise rho_VG
         self.snapshot_in_fp16: bool = False  # set True for models > ~10B params
-        self._prev_params_buffers: Dict[str, torch.Tensor] = {}
         self._prev_params_norms: bool = False
         self.rho_vg_per_layer_history: List[Dict[str, float]] = []
         
@@ -451,16 +450,18 @@ class LERTracker:
             self.min_phase_duration = task_cal["min_phase_duration"]
     
     def _get_default_calibration(self) -> Dict:
-        """Get default calibration for different tasks."""
+        """Default per-task calibration. Thresholds scaled for L2-norm velocity
+        (factor of ~1e4 larger than the previous per-element RMS).
+        Tune per task using one validation seed; final values go in the paper."""
         return {
-            "sst2": {"ler_threshold": 0.01, "entropy_weight": 1.0},
-            "qnli": {"ler_threshold": 0.008, "entropy_weight": 1.1},
-            "qqp": {"ler_threshold": 0.012, "entropy_weight": 0.9},
-            "mnli": {"ler_threshold": 0.009, "entropy_weight": 1.2},
-            "rte": {"ler_threshold": 0.015, "entropy_weight": 1.3},
-            "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4},
-            "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0},
-            "stsb": {"ler_threshold": 5e-5, "entropy_weight": 1.5, "min_phase_duration": 3},
+            "sst2": {"ler_threshold": 1e2,   "entropy_weight": 1.0},
+            "qnli": {"ler_threshold": 8e1,   "entropy_weight": 1.1},
+            "qqp":  {"ler_threshold": 1.2e2, "entropy_weight": 0.9},
+            "mnli": {"ler_threshold": 9e1,   "entropy_weight": 1.2},
+            "rte":  {"ler_threshold": 1.5e2, "entropy_weight": 1.3},
+            "mrpc": {"ler_threshold": 1.4e2, "entropy_weight": 1.4},
+            "cola": {"ler_threshold": 1.3e2, "entropy_weight": 1.0},
+            "stsb": {"ler_threshold": 0.5,   "entropy_weight": 1.5, "min_phase_duration": 3},
         }
     
     def update(
@@ -609,10 +610,8 @@ class LERTracker:
                     self._validate_correlation()
 
     def record_step_update(self, loss: float, model: torch.nn.Module):
-        # DEBUG: confirm firing each step
-        print(f"[DEBUG record_step] model={'set' if model is not None else 'None'}, loss={loss:.4f}, _prev_params_buffers={'set' if self._prev_params_buffers else 'None/empty'}")
         self.loss_history.append(float(loss))
-        if not self._prev_params_buffers:  # empty dict = needs priming
+        if not self._prev_params:  # None = needs priming
             self._snapshot_params(model)
             return  # first call: prime only, no velocity yet
         # compute BEFORE re-snapshotting
@@ -626,53 +625,26 @@ class LERTracker:
             self.ler_history.append(ler)
 
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
-        # DEBUG: entry trace
-        print(f"[DEBUG velocity ENTRY] _prev_params_buffers={'set' if self._prev_params_buffers else 'None/empty'}, len={len(self._prev_params_buffers) if self._prev_params_buffers else 0}")
-        if model is None:
+        """L2 norm of parameter update vector. Uses fp64 to avoid underflow
+        when summing 1e8 small squared values."""
+        if model is None or self._prev_params is None:
             return None
-        if not self._prev_params_buffers:  # empty dict = needs priming
-            # Seed snapshot on first call so velocity can be computed on next call
-            self._snapshot_params(model)
-            return None
-        
+
         total_delta_sq = 0.0
         total_params = 0
-        sample_deltas = []
-        
-        # DEBUG: Check for param name mismatch
-        model_params = {name: p for name, p in model.named_parameters() if p.requires_grad}
-        buffer_names = set(self._prev_params_buffers.keys())
-        model_names = set(model_params.keys())
-        missing_in_model = buffer_names - model_names
-        extra_in_model = model_names - buffer_names
-        if missing_in_model:
-            print(f"[DEBUG velocity] MISSING in model: {list(missing_in_model)[:5]}")
-        if extra_in_model:
-            print(f"[DEBUG velocity] EXTRA in model: {list(extra_in_model)[:5]}")
-        
+
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name in self._prev_params_buffers:
-                param_current = param.data.detach().clone()
-                param_prev = self._prev_params_buffers[name].detach()
-                delta = param_current - param_prev
-                delta_sq = delta.pow(2).sum().item()
-                total_delta_sq += delta_sq
+            if name in self._prev_params:
+                delta = param.data.detach().double() - self._prev_params[name].double()
+                total_delta_sq += delta.pow(2).sum().item()
                 total_params += param.numel()
-                # DEBUG: print first non-zero delta
-                if delta_sq > 0 and len(sample_deltas) < 3:
-                    sample_deltas.append((name, delta_sq ** 0.5, param.numel()))
-        
-        if sample_deltas:
-            print(f"[DEBUG velocity] sample_deltas={sample_deltas}")
-        
+
         if total_params == 0:
             return None
-        
-        velocity = (total_delta_sq ** 0.5) / (total_params ** 0.5)
-        # DEBUG: confirm velocity computed
-        print(f"[DEBUG velocity] vel={velocity:.6f}, params={total_params}")
+
+        velocity = total_delta_sq ** 0.5
         self.velocity_history.append(velocity)
         return velocity
     
@@ -702,7 +674,7 @@ class LERTracker:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            prev_norm_info = self._prev_params_buffers.get(name)
+            prev_norm_info = self._prev_params.get(name)
             if prev_norm_info is None:
                 continue
             # velocity for this layer: θ_t − θ_{t−1}
@@ -737,33 +709,11 @@ class LERTracker:
         return dot / ((vel_sq * grad_sq) ** 0.5)
     
     def _snapshot_params(self, model: torch.nn.Module):
-        """Store one tensor per param (same tensors that existed anyway),
-        not a full deep-clone copy of the model. For memory-bounded training
-        of large models, use ``snapshot_in_fp16=True``.
-        """
-        # DEBUG: diagnose snapshot
-        total = 0
-        trainable = 0
-        sample_names = []
-        for name, param in model.named_parameters():
-            total += 1
-            if param.requires_grad:
-                trainable += 1
-                if len(sample_names) < 3:
-                    sample_names.append(name)
-        print(f"[DEBUG snapshot] total={total}, trainable={trainable}, samples={sample_names}")
-        
-        buffers = {}
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            # Keep in the parameter's own dtype; .clone() still allocates but
-            # avoids the earlier .detach().clone() semantics duplication.
-            buffers[name] = p.data.detach().clone() if not self.snapshot_in_fp16 \
-                            else p.data.detach().to(torch.float16).clone()
-        self._prev_params_buffers = buffers
-        self._prev_params_norms = True
-        print(f"[DEBUG snapshot] _prev_params size={len(self._prev_params_buffers)}")
+        self._prev_params = {
+            name: param.data.detach().double().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
     
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).
@@ -771,7 +721,7 @@ class LERTracker:
         Computes rho_VG using current gradients and caches the result
         so the next update() call can use it.
         """
-        if not self._prev_params_buffers:
+        if not self._prev_params:
             self._snapshot_params(model)
             return
         
