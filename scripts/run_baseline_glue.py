@@ -1734,11 +1734,7 @@ def run_single_experiment(
             self._model = model_ref
             self._trainer_holder = trainer_ref_holder  # mutable list to hold trainer ref
             self.step_count = 0
-            self._last_loss = None
-            self._last_loss_fed_to_waste = None  # Track last value fed to WasteQuantifier
-            self._last_waste_fed_step = -10**9  # Enforces stride between waste feeds
             self._step_start_time = None
-            self.waste_feed_stride = waste_feed_stride  # Store stride for on_step_end
             # GSNR EMA must fire often enough on short runs to accumulate
             # stats before training ends. Old `max(eval_steps, 200)` meant a
             # 189-step run never triggered and GSNR stayed N/A.
@@ -1813,58 +1809,43 @@ def run_single_experiment(
             # which comes from on_log and fires at HF's log cadence
             # (eval_steps on this config, giving only ~25 feeds per 588
             # steps — far too sparse for plateau detection).
-            trainer = self._trainer_holder[0] if self._trainer_holder else None
+trainer = self._trainer_holder[0] if self._trainer_holder else None
             fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
-            # DEBUG: track loss capture
-            if state.global_step % 50 == 0:
-                print(f"[DEBUG loss] step={state.global_step}, trainer={trainer is not None}, _last_real_loss={fresh_loss}, backup={self._last_loss}")
+
             if fresh_loss is None:
-                fresh_loss = self._last_loss
-            if fresh_loss is None:
-                return
+                return  # Can't proceed without fresh loss
 
             step_time = time.time() - self._step_start_time if self._step_start_time else None
 
             if self._model is None and model is not None:
                 self._model = model
 
-            # Keep a mirror of _last_loss so on_evaluate still has a
-            # reasonable training-loss reference even between HF logs.
-            self._last_loss = fresh_loss
-
             global_grad_norm = None
             if self.gsnr_tracker.global_grad_norm_history:
                 global_grad_norm = self.gsnr_tracker.global_grad_norm_history[-1]
 
-            step_gap = state.global_step - getattr(self, "_last_waste_fed_step", -10**9)
-            # DEBUG: track waste feeding
-            if state.global_step % 50 == 0:
-                print(f"[DEBUG waste] step={state.global_step}, gap={step_gap}, stride={self.waste_feed_stride}, last_fed={getattr(self, '_last_waste_fed_step', 'N/A')}")
-            if step_gap >= self.waste_feed_stride:
-                try:
-                    self.waste_quantifier.record_step(
-                        loss=fresh_loss,
-                        grad_norm=global_grad_norm,
-                        step_time=step_time,
-                    )
-                except Exception as e:
-                    print(f"[waste warn] {e}")
-                self._last_waste_fed_step = state.global_step
-                self._last_loss_fed_to_waste = fresh_loss
+            # Per-step unconditional feeding to ALL trackers
+            try:
+                self.waste_quantifier.record_step(
+                    loss=fresh_loss,
+                    grad_norm=global_grad_norm,
+                    step_time=step_time,
+                )
+            except Exception as e:
+                print(f"[waste warn] {e}")
 
-                # Phase detector and LR-loss tracker use every step.
-                try:
-                    self.phase_detector.update(
-                        step=state.global_step,
-                        loss=fresh_loss,
-                        grad_norm=global_grad_norm,
-                        lr=kwargs.get("lr"),
-                    )
-                except Exception as e:
-                    print(f"[phase warn] {e}")
-                current_lr = kwargs.get("lr")
-                if current_lr is not None:
-                    self.lr_loss_tracker.update(current_lr, fresh_loss)
+            try:
+                self.phase_detector.update(
+                    step=state.global_step,
+                    loss=fresh_loss,
+                    grad_norm=global_grad_norm,
+                    lr=kwargs.get("lr"),
+                )
+            except Exception as e:
+                print(f"[phase warn] {e}")
+            current_lr = kwargs.get("lr")
+            if current_lr is not None:
+                self.lr_loss_tracker.update(current_lr, fresh_loss)
 
             # Per-step LER + velocity snapshot (every step, not just stride)
             if self._model is not None:
@@ -1883,8 +1864,6 @@ def run_single_experiment(
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs is not None:
-                self._last_loss = logs.get("loss", self._last_loss)
-                
                 # Log gradient norms from trainer logs
                 if use_wandb:
                     try:
@@ -1936,7 +1915,7 @@ def run_single_experiment(
                     num_labels = GLUE_TASK_CONFIG[task_name]["num_labels"]
                     real_logits = torch.randn(8, num_labels)
 
-            loss_for_ler = self._last_loss if self._last_loss is not None else eval_loss
+            loss_for_ler = eval_loss  # Use eval_loss directly in on_evaluate
 
             try:
                 self.ler_tracker.update(
