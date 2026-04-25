@@ -21,6 +21,7 @@ from collections import defaultdict
 import torch.nn.functional as F
 import json
 import os
+import math
 
 
 # =============================================================================
@@ -636,14 +637,35 @@ class LERTracker:
         
         total_delta_sq = 0.0
         total_params = 0
+        sample_deltas = []
+        
+        # DEBUG: Check for param name mismatch
+        model_params = {name: p for name, p in model.named_parameters() if p.requires_grad}
+        buffer_names = set(self._prev_params_buffers.keys())
+        model_names = set(model_params.keys())
+        missing_in_model = buffer_names - model_names
+        extra_in_model = model_names - buffer_names
+        if missing_in_model:
+            print(f"[DEBUG velocity] MISSING in model: {list(missing_in_model)[:5]}")
+        if extra_in_model:
+            print(f"[DEBUG velocity] EXTRA in model: {list(extra_in_model)[:5]}")
         
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             if name in self._prev_params_buffers:
-                delta = param.data.detach() - self._prev_params_buffers[name]
-                total_delta_sq += delta.pow(2).sum().item()
+                param_current = param.data.detach().clone()
+                param_prev = self._prev_params_buffers[name].detach()
+                delta = param_current - param_prev
+                delta_sq = delta.pow(2).sum().item()
+                total_delta_sq += delta_sq
                 total_params += param.numel()
+                # DEBUG: print first non-zero delta
+                if delta_sq > 0 and len(sample_deltas) < 3:
+                    sample_deltas.append((name, delta_sq ** 0.5, param.numel()))
+        
+        if sample_deltas:
+            print(f"[DEBUG velocity] sample_deltas={sample_deltas}")
         
         if total_params == 0:
             return None

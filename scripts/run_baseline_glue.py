@@ -481,33 +481,44 @@ class WasteQuantifier:
         if len(self.improving_steps) > _MAX_HIST * 2:
             self.improving_steps = self.improving_steps[-_MAX_HIST:]
 
-        # --- EMA-based plateau detection (the correct metric) ---
-        if self._ema_loss is None:
-            self._ema_loss = loss
-            self._best_ema_loss = loss
-        else:
-            self._ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+        # --- Window-slope plateau detection ---------------------------------
+        # Previous EMA-vs-best logic fails when the EMA is a slow lag filter
+        # chasing a monotonically-decaying loss: best_ema_loss resets on every
+        # feed because EMA is still catching up, so the counter never
+        # accumulates. Instead, compare the mean of the recent window to the
+        # mean of the prior window. If the recent window has not meaningfully
+        # improved over the prior one for `plateau_patience` feeds, declare
+        # plateau. This is the standard ReduceLROnPlateau approach and is
+        # robust to EMA dynamics and per-feed noise.
+        self._ema_loss = (
+            loss if self._ema_loss is None
+            else self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+        )
+        if self._best_ema_loss is None or self._ema_loss < self._best_ema_loss:
+            self._best_ema_loss = self._ema_loss
 
-            # Check if EMA loss improved meaningfully
-            if self._best_ema_loss is not None and self._best_ema_loss > 0:
-                relative_improvement = (self._best_ema_loss - self._ema_loss) / self._best_ema_loss
-                if relative_improvement > self.plateau_min_improvement:
-                    self._best_ema_loss = self._ema_loss
-                    self._steps_since_ema_improvement = 0
-                else:
-                    self._steps_since_ema_improvement += 1
+        window = max(5, int(self.plateau_patience))
+        recent = self.loss_history[-window:]
+        prior = self.loss_history[-2 * window:-window]
+        if len(prior) >= window and len(recent) >= window:
+            recent_mean = sum(recent) / len(recent)
+            prior_mean = sum(prior) / len(prior)
+            if prior_mean > 0:
+                rel_drop = (prior_mean - recent_mean) / prior_mean
             else:
-                if self._ema_loss < self._best_ema_loss:
-                    self._best_ema_loss = self._ema_loss
-                    self._steps_since_ema_improvement = 0
-                else:
-                    self._steps_since_ema_improvement += 1
+                rel_drop = 0.0
+            if rel_drop > self.plateau_min_improvement:
+                self._steps_since_ema_improvement = 0
+            else:
+                self._steps_since_ema_improvement += 1
+        else:
+            # Not enough history yet for a window comparison.
+            self._steps_since_ema_improvement = 0
 
-            # Detect plateau onset (only set once, after warmup period)
-            if (self._plateau_step is None
-                    and self._steps_since_ema_improvement >= self.plateau_patience
-                    and self._total_steps_seen >= self.min_steps_before_plateau):
-                self._plateau_step = self._total_steps_seen - self.plateau_patience
+        if (self._plateau_step is None
+                and self._steps_since_ema_improvement >= self.plateau_patience
+                and self._total_steps_seen >= self.min_steps_before_plateau):
+            self._plateau_step = self._total_steps_seen - self.plateau_patience
 
         # --- Legacy per-step comparison (kept as secondary metric) ---
         if len(self.loss_history) >= 2:
@@ -592,6 +603,18 @@ class WasteQuantifier:
             "wasted_time_s": float(wasted_time),
             "total_time_s": float(total_time),
             "waste_reasons": dict(self.waste_reasons),
+            # Debug state (so we can see *why* plateau did/didn't trigger):
+            "ema_loss_final": float(self._ema_loss) if self._ema_loss is not None else None,
+            "best_ema_loss": float(self._best_ema_loss) if self._best_ema_loss is not None else None,
+            "steps_since_ema_improvement": int(self._steps_since_ema_improvement),
+            "plateau_patience": int(self.plateau_patience),
+            "plateau_min_improvement": float(self.plateau_min_improvement),
+            "min_steps_before_plateau": int(self.min_steps_before_plateau),
+            # Diagnostic: how many times was record_step actually called?
+            "total_steps_seen": int(self._total_steps_seen),
+            "loss_history_len": len(self.loss_history),
+            "loss_history_first5": [float(x) for x in self.loss_history[:5] if x is not None],
+            "loss_history_last5": [float(x) for x in self.loss_history[-5:] if x is not None],
         }
 
 
@@ -1406,31 +1429,48 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
 # Custom Trainer to capture real logits (FIX #4)
 # ═══════════════════════════════════════════════════════════════════════
 
-class LERNATrainer(Trainer):
-    """Extended Trainer that captures real logits for LER tracking."""
+class CapturingTrainer(Trainer):
+    """Extended Trainer that captures real logits and gradients before zero_grad."""
 
-    def __init__(self, *args, ler_tracker=None, **kwargs):
+    def __init__(self, *args, ler_tracker=None, gsnr_tracker=None,
+                 gsnr_interval=50, **kwargs):
         super().__init__(*args, **kwargs)
         self._ler_tracker = ler_tracker
-        self._last_real_logits = None
+        self._gsnr_tracker = gsnr_tracker
+        self._gsnr_interval = gsnr_interval
         self._last_real_loss = None
+        self._last_real_logits = None
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # Runs forward + backward; gradients are live after this returns
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        # Capture BEFORE HF's zero_grad (which happens after this method)
+        step = self.state.global_step
+        if self._gsnr_tracker is not None:
+            self._gsnr_tracker.capture_scalar_norms(model)
+            if step > 0 and step % self._gsnr_interval == 0:
+                self._gsnr_tracker.capture_gradients(model)
+
+        if self._ler_tracker is not None:
+            self._ler_tracker.capture_step_gradients(model)  # caches rho_VG
+
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Override to capture real logits."""
         outputs = model(**inputs)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        logits = outputs.logits if hasattr(outputs, "logits") else (
+            outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
+        )
 
-        # Capture real logits for LER tracker
-        if hasattr(outputs, "logits"):
-            self._last_real_logits = outputs.logits.detach()
-        elif isinstance(outputs, dict) and "logits" in outputs:
-            self._last_real_logits = outputs["logits"].detach()
-
-        # NEW: capture loss paired with logits (same forward pass) for per-step LER.
+        # Always capture fresh per-step values
         try:
             self._last_real_loss = float(loss.detach().item())
         except Exception:
             self._last_real_loss = None
+        self._last_real_logits = logits.detach() if logits is not None else None
 
         return (loss, outputs) if return_outputs else loss
 
@@ -1583,6 +1623,9 @@ def run_single_experiment(
     total_steps = steps_per_epoch * num_epochs
     eval_steps = max(total_steps // 20, 10)
 
+    # Compute GSNR capture interval — fire at least ~10 times over the run
+    gsnr_log_interval = max(1, min(eval_steps, total_steps // 10))
+
     # ── Initialize ALL trackers ───────────────────────────────────────
     ler_tracker = LERTracker(task=task_name, window_size=5)
     power_callback = PowerTelemetryCallback(
@@ -1616,8 +1659,11 @@ def run_single_experiment(
     # For regression tasks, use small fixed parameters since we know the
     # data resolution is extremely low. For classification, scale to the
     # estimated unique observations.
-    logging_steps = max(eval_steps // 5, 1)  # matches TrainingArguments.logging_steps
-    expected_unique_obs = max(1, total_steps // logging_steps)
+    logging_steps = max(eval_steps // 2, 10)
+    # WasteQuantifier is fed at this stride (see FullDiagnosticsCallback.on_step_end).
+    # Floor at 5 so per-step HF logging (logging_steps==1) doesn't over-feed the EMA.
+    waste_feed_stride = max(logging_steps, 5)
+    expected_unique_obs = max(1, total_steps // waste_feed_stride)
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
     if is_regression:
         # Regression tasks produce very few unique loss values (~20-30)
@@ -1648,7 +1694,12 @@ def run_single_experiment(
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
-    waste_min_improvement = 0.04 if is_regression else 0.0005
+    # With the window-slope plateau detector, threshold is a per-step
+    # relative drop between adjacent feed windows. 0.005 (0.5%) = "recent
+    # window must have dropped at least 0.5% vs prior window to count as
+    # still-improving". Regression still uses 0.04 because MSE loss has
+    # larger inter-window variance on STS-B's ~26 obs.
+    waste_min_improvement = 0.04 if is_regression else 0.005
     # Also use a smoother EMA for regression (alpha=0.05 vs default 0.1)
     # Higher alpha than before (was 0.02) because we now feed fewer, more
     # meaningful data points. With only ~26 points, alpha=0.02 makes the
@@ -1660,10 +1711,10 @@ def run_single_experiment(
     # step as the EMA catches up, preventing plateau detection entirely.
     waste_ema_alpha = 0.5 if is_regression else 0.05
     waste_quantifier = WasteQuantifier(
-        ema_alpha=waste_ema_alpha,
-        plateau_patience=waste_patience,
-        plateau_min_improvement=waste_min_improvement,
-        min_steps_before_plateau=waste_min_steps,
+        ema_alpha=0.1,
+        plateau_patience=max(30, total_steps // 10),
+        plateau_min_improvement=0.001,
+        min_steps_before_plateau=max(20, total_steps // 20),
     )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
@@ -1673,7 +1724,7 @@ def run_single_experiment(
     class FullDiagnosticsCallback:
         """Comprehensive diagnostics: LER + GSNR + waste + phase + ETA."""
 
-        def __init__(self, ler_trk, gsnr_trk, waste_q, phase_det, lr_loss_trk, eta_est, model_ref, trainer_ref_holder):
+        def __init__(self, ler_trk, gsnr_trk, waste_q, phase_det, lr_loss_trk, eta_est, model_ref, trainer_ref_holder, gsnr_interval, waste_feed_stride):
             self.ler_tracker = ler_trk
             self.gsnr_tracker = gsnr_trk
             self.waste_quantifier = waste_q
@@ -1685,11 +1736,13 @@ def run_single_experiment(
             self.step_count = 0
             self._last_loss = None
             self._last_loss_fed_to_waste = None  # Track last value fed to WasteQuantifier
+            self._last_waste_fed_step = -10**9  # Enforces stride between waste feeds
             self._step_start_time = None
+            self.waste_feed_stride = waste_feed_stride  # Store stride for on_step_end
             # GSNR EMA must fire often enough on short runs to accumulate
             # stats before training ends. Old `max(eval_steps, 200)` meant a
             # 189-step run never triggered and GSNR stayed N/A.
-            self._gsnr_log_interval = max(10, min(100, eval_steps))
+            self._gsnr_log_interval = gsnr_interval
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
@@ -1754,171 +1807,71 @@ def run_single_experiment(
             return control
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
-            self.step_count += 1
-            
-            # ETA tracking
-            self.eta_estimator.step_completed(state.global_step)
-            
-            # Fallback gradient capture if pre_optimizer didn't fire
-            if self.ler_tracker._cached_rho_vg is None and self._model is not None:
-                has_grad = any(
-                    p.grad is not None for p in self._model.parameters() if p.requires_grad
-                )
-                if has_grad:
-                    try:
-                        self.ler_tracker.capture_step_gradients(self._model)
-                    except Exception:
-                        pass
-            
-            # Step time for waste tracking
-            step_time = time.time() - self._step_start_time if self._step_start_time else None
-            
-            # Get current LR from scheduler
-            current_lr = None
+            # Feed the WasteQuantifier and phase_detector from the fresh
+            # per-step loss captured in CapturingTrainer.compute_loss
+            # (trainer._last_real_loss). Do NOT rely on self._last_loss,
+            # which comes from on_log and fires at HF's log cadence
+            # (eval_steps on this config, giving only ~25 feeds per 588
+            # steps — far too sparse for plateau detection).
             trainer = self._trainer_holder[0] if self._trainer_holder else None
-            if trainer is not None and hasattr(trainer, 'lr_scheduler') and trainer.lr_scheduler is not None:
+            fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
+            # DEBUG: track loss capture
+            if state.global_step % 50 == 0:
+                print(f"[DEBUG loss] step={state.global_step}, trainer={trainer is not None}, _last_real_loss={fresh_loss}, backup={self._last_loss}")
+            if fresh_loss is None:
+                fresh_loss = self._last_loss
+            if fresh_loss is None:
+                return
+
+            step_time = time.time() - self._step_start_time if self._step_start_time else None
+
+            if self._model is None and model is not None:
+                self._model = model
+
+            # Keep a mirror of _last_loss so on_evaluate still has a
+            # reasonable training-loss reference even between HF logs.
+            self._last_loss = fresh_loss
+
+            global_grad_norm = None
+            if self.gsnr_tracker.global_grad_norm_history:
+                global_grad_norm = self.gsnr_tracker.global_grad_norm_history[-1]
+
+            step_gap = state.global_step - getattr(self, "_last_waste_fed_step", -10**9)
+            # DEBUG: track waste feeding
+            if state.global_step % 50 == 0:
+                print(f"[DEBUG waste] step={state.global_step}, gap={step_gap}, stride={self.waste_feed_stride}, last_fed={getattr(self, '_last_waste_fed_step', 'N/A')}")
+            if step_gap >= self.waste_feed_stride:
                 try:
-                    current_lr = trainer.lr_scheduler.get_last_lr()[0]
-                except Exception:
-                    pass
-            
-            # Record waste and phase data.
-            # CRITICAL: Only feed the WasteQuantifier when _last_loss has
-            # actually changed since the last feed. The Trainer logs loss
-            # every logging_steps (e.g., 4 steps), so between log events
-            # _last_loss is stale. Feeding the same value repeatedly to
-            # the EMA creates artificial "no improvement" periods followed
-            # by artificial "improvement" when a new value arrives, which
-            # prevents plateau detection from ever triggering.
-            if self._last_loss is not None:
-                # Get global grad norm
-                global_grad_norm = None
-                if self.gsnr_tracker.global_grad_norm_history:
-                    global_grad_norm = self.gsnr_tracker.global_grad_norm_history[-1]
-                
-                # Only feed WasteQuantifier on genuinely new loss values
-                loss_is_new = (self._last_loss_fed_to_waste is None or
-                               self._last_loss != self._last_loss_fed_to_waste)
-                if loss_is_new:
                     self.waste_quantifier.record_step(
-                        loss=self._last_loss,
+                        loss=fresh_loss,
                         grad_norm=global_grad_norm,
                         step_time=step_time,
                     )
-                    self._last_loss_fed_to_waste = self._last_loss
-                
-                # Phase detector and LR-loss tracker can still use every step
-                self.phase_detector.update(
-                    step=state.global_step,
-                    loss=self._last_loss,
-                    grad_norm=global_grad_norm,
-                    lr=current_lr,
-                )
-                if current_lr is not None:
-                    self.lr_loss_tracker.update(current_lr, self._last_loss)
-
-                # Per-step LER + velocity. Heavy update() still runs at eval
-                # for entropy refresh from real logits.
-                try:
-                    self.ler_tracker.record_step_update(self._last_loss, self._model)
                 except Exception as e:
-                    if state.global_step % 50 == 0:
-                        print(f"  [LER step warn] {e}")
+                    print(f"[waste warn] {e}")
+                self._last_waste_fed_step = state.global_step
+                self._last_loss_fed_to_waste = fresh_loss
 
-            # Periodic ETA print
-            if state.global_step % max(eval_steps, 10) == 0 and state.global_step > 0:
-                eta = self.eta_estimator.get_eta(state.global_step)
-                if eta:
-                    print(
-                        f"  [ETA] Step {eta['current_step']}/{eta['total_steps']} "
-                        f"({eta['progress_pct']:.1f}%) | "
-                        f"Elapsed: {eta['elapsed_formatted']} | "
-                        f"ETA: {eta['eta_formatted']} | "
-                        f"{eta['steps_per_second']:.1f} steps/s"
+                # Phase detector and LR-loss tracker use every step.
+                try:
+                    self.phase_detector.update(
+                        step=state.global_step,
+                        loss=fresh_loss,
+                        grad_norm=global_grad_norm,
+                        lr=kwargs.get("lr"),
                     )
-            
-            # Periodic GSNR computation and logging
-            if state.global_step % self._gsnr_log_interval == 0 and state.global_step > 0:
-                try:
-                    gsnr_results = self.gsnr_tracker.compute_gsnr()
-                    global_gsnr = gsnr_results.get("__global__")
-                    
-                    if use_wandb and global_gsnr is not None:
-                        import wandb
-                        if wandb.run is not None:
-                            log_data = {
-                                "gsnr/global": global_gsnr,
-                                "gsnr/global_log10": math.log10(global_gsnr + 1e-10),
-                            }
-                            # Log top/bottom layers
-                            layer_gsnrs = {k: v for k, v in gsnr_results.items() if k != "__global__"}
-                            if layer_gsnrs:
-                                sorted_layers = sorted(layer_gsnrs.items(), key=lambda x: x[1])
-                                for i, (name, val) in enumerate(sorted_layers[:3]):
-                                    short = name.split(".")[-2:]
-                                    log_data[f"gsnr/bottom_{i+1}_{'_'.join(short)}"] = val
-                                for i, (name, val) in enumerate(sorted_layers[-3:]):
-                                    short = name.split(".")[-2:]
-                                    log_data[f"gsnr/top_{i+1}_{'_'.join(short)}"] = val
+                except Exception as e:
+                    print(f"[phase warn] {e}")
+                current_lr = kwargs.get("lr")
+                if current_lr is not None:
+                    self.lr_loss_tracker.update(current_lr, fresh_loss)
 
-                            # Fisher Information (computed from same accumulators)
-                            fisher_results = self.gsnr_tracker.compute_fisher_info()
-                            fi_global = fisher_results.get("__global__")
-                            if fi_global is not None:
-                                log_data["fisher/global"] = fi_global
-                                log_data["fisher/global_log10"] = math.log10(fi_global + 1e-10)
-
-                            wandb.log(log_data, step=state.global_step)
-                except Exception:
-                    pass
-            
-            # Log waste and phase to W&B
-            if use_wandb and state.global_step % max(eval_steps // 2, 5) == 0:
+            # Per-step LER + velocity snapshot (every step, not just stride)
+            if self._model is not None:
                 try:
-                    import wandb
-                    if wandb.run is not None:
-                        wm = self.waste_quantifier.compute_waste_metrics()
-                        wandb.log({
-                            "waste/ratio": wm["waste_ratio"],
-                            "waste/ci_95_low": wm["ci_95_low"],
-                            "waste/ci_95_high": wm["ci_95_high"],
-                            "waste/cumulative_wasted_steps": wm["wasted_steps"],
-                            "phase/current": self.phase_detector.current_phase,
-                            "phase/num_transitions": len(self.phase_detector.transition_points),
-                        }, step=state.global_step)
-                        
-                        # LR-loss correlation
-                        corr = self.lr_loss_tracker.compute_correlation(window=100)
-                        if corr:
-                            wandb.log({
-                                "lr_loss/correlation": corr["correlation"],
-                                "lr_loss/p_value": corr["p_value"],
-                            }, step=state.global_step)
-                except Exception:
-                    pass
-            
-            # ── Per-step LER update ──────────────────────────────────────────
-            # Fixes "LER samples: 5" regression: previously update() only fired on
-            # on_log/on_evaluate boundaries. We call it every step with fresh
-            # loss + logits captured by CapturingTrainer, which also feeds
-            # _snapshot_params(model) for param_velocity.
-            try:
-                trainer = self._trainer_holder[0] if self._trainer_holder else None
-                if trainer is not None and self._model is not None:
-                    real_logits = getattr(trainer, "_last_real_logits", None)
-                    real_loss   = getattr(trainer, "_last_real_loss", None)
-                    if real_logits is not None and real_loss is not None:
-                        self.ler_tracker.update(
-                            loss=real_loss,
-                            logits=real_logits,
-                            accuracy=None,                     # set via on_evaluate path
-                            n_steps=state.global_step,
-                            model=self._model,
-                            gradients=None,                    # captured via capture_step_gradients
-                        )
-            except Exception as e:
-                if os.environ.get("LERNA_DEBUG"):
-                    print(f"[LER per-step update failed step={state.global_step}] {e}")
+                    self.ler_tracker.record_step_update(fresh_loss, self._model)
+                except Exception as e:
+                    print(f"[LER warn] {e}")
 
             return control
 
@@ -2119,6 +2072,8 @@ def run_single_experiment(
         eta_est=eta_estimator,
         model_ref=model,
         trainer_ref_holder=trainer_holder,
+        gsnr_interval=gsnr_log_interval,
+        waste_feed_stride=waste_feed_stride,
     )
 
     # ── Training arguments ────────────────────────────────────────────
@@ -2145,7 +2100,7 @@ def run_single_experiment(
         load_best_model_at_end=True,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=greater_is_better,
-        logging_steps=max(eval_steps // 5, 1),
+        logging_steps=max(eval_steps // 2, 10),
         report_to="wandb" if use_wandb else "none",
         run_name=run_id if use_wandb else None,
         seed=seed,
@@ -2169,7 +2124,7 @@ def run_single_experiment(
     if extra_callbacks:
         callbacks.extend(extra_callbacks)
     
-    trainer = LERNATrainer(
+    trainer = CapturingTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -2177,6 +2132,8 @@ def run_single_experiment(
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
+        gsnr_tracker=gsnr_tracker,
+        gsnr_interval=gsnr_log_interval,
         callbacks=callbacks,
     )
     
