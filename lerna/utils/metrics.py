@@ -1534,3 +1534,204 @@ def compute_effect_sizes(
             f"(d = {cohens_d:.2f}, p = {p_value:.4f})"
         ),
     }
+
+
+class WasteQuantifier:
+    """
+    Quantifies compute waste during training based on plateau detection.
+    
+    Uses EMA-smoothed loss to detect plateau onset, then computes:
+        waste_ratio = (total_steps - plateau_step) / total_steps
+    
+    Also supports eval-loss based plateau detection (more accurate).
+    """
+    
+    def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001,
+                 min_steps_before_plateau=100, plateau_eval_patience=3, 
+                 plateau_eval_min_improvement=0.005):
+        """
+        Args:
+            ema_alpha: Smoothing factor for EMA loss (lower = smoother).
+            plateau_patience: Number of steps with no EMA improvement to declare plateau.
+            plateau_min_improvement: Minimum relative improvement in EMA loss to count
+                                     as "still improving" (0.001 = 0.1%).
+            min_steps_before_plateau: Minimum number of steps before plateau detection
+                                      activates.
+            plateau_eval_patience: Number of evals with no improvement to declare plateau.
+            plateau_eval_min_improvement: Minimum relative improvement in eval loss.
+        """
+        self.ema_alpha = ema_alpha
+        self.plateau_patience = plateau_patience
+        self.plateau_min_improvement = plateau_min_improvement
+        self.min_steps_before_plateau = min_steps_before_plateau
+        
+        self.loss_history = []
+        self.grad_norm_history = []
+        self.energy_per_step = []
+        self.step_times = []
+        
+        self._total_steps_seen = 0
+        
+        self._ema_loss = None
+        self._best_ema_loss = None
+        self._steps_since_ema_improvement = 0
+        self._plateau_step = None
+        
+        self.eval_loss_history = []
+        self._best_eval_loss = None
+        self._evals_since_improvement = 0
+        self._plateau_eval_step = None
+        self.plateau_eval_patience = plateau_eval_patience
+        self.plateau_eval_min_improvement = plateau_eval_min_improvement
+        
+        self.improving_steps = []
+        self.waste_reasons = defaultdict(int)
+    
+    def record_step(self, loss, grad_norm=None, energy_j=None, step_time=None):
+        """Record metrics for a single training step."""
+        self._total_steps_seen += 1
+        self.loss_history.append(loss)
+        if grad_norm is not None:
+            self.grad_norm_history.append(grad_norm)
+        if energy_j is not None:
+            self.energy_per_step.append(energy_j)
+        if step_time is not None:
+            self.step_times.append(step_time)
+        
+        _MAX_HIST = 5000
+        if len(self.loss_history) > _MAX_HIST * 2:
+            self.loss_history = self.loss_history[-_MAX_HIST:]
+        if len(self.grad_norm_history) > _MAX_HIST * 2:
+            self.grad_norm_history = self.grad_norm_history[-_MAX_HIST:]
+        if len(self.step_times) > _MAX_HIST * 2:
+            self.step_times = self.step_times[-_MAX_HIST:]
+        if len(self.improving_steps) > _MAX_HIST * 2:
+            self.improving_steps = self.improving_steps[-_MAX_HIST:]
+        
+        self._ema_loss = (
+            loss if self._ema_loss is None
+            else self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+        )
+        if self._best_ema_loss is None or self._ema_loss < self._best_ema_loss:
+            self._best_ema_loss = self._ema_loss
+        
+        window = max(5, int(self.plateau_patience))
+        recent = self.loss_history[-window:]
+        prior = self.loss_history[-2 * window:-window]
+        if len(prior) >= window and len(recent) >= window:
+            recent_mean = sum(recent) / len(recent)
+            prior_mean = sum(prior) / len(prior)
+            if prior_mean > 0:
+                rel_drop = (prior_mean - recent_mean) / prior_mean
+            else:
+                rel_drop = 0.0
+            if rel_drop > self.plateau_min_improvement:
+                self._steps_since_ema_improvement = 0
+            else:
+                self._steps_since_ema_improvement += 1
+        else:
+            self._steps_since_ema_improvement = 0
+        
+        if (self._plateau_step is None
+                and self._steps_since_ema_improvement >= self.plateau_patience
+                and self._total_steps_seen >= self.min_steps_before_plateau):
+            self._plateau_step = self._total_steps_seen - self.plateau_patience
+        
+        if len(self.loss_history) >= 2:
+            improved = self.loss_history[-1] < self.loss_history[-2]
+            self.improving_steps.append(improved)
+            if not improved:
+                if loss > self.loss_history[-2] * 1.1:
+                    self.waste_reasons["loss_spike"] += 1
+                elif grad_norm is not None and grad_norm < 1e-7:
+                    self.waste_reasons["vanishing_gradient"] += 1
+                else:
+                    self.waste_reasons["no_improvement"] += 1
+    
+    def record_eval(self, eval_loss, current_step):
+        """Record eval loss and detect plateau based on eval performance."""
+        self.eval_loss_history.append((current_step, eval_loss))
+        
+        if self._best_eval_loss is None:
+            self._best_eval_loss = eval_loss
+            self._evals_since_improvement = 0
+        elif eval_loss < self._best_eval_loss * (1 - self.plateau_eval_min_improvement):
+            self._best_eval_loss = eval_loss
+            self._evals_since_improvement = 0
+        else:
+            self._evals_since_improvement += 1
+        
+        if (self._plateau_eval_step is None
+                and self._evals_since_improvement >= self.plateau_eval_patience):
+            idx = len(self.eval_loss_history) - self.plateau_eval_patience
+            if idx >= 0:
+                self._plateau_eval_step = self.eval_loss_history[idx][0]
+    
+    def compute_waste_metrics(self):
+        """Compute waste metrics with 95% confidence intervals."""
+        n = self._total_steps_seen
+        if n == 0:
+            return {"waste_ratio": 0, "ci_95_low": 0, "ci_95_high": 0, "total_steps": 0,
+                    "wasted_steps": 0, "plateau_step": None, "improving_steps": 0,
+                    "raw_improving_ratio": 0,
+                    "wasted_energy_j": 0, "total_energy_j": 0, "energy_waste_pct": 0,
+                    "wasted_time_s": 0, "total_time_s": 0, "waste_reasons": {},
+                    "plateau_eval_step": None}
+        
+        plateau_step = (self._plateau_eval_step if self._plateau_eval_step is not None 
+                       else self._plateau_step)
+        if plateau_step is not None:
+            plateau_step = max(0, plateau_step)
+            wasted_steps = n - plateau_step
+            waste_ratio = wasted_steps / n
+        else:
+            plateau_step = None
+            wasted_steps = 0
+            waste_ratio = 0.0
+        
+        if n >= 2 and waste_ratio > 0:
+            z = 1.96
+            p_hat = waste_ratio
+            denominator = 1 + z**2 / n
+            center = (p_hat + z**2 / (2 * n)) / denominator
+            spread = z * math.sqrt((p_hat * (1 - p_hat)) + z**2 / (4 * n)) / n) / denominator
+            ci_low = max(0, center - spread)
+            ci_high = min(1, center + spread)
+        else:
+            ci_low = ci_high = waste_ratio
+        
+        n_legacy = len(self.improving_steps)
+        if n_legacy > 0:
+            raw_waste_flags = [0 if imp else 1 for imp in self.improving_steps]
+            raw_improving_ratio = 1.0 - np.mean(raw_waste_flags)
+        else:
+            raw_improving_ratio = 0.0
+        
+        total_energy = sum(self.energy_per_step) if self.energy_per_step else 0
+        wasted_energy = 0.0
+        if self.energy_per_step and plateau_step is not None:
+            wasted_energy = sum(self.energy_per_step[plateau_step:])
+        
+        total_time = sum(self.step_times) if self.step_times else 0
+        wasted_time = 0.0
+        if self.step_times and plateau_step is not None:
+            wasted_time = sum(self.step_times[plateau_step:])
+        
+        return {
+            "waste_ratio": waste_ratio,
+            "ci_95_low": ci_low,
+            "ci_95_high": ci_high,
+            "total_steps": n,
+            "wasted_steps": wasted_steps,
+            "plateau_step": plateau_step,
+            "improving_steps": n - wasted_steps,
+            "raw_improving_ratio": raw_improving_ratio,
+            "wasted_energy_j": wasted_energy,
+            "total_energy_j": total_energy,
+            "energy_waste_pct": (wasted_energy / total_energy * 100) if total_energy > 0 else 0,
+            "wasted_time_s": wasted_time,
+            "total_time_s": total_time,
+            "waste_reasons": dict(self.waste_reasons),
+            "plateau_eval_step": self._plateau_eval_step,
+            "eval_loss_history": [x[1] for x in self.eval_loss_history],
+        }

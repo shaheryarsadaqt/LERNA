@@ -425,7 +425,8 @@ class WasteQuantifier:
     """
 
     def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001,
-                 min_steps_before_plateau=100):
+                 min_steps_before_plateau=100, plateau_eval_patience=3, 
+                 plateau_eval_min_improvement=0.005):
         """
         Args:
             ema_alpha: Smoothing factor for EMA loss (lower = smoother).
@@ -435,6 +436,9 @@ class WasteQuantifier:
             min_steps_before_plateau: Minimum number of steps before plateau detection
                                       activates. Prevents false early detection on
                                       large-dataset tasks where EMA needs warmup time.
+            plateau_eval_patience: Number of evals with no improvement to declare plateau.
+            plateau_eval_min_improvement: Minimum relative improvement in eval loss to count
+                                         as "still improving" (0.005 = 0.5%).
         """
         self.ema_alpha = ema_alpha
         self.plateau_patience = plateau_patience
@@ -454,6 +458,14 @@ class WasteQuantifier:
         self._best_ema_loss = None
         self._steps_since_ema_improvement = 0
         self._plateau_step = None  # Step at which plateau was first detected
+
+        # Eval-loss based plateau detection (primary - more accurate)
+        self.eval_loss_history = []
+        self._best_eval_loss = None
+        self._evals_since_improvement = 0
+        self._plateau_eval_step = None
+        self.plateau_eval_patience = plateau_eval_patience
+        self.plateau_eval_min_improvement = plateau_eval_min_improvement
 
         # Legacy per-step improving flags (kept for backward compat / raw metric)
         self.improving_steps = []  # True/False per step
@@ -532,6 +544,25 @@ class WasteQuantifier:
                 else:
                     self.waste_reasons["no_improvement"] += 1
 
+    def record_eval(self, eval_loss, current_step):
+        """Record eval loss and detect plateau based on eval performance."""
+        self.eval_loss_history.append((current_step, eval_loss))
+        
+        if self._best_eval_loss is None:
+            self._best_eval_loss = eval_loss
+            self._evals_since_improvement = 0
+        elif eval_loss < self._best_eval_loss * (1 - self.plateau_eval_min_improvement):
+            self._best_eval_loss = eval_loss
+            self._evals_since_improvement = 0
+        else:
+            self._evals_since_improvement += 1
+        
+        if (self._plateau_eval_step is None
+                and self._evals_since_improvement >= self.plateau_eval_patience):
+            idx = len(self.eval_loss_history) - self.plateau_eval_patience
+            if idx >= 0:
+                self._plateau_eval_step = self.eval_loss_history[idx][0]
+
     def compute_waste_metrics(self):
         """Compute waste metrics with 95% confidence intervals.
         
@@ -546,9 +577,11 @@ class WasteQuantifier:
                     "wasted_energy_j": 0, "total_energy_j": 0, "energy_waste_pct": 0,
                     "wasted_time_s": 0, "total_time_s": 0, "waste_reasons": {}}
 
-        # --- Primary: plateau-based waste ---
-        if self._plateau_step is not None:
-            plateau_step = max(0, self._plateau_step)
+        # --- Primary: plateau-based waste (prefer eval loss plateau, fallback to train loss) ---
+        plateau_step = (self._plateau_eval_step if self._plateau_eval_step is not None 
+                       else self._plateau_step)
+        if plateau_step is not None:
+            plateau_step = max(0, plateau_step)
             wasted_steps = n - plateau_step
             waste_ratio = wasted_steps / n
         else:
@@ -1464,8 +1497,6 @@ class CapturingTrainer(Trainer):
 
         self._last_real_loss = float(loss.mean().detach().item()) if loss.numel() > 1 else float(loss.detach().item())
         self._last_real_logits = logits.detach() if logits is not None else None
-        print(f"[DBG compute_loss] set _last_real_loss={self._last_real_loss}")  # ADD THIS
-        print(f"[DBG compute_loss] self id={id(self)}")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -1735,6 +1766,8 @@ def run_single_experiment(
             # stats before training ends. Old `max(eval_steps, 200)` meant a
             # 189-step run never triggered and GSNR stayed N/A.
             self._gsnr_log_interval = gsnr_interval
+            # Flag to detect post-reload eval (after load_best_model_at_end)
+            self._train_ended = False
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
@@ -1754,6 +1787,9 @@ def run_single_experiment(
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
+            # Set flag BEFORE the post-reload eval runs
+            # This fires before trainer.evaluate() you call after train() returns
+            self._train_ended = True
             # Save all diagnostics
             self._save_all_diagnostics()
             
@@ -1799,19 +1835,10 @@ def run_single_experiment(
             return control
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
-            # DEBUG: track every step
-            print(f"[DBG step_end] step={state.global_step}")
-            
             # Feed from trainer._last_real_loss (captured in CapturingTrainer.compute_loss)
             # Use explicit binding first, fallback to holder
             trainer = self._trainer if self._trainer is not None else (self._trainer_holder[0] if self._trainer_holder else None)
-            
-            # ADD DEBUG: show trainer id and loss value
-            if trainer is not None:
-                print(f"[DBG step_end] trainer id={id(trainer)} "
-                      f"has_attr={hasattr(trainer, '_last_real_loss')} "
-                      f"val={getattr(trainer, '_last_real_loss', 'MISSING')}")
-            
+
             fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
 
             if fresh_loss is None:
@@ -1885,15 +1912,20 @@ def run_single_experiment(
             if metrics is None:
                 return control
 
-            # FIX: Skip LER update on post-load_best_model_at_end eval (velocity collision bug)
-            # When global_step == max_steps, the model was reloaded to best checkpoint,
-            # causing velocity to appear zero because _prev_params was snapshotted from same weights
-            if state.global_step == state.max_steps:
+            # FIX: Skip post-reload eval (after load_best_model_at_end)
+            # on_train_end fires before the explicit trainer.evaluate() you call after
+            # train() returns, so the flag is set in time. This is unambiguous
+            # regardless of step alignment.
+            if self._train_ended:
                 print(f"  [LERNA] Skipping post-reload eval at step {state.global_step}")
                 return control
 
             eval_loss = metrics.get("eval_loss", 0)
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
+
+            # Record eval loss for plateau detection (more accurate than train loss)
+            if eval_loss > 0:
+                self.waste_quantifier.record_eval(eval_loss, state.global_step)
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
