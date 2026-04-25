@@ -1694,7 +1694,8 @@ class WasteQuantifier:
             p_hat = waste_ratio
             denominator = 1 + z**2 / n
             center = (p_hat + z**2 / (2 * n)) / denominator
-            spread = z * math.sqrt((p_hat * (1 - p_hat)) + z**2 / (4 * n)) / n) / denominator
+            spread = z * math.sqrt((p_hat * (1 - p_hat) / n) + (z**2 / (4 * n**2)))
+            spread = spread / denominator
             ci_low = max(0, center - spread)
             ci_high = min(1, center + spread)
         else:
