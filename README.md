@@ -101,6 +101,7 @@ Prediction Spread Entropy (RPSE) fix. Results confirm the fix is working correct
 1. **STS-B LER=0 (RESOLVED):** Fixed with Regression Prediction Spread Entropy (RPSE).
    Re-run completed with 10 seeds, waste detection now working correctly.
 2. **SST-2 seed 42:** Re-run completed successfully.
+3. **Waste Ratio Showing 0 (RESOLVED):** Fixed unit mismatch causing plateau detection to fail.
 
 #### STS-B Waste Detection Fix (Detailed)
 
@@ -128,6 +129,61 @@ around epoch 2-3.
 Classification tasks are unaffected (they use the original parameters: `ema_alpha=0.05`,
 `min_improvement=0.0005`, scaled patience). For future regression benchmarks (e.g.,
 CNN/DailyMail ROUGE in Phase 2), no additional configuration is needed.
+
+#### Waste Ratio Showing 0 Fix (Detailed)
+
+**Problem:** The WasteQuantifier reported `waste_ratio=0` (CI: [0, 0]) even when training clearly reached a plateau. This affected runs with both 3 epochs and 10 epochs.
+
+**Root Cause Analysis:**
+
+| # | Issue | Root Cause | Fix |
+|---|-------|-----------|-----|
+| 1 | **Unit mismatch** | `_last_loss` only updated in `on_log` (every 19 steps for 1960-step run). `record_step` fired only ~103 times instead of 1960 times. `_total_steps_seen` max was ~103 but threshold was 100 — gate never opened | Feed `trainer._last_real_loss` directly on every training step, remove dedup |
+| 2 | **Wrong plateau signal** | Train-loss plateau ≠ compute waste. Train loss can keep decreasing while eval loss plateaus | Add eval-loss based plateau detection (`record_eval()`) with `plateau_eval_patience=3`, `plateau_eval_min_improvement=0.005` |
+| 3 | **Eval loss filtered** | `if eval_loss > 0:` filtered out valid 0.0 eval losses | Changed to `if eval_loss is not None:` |
+| 4 | **Eval blocked** | `record_eval()` called AFTER `_train_ended` check, blocking training evals | Moved `record_eval()` BEFORE `_train_ended` check |
+
+**Key Code Changes:**
+
+```python
+# BEFORE: _last_loss only updated in on_log (stale between log events)
+def on_step_end(...):
+    if self._last_loss is not None:  # Dedup - fires ~103 times for 1960 steps
+        self.waste_quantifier.record_step(loss=self._last_loss, ...)
+
+# AFTER: Read fresh per-step loss directly from trainer
+def on_step_end(...):
+    fresh_loss = getattr(trainer, "_last_real_loss", None)
+    if fresh_loss is not None:
+        self.waste_quantifier.record_step(loss=fresh_loss, ...)  # Fires every step
+```
+
+```python
+# Add eval-loss plateau detection
+def record_eval(self, eval_loss, current_step):
+    self.eval_loss_history.append((current_step, eval_loss))
+    if eval_loss < self._best_eval_loss * (1 - self.plateau_eval_min_improvement):
+        self._best_eval_loss = eval_loss
+        self._evals_since_improvement = 0
+    else:
+        self._evals_since_improvement += 1
+    
+    if (self._plateau_eval_step is None 
+        and self._evals_since_improvement >= self.plateau_eval_patience):
+        self._plateau_eval_step = current_step - self.plateau_eval_patience * eval_interval
+```
+
+**Results:**
+
+| Metric | Before Fix | After Fix |
+|--------|------------|-----------|
+| Waste ratio | 0 | 0.602 |
+| 95% CI | [0, 0] | [0.580, 0.623] |
+| Total steps seen | ~103 | 1960 |
+| Plateau step | None | 780 |
+| Wasted steps | 0 | 1180 |
+
+**Commit:** `2f8d4c9`
 
 ### Phase 1.2: Simple Baselines & Flaw Fixes (COMPLETED)
 
