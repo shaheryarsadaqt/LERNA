@@ -1912,20 +1912,20 @@ def run_single_experiment(
             if metrics is None:
                 return control
 
-            # FIX: Skip post-reload eval (after load_best_model_at_end)
-            # on_train_end fires before the explicit trainer.evaluate() you call after
-            # train() returns, so the flag is set in time. This is unambiguous
-            # regardless of step alignment.
-            if self._train_ended:
-                print(f"  [LERNA] Skipping post-reload eval at step {state.global_step}")
-                return control
-
             eval_loss = metrics.get("eval_loss")
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
 
             # Record eval loss for plateau detection (more accurate than train loss)
+            # Record BEFORE checking _train_ended so training evals are captured
             if eval_loss is not None:
                 self.waste_quantifier.record_eval(float(eval_loss), state.global_step)
+
+            # FIX: Skip post-reload eval (after load_best_model_at_end)
+            # on_train_end fires before the explicit trainer.evaluate() you call after
+            # train() returns, so the flag is set in time.
+            if self._train_ended:
+                print(f"  [LERNA] Skipping post-reload eval at step {state.global_step}")
+                return control
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
