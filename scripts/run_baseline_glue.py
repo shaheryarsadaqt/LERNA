@@ -1920,12 +1920,12 @@ def run_single_experiment(
                 print(f"  [LERNA] Skipping post-reload eval at step {state.global_step}")
                 return control
 
-            eval_loss = metrics.get("eval_loss", 0)
+            eval_loss = metrics.get("eval_loss")
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
 
             # Record eval loss for plateau detection (more accurate than train loss)
-            if eval_loss > 0:
-                self.waste_quantifier.record_eval(eval_loss, state.global_step)
+            if eval_loss is not None:
+                self.waste_quantifier.record_eval(float(eval_loss), state.global_step)
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
