@@ -1733,6 +1733,7 @@ def run_single_experiment(
             self.eta_estimator = eta_est
             self._model = model_ref
             self._trainer_holder = trainer_ref_holder  # mutable list to hold trainer ref
+            self._trainer = None  # bound explicitly after trainer construction
             self.step_count = 0
             self._step_start_time = None
             # GSNR EMA must fire often enough on short runs to accumulate
@@ -1803,16 +1804,16 @@ def run_single_experiment(
             return control
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
-            # Feed the WasteQuantifier and phase_detector from the fresh
-            # per-step loss captured in CapturingTrainer.compute_loss
-            # (trainer._last_real_loss). Do NOT rely on self._last_loss,
-            # which comes from on_log and fires at HF's log cadence
-            # (eval_steps on this config, giving only ~25 feeds per 588
-            # steps — far too sparse for plateau detection).
-            trainer = self._trainer_holder[0] if self._trainer_holder else None
+            # DEBUG: track every step
+            print(f"[DBG step_end] step={state.global_step}")
+            
+            # Feed from trainer._last_real_loss (captured in CapturingTrainer.compute_loss)
+            # Use explicit binding first, fallback to holder
+            trainer = self._trainer if self._trainer is not None else (self._trainer_holder[0] if self._trainer_holder else None)
             fresh_loss = getattr(trainer, "_last_real_loss", None) if trainer is not None else None
 
             if fresh_loss is None:
+                print(f"[DBG step_end] WARNING: fresh_loss=None at step {state.global_step}")
                 return  # Can't proceed without fresh loss
 
             step_time = time.time() - self._step_start_time if self._step_start_time else None
@@ -2118,6 +2119,7 @@ def run_single_experiment(
     
     # Set trainer reference in callback
     trainer_holder[0] = trainer
+    diag_callback._trainer = trainer  # CRITICAL: bind explicitly for on_step_end access
 
     # Give LER tracker access to the optimizer for velocity-from-Adam
     ler_tracker._optimizer = trainer.optimizer if hasattr(trainer, 'optimizer') else None
