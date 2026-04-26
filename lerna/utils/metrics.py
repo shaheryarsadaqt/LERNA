@@ -427,6 +427,7 @@ class LERTracker:
         self._prev_params: Optional[Dict[str, torch.Tensor]] = None
         self._prev_params_rho: Optional[Dict[str, torch.Tensor]] = None
         self._cached_rho_vg: Optional[float] = None
+        self._optimizer = None  # set by callback via set_optimizer()
         
         # FIX #7: streaming layer-wise rho_VG
         self.snapshot_in_fp16: bool = False  # set True for models > ~10B params
@@ -713,6 +714,40 @@ class LERTracker:
             if param.requires_grad
         }
     
+    def set_optimizer(self, optimizer):
+        """Bind optimizer for Adam-corrected rho_VG. Call once after trainer init."""
+        self._optimizer = optimizer
+
+    def _effective_grad(self, param):
+        """Return the *applied update direction* for AdamW, falling back to raw grad.
+
+        Under AdamW, the update is -lr * m_hat / (sqrt(v_hat) + eps), not -lr * grad.
+        Cosine of (Δθ, raw_grad) is meaningless; cosine of (Δθ, m_hat/sqrt(v_hat))
+        recovers the SGD-style interpretation.
+        """
+        if self._optimizer is None or param.grad is None:
+            return param.grad.detach() if param.grad is not None else None
+
+        state = self._optimizer.state.get(param)
+        if not state or 'exp_avg' not in state or 'exp_avg_sq' not in state:
+            return param.grad.detach()  # not yet primed
+
+        step = state.get('step', 1)
+        if torch.is_tensor(step):
+            step = step.item()
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+        for group in self._optimizer.param_groups:
+            if any(p is param for p in group['params']):
+                beta1, beta2 = group.get('betas', (0.9, 0.999))
+                eps = group.get('eps', 1e-8)
+                break
+
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        m_hat = state['exp_avg'] / bc1
+        v_hat = state['exp_avg_sq'] / bc2
+        return (m_hat / (v_hat.sqrt() + eps)).detach()
+    
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).
         Uses its OWN snapshot slot so record_step_update can't clobber it."""
@@ -730,10 +765,13 @@ class LERTracker:
             if not param.requires_grad:
                 continue
             prev = self._prev_params_rho.get(name)
-            if prev is None or param.grad is None:
+            if prev is None:
+                continue
+            eff = self._effective_grad(param)
+            if eff is None:
                 continue
             v = (param.data.detach() - prev).float().flatten()
-            g = param.grad.detach().float().flatten()
+            g = eff.float().flatten()
             d = torch.dot(v, g).item()
             vn = v.norm().item()
             gn = g.norm().item()

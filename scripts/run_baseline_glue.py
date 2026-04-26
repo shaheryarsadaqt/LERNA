@@ -1791,6 +1791,9 @@ def run_single_experiment(
         def on_train_begin(self, args, state, control, model=None, **kwargs):
             # Capture model for later hooks (on_step_end, etc.)
             self._model = model
+            # Bind optimizer for Adam-corrected rho_VG
+            if self._trainer is not None and hasattr(self._trainer, 'optimizer'):
+                self.ler_tracker.set_optimizer(self._trainer.optimizer)
             # Force fresh snapshot after LoRA wrapping - previous snapshot
             # may have captured base model (frozen) before PEFT adapter attached.
             try:
