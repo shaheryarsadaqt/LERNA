@@ -1984,6 +1984,12 @@ def run_single_experiment(
             rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
 
             # Also get GSNR and waste info for the print
+            # Force a compute so eval prints reflect current state, even if
+            # state.global_step is not a multiple of gsnr_interval.
+            try:
+                gsnr_tracker.compute_gsnr()
+            except Exception as e:
+                print(f"  [GSNR warn] eval-time compute_gsnr: {e}")
             gsnr_global = None
             if gsnr_tracker.gsnr_global_history:
                 gsnr_global = gsnr_tracker.gsnr_global_history[-1]
