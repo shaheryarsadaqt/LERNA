@@ -220,7 +220,7 @@ class GSNRTracker:
     which caused OOM on large models like ModernBERT.
     """
 
-    def __init__(self, model, window_size=50):
+    def __init__(self, model, window_size=20):
         self.window_size = window_size
         self.layer_names = []
         self.layer_param_map = {}  # layer_name -> list of param names
@@ -1466,7 +1466,7 @@ class CapturingTrainer(Trainer):
     """Extended Trainer that captures real logits and gradients before zero_grad."""
 
     def __init__(self, *args, ler_tracker=None, gsnr_tracker=None,
-                 gsnr_interval=50, **kwargs):
+                 gsnr_interval=10, **kwargs):
         super().__init__(*args, **kwargs)
         self._ler_tracker = ler_tracker
         self._gsnr_tracker = gsnr_tracker
@@ -2116,12 +2116,12 @@ def run_single_experiment(
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
-        save_total_limit=3,  # Keep 3 checkpoints (warmup/active/plateau phases for TracIn)
-        save_safetensors=True,
+        save_total_limit=3,
         # FIX #9: load_best_model_at_end=True to evaluate best model
         # FIX: Use task-specific metric for model selection (not hardcoded eval_loss)
         # CoLA -> eval_matthews_correlation, RTE/MRPC -> eval_accuracy, etc.
         load_best_model_at_end=True,
+        save_safetensors=False,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=greater_is_better,
         logging_steps=max(eval_steps // 2, 10),
@@ -2178,7 +2178,7 @@ def run_single_experiment(
     total_time = time.time() - start_time
 
     # Verify load_best_model_at_end did not corrupt LayerNorm parameters.
-    assert_layernorm_trained(model)
+    assert_layernorm_trained(model, base_model_name=MODEL_NAME)
 
     # FIX #9: Now evaluating the BEST model (loaded automatically)
     print(f"\n  Evaluating best model (loaded via load_best_model_at_end=True)...")

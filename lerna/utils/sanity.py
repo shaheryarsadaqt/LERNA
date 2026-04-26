@@ -1,31 +1,53 @@
 """Post-load model sanity checks."""
-
+from typing import Optional
 import torch
+from transformers import AutoModel
 
 
 def assert_layernorm_trained(
     model: torch.nn.Module,
-    weight_mean_min: float = 0.5,
-    weight_std_max: float = 0.8,
+    base_model_name: str,
+    abs_tol: float = 0.15,
     log_first_n: int = 3,
 ) -> None:
-    """Raise if any LayerNorm.weight looks randomly initialized."""
-    checked = 0
-    for name, p in model.named_parameters():
+    """Verify LayerNorm.weight tensors are close to their pretrained reference.
+
+    Catches the gamma/beta key corruption that occurs when transformers/PyTorch
+    version mismatches cause LayerNorm parameters to silently mis-load.
+
+    Args:
+        model: the (post-load) model to validate
+        base_model_name: HF model id used to initialize `model` (e.g. "roberta-base")
+        abs_tol: max allowed absolute deviation in mean from reference
+        log_first_n: how many passing checks to print
+    """
+    ref_sd = {
+        k: v for k, v in AutoModel.from_pretrained(base_model_name).state_dict().items()
+        if "LayerNorm.weight" in k
+    }
+    cur_sd = dict(model.named_parameters())
+
+    logged = 0
+    for name, p in cur_sd.items():
         if "LayerNorm.weight" not in name:
             continue
-        t = p.detach().float()
-        mean = t.mean().item()
-        std = t.std().item()
-        if checked < log_first_n:
-            print(f"  [SANITY] {name}: mean={mean:.4f}, std={std:.4f}")
-        if abs(mean) < weight_mean_min or std > weight_std_max:
+        # Strip task-head prefix (e.g. "roberta." in RobertaForSequenceClassification)
+        key = name.split(".", 1)[1] if "." in name and name.split(".", 1)[0] not in ref_sd else name
+        if key not in ref_sd:
+            continue
+        cur_mean = p.detach().float().mean().item()
+        ref_mean = ref_sd[key].mean().item()
+        delta = abs(cur_mean - ref_mean)
+        if delta > abs_tol:
             raise RuntimeError(
-                f"LayerNorm parameter {name} looks randomly initialized "
-                f"(mean={mean:.4f}, std={std:.4f}). Likely cause: "
-                f"load_best_model_at_end loaded a checkpoint with legacy "
-                f"gamma/beta keys."
+                f"LayerNorm sanity check failed: {name} mean={cur_mean:.4f} "
+                f"deviates from pretrained reference {ref_mean:.4f} by {delta:.4f} "
+                f"(tol={abs_tol}). Likely gamma/beta key corruption from "
+                f"safetensors save/load mismatch."
             )
-        checked += 1
-    if checked == 0:
-        print("  [SANITY] No LayerNorm.weight parameters found (skipped).")
+        if logged < log_first_n:
+            print(f"  [SANITY] {name}: mean={cur_mean:.4f} (ref {ref_mean:.4f}, Δ={delta:.4f}) ✓")
+            logged += 1
+
+    if logged == 0:
+        raise RuntimeError("No LayerNorm.weight parameters found — model architecture unexpected.")

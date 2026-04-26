@@ -663,7 +663,7 @@ class LERTracker:
         is provably equivalent to the flattened cosine under equal variance
         (and is more informative when variances differ across layers).
         """
-        if model is None or not self._prev_params_norms:
+        if model is None or not self._prev_params:
             return None
 
         dot = 0.0
@@ -728,6 +728,7 @@ class LERTracker:
         rho = self._compute_rho_vg(model, gradients=None)
         if rho is not None:
             self._cached_rho_vg = rho
+        self._snapshot_params(model)
     
     def get_ler(self, window: Optional[int] = None) -> Optional[float]:
         """Get LER value over specified window.
