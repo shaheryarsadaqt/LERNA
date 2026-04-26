@@ -775,6 +775,7 @@ class LERTracker:
             if vn > 1e-12 and gn > 1e-12:
                 per_layer[name] = d / (vn * gn)
 
+        self._cached_rho_vg = None  # Reset before compute to avoid stale -1.0
         if vel_sq > 1e-24 and grad_sq > 1e-24:
             self._cached_rho_vg = dot / ((vel_sq * grad_sq) ** 0.5)
             self.rho_vg_per_layer_history.append(per_layer)
