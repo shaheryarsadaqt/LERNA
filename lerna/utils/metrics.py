@@ -777,7 +777,7 @@ class LERTracker:
 
         if vel_sq > 1e-24 and grad_sq > 1e-24:
             self._cached_rho_vg = dot / ((vel_sq * grad_sq) ** 0.5)
-            # Per-layer tracking now done in _compute_rho_vg with Dict[str, List[float]] format
+            self.rho_vg_per_layer_history.append(per_layer)
 
         self._prev_params_rho = {
             name: param.data.detach().double().clone()
