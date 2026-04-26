@@ -168,6 +168,10 @@ class _EMAWelfordAccumulator:
 
     def update(self, grad_vec: torch.Tensor):
         """Incorporate a new gradient vector (already on CPU, float32)."""
+        # Skip non-finite gradients (fp16 loss-scale overflow, NaN spikes).
+        # One bad sample would otherwise poison the EMA forever.
+        if not torch.isfinite(grad_vec).all():
+            return
         self.n += 1
         if self._ema_mean is None:
             self._ema_mean = grad_vec.clone()
@@ -193,6 +197,13 @@ class _EMAWelfordAccumulator:
             return 0.0
         signal = self._ema_mean.norm().item() ** 2
         noise = self._ema_var.sum().item()
+        if not (math.isfinite(signal) and math.isfinite(noise)) or noise < 0:
+            # State went non-finite (fp16 spike). Reset and start fresh.
+            self.n = 0
+            self._ema_mean = None
+            self._ema_var = None
+            self._ema_grad_sq = 0.0
+            return 0.0
         return signal / (noise + 1e-10)
 
     def compute_fisher_info(self) -> float:
