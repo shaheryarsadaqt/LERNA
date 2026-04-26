@@ -224,6 +224,84 @@ def record_eval(self, eval_loss, current_step):
 
 **Commit:** `2f8d4c9`
 
+#### Phase 1.1 Methodology
+
+##### §3.1.1 Purpose and Position in the Research Programme
+
+Phase 1.1 is the empirical foundation of LERNA. Before any compute-saving mechanism is deployed, we must answer four prerequisite questions whose answers determine whether the framework as a whole is methodologically tractable:
+
+- **RQ-1 (Existence).** Does fine-tuning of pretrained language models contain a measurable fraction of compute that yields no further reduction in validation loss, and is this fraction stable across tasks and seeds?
+- **RQ-2 (Detectability).** Can the productive-vs-unproductive distinction be read off from a small number of training-time signals (loss, gradients, parameters, predictions) without access to validation gradients or held-out probes?
+- **RQ-3 (Calibration).** Are the proposed diagnostic signals — Learning Efficiency Ratio (LER), velocity-gradient correlation (ρ_VG), Gradient Signal-to-Noise Ratio (GSNR), and Waste Ratio (W) — distributionally well-behaved across heterogeneous tasks (classification ↔ regression; small ↔ large datasets), or do they require task-specific calibration that would compromise generality?
+- **RQ-4 (Discrimination).** Do the diagnostic signals discriminate between training regimes that are a priori different (e.g. a small dataset trained with early stopping vs. a large dataset trained for a fixed step budget), or do they collapse to identical values regardless of regime?
+
+Phase 1.1 produces a non-interventional, observational dataset across 8 GLUE tasks × 10 seeds = 80 runs. No skipping, no momentum extrapolation, no behavioural intervention is performed. The model is trained to convergence under standard fine-tuning practice and the diagnostic instruments record signals at every step. The output of Phase 1.1 is therefore (i) a calibrated set of thresholds for each diagnostic, (ii) per-task waste ratios with confidence intervals, and (iii) a verified signal-to-noise budget that establishes whether subsequent phases are statistically powered.
+
+##### §3.1.3 Instrumentation Suite
+
+We instrument ten distinct measured quantities per run:
+
+| # | Quantity | Definition | Purpose |
+|---|----------|------------|----------|
+| 1 | Loss trajectory L_t | Mini-batch loss sampled every step | Ground-truth signal for learning; input to Waste Ratio |
+| 2 | Parameter velocity v_t | v_t = |θ_t - θ_{t-1}|_2 | Proxy for "optimizer doing nontrivial work" |
+| 3 | Effective gradient g̃_t | g̃_t = m̂ / (√v̂ + ε) | AdamW-corrected update direction |
+| 4 | ρ_VG,t | cos(Δθ_t, g̃_t) | Velocity-gradient correlation |
+| 5 | Prediction entropy H_t | -Σ p_c log p_c (classification) / RPSE (regression) | Uncertainty proxy |
+| 6 | LER_t | w_task · (v_t · max(0, L_{t-1} - L_t) · H̄_t) / n_steps | Central control signal |
+| 7 | GSNR_t | (̄g_t)² / Var[g_t] | Gradient signal-to-noise ratio |
+| 8 | Waste Ratio W | #{t > t_plateau} / T | Fraction of wasted compute |
+| 9 | Phase classification | {warmup, active_learning, fine_tuning, plateau} | Human-interpretable state |
+| 10 | Energy & wall-time | E = ∫ P_t dt | Ground-truth outcome metric |
+
+##### §3.1.4 Experimental Design
+
+- **Model:** RoBERTa-base (125M parameters)
+- **Dataset:** 8 GLUE tasks (SST-2, QNLI, QQP, MNLI, RTE, MRPC, CoLA, STS-B)
+- **Hyperparameters:** η = 2×10⁻⁵ (CoLA: 1×10⁻⁵), AdamW (β₁=0.9, β₂=0.999), weight decay 0.01, linear warmup 6%
+- **Seeds:** {42, 43, …, 51} (n=10 replicates per task)
+- **Evaluation:** load_best_model_at_end=True with task-specific selection metric
+- **Sweep size:** 8 tasks × 10 seeds = 80 runs + 10 STS-B re-runs = 90 runs total
+
+##### §3.1.5 Decision Criteria
+
+| RQ | Affirmative Criterion | If Failed |
+|----|---------------------|------------|
+| RQ-1 (Existence) | W > 25% across ≥5 tasks, CI excludes zero | Reframe around task-conditional waste |
+| RQ-2 (Detectability) | LER threshold classifies ≥80% runs correctly | Augment with third signal |
+| RQ-3 (Calibration) | Per-task LER thresholds achieve ≥90% classification | Joint calibration per-(task, LR) |
+| RQ-4 (Discrimination) | E.g., RTE/CoLA: W < 5%; QQP/MNLI: W > 80% | Investigate WasteQuantifier biases |
+
+##### §3.1.6 What Phase 1.1 Buys Us For Phase 1.2
+
+Each Phase 1.2 simple baseline (SB) requires calibration from Phase 1.1:
+
+| Phase 1.2 Baseline | Required Calibration | Source |
+|---------------------|---------------------|--------|
+| SB-1 Gradient norm thresholding | Per-task gradient-norm threshold | §3.1.3.10 gradient distribution |
+| SB-2 Random step skipping | Per-task skip rate = W^{(task)} | §3.1.3.8 measured W |
+| SB-3 Early stopping (oracle) | Patience values from plateau onset | §3.1.3.8 t_plateau |
+| SB-4 Weight freezing | LER threshold to declare plateau | §3.1.3.6 calibrated τ_LER |
+| SB-5 Reduced total steps | Budget = T · (1 - W) | §3.1.3.8 measured W |
+| SB-6 Cosine annealing restarts | Restart period from phase transitions | §3.1.3.9 phase counts |
+
+##### §3.1.7 Threats to Validity
+
+1. **Optimizer-induced bias in ρ_VG:** Computing against raw g_t collapses metric under AdamW (max |ρ_VG| ≈ 0.04). Fixed by using g̃_t.
+2. **Stale-loss feeding:** Dedup on loss-value change before feeding WasteQuantifier.
+3. **Single-seed variance:** Report median plateau onset with bootstrap CI.
+4. **Best-model accounting:** Use load_best_model_at_end=True convention.
+5. **Energy sub-second resolution:** Attribute to epochs rather than steps.
+
+##### §3.1.8 Summary
+
+Phase 1.1 is the observational backbone: it answers whether diagnostic primitives (LER, ρ_VG, GSNR, W) are stable, discriminative, and calibratable across GLUE without intervention. Success criteria are pre-registered to prevent narrative drift. Upon completion, Phase 1.1 yields:
+
+- Calibrated diagnostic suite for Phase 2 switching signals
+- Per-task waste ratios with 95% CIs (supports 36.7% ± 5.3% claim)
+- Per-task plateau onset times and gradient-norm distributions
+- Documented edge cases and fixes (RPSE, dedup, Adam-corrected ρ_VG, GSNR interval calibration)
+
 ### Phase 1.2: Simple Baselines & Flaw Fixes (COMPLETED)
 
 **Status:** Code review and flaw fixes completed
