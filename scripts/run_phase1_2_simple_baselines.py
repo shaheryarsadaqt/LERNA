@@ -662,7 +662,7 @@ def create_baseline_callback(
     base_lr: float,
     seed: int,
     ler_tracker: Optional[LERTracker] = None,
-    target_skip_rate: float = 0.33,
+    target_skip_rate: float = 0.22,   # A.4: matches measured 22.2% waste excl. STS-B
     wandb_enabled: bool = True,
 ) -> Tuple[Optional[Any], Optional[int]]:
     """
@@ -759,7 +759,7 @@ def run_single_baseline_experiment(
     total_runs: int = 0,
     wandb_project: str = "lerna-phase1.2",
     wandb_group: str = "phase1.2-baselines",
-    target_skip_rate: float = 0.33,
+    target_skip_rate: float = 0.22,   # A.4: matches measured 22.2% waste excl. STS-B
 ) -> dict:
     """Run a single Phase 1.2 baseline experiment."""
     hw_cfg = get_training_config(profile)
@@ -1255,8 +1255,8 @@ Examples:
         help="Use full dataset without sample cap",
     )
     parser.add_argument(
-        "--target-skip-rate", type=float, default=0.33,
-        help="Target skip rate for baselines that need it (default: 0.33)",
+        "--target-skip-rate", type=float, default=0.22,
+        help="Target skip rate for baselines that need it (A.4 default: 0.22)",
     )
     parser.add_argument("--smoke-test", action="store_true",
                         help="Allow LERNA to not activate without failing")

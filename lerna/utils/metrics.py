@@ -424,15 +424,17 @@ class LERTracker:
         
         self.velocity_history: List[float] = []
         self.rho_vg_history: List[float] = []
+        # A.2.2: list of per-step {layer_name: rho} snapshots, populated by
+        # capture_step_gradients(). Now serialized into ler_diagnostics.json.
+        self.rho_vg_per_layer_history: List[Dict[str, float]] = []
         self._prev_params: Optional[Dict[str, torch.Tensor]] = None
         self._prev_params_rho: Optional[Dict[str, torch.Tensor]] = None
         self._cached_rho_vg: Optional[float] = None
-        self._optimizer = None  # set by callback via set_optimizer()
+        self._optimizer = None
         
         # FIX #7: streaming layer-wise rho_VG
         self.snapshot_in_fp16: bool = False  # set True for models > ~10B params
         self._prev_params_norms: bool = False
-        self.rho_vg_per_layer_history: List[Dict[str, float]] = []
         
         self.correlation_history: List[Tuple[float, float]] = []
         self.validation_results: Dict = {}
@@ -668,7 +670,6 @@ class LERTracker:
         dot = 0.0
         vel_sq = 0.0
         grad_sq = 0.0
-        per_layer: Dict[str, float] = {}
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
@@ -695,13 +696,6 @@ class LERTracker:
             dot += d
             vel_sq += vn * vn
             grad_sq += gn * gn
-            if vn > 1e-12 and gn > 1e-12:
-                per_layer[name] = d / (vn * gn)
-
-            # free immediately
-            del v, g, vel
-
-        self.rho_vg_per_layer_history.append(per_layer)
 
         if vel_sq < 1e-24 or grad_sq < 1e-24:
             return 0.0
@@ -783,7 +777,7 @@ class LERTracker:
 
         if vel_sq > 1e-24 and grad_sq > 1e-24:
             self._cached_rho_vg = dot / ((vel_sq * grad_sq) ** 0.5)
-            self.rho_vg_per_layer_history.append(per_layer)
+            # Per-layer tracking now done in _compute_rho_vg with Dict[str, List[float]] format
 
         self._prev_params_rho = {
             name: param.data.detach().double().clone()

@@ -1759,6 +1759,13 @@ def run_single_experiment(
     lr_loss_tracker = LRLossCorrelationTracker()
     eta_estimator = ETAEstimator(total_steps)
 
+    # A.2.3 FIX: hard-set GSNR full-capture interval to 25 to cut
+    # ~26 min/run × 60 runs ≈ 26 h of overhead at paper-scale.
+    # Lightweight per-step capture_scalar_norms() still runs every step
+    # (line ~1722) to keep phase detection responsive; only the
+    # expensive full EMA-Welford update is throttled here.
+    gsnr_log_interval = 25
+
     # ── Enhanced Diagnostics Callback ─────────────────────────────────
     class FullDiagnosticsCallback:
         """Comprehensive diagnostics: LER + GSNR + waste + phase + ETA."""
@@ -2062,6 +2069,11 @@ def run_single_experiment(
             final["ler_history"] = self.ler_tracker.ler_history
             final["velocity_history"] = self.ler_tracker.velocity_history
             final["rho_vg_history"] = self.ler_tracker.rho_vg_history
+            # A.2.2 FIX: persist per-layer rho_VG snapshots so heterogeneous
+            # layer-wise dynamics survive into the analysis stage.
+            final["rho_vg_per_layer_history"] = list(
+                self.ler_tracker.rho_vg_per_layer_history
+            )
             final["loss_history"] = self.ler_tracker.loss_history
             final["entropy_history"] = self.ler_tracker.entropy_history
             with open(diag_path, "w") as f:
@@ -2187,8 +2199,17 @@ def run_single_experiment(
     trainer_holder[0] = trainer
     diag_callback._trainer = trainer  # CRITICAL: bind explicitly for on_step_end access
 
-    # Give LER tracker access to the optimizer for velocity-from-Adam
-    ler_tracker._optimizer = trainer.optimizer if hasattr(trainer, 'optimizer') else None
+    # A.2.1 FIX: bind optimizer to LERTracker so ρ_VG is computed against
+    # the AdamW *effective* update direction (m_hat / sqrt(v_hat)+eps),
+    # not the raw gradient. Without this, all five hard-coded thresholds
+    # (metrics.py:774, lerna_switching.py:140/168, lerna_baseline.py:32/85)
+    # mis-fire under AdamW because rho_VG max ≈ 0.04 instead of SGD-scale.
+    if hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
+        ler_tracker.set_optimizer(trainer.optimizer)
+    else:
+        # Fallback: trainer.optimizer is created lazily inside trainer.train();
+        # FullDiagnosticsCallback.on_train_begin will rebind via kwargs there.
+        ler_tracker._optimizer = None
 
     # ── Train & evaluate ──────────────────────────────────────────────
     start_time = time.time()

@@ -65,12 +65,12 @@ BASELINE_CONFIGS = {
     "grad_norm_skip": {
         "description": "Skip backward when ||g|| < threshold",
         "class": GradientNormSkippingCallback,
-        "params": {"grad_norm_threshold": 0.01},
+        "params": {"grad_norm_threshold": 480000},  # A.4: per-task tuned for ~22% skip on RoBERTa-base/GLUE
     },
     "random_skip": {
         "description": "Skip backward randomly at matched rate",
         "class": RandomStepSkippingCallback,
-        "params": {"target_skip_rate": 0.33},
+        "params": {"target_skip_rate": 0.22},  # A.4: matches measured 22.2% waste excl. STS-B
     },
     "weight_freeze": {
         "description": "Freeze weights during LER-detected plateaus (no momentum)",

@@ -283,7 +283,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
 
     def __init__(
         self,
-        target_skip_rate: float = 0.33,
+        target_skip_rate: float = 0.22,   # A.4: matches measured 22.2% waste excl. STS-B
         calibration_steps: int = 200,
         recalibrate_every: int = 500,
         min_step: int = 0,
