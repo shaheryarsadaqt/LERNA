@@ -1768,6 +1768,8 @@ def run_single_experiment(
             # stats before training ends. Old `max(eval_steps, 200)` meant a
             # 189-step run never triggered and GSNR stayed N/A.
             self._gsnr_log_interval = gsnr_interval
+            # Separate interval for gradient capture (more frequent than GSNR compute)
+            self._gsnr_capture_interval = max(10, min(100, gsnr_interval // 50))
             # Flag to detect post-reload eval (after load_best_model_at_end)
             self._train_ended = False
 
@@ -1816,21 +1818,21 @@ def run_single_experiment(
             """Capture gradients BEFORE optimizer step (when grads are fresh)."""
             try:
                 self.ler_tracker.capture_step_gradients(self._model)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f" [GSNR warn] capture_step_gradients: {e}")
 
             # Lightweight scalar norms every step for phase detector
             try:
                 self.gsnr_tracker.capture_scalar_norms(self._model)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f" [GSNR warn] capture_scalar_norms: {e}")
 
             # Full EMA-Welford GSNR update less frequently
-            if self.step_count % self._gsnr_log_interval == 0:
+            if self.step_count % self._gsnr_capture_interval == 0:
                 try:
                     self.gsnr_tracker.capture_gradients(self._model)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f" [GSNR warn] capture_gradients: {e}")
             return control
 
         def on_optimizer_step(self, args, state, control, **kwargs):
