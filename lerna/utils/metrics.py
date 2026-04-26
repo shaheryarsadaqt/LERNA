@@ -425,6 +425,7 @@ class LERTracker:
         self.velocity_history: List[float] = []
         self.rho_vg_history: List[float] = []
         self._prev_params: Optional[Dict[str, torch.Tensor]] = None
+        self._prev_params_rho: Optional[Dict[str, torch.Tensor]] = None
         self._cached_rho_vg: Optional[float] = None
         
         # FIX #7: streaming layer-wise rho_VG
@@ -556,20 +557,17 @@ class LERTracker:
             self.accuracy_history.append(accuracy)
         
         # FIX: Take snapshot BEFORE computing velocity.
-        # Velocity needs a prior snapshot from the previous step.
-        # Without this, the first call has no prior snapshot -> velocity=None,
-        # and we never take a snapshot because we returned early.
-        if model is not None:
-            self._snapshot_params(model)
-        
-        param_velocity = self._compute_param_velocity(model)
-        
-        rho_vg = self._compute_rho_vg(model, gradients)
-        if rho_vg is None and self._cached_rho_vg is not None:
+        # Velocity: read most recent value computed by record_step_update
+        # (don't recompute here — _prev_params is owned by record_step_update)
+        param_velocity = self.velocity_history[-1] if self.velocity_history else None
+
+        # rho_VG: consume cached value from capture_step_gradients only
+        if self._cached_rho_vg is not None:
+            self.rho_vg_history.append(self._cached_rho_vg)
             rho_vg = self._cached_rho_vg
             self._cached_rho_vg = None
-        if rho_vg is not None:
-            self.rho_vg_history.append(rho_vg)
+        else:
+            rho_vg = None
         
         if len(self.loss_history) >= 2:
             loss_gain = max(0.0, self.loss_history[-2] - self.loss_history[-1])  # signed, clipped at 0
@@ -717,18 +715,43 @@ class LERTracker:
     
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).
-        
-        Computes rho_VG using current gradients and caches the result
-        so the next update() call can use it.
-        """
-        if not self._prev_params:
-            self._snapshot_params(model)
+        Uses its OWN snapshot slot so record_step_update can't clobber it."""
+        if not self._prev_params_rho:
+            self._prev_params_rho = {
+                name: param.data.detach().double().clone()
+                for name, param in model.named_parameters()
+                if param.requires_grad
+            }
             return
-        
-        rho = self._compute_rho_vg(model, gradients=None)
-        if rho is not None:
-            self._cached_rho_vg = rho
-        self._snapshot_params(model)
+
+        dot, vel_sq, grad_sq = 0.0, 0.0, 0.0
+        per_layer = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            prev = self._prev_params_rho.get(name)
+            if prev is None or param.grad is None:
+                continue
+            v = (param.data.detach() - prev).float().flatten()
+            g = param.grad.detach().float().flatten()
+            d = torch.dot(v, g).item()
+            vn = v.norm().item()
+            gn = g.norm().item()
+            dot += d
+            vel_sq += vn * vn
+            grad_sq += gn * gn
+            if vn > 1e-12 and gn > 1e-12:
+                per_layer[name] = d / (vn * gn)
+
+        if vel_sq > 1e-24 and grad_sq > 1e-24:
+            self._cached_rho_vg = dot / ((vel_sq * grad_sq) ** 0.5)
+            self.rho_vg_per_layer_history.append(per_layer)
+
+        self._prev_params_rho = {
+            name: param.data.detach().double().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
     
     def get_ler(self, window: Optional[int] = None) -> Optional[float]:
         """Get LER value over specified window.
