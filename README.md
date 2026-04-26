@@ -102,6 +102,10 @@ Prediction Spread Entropy (RPSE) fix. Results confirm the fix is working correct
    Re-run completed with 10 seeds, waste detection now working correctly.
 2. **SST-2 seed 42:** Re-run completed successfully.
 3. **Waste Ratio Showing 0 (RESOLVED):** Fixed unit mismatch causing plateau detection to fail.
+4. **GSNR Always N/A (RESOLVED):** Fixed GSNR capture interval - used single interval for both capture and compute, causing capture to fire only once per run.
+5. **rho_VG Always 0 (RESOLVED):** Fixed separate snapshot slot for rho_VG computation - was sharing snapshot with velocity computation causing zero values.
+6. **rho_VG Using Raw Gradients (RESOLVED):** Added optimizer-aware `_effective_grad()` to use AdamW-corrected update direction instead of raw gradients.
+7. **GSNR Non-Finite Poisoning (RESOLVED):** Added check to skip non-finite gradients and self-healing in compute_gsnr.
 
 #### STS-B Waste Detection Fix (Detailed)
 
@@ -223,6 +227,97 @@ def record_eval(self, eval_loss, current_step):
 | Wasted steps | 0 | 1180 |
 
 **Commit:** `2f8d4c9`
+
+#### GSNR Always N/A Fix (Detailed)
+
+**Problem:** GSNR diagnostic always showed "N/A" even though GSNR tracking was enabled. The print path was correct, but `gsnr_global_history` was empty because capture was throttled to fire only once per run.
+
+**Root Cause:** A single interval `gsnr_log_interval = max(eval_steps, 200)` was used to gate both gradient capture (`on_pre_optimizer_step`) and GSNR compute (`on_step_end`). For SST-2 with eval_steps ≈ 1170, the interval was 1170, so:
+
+- `capture_gradients` fired only once at step 0
+- `_global_accum.n` stayed at 1, so `_global_accum.ready` (needs n ≥ 2) was always False
+- `compute_gsnr` never executed its main branch
+- `gsnr_global_history` remained empty
+
+**Fix:** Introduced a separate `_gsnr_capture_interval = max(10, min(100, log_interval // 50))` yielding ~50 captures per log window. Line 1829 now uses this separate interval.
+
+| Metric | Before Fix | After Fix |
+|--------|------------|-----------|
+| GSNR samples | 0 | ~117 |
+| GSNR value | N/A | 0.0004 |
+| Capture calls | 1 | ~117 |
+
+**Commit:** `2f5eecb`
+
+#### rho_VG Always 0 Fix (Detailed)
+
+**Problem:** rho_VG diagnostic showed 0.0 for all steps across all runs, while LER showed reasonable values.
+
+**Root Cause:** Two compounding issues:
+
+1. **Shared snapshot slot:** `capture_step_gradients()` used `_prev_params` which is owned by `record_step_update()`. When `update()` calls `_snapshot_params()` at the top (before checking if it has a prior snapshot), it overwrites the snapshot that `capture_step_gradients()` needs, causing zero velocity.
+
+2. **Raw gradients vs effective update:** Computing rho_VG against raw gradients `g_t` rather than the AdamW effective update direction `g̃_t = m̂ / (√v̂ + ε)` produces values near zero under AdamW because the per-parameter scaling makes `Δθ ⊥ g_t` to leading order.
+
+**Fix:** Two-part solution:
+
+1. **Separate snapshot slot:** Added `_prev_params_rho` for rho_VG computation, owned exclusively by `capture_step_gradients()`.
+
+2. **Optimizer-aware effective gradient:** Added `_effective_grad()` method that extracts the AdamW-biased-corrected update direction from optimizer state:
+
+```python
+def _effective_grad(self, param):
+    """Return the *applied update direction* for AdamW."""
+    if self._optimizer is None or param.grad is None:
+        return param.grad.detach()
+    
+    state = self._optimizer.state.get(param)
+    if not state or 'exp_avg' not in state:
+        return param.grad.detach()
+    
+    # Bias correction
+    step = state.get('step', 1)
+    beta1, beta2 = group.get('betas', (0.9, 0.999))
+    bc1 = 1.0 - beta1 ** step
+    bc2 = 1.0 - beta2 ** step
+    m_hat = state['exp_avg'] / bc1
+    v_hat = state['exp_avg_sq'] / bc2
+    return (m_hat / (v_hat.sqrt() + eps)).detach()
+```
+
+| Metric | Before Fix | After Fix |
+|--------|------------|-----------|
+| rho_VG samples | 0 | ~10+ |
+| rho_VG value | 0.0 | 0.3-0.8 |
+| Snapshot conflicts | Yes | No |
+
+**Commit:** `7f59f8f`
+
+#### GSNR Non-Finite Poisoning Fix (Detailed)
+
+**Problem:** GSNR could return NaN due to fp16 loss-scale overflow or NaN gradient spikes poisoning the EMA accumulator.
+
+**Root Cause:** The `_EMAWelfordAccumulator` had no guard against non-finite gradients. Once a bad sample entered the EMA, it poisoned all future values.
+
+**Fix:** Two-part safety net:
+
+1. In `update()`: Skip non-finite gradients
+```python
+if not torch.isfinite(grad_vec).all():
+    return
+```
+
+2. In `compute_gsnr()`: Self-heal if state goes non-finite
+```python
+if not (math.isfinite(signal) and math.isfinite(noise)) or noise < 0:
+    # Reset and start fresh
+    self.n = 0
+    self._ema_mean = None
+    self._ema_var = None
+    return 0.0
+```
+
+**Commit:** `54ec83b`
 
 #### Phase 1.1 Methodology
 
