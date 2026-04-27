@@ -96,33 +96,64 @@ class LERNABaselineCallback(TrainerCallback):
             self._rho_vg_history.append(float(rho_vg))
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        """Feed gradients into LERTracker for rho_VG computation."""
+        """Feed gradients into LERTracker for rho_VG computation.
+
+        FIX: LERTracker exposes capture_step_gradients(model) and update(...)
+        — there is no update_gradient() method. The previous code raised
+        AttributeError on the first optimizer step, which is why this
+        baseline silently never activated.
+        """
         if self.tracker is None:
             return
         model = kwargs.get("model")
         if model is None:
             return
 
-        total_norm_sq = 0.0
-        grad_snapshot = []
-        for p in model.parameters():
-            if p.grad is not None:
-                g = p.grad.data
-                total_norm_sq += g.norm(2).item() ** 2
-                grad_snapshot.append(g.detach().flatten())
-        grad_norm = total_norm_sq ** 0.5
-        flat_grad = (
-            torch.cat(grad_snapshot) if grad_snapshot else torch.zeros(1)
-        )
-        self.tracker.update_gradient(grad_norm=grad_norm, flat_grad=flat_grad)
+        # Bind optimizer once (LERTracker uses it for AdamW-aware ρ_VG).
+        opt = kwargs.get("optimizer")
+        if opt is not None and hasattr(self.tracker, "set_optimizer") \
+                and getattr(self.tracker, "_optimizer", None) is None:
+            self.tracker.set_optimizer(opt)
+
+        # Compute & cache ρ_VG while gradients are live.
+        self.tracker.capture_step_gradients(model)
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Feed eval metrics into LERTracker for LER update."""
+        """Feed eval metrics into LERTracker for LER update.
+
+        FIX: LERTracker has no update_evaluation(); the real entry point is
+        update(loss, logits, accuracy=..., model=...). We pass dummy logits
+        when the trainer didn't expose its last real logits — entropy will
+        fall back to the regression branch but LER still progresses.
+        """
         if self.tracker is None or metrics is None:
             return
+
         eval_loss = metrics.get("eval_loss")
-        eval_acc = metrics.get("eval_accuracy") or metrics.get("eval_matthews_correlation")
-        self.tracker.update_evaluation(eval_loss=eval_loss, eval_metric=eval_acc)
+        eval_acc = (
+            metrics.get("eval_accuracy")
+            or metrics.get("eval_matthews_correlation")
+            or metrics.get("eval_pearsonr")
+            or metrics.get("eval_pearson")
+        )
+        if eval_loss is None:
+            return
+
+        model = kwargs.get("model")
+        # Prefer real logits if the custom trainer cached them.
+        logits = None
+        if self._trainer is not None:
+            logits = getattr(self._trainer, "_last_real_logits", None)
+        if logits is None:
+            logits = torch.zeros(1, 2)  # safe fallback (binary-shape dummy)
+
+        self.tracker.update(
+            loss=float(eval_loss),
+            logits=logits,
+            accuracy=float(eval_acc) if eval_acc is not None else None,
+            model=model,
+            gradients=None,
+        )
 
     # ------------------------------------------------------------------ #
     # Activation summary (matches other baselines' contract)

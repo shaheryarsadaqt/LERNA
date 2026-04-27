@@ -1687,6 +1687,13 @@ def run_single_experiment(
             return control
 
         def on_train_begin(self, args, state, control, **kwargs):
+            # A.2.1 FIX: HF Trainer creates the optimizer lazily inside
+            # trainer.train(). It is exposed to callbacks via kwargs at
+            # on_train_begin. Bind it here so LERTracker can compute ρ_VG
+            # against the Adam-effective update direction.
+            opt = kwargs.get("optimizer", None)
+            if opt is not None and hasattr(self.ler_tracker, "set_optimizer"):
+                self.ler_tracker.set_optimizer(opt)
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
@@ -2129,8 +2136,13 @@ def run_single_experiment(
     # Set trainer reference in callback
     trainer_holder[0] = trainer
 
-    # Give LER tracker access to the optimizer for velocity-from-Adam
-    ler_tracker._optimizer = trainer.optimizer if hasattr(trainer, 'optimizer') else None
+    # A.2.1 FIX: trainer.optimizer is None until trainer.train() runs. The
+    # real binding happens in FullDiagnosticsCallback.on_train_begin via
+    # kwargs["optimizer"]. We only attempt an eager bind here as a no-op
+    # safety in case some path constructs the optimizer up-front.
+    if hasattr(trainer, "optimizer") and trainer.optimizer is not None \
+            and hasattr(ler_tracker, "set_optimizer"):
+        ler_tracker.set_optimizer(trainer.optimizer)
 
     # ── Train & evaluate ──────────────────────────────────────────────
     start_time = time.time()

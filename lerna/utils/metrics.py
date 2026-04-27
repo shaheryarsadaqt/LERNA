@@ -350,15 +350,24 @@ class LERTracker:
         self.rho_vg_history: List[float] = []
         self._prev_params: Optional[Dict[str, torch.Tensor]] = None
         self._cached_rho_vg: Optional[float] = None
-        
+
+        # A.2.1 FIX: optimizer reference for AdamW-effective ρ_VG.
+        # When bound, _compute_rho_vg correlates velocity against
+        # -m_hat / (sqrt(v_hat) + eps) instead of raw param.grad.
+        self._optimizer = None
+        self._adam_eps_fallback: float = 1e-8
+        # Per-layer snapshot history (one dict per capture_step_gradients call).
+        self.per_layer_snapshots: List[Dict[str, Dict[str, float]]] = []
+
+        # ── Original tail of __init__ (do not delete) ──────────────────
         self.correlation_history: List[Tuple[float, float]] = []
         self.validation_results: Dict = {}
-        
+
         # Hysteresis state for phase detection
         self._committed_phase: str = "warmup"
         self._candidate_phase: Optional[str] = None
         self._candidate_phase_count: int = 0
-        
+
         if task_calibration is None:
             task_calibration = self._get_default_calibration()
         self.task_calibration = task_calibration
@@ -367,20 +376,27 @@ class LERTracker:
         task_cal = self.task_calibration.get(self.task, {})
         if "min_phase_duration" in task_cal:
             self.min_phase_duration = task_cal["min_phase_duration"]
-    
+
     def _get_default_calibration(self) -> Dict:
         """Get default calibration for different tasks."""
         return {
             "sst2": {"ler_threshold": 0.01, "entropy_weight": 1.0},
             "qnli": {"ler_threshold": 0.008, "entropy_weight": 1.1},
-            "qqp": {"ler_threshold": 0.012, "entropy_weight": 0.9},
+            "qqp":  {"ler_threshold": 0.012, "entropy_weight": 0.9},
             "mnli": {"ler_threshold": 0.009, "entropy_weight": 1.2},
-            "rte": {"ler_threshold": 0.015, "entropy_weight": 1.3},
+            "rte":  {"ler_threshold": 0.015, "entropy_weight": 1.3},
             "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4},
             "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0},
             "stsb": {"ler_threshold": 5e-5, "entropy_weight": 1.5, "min_phase_duration": 3},
         }
-    
+
+    def _snapshot_params(self, model: torch.nn.Module):
+        self._prev_params = {
+            name: param.data.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
     def update(
         self,
         loss: float,
@@ -391,128 +407,79 @@ class LERTracker:
         gradients: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self.loss_history.append(loss)
-        
+
         # Compute entropy: handle both classification and regression tasks
         if logits.dim() >= 2 and logits.size(-1) > 1:
-            # Classification: use prediction entropy over class probabilities
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
         else:
-            # Regression (num_labels=1): softmax on a single logit is always 1.0,
-            # giving entropy=0 and making LER=0 for the entire run.
-            #
-            # FIX (2026-04-06): The previous approach using log1p(pred_std)
-            # collapsed to ~0 once the model converged, because prediction
-            # variance drops to near-zero for well-trained regression models.
-            # Classification entropy for binary tasks is typically 0.5-0.7,
-            # but log1p(std) for converged regression was 0.0-0.05.
-            #
-            # New approach: Regression Prediction Spread Entropy (RPSE)
-            # Combines three signals that remain informative throughout training:
-            #   1. Prediction spread: how dispersed predictions are across the
-            #      batch (normalized by target range to be scale-invariant)
-            #   2. Prediction range utilization: what fraction of the output
-            #      space the model is actually using
-            #   3. Per-sample deviation from batch mean (analogous to how
-            #      classification entropy measures per-sample uncertainty)
-            #
-            # The result is scaled to match classification entropy magnitude
-            # (~0.3-0.8 for active learning, ~0.1-0.3 for plateau).
             preds = logits.squeeze()
             if preds.numel() > 1:
                 pred_mean = preds.mean().item()
                 pred_std = preds.std().item()
                 pred_range = (preds.max() - preds.min()).item()
-
-                # For STS-B, target range is [0, 5]. For general regression,
-                # estimate from prediction range or use a reasonable default.
-                # We use max(pred_range, 1.0) to avoid division by zero and
-                # to handle tasks where the model hasn't spread predictions yet.
                 effective_range = max(pred_range, 1.0)
-
-                # Component 1: Normalized spread (coefficient of variation analog)
-                # High when predictions are diverse, low when collapsed
                 spread = pred_std / (abs(pred_mean) + 1e-6)
-
-                # Component 2: Range utilization entropy
-                # Measures how much of the output space is being used
-                # Normalize predictions to [0, 1] range and compute entropy
                 preds_norm = (preds - preds.min()) / (effective_range + 1e-8)
-                # Bin into a simple histogram (10 bins) and compute entropy
                 hist_counts = torch.histc(preds_norm.float(), bins=10, min=0.0, max=1.0)
                 hist_probs = hist_counts / (hist_counts.sum() + 1e-8)
                 range_entropy = -(hist_probs * torch.log(hist_probs + 1e-10)).sum().item()
-                # Normalize: max entropy for 10 bins is log(10) ~ 2.3
                 range_entropy_norm = range_entropy / (np.log(10) + 1e-8)
-
-                # Component 3: Per-sample deviation entropy
-                # Analogous to classification per-sample entropy
                 deviations = (preds - pred_mean).abs()
                 dev_norm = deviations / (pred_std + 1e-8)
-                # Use mean absolute z-score as uncertainty measure
                 mean_abs_z = dev_norm.mean().item()
-
-                # Combine components with scaling to match classification
-                # entropy range (~0.3-0.8 during active learning)
-                # spread: typically 0.1-2.0, scale by 0.3
-                # range_entropy_norm: 0-1, scale by 0.4
-                # mean_abs_z: typically 0.5-1.5, scale by 0.15
                 entropy = float(
                     0.3 * min(spread, 3.0)
                     + 0.4 * range_entropy_norm
                     + 0.15 * min(mean_abs_z, 2.0)
                 )
-                # Floor: ensure entropy never drops below 0.05 so LER
-                # remains nonzero even for highly converged models.
-                # This allows the WasteQuantifier to detect plateaus.
                 entropy = max(entropy, 0.05)
             else:
-                entropy = 0.1  # single-sample fallback
+                entropy = 0.1
         self.entropy_history.append(entropy)
-        
+
         if accuracy is not None:
             self.accuracy_history.append(accuracy)
-        
+
         param_velocity = self._compute_param_velocity(model)
-        
+
         rho_vg = self._compute_rho_vg(model, gradients)
         if rho_vg is None and self._cached_rho_vg is not None:
             rho_vg = self._cached_rho_vg
             self._cached_rho_vg = None
         if rho_vg is not None:
             self.rho_vg_history.append(rho_vg)
-        
+
         if model is not None:
             self._snapshot_params(model)
-        
+
         if len(self.loss_history) >= 2:
             loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
-            
             window_start = max(0, len(self.entropy_history) - self.window_size)
             avg_entropy = np.mean(self.entropy_history[window_start:])
-            
+
             if param_velocity is not None and param_velocity > 0:
                 ler = (param_velocity * loss_gain * avg_entropy) / (n_steps + 1e-8)
             else:
                 ler = (loss_gain * avg_entropy) / (n_steps + 1e-8)
-            
+
             if self.task in self.task_calibration:
                 ler *= self.task_calibration[self.task]["entropy_weight"]
-            
+
             self.ler_history.append(ler)
-            
+
             if accuracy is not None and self.validate_correlation:
                 self.correlation_history.append((ler, accuracy))
                 if len(self.correlation_history) % 50 == 0:
                     self._validate_correlation()
-    
+
     def _compute_param_velocity(self, model: Optional[torch.nn.Module]) -> Optional[float]:
         if model is None or self._prev_params is None:
             return None
-        
+
         total_delta_sq = 0.0
         total_params = 0
-        
+
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
@@ -520,78 +487,140 @@ class LERTracker:
                 delta = param.data.detach() - self._prev_params[name]
                 total_delta_sq += delta.pow(2).sum().item()
                 total_params += param.numel()
-        
+
         if total_params == 0:
             return None
-        
+
         velocity = (total_delta_sq ** 0.5) / (total_params ** 0.5)
         self.velocity_history.append(velocity)
         return velocity
-    
+
     def _compute_rho_vg(
         self,
         model: Optional[torch.nn.Module],
         gradients: Optional[Dict[str, torch.Tensor]],
     ) -> Optional[float]:
+        """Velocity / signal cosine.
+
+        If an optimizer is bound (set_optimizer), the comparison signal is
+        the Adam-effective update direction:
+            u = m_hat / (sqrt(v_hat) + eps),  where m_hat = m / (1-β1^t),
+                                                    v_hat = v / (1-β2^t)
+        and we correlate velocity against -u so productive learning ≈ +1.
+
+        Otherwise we fall back to the raw gradient (legacy SGD behaviour),
+        which under AdamW collapses to ρ_VG ≈ -1 (anti-parallel to Δθ).
+        """
         if model is None or self._prev_params is None:
             return None
-        
+
+        # Build a fast id->state lookup if optimizer is available.
+        state_lookup = {}
+        if self._optimizer is not None:
+            for group in self._optimizer.param_groups:
+                for p in group["params"]:
+                    state_lookup[id(p)] = (group, self._optimizer.state.get(p, {}))
+
         velocity_parts = []
-        gradient_parts = []
-        
+        signal_parts = []
+
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             if name not in self._prev_params:
                 continue
-            
+
             vel = (param.data.detach() - self._prev_params[name]).flatten()
-            
-            grad = None
-            if gradients is not None and name in gradients:
-                grad = gradients[name].detach().flatten()
-            elif param.grad is not None:
-                grad = param.grad.detach().flatten()
-            
-            if grad is not None:
+
+            sig = None
+            if self._optimizer is not None and id(param) in state_lookup:
+                group, st = state_lookup[id(param)]
+                m = st.get("exp_avg")
+                v = st.get("exp_avg_sq")
+                step = st.get("step", 0)
+                if m is not None and v is not None and step:
+                    beta1, beta2 = group.get("betas", (0.9, 0.999))
+                    eps = group.get("eps", self._adam_eps_fallback)
+                    t = float(step.item() if torch.is_tensor(step) else step)
+                    if t > 0:
+                        m_hat = m / (1.0 - beta1 ** t)
+                        v_hat = v / (1.0 - beta2 ** t)
+                        u = (m_hat / (v_hat.sqrt() + eps)).detach().flatten()
+                        # Productive learning convention: cos(vel, -u) ≈ +1.
+                        sig = -u
+
+            if sig is None:
+                # Fallback to raw gradient path.
+                if gradients is not None and name in gradients:
+                    sig = gradients[name].detach().flatten()
+                elif param.grad is not None:
+                    sig = param.grad.detach().flatten()
+
+            if sig is not None:
                 velocity_parts.append(vel)
-                gradient_parts.append(grad)
-        
+                signal_parts.append(sig)
+
         if not velocity_parts:
             return None
-        
+
         vel_vec = torch.cat(velocity_parts)
-        grad_vec = torch.cat(gradient_parts)
-        
+        sig_vec = torch.cat(signal_parts)
+
         vel_norm = vel_vec.norm()
-        grad_norm = grad_vec.norm()
-        
-        if vel_norm < 1e-12 or grad_norm < 1e-12:
+        sig_norm = sig_vec.norm()
+        if vel_norm < 1e-12 or sig_norm < 1e-12:
             return 0.0
-        
-        rho = torch.dot(vel_vec, grad_vec) / (vel_norm * grad_norm)
+
+        rho = torch.dot(vel_vec, sig_vec) / (vel_norm * sig_norm)
         return rho.item()
-    
-    def _snapshot_params(self, model: torch.nn.Module):
-        self._prev_params = {
-            name: param.data.detach().clone()
-            for name, param in model.named_parameters()
-            if param.requires_grad
-        }
-    
+
+    def set_optimizer(self, optimizer) -> None:
+        """Bind the trainer's optimizer so ρ_VG is computed against the
+        Adam-effective update direction (m_hat / sqrt(v_hat) + eps) instead
+        of the raw gradient. Without this, ρ_VG collapses to ~ -1 under
+        AdamW because Δθ ≈ -η·m_hat/√v_hat is anti-parallel to the recent g.
+        """
+        self._optimizer = optimizer
+
     def capture_step_gradients(self, model: torch.nn.Module):
         """Call during training when param.grad is live (before optimizer.zero_grad).
-        
-        Computes rho_VG using current gradients and caches the result
-        so the next update() call can use it.
+
+        Computes rho_VG using current gradients (or Adam moments if optimizer
+        is bound) and caches the result so the next update() call can use it.
+        Also appends a per-layer snapshot dict for diagnostics.
         """
         if self._prev_params is None:
             self._snapshot_params(model)
             return
-        
+
         rho = self._compute_rho_vg(model, gradients=None)
         if rho is not None:
             self._cached_rho_vg = rho
+
+        # A.2.1 FIX: per-layer snapshot history (was always empty before).
+        snap: Dict[str, Dict[str, float]] = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad.detach()
+            entry = {
+                "grad_norm": float(g.norm().item()),
+                "param_norm": float(p.data.detach().norm().item()),
+            }
+            # Optional: Adam moment magnitudes for richer diagnostics.
+            if self._optimizer is not None:
+                for group in self._optimizer.param_groups:
+                    if any(p is q for q in group["params"]):
+                        st = self._optimizer.state.get(p, {})
+                        m = st.get("exp_avg")
+                        v = st.get("exp_avg_sq")
+                        if m is not None:
+                            entry["m_norm"] = float(m.norm().item())
+                        if v is not None:
+                            entry["v_mean_sqrt"] = float(v.mean().sqrt().item())
+                        break
+            snap[name] = entry
+        self.per_layer_snapshots.append(snap)
     
     def get_ler(self, window: Optional[int] = None) -> Optional[float]:
         """Get LER value over specified window.
