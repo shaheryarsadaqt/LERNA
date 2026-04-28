@@ -634,77 +634,41 @@ class WasteQuantifier:
         if len(self.improving_steps) > _MAX_HIST * 2:
             self.improving_steps = self.improving_steps[-_MAX_HIST:]
 
-        # --- Dual-signal change-point plateau detection ---
-        # Update EMA loss
-        if self._ema_loss is None:
-            self._ema_loss = loss
-            self._best_ema_loss = loss
-        else:
-            self._ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+        # --- Legacy EMA-based detector (kept for `detector="relative"`) ---
+        if self.detector_name == "relative":
+            if self._ema_loss is None:
+                self._ema_loss = loss
+                self._best_ema_loss = loss
+            else:
+                self._ema_loss = self.ema_alpha * loss + (1 - self.ema_alpha) * self._ema_loss
+                if self._best_ema_loss is not None and self._best_ema_loss > 0:
+                    relative_improvement = (self._best_ema_loss - self._ema_loss) / self._best_ema_loss
+                    if relative_improvement > self.plateau_min_improvement:
+                        self._best_ema_loss = self._ema_loss
+                        self._steps_since_ema_improvement = 0
+                    else:
+                        self._steps_since_ema_improvement += 1
+                else:
+                    if self._ema_loss < self._best_ema_loss:
+                        self._best_ema_loss = self._ema_loss
+                        self._steps_since_ema_improvement = 0
+                    else:
+                        self._steps_since_ema_improvement += 1
 
-            # Update log(EMA(loss)) for Theil-Sen
-            if self._ema_loss > 0:
-                self._log_ema_loss_history.append(math.log(self._ema_loss))
+                if (self._plateau_step is None
+                        and self._steps_since_ema_improvement >= self.plateau_patience
+                        and self._total_steps_seen >= self.min_steps_before_plateau):
+                    self._plateau_step = self._total_steps_seen - self.plateau_patience
 
-            # Update GSNR if grad_norm available (GSNR = grad_norm / (2 * var(loss)) approximation
-            if grad_norm is not None and len(self.loss_history) >= 2:
-                loss_var = np.var(self.loss_history[-min(10, len(self.loss_history)):])
-                if loss_var > 0:
-                    gsnr = grad_norm / math.sqrt(loss_var)
-                    self._gsnr_history.append(gsnr)
-
-            # Check dual-signal plateau conditions after warmup
+        # --- New slope / dual-signal detector ---
+        if self.detector_name in ("slope", "dual_signal"):
+            sgd_now = sgd_step if sgd_step is not None else self._total_steps_seen
+            self._slope_det.update_loss(sgd_now, loss)
             if (self._plateau_step is None
-                    and self._total_steps_seen >= self.min_steps_before_plateau
-                    and len(self._log_ema_loss_history) >= self._plateau_window):
-                W = self._plateau_window
-                log_ema_window = self._log_ema_loss_history[-W:]
-                loss_window = self.loss_history[-W:]
-
-                # T1: |Theil-Sen slope of log(EMA(loss))| < epsilon_slope
-                t1_passed = False
-                if len(log_ema_window) >= 3:
-                    slopes = []
-                    for i in range(len(log_ema_window)):
-                        for j in range(i + 1, len(log_ema_window)):
-                            dx = j - i
-                            if dx > 0:
-                                dy = log_ema_window[j] - log_ema_window[i]
-                                slopes.append(dy / dx)
-                    theil_sen_slope = np.median(slopes) if slopes else 0
-                    # Scale to per-1000 steps
-                    per_1000_slope = theil_sen_slope * (1000 / W)
-                    t1_passed = abs(per_1000_slope) < self.epsilon_slope
-
-                # T2: Mann-Kendall p-value > alpha_mk (fail to reject H0: no trend)
-                t2_passed = False
-                if len(loss_window) >= 3:
-                    n = len(loss_window)
-                    s = 0
-                    for i in range(n - 1):
-                        for j in range(i + 1, n):
-                            diff = loss_window[j] - loss_window[i]
-                            if diff > 0:
-                                s += 1
-                            elif diff < 0:
-                                s -= 1
-                    var_s = (n * (n - 1) * (2 * n + 5)) / 18
-                    z = s / math.sqrt(var_s) if var_s > 0 else 0
-                    # Two-tailed p-value approximation
-                    p_value = 2 * (1 - self._normal_cdf(abs(z))) if z != 0 else 1.0
-                    t2_passed = p_value > self.alpha_mk
-
-                # T3: GSNR_t < 0.10 * max_gsnr for K=3 consecutive
-                t3_passed = False
-                if len(self._gsnr_history) >= 3:
-                    max_gsnr = max(self._gsnr_history)
-                    recent_gsnr = self._gsnr_history[-3:]
-                    if all(g < 0.10 * max_gsnr for g in recent_gsnr):
-                        t3_passed = True
-
-                # Plateau: (T1 ∧ T2) ∨ (T1 ∧ T3)
-                if t1_passed and (t2_passed or t3_passed):
-                    self._plateau_step = self._total_steps_seen - self._plateau_window
+                    and self._slope_det.plateau_step is not None
+                    and self._total_steps_seen >= self.min_steps_before_plateau):
+                self._plateau_step = self._total_steps_seen - 1
+                self._plateau_step_train = self._slope_det.plateau_step
 
         # --- Legacy per-step comparison (kept as secondary metric) ---
         if len(self.loss_history) >= 2:
