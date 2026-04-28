@@ -576,6 +576,18 @@ class WasteQuantifier:
         if self.step_times and plateau_step is not None:
             wasted_time = sum(self.step_times[plateau_step:])
 
+        # --- Eval-metric-based waste (the meaningful one) ---
+        best_eval_step = getattr(self, "_best_eval_step", None)
+        best_eval_metric = getattr(self, "_best_eval_metric", None)
+        if best_eval_step is not None and n > 0:
+            last_step = getattr(self, "_last_global_step", None)
+            if last_step and last_step > 0:
+                eval_waste_ratio = max(0.0, (last_step - best_eval_step) / last_step)
+            else:
+                eval_waste_ratio = 0.0
+        else:
+            eval_waste_ratio = 0.0
+
         return {
             "waste_ratio": float(waste_ratio),
             "ci_95_low": float(ci_low),
@@ -591,7 +603,33 @@ class WasteQuantifier:
             "wasted_time_s": float(wasted_time),
             "total_time_s": float(total_time),
             "waste_reasons": dict(self.waste_reasons),
+            "eval_waste_ratio": float(eval_waste_ratio),
+            "best_eval_step": best_eval_step,
+            "best_eval_metric": float(best_eval_metric) if best_eval_metric is not None else None,
         }
+
+
+    def record_eval_improvement(self, global_step, eval_metric, greater_is_better=True):
+        """Track best-eval-metric step for the secondary, eval-based waste ratio.
+
+        Called from on_evaluate() in the diagnostics callback. This metric
+        answers the question 'how much compute happened after the eval
+        metric stopped improving?' and is independent of training-loss
+        smoothing artefacts.
+        """
+        if self._best_eval_metric is None:
+            self._best_eval_step = global_step
+            self._best_eval_metric = eval_metric
+            self._last_global_step = global_step
+            return
+        improved = (
+            (greater_is_better and eval_metric > self._best_eval_metric)
+            or (not greater_is_better and eval_metric < self._best_eval_metric)
+        )
+        if improved:
+            self._best_eval_step = global_step
+            self._best_eval_metric = eval_metric
+        self._last_global_step = global_step
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1759,9 +1797,20 @@ def run_single_experiment(
                 loss_is_new = (self._last_loss_fed_to_waste is None or
                                self._last_loss != self._last_loss_fed_to_waste)
                 if loss_is_new:
+                    # Pull last per-step energy from power callback if available
+                    energy_j = None
+                    try:
+                        pc = power_callback
+                        if hasattr(pc, "_power_samples") and pc._power_samples:
+                            last = pc._power_samples[-1]
+                            if step_time and "power_w" in last:
+                                energy_j = float(last["power_w"]) * float(step_time)
+                    except Exception:
+                        energy_j = None
                     self.waste_quantifier.record_step(
                         loss=self._last_loss,
                         grad_norm=global_grad_norm,
+                        energy_j=energy_j,
                         step_time=step_time,
                     )
                     self._last_loss_fed_to_waste = self._last_loss
@@ -1880,6 +1929,24 @@ def run_single_experiment(
 
             eval_loss = metrics.get("eval_loss", 0)
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
+
+            # Wire eval-metric into WasteQuantifier (eval-based waste ratio).
+            # Pick the same metric the trainer uses for best-model selection.
+            try:
+                _eval_metric_name = "eval_" + str(metric_for_best_model)
+                _gib = bool(greater_is_better)
+                _val = metrics.get(_eval_metric_name)
+                if _val is None:
+                    _val = accuracy if accuracy else (-eval_loss)
+                    _gib = True
+                self.waste_quantifier.record_eval_improvement(
+                    global_step=state.global_step,
+                    eval_metric=float(_val),
+                    greater_is_better=_gib,
+                )
+            except Exception as _e:
+                print(f"  [WARN] record_eval_improvement failed: {_e}")
+
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
@@ -2207,8 +2274,10 @@ def run_single_experiment(
     print(f"  Time: {total_time:.1f}s")
     if gsnr_tracker.gsnr_global_history:
         print(f"  GSNR (global): {gsnr_tracker.gsnr_global_history[-1]:.4f}")
-    print(f"  Waste ratio: {waste_metrics['waste_ratio']:.3f} "
+    print(f"  Waste ratio (train-loss): {waste_metrics['waste_ratio']:.3f} "
           f"(95% CI: [{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}])")
+    print(f"  Waste ratio (eval-metric): {waste_metrics.get('eval_waste_ratio', 0.0):.3f} "
+          f"(best at step {waste_metrics.get('best_eval_step')})")
     print(f"  Phase: {phase_summary['current_phase']} "
           f"({len(phase_summary['transitions'])} transitions)")
     if lr_loss_corr:
