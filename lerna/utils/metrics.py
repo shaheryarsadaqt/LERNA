@@ -380,14 +380,14 @@ class LERTracker:
     def _get_default_calibration(self) -> Dict:
         """Get default calibration for different tasks."""
         return {
-            "sst2": {"ler_threshold": 0.01, "entropy_weight": 1.0},
-            "qnli": {"ler_threshold": 0.008, "entropy_weight": 1.1},
-            "qqp":  {"ler_threshold": 0.012, "entropy_weight": 0.9},
-            "mnli": {"ler_threshold": 0.009, "entropy_weight": 1.2},
-            "rte":  {"ler_threshold": 0.015, "entropy_weight": 1.3},
-            "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4},
-            "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0},
-            "stsb": {"ler_threshold": 5e-5, "entropy_weight": 1.5, "min_phase_duration": 3},
+            "sst2": {"ler_threshold": 0.01,  "entropy_weight": 1.0, "min_phase_duration": 3},
+            "qnli": {"ler_threshold": 0.008, "entropy_weight": 1.1, "min_phase_duration": 3},
+            "qqp":  {"ler_threshold": 0.012, "entropy_weight": 0.9, "min_phase_duration": 3},
+            "mnli": {"ler_threshold": 0.009, "entropy_weight": 1.2, "min_phase_duration": 3},
+            "rte":  {"ler_threshold": 0.015, "entropy_weight": 1.3, "min_phase_duration": 3},
+            "mrpc": {"ler_threshold": 0.014, "entropy_weight": 1.4, "min_phase_duration": 3},
+            "cola": {"ler_threshold": 0.013, "entropy_weight": 1.0, "min_phase_duration": 3},
+            "stsb": {"ler_threshold": 5e-5,  "entropy_weight": 1.5, "min_phase_duration": 3},
         }
 
     def _snapshot_params(self, model: torch.nn.Module):

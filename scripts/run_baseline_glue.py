@@ -447,6 +447,8 @@ class WasteQuantifier:
 
         # True step counter (not affected by history capping)
         self._total_steps_seen = 0
+        self._sgd_step_at_obs = []  # parallel to loss_history; SGD step at which that loss was logged
+        self._eval_greater_is_better = True  # default; updated via set_eval_direction
 
         # EMA-based plateau detection state
         self._ema_loss = None
@@ -458,9 +460,16 @@ class WasteQuantifier:
         self.improving_steps = []  # True/False per step
         self.waste_reasons = defaultdict(int)
 
-    def record_step(self, loss, grad_norm=None, energy_j=None, step_time=None):
+        # Eval-metric–based plateau tracking (separate from train-loss EMA)
+        self._best_eval_metric = None
+        self._best_eval_step = None
+        self._last_global_step = None
+
+    def record_step(self, loss, grad_norm=None, energy_j=None, step_time=None, sgd_step=None):
         """Record metrics for a single training step."""
         self._total_steps_seen += 1
+        if sgd_step is not None:
+            self._sgd_step_at_obs.append(int(sgd_step))
         self.loss_history.append(loss)
         if grad_norm is not None:
             self.grad_norm_history.append(grad_norm)
@@ -534,15 +543,26 @@ class WasteQuantifier:
                     "wasted_energy_j": 0, "total_energy_j": 0, "energy_waste_pct": 0,
                     "wasted_time_s": 0, "total_time_s": 0, "waste_reasons": {}}
 
-        # --- Primary: plateau-based waste ---
-        if self._plateau_step is not None:
-            plateau_step = max(0, self._plateau_step)
-            wasted_steps = n - plateau_step
-            waste_ratio = wasted_steps / n
+        # --- Primary: plateau-based waste (translate obs-index to SGD steps) ---
+        # Backward-compat: use SGD-step translation only if _sgd_step_at_obs is fully wired
+        if (self._plateau_step is not None and self._sgd_step_at_obs
+                and len(self._sgd_step_at_obs) == self._total_steps_seen):
+            obs_idx = max(0, min(self._plateau_step, len(self._sgd_step_at_obs) - 1))
+            plateau_step_sgd = self._sgd_step_at_obs[obs_idx]
+            total_steps_sgd = self._sgd_step_at_obs[-1]
+            wasted_steps = max(0, total_steps_sgd - plateau_step_sgd)
+            waste_ratio = wasted_steps / total_steps_sgd if total_steps_sgd else 0.0
         else:
-            plateau_step = None
-            wasted_steps = 0
-            waste_ratio = 0.0
+            # Fallback: obs-index units (old behaviour for legacy callers)
+            if self._plateau_step is not None:
+                plateau_step_sgd = max(0, self._plateau_step)
+                wasted_steps = n - self._plateau_step
+                waste_ratio = wasted_steps / n if n else 0.0
+            else:
+                plateau_step_sgd = None
+                wasted_steps = 0
+                waste_ratio = 0.0
+            total_steps_sgd = n
 
         # 95% CI for waste ratio using Wilson score interval
         if n >= 2 and waste_ratio > 0:
@@ -567,23 +587,37 @@ class WasteQuantifier:
         # Energy waste (attributed to post-plateau steps)
         total_energy = sum(self.energy_per_step) if self.energy_per_step else 0
         wasted_energy = 0.0
-        if self.energy_per_step and plateau_step is not None:
-            wasted_energy = sum(self.energy_per_step[plateau_step:])
+        if self.energy_per_step and self._plateau_step is not None:
+            obs_idx = max(0, min(self._plateau_step, len(self.energy_per_step) - 1))
+            wasted_energy = sum(self.energy_per_step[obs_idx:])
 
         # Time waste (attributed to post-plateau steps)
         total_time = sum(self.step_times) if self.step_times else 0
         wasted_time = 0.0
-        if self.step_times and plateau_step is not None:
-            wasted_time = sum(self.step_times[plateau_step:])
+        if self.step_times and self._plateau_step is not None:
+            obs_idx = max(0, min(self._plateau_step, len(self.step_times) - 1))
+            wasted_time = sum(self.step_times[obs_idx:])
+
+        # --- Eval-metric-based waste (the meaningful one) ---
+        best_eval_step = getattr(self, "_best_eval_step", None)
+        best_eval_metric = getattr(self, "_best_eval_metric", None)
+        if best_eval_step is not None and n > 0:
+            last_step = getattr(self, "_last_global_step", None)
+            if last_step and last_step > 0:
+                eval_waste_ratio = max(0.0, (last_step - best_eval_step) / last_step)
+            else:
+                eval_waste_ratio = 0.0
+        else:
+            eval_waste_ratio = 0.0
 
         return {
             "waste_ratio": float(waste_ratio),
             "ci_95_low": float(ci_low),
             "ci_95_high": float(ci_high),
-            "total_steps": n,
+            "total_steps": total_steps_sgd if self._sgd_step_at_obs else n,
             "wasted_steps": int(wasted_steps),
-            "plateau_step": plateau_step,
-            "improving_steps": int(n - wasted_steps),
+            "plateau_step": plateau_step_sgd,
+            "improving_steps": int((total_steps_sgd if self._sgd_step_at_obs else n) - wasted_steps),
             "raw_improving_ratio": float(raw_improving_ratio),
             "wasted_energy_j": float(wasted_energy),
             "total_energy_j": float(total_energy),
@@ -591,7 +625,39 @@ class WasteQuantifier:
             "wasted_time_s": float(wasted_time),
             "total_time_s": float(total_time),
             "waste_reasons": dict(self.waste_reasons),
+            "best_eval_step": self._best_eval_step,
+            "best_eval_metric": self._best_eval_metric,
+            "eval_waste_ratio": float(eval_waste_ratio),
         }
+
+
+    def set_eval_direction(self, greater_is_better):
+        """Set the evaluation metric direction for waste tracking."""
+        self._eval_greater_is_better = greater_is_better
+
+    def record_eval_improvement(self, global_step, eval_metric, greater_is_better=None):
+        """Track best-eval-metric step for the secondary, eval-based waste ratio.
+
+        Called from on_evaluate() in the diagnostics callback. This metric
+        answers the question 'how much compute happened after the eval
+        metric stopped improving?' and is independent of training-loss
+        smoothing artefacts.
+        """
+        if greater_is_better is None:
+            greater_is_better = self._eval_greater_is_better
+        if self._best_eval_metric is None:
+            self._best_eval_step = global_step
+            self._best_eval_metric = eval_metric
+            self._last_global_step = global_step
+            return
+        improved = (
+            (greater_is_better and eval_metric > self._best_eval_metric)
+            or (not greater_is_better and eval_metric < self._best_eval_metric)
+        )
+        if improved:
+            self._best_eval_step = global_step
+            self._best_eval_metric = eval_metric
+        self._last_global_step = global_step
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1620,9 +1686,14 @@ def run_single_experiment(
         # rapid-learning phase (steps 0-9) always shows >10% improvement.
         waste_min_steps = 5
         waste_patience = 1
+        waste_min_improvement = 0.04
+        waste_ema_alpha = 0.5
     else:
         waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
         waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
+        waste_min_improvement = 0.0005
+        target_window = max(4, 2 * waste_patience)
+        waste_ema_alpha = min(0.5, 2.0 / (target_window + 1))
     # Regression tasks (MSE loss) need a much higher min_improvement
     # threshold than classification. The stale-loss dedup means each
     # unique observation spans multiple training steps, so the loss
@@ -1639,17 +1710,6 @@ def run_single_experiment(
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
-    waste_min_improvement = 0.04 if is_regression else 0.0005
-    # Also use a smoother EMA for regression (alpha=0.05 vs default 0.1)
-    # Higher alpha than before (was 0.02) because we now feed fewer, more
-    # meaningful data points. With only ~26 points, alpha=0.02 makes the
-    # EMA too sluggish to track the rapid initial drop.
-    # Regression needs high alpha (0.5, effective window ~3) because with
-    # only ~26 unique observations, a low alpha EMA never converges to the
-    # actual loss values. With alpha=0.05, the EMA starts at 8.09 and is
-    # still at 2.53 after 26 steps, showing ~4.6% "improvement" at every
-    # step as the EMA catches up, preventing plateau detection entirely.
-    waste_ema_alpha = 0.5 if is_regression else 0.05
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
@@ -1664,7 +1724,7 @@ def run_single_experiment(
     class FullDiagnosticsCallback:
         """Comprehensive diagnostics: LER + GSNR + waste + phase + ETA."""
 
-        def __init__(self, ler_trk, gsnr_trk, waste_q, phase_det, lr_loss_trk, eta_est, model_ref, trainer_ref_holder):
+        def __init__(self, ler_trk, gsnr_trk, waste_q, phase_det, lr_loss_trk, eta_est, model_ref, trainer_ref_holder, greater_is_better=True):
             self.ler_tracker = ler_trk
             self.gsnr_tracker = gsnr_trk
             self.waste_quantifier = waste_q
@@ -1673,6 +1733,7 @@ def run_single_experiment(
             self.eta_estimator = eta_est
             self._model = model_ref
             self._trainer_holder = trainer_ref_holder  # mutable list to hold trainer ref
+            self._greater_is_better = greater_is_better
             self.step_count = 0
             self._last_loss = None
             self._last_loss_fed_to_waste = None  # Track last value fed to WasteQuantifier
@@ -1680,7 +1741,7 @@ def run_single_experiment(
             # Scale GSNR interval with dataset size to avoid CPU bottleneck
             # Small datasets (~800 steps): every ~50 steps
             # Large datasets (~36K steps): every eval_steps
-            self._gsnr_log_interval = max(eval_steps, 200)
+            self._gsnr_log_interval = max(1, min(max(eval_steps, 200), max(1, total_steps // 4)))
 
         # ── Trainer callback interface ────────────────────────────────
         def on_init_end(self, args, state, control, **kwargs):
@@ -1748,6 +1809,7 @@ def run_single_experiment(
             self.eta_estimator.step_completed(state.global_step)
             
             # Fallback gradient capture if pre_optimizer didn't fire
+            # Also capture GSNR gradients as belt-and-braces fallback
             if self.ler_tracker._cached_rho_vg is None and self._model is not None:
                 has_grad = any(
                     p.grad is not None for p in self._model.parameters() if p.requires_grad
@@ -1757,6 +1819,12 @@ def run_single_experiment(
                         self.ler_tracker.capture_step_gradients(self._model)
                     except Exception:
                         pass
+            # Belt-and-braces GSNR fallback: capture if on_pre_optimizer_step never fired
+            if self.step_count % self._gsnr_log_interval == 0:
+                try:
+                    self.gsnr_tracker.capture_gradients(self._model)
+                except Exception:
+                    pass
             
             # Step time for waste tracking
             step_time = time.time() - self._step_start_time if self._step_start_time else None
@@ -1788,10 +1856,22 @@ def run_single_experiment(
                 loss_is_new = (self._last_loss_fed_to_waste is None or
                                self._last_loss != self._last_loss_fed_to_waste)
                 if loss_is_new:
+                    # Pull last per-step energy from power callback if available
+                    energy_j = None
+                    try:
+                        pc = power_callback
+                        if hasattr(pc, "_power_samples") and pc._power_samples:
+                            last = pc._power_samples[-1]
+                            if step_time and "power_w" in last:
+                                energy_j = float(last["power_w"]) * float(step_time)
+                    except Exception:
+                        energy_j = None
                     self.waste_quantifier.record_step(
                         loss=self._last_loss,
                         grad_norm=global_grad_norm,
+                        energy_j=energy_j,
                         step_time=step_time,
+                        sgd_step=state.global_step,
                     )
                     self._last_loss_fed_to_waste = self._last_loss
                 
@@ -1909,6 +1989,25 @@ def run_single_experiment(
 
             eval_loss = metrics.get("eval_loss", 0)
             accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
+
+            # Wire eval-metric into WasteQuantifier (eval-based waste ratio).
+            # Pick the same metric the trainer uses for best-model selection.
+            try:
+                self.waste_quantifier.set_eval_direction(self._greater_is_better)
+                _eval_metric_name = "eval_" + str(metric_for_best_model)
+                _gib = bool(greater_is_better)
+                _val = metrics.get(_eval_metric_name)
+                if _val is None:
+                    _val = accuracy if accuracy else (-eval_loss)
+                    _gib = True
+                self.waste_quantifier.record_eval_improvement(
+                    global_step=state.global_step,
+                    eval_metric=float(_val),
+                    greater_is_better=_gib,
+                )
+            except Exception as _e:
+                print(f"  [WARN] record_eval_improvement failed: {_e}")
+
 
             # FIX #4: Use REAL logits from the custom trainer instead of dummy
             trainer = self._trainer_holder[0] if self._trainer_holder else None
@@ -2076,6 +2175,7 @@ def run_single_experiment(
         eta_est=eta_estimator,
         model_ref=model,
         trainer_ref_holder=trainer_holder,
+        greater_is_better=greater_is_better,
     )
 
     # ── Training arguments ────────────────────────────────────────────
@@ -2241,8 +2341,10 @@ def run_single_experiment(
     print(f"  Time: {total_time:.1f}s")
     if gsnr_tracker.gsnr_global_history:
         print(f"  GSNR (global): {gsnr_tracker.gsnr_global_history[-1]:.4f}")
-    print(f"  Waste ratio: {waste_metrics['waste_ratio']:.3f} "
+    print(f"  Waste ratio (train-loss): {waste_metrics['waste_ratio']:.3f} "
           f"(95% CI: [{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}])")
+    print(f"  Waste ratio (eval-metric): {waste_metrics.get('eval_waste_ratio', 0.0):.3f} "
+          f"(best at step {waste_metrics.get('best_eval_step')})")
     print(f"  Phase: {phase_summary['current_phase']} "
           f"({len(phase_summary['transitions'])} transitions)")
     if lr_loss_corr:
