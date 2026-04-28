@@ -686,6 +686,14 @@ class WasteQuantifier:
         """Standard normal CDF approximation."""
         return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
+    def update_gsnr(self, gsnr_value, sgd_step=None):
+        """Optional T3 feed. Call from the diagnostics callback after each
+        GSNRTracker update. Without this call T3 never fires and the
+        detector falls back to T1∧T2 (still strictly correct)."""
+        if self.detector_name == "dual_signal":
+            sgd_now = sgd_step if sgd_step is not None else self._total_steps_seen
+            self._slope_det.update_gsnr(sgd_now, gsnr_value)
+
     def compute_waste_metrics(self):
         """Compute waste metrics with 95% confidence intervals.
         
@@ -785,6 +793,18 @@ class WasteQuantifier:
             "best_eval_step": self._best_eval_step,
             "best_eval_metric": self._best_eval_metric,
             "eval_waste_ratio": float(eval_waste_ratio),
+            # ── New paper-ready reporting fields ──────────────────────
+            "detector_name": self.detector_name,
+            "waste_ratio_train": float(waste_ratio),
+            "waste_ratio_eval": float(eval_waste_ratio),
+            "waste_ratio_gsnr": (
+                float(max(0.0, ((self._last_global_step or 0) - self._slope_det.t3_fired_at)
+                          / max(1, (self._last_global_step or 1))))
+                if self._slope_det.t3_fired_at is not None else 0.0
+            ),
+            "t1_fired_at": self._slope_det.t1_fired_at,
+            "t2_fired_at": self._slope_det.t2_fired_at,
+            "t3_fired_at": self._slope_det.t3_fired_at,
         }
 
 
@@ -1867,11 +1887,25 @@ def run_single_experiment(
     #
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
+    # ── New: slope detector kwargs (paper default) ────────────────────
+    if is_regression:
+        slope_kwargs = dict(window_W=max(6, min(20, total_steps // 20)),
+                            ema_alpha=0.5,
+                            eps_slope_per_1k=2e-2,
+                            alpha_mk=0.20)
+    else:
+        slope_kwargs = dict(window_W=max(8, min(64, total_steps // 20)),
+                            ema_alpha=2.0 / (32 + 1),
+                            eps_slope_per_1k=5e-3,
+                            alpha_mk=0.10)
+
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
         plateau_patience=waste_patience,
         plateau_min_improvement=waste_min_improvement,
         min_steps_before_plateau=waste_min_steps,
+        detector="dual_signal",          # NEW default; "relative" reproduces older runs bit-exactly
+        slope_kwargs=slope_kwargs,
     )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
@@ -2086,6 +2120,13 @@ def run_single_experiment(
                                 log_data["fisher/global_log10"] = math.log10(fi_global + 1e-10)
 
                             wandb.log(log_data, step=state.global_step)
+
+                            # Feed T3 (GSNR collapse) into the waste detector
+                            if gsnr_tracker.gsnr_global_history:
+                                self.waste_quantifier.update_gsnr(
+                                    gsnr_value=gsnr_tracker.gsnr_global_history[-1],
+                                    sgd_step=state.global_step,
+                                )
                 except Exception:
                     pass
             
