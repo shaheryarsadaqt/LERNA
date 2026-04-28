@@ -410,16 +410,27 @@ class GSNRTracker:
 # Plateau Detectors — Theil–Sen slope + Mann–Kendall + GSNR collapse
 # ═══════════════════════════════════════════════════════════════════════
 
-def _theil_sen_slope(y):
-    """Robust slope (median of pairwise slopes). O(W^2); W ≤ 64 ⇒ fast."""
+def _theil_sen_slope(y, x=None):
+    """Robust slope (median of pairwise slopes). O(W^2); W ≤ 64 ⇒ fast.
+
+    If `x` is given, slope is computed against `x` (e.g., true SGD steps),
+    so the returned value has units of `dy / d(x_unit)`. If `x` is None,
+    slope is per array index (legacy behaviour, kept for backward-compat).
+    """
     n = len(y)
     if n < 3:
         return 0.0
     slopes = []
-    for i in range(n - 1):
-        for j in range(i + 1, n):
-            dx = j - i
-            slopes.append((y[j] - y[i]) / dx)
+    if x is None:
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                slopes.append((y[j] - y[i]) / (j - i))
+    else:
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                dx = x[j] - x[i]
+                if dx > 0:
+                    slopes.append((y[j] - y[i]) / dx)
     return float(np.median(slopes)) if slopes else 0.0
 
 
@@ -480,6 +491,7 @@ class SlopePlateauDetector:
 
         self._raw = []
         self._log_ema = []
+        self._steps = []  # SGD step at each observation (parallel to _log_ema)
         self._ema = None
 
         self._gsnr_peak = 0.0
@@ -497,15 +509,18 @@ class SlopePlateauDetector:
             self._ema = self.ema_alpha * float(loss) + (1 - self.ema_alpha) * self._ema
         self._log_ema.append(math.log(max(self._ema, 1e-12)))
         self._raw.append(float(loss))
+        self._steps.append(int(step))
 
         if len(self._log_ema) > self.W * 4:
             self._log_ema = self._log_ema[-self.W * 2:]
             self._raw = self._raw[-self.W * 2:]
+            self._steps = self._steps[-self.W * 2:]
 
         if len(self._log_ema) < self.W:
             return
 
-        slope_per_step = _theil_sen_slope(self._log_ema[-self.W:])
+        # True slope in units of log-loss per SGD step (use real step gaps, not array indices)
+        slope_per_step = _theil_sen_slope(self._log_ema[-self.W:], self._steps[-self.W:])
         slope_per_1k = abs(slope_per_step) * 1000.0
         t1 = slope_per_1k < self.eps_slope_per_1k
         if t1 and self.t1_fired_at is None:
@@ -664,6 +679,15 @@ class WasteQuantifier:
         if self.detector_name in ("slope", "dual_signal"):
             sgd_now = sgd_step if sgd_step is not None else self._total_steps_seen
             self._slope_det.update_loss(sgd_now, loss)
+            # Optional diagnostic trace; enable with env var LERNA_WASTE_DEBUG=1
+            if os.environ.get("LERNA_WASTE_DEBUG") == "1" and self._total_steps_seen % 50 == 0:
+                print(f"[waste-debug] sgd={sgd_now} obs={self._total_steps_seen} "
+                      f"buf={len(self._slope_det._log_ema)}/W={self._slope_det.W} "
+                      f"t1={self._slope_det.t1_fired_at} "
+                      f"t2={self._slope_det.t2_fired_at} "
+                      f"t3={self._slope_det.t3_fired_at} "
+                      f"plateau={self._slope_det.plateau_step} "
+                      f"min_steps={self.min_steps_before_plateau}")
             if (self._plateau_step is None
                     and self._slope_det.plateau_step is not None
                     and self._total_steps_seen >= self.min_steps_before_plateau):
