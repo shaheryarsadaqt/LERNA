@@ -536,6 +536,10 @@ class SlopePlateauDetector:
             if self.plateau_step is None:
                 self.plateau_step = step
 
+        # Expose live values for LERNA_WASTE_DEBUG diagnostics
+        self._last_slope_per_1k = slope_per_1k
+        self._last_mk_p = p_mk
+
     def update_gsnr(self, step, gsnr_value):
         if gsnr_value is None:
             return
@@ -681,13 +685,14 @@ class WasteQuantifier:
             self._slope_det.update_loss(sgd_now, loss)
             # Optional diagnostic trace; enable with env var LERNA_WASTE_DEBUG=1
             if os.environ.get("LERNA_WASTE_DEBUG") == "1" and self._total_steps_seen % 5 == 0:
+                sd = self._slope_det
                 print(f"[waste-debug] sgd={sgd_now} obs={self._total_steps_seen} "
-                      f"buf={len(self._slope_det._log_ema)}/W={self._slope_det.W} "
-                      f"t1={self._slope_det.t1_fired_at} "
-                      f"t2={self._slope_det.t2_fired_at} "
-                      f"t3={self._slope_det.t3_fired_at} "
-                      f"plateau={self._slope_det.plateau_step} "
-                      f"min_steps={self.min_steps_before_plateau}")
+                      f"buf={len(sd._log_ema)}/W={sd.W} "
+                      f"|slope|*1k={getattr(sd, '_last_slope_per_1k', None)} "
+                      f"mk_p={getattr(sd, '_last_mk_p', None)} "
+                      f"eps={sd.eps_slope_per_1k} alpha_mk={sd.alpha_mk} "
+                      f"t1={sd.t1_fired_at} t2={sd.t2_fired_at} t3={sd.t3_fired_at} "
+                      f"plateau={sd.plateau_step}")
             if (self._plateau_step is None
                     and self._slope_det.plateau_step is not None
                     and self._total_steps_seen >= self.min_steps_before_plateau):
