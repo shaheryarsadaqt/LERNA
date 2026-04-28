@@ -554,7 +554,8 @@ class WasteQuantifier:
     """
 
     def __init__(self, ema_alpha=0.05, plateau_patience=50, plateau_min_improvement=0.001,
-                 min_steps_before_plateau=100, epsilon_slope=5e-3, alpha_mk=0.10):
+                 min_steps_before_plateau=100,
+                 detector="dual_signal", slope_kwargs=None):
         """
         Args:
             ema_alpha: Smoothing factor for EMA loss (lower = smoother).
@@ -562,18 +563,19 @@ class WasteQuantifier:
             plateau_min_improvement: Minimum relative improvement in EMA loss to count
                                      as "still improving" (0.001 = 0.1%).
             min_steps_before_plateau: Minimum number of steps before plateau detection
-                                      activates. Prevents false early detection on
-                                      large-dataset tasks where EMA needs warmup time.
-            epsilon_slope: Theil-Sen slope threshold for plateau (units: nat-log per 1000 steps).
-            alpha_mk: Mann-Kendall p-value threshold for plateau detection.
+                                     activates. Prevents false early detection on
+                                     large-dataset tasks where EMA needs warmup time.
+            detector: Which plateau detector to use ("dual_signal", "relative", or "slope").
+            slope_kwargs: Keyword arguments for SlopePlateauDetector.
         """
         self.ema_alpha = ema_alpha
         self.plateau_patience = plateau_patience
         self.plateau_min_improvement = plateau_min_improvement
         self.min_steps_before_plateau = min_steps_before_plateau
-        self.epsilon_slope = epsilon_slope
-        self.alpha_mk = alpha_mk
-        self._plateau_window = plateau_patience  # W = plateau_patience for dual-signal test
+        self.detector_name = str(detector)
+        self.epsilon_slope = 5e-3
+        self.alpha_mk = 0.10
+        self._plateau_window = plateau_patience
 
         self.loss_history = []
         self.grad_norm_history = []
@@ -604,6 +606,9 @@ class WasteQuantifier:
         self._best_eval_metric = None
         self._best_eval_step = None
         self._last_global_step = None
+
+        self._slope_det = SlopePlateauDetector(**(slope_kwargs or {}))
+        self._plateau_step_train = None
 
     def record_step(self, loss, grad_norm=None, energy_j=None, step_time=None, sgd_step=None):
         """Record metrics for a single training step."""
