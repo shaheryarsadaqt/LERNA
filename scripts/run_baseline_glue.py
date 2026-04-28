@@ -407,6 +407,136 @@ class GSNRTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Plateau Detectors — Theil–Sen slope + Mann–Kendall + GSNR collapse
+# ═══════════════════════════════════════════════════════════════════════
+
+def _theil_sen_slope(y):
+    """Robust slope (median of pairwise slopes). O(W^2); W ≤ 64 ⇒ fast."""
+    n = len(y)
+    if n < 3:
+        return 0.0
+    slopes = []
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            dx = j - i
+            slopes.append((y[j] - y[i]) / dx)
+    return float(np.median(slopes)) if slopes else 0.0
+
+
+def _mann_kendall_pvalue(y):
+    """Two-sided Mann–Kendall p-value (no scipy needed).
+    Large p ⇒ fail to reject 'no monotone trend' (= plateau evidence).
+    """
+    n = len(y)
+    if n < 4:
+        return 1.0
+    s = 0
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            d = y[j] - y[i]
+            if d > 0:
+                s += 1
+            elif d < 0:
+                s -= 1
+    var_s = n * (n - 1) * (2 * n + 5) / 18.0
+    if var_s <= 0:
+        return 1.0
+    if s > 0:
+        z = (s - 1) / math.sqrt(var_s)
+    elif s < 0:
+        z = (s + 1) / math.sqrt(var_s)
+    else:
+        z = 0.0
+    p = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0))))
+    return float(max(0.0, min(1.0, p)))
+
+
+class SlopePlateauDetector:
+    """Dual-signal train-loss plateau detector.
+
+        T1: Theil–Sen slope of log(EMA(loss)) over the trailing window
+            is below ε_slope (in nat-log per 1000 SGD steps).
+        T2: Mann–Kendall on raw recent losses fails to reject the null
+            'no monotone trend' (p > α_MK).
+        T3: GSNR has collapsed to < γ · gsnr_peak for ≥ K consecutive
+            evaluations (fed externally via update_gsnr).
+
+    plateau ⇔ (T1 ∧ T2) ∨ (T1 ∧ T3)
+    """
+
+    def __init__(self,
+                 window_W=32,
+                 ema_alpha=0.061,
+                 eps_slope_per_1k=5e-3,
+                 alpha_mk=0.10,
+                 gsnr_gamma=0.10,
+                 gsnr_K=3):
+        self.W = int(window_W)
+        self.ema_alpha = float(ema_alpha)
+        self.eps_slope_per_1k = float(eps_slope_per_1k)
+        self.alpha_mk = float(alpha_mk)
+        self.gsnr_gamma = float(gsnr_gamma)
+        self.gsnr_K = int(gsnr_K)
+
+        self._raw = []
+        self._log_ema = []
+        self._ema = None
+
+        self._gsnr_peak = 0.0
+        self._gsnr_below = 0
+
+        self.t1_fired_at = None
+        self.t2_fired_at = None
+        self.t3_fired_at = None
+        self.plateau_step = None
+
+    def update_loss(self, step, loss):
+        if self._ema is None:
+            self._ema = float(loss)
+        else:
+            self._ema = self.ema_alpha * float(loss) + (1 - self.ema_alpha) * self._ema
+        self._log_ema.append(math.log(max(self._ema, 1e-12)))
+        self._raw.append(float(loss))
+
+        if len(self._log_ema) > self.W * 4:
+            self._log_ema = self._log_ema[-self.W * 2:]
+            self._raw = self._raw[-self.W * 2:]
+
+        if len(self._log_ema) < self.W:
+            return
+
+        slope_per_step = _theil_sen_slope(self._log_ema[-self.W:])
+        slope_per_1k = abs(slope_per_step) * 1000.0
+        t1 = slope_per_1k < self.eps_slope_per_1k
+        if t1 and self.t1_fired_at is None:
+            self.t1_fired_at = step
+
+        p_mk = _mann_kendall_pvalue(self._raw[-self.W:])
+        t2 = p_mk > self.alpha_mk
+        if t2 and self.t2_fired_at is None:
+            self.t2_fired_at = step
+
+        t3 = self.t3_fired_at is not None
+        if (t1 and t2) or (t1 and t3):
+            if self.plateau_step is None:
+                self.plateau_step = step
+
+    def update_gsnr(self, step, gsnr_value):
+        if gsnr_value is None:
+            return
+        g = float(gsnr_value)
+        if g > self._gsnr_peak:
+            self._gsnr_peak = g
+        threshold = self.gsnr_gamma * self._gsnr_peak
+        if self._gsnr_peak > 0 and g < threshold:
+            self._gsnr_below += 1
+        else:
+            self._gsnr_below = 0
+        if self._gsnr_below >= self.gsnr_K and self.t3_fired_at is None:
+            self.t3_fired_at = step
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Waste Quantifier (NEW)
 # ═══════════════════════════════════════════════════════════════════════
 
