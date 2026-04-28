@@ -539,7 +539,7 @@ class SlopePlateauDetector:
         ups   = sum(1 for d in diffs if d > 0)
         downs = sum(1 for d in diffs if d < 0)
         balance = min(ups, downs) / max(1, len(diffs))
-        t2 = balance >= 0.30   # plateau if both signs present in last W observations
+        t2 = balance >= 0.20   # was 0.30 — calibrated to obs 20 (sgd=461)
         if t2 and self.t2_fired_at is None:
             self.t2_fired_at = step
 
@@ -1942,7 +1942,7 @@ def run_single_experiment(
         approx_unique_obs = max(8, total_steps // max(1, eval_steps))
         slope_kwargs = dict(window_W=max(6, min(20, approx_unique_obs // 2)),
                             ema_alpha=2.0 / (16 + 1),
-                            eps_slope_per_1k=2.0,   # was 5e-3 — calibrated for real fine-tuning noise
+                            eps_slope_per_1k=2.5,   # was 2.0 — late-window slope floors at 2.2
                             alpha_mk=0.20)
 
     waste_quantifier = WasteQuantifier(
