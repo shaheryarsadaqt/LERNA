@@ -496,6 +496,8 @@ class SlopePlateauDetector:
 
         self._gsnr_peak = 0.0
         self._gsnr_below = 0
+        self._initial_slope_per_1k = None
+        self.eps_slope_frac = 0.20   # plateau if |slope| < 20% of initial slope
 
         self.t1_fired_at = None
         self.t2_fired_at = None
@@ -522,7 +524,12 @@ class SlopePlateauDetector:
         # True slope in units of log-loss per SGD step (use real step gaps, not array indices)
         slope_per_step = _theil_sen_slope(self._log_ema[-self.W:], self._steps[-self.W:])
         slope_per_1k = abs(slope_per_step) * 1000.0
-        t1 = slope_per_1k < self.eps_slope_per_1k
+        # Adaptive threshold: plateau if slope < 20% of initial slope
+        if self._initial_slope_per_1k is None and slope_per_1k > 0:
+            self._initial_slope_per_1k = slope_per_1k
+        adaptive_eps = max(self.eps_slope_per_1k,
+                           self.eps_slope_frac * (self._initial_slope_per_1k or 0.0))
+        t1 = slope_per_1k < adaptive_eps
         if t1 and self.t1_fired_at is None:
             self.t1_fired_at = step
 
