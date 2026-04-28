@@ -533,8 +533,13 @@ class SlopePlateauDetector:
         if t1 and self.t1_fired_at is None:
             self.t1_fired_at = step
 
-        p_mk = _mann_kendall_pvalue(self._raw[-self.W:])
-        t2 = p_mk > self.alpha_mk
+        # Sign-run test (robust on small W, no scipy needed)
+        recent = self._raw[-self.W:]
+        diffs = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
+        ups   = sum(1 for d in diffs if d > 0)
+        downs = sum(1 for d in diffs if d < 0)
+        balance = min(ups, downs) / max(1, len(diffs))
+        t2 = balance >= 0.30   # plateau if both signs present in last W observations
         if t2 and self.t2_fired_at is None:
             self.t2_fired_at = step
 
@@ -545,7 +550,7 @@ class SlopePlateauDetector:
 
         # Expose live values for LERNA_WASTE_DEBUG diagnostics
         self._last_slope_per_1k = slope_per_1k
-        self._last_mk_p = p_mk
+        self._last_balance = balance
 
     def update_gsnr(self, step, gsnr_value):
         if gsnr_value is None:
@@ -693,11 +698,12 @@ class WasteQuantifier:
             # Optional diagnostic trace; enable with env var LERNA_WASTE_DEBUG=1
             if os.environ.get("LERNA_WASTE_DEBUG") == "1" and self._total_steps_seen % 5 == 0:
                 sd = self._slope_det
+                balance = getattr(sd, '_last_balance', None)
                 print(f"[waste-debug] sgd={sgd_now} obs={self._total_steps_seen} "
                       f"buf={len(sd._log_ema)}/W={sd.W} "
                       f"|slope|*1k={getattr(sd, '_last_slope_per_1k', None)} "
-                      f"mk_p={getattr(sd, '_last_mk_p', None)} "
-                      f"eps={sd.eps_slope_per_1k} alpha_mk={sd.alpha_mk} "
+                      f"sign_balance={balance} "
+                      f"eps={sd.eps_slope_per_1k} eps_frac={sd.eps_slope_frac} "
                       f"t1={sd.t1_fired_at} t2={sd.t2_fired_at} t3={sd.t3_fired_at} "
                       f"plateau={sd.plateau_step}")
             if (self._plateau_step is None
