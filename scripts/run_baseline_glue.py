@@ -680,7 +680,7 @@ class WasteQuantifier:
             sgd_now = sgd_step if sgd_step is not None else self._total_steps_seen
             self._slope_det.update_loss(sgd_now, loss)
             # Optional diagnostic trace; enable with env var LERNA_WASTE_DEBUG=1
-            if os.environ.get("LERNA_WASTE_DEBUG") == "1" and self._total_steps_seen % 50 == 0:
+            if os.environ.get("LERNA_WASTE_DEBUG") == "1" and self._total_steps_seen % 5 == 0:
                 print(f"[waste-debug] sgd={sgd_now} obs={self._total_steps_seen} "
                       f"buf={len(self._slope_det._log_ema)}/W={self._slope_det.W} "
                       f"t1={self._slope_det.t1_fired_at} "
@@ -2121,7 +2121,14 @@ def run_single_experiment(
                 try:
                     gsnr_results = self.gsnr_tracker.compute_gsnr()
                     global_gsnr = gsnr_results.get("__global__")
-                    
+
+                    # Feed T3 ALWAYS (independent of W&B) — fixes Bug A
+                    if gsnr_tracker.gsnr_global_history:
+                        self.waste_quantifier.update_gsnr(
+                            gsnr_value=gsnr_tracker.gsnr_global_history[-1],
+                            sgd_step=state.global_step,
+                        )
+
                     if use_wandb and global_gsnr is not None:
                         import wandb
                         if wandb.run is not None:
@@ -2148,13 +2155,6 @@ def run_single_experiment(
                                 log_data["fisher/global_log10"] = math.log10(fi_global + 1e-10)
 
                             wandb.log(log_data, step=state.global_step)
-
-                            # Feed T3 (GSNR collapse) into the waste detector
-                            if gsnr_tracker.gsnr_global_history:
-                                self.waste_quantifier.update_gsnr(
-                                    gsnr_value=gsnr_tracker.gsnr_global_history[-1],
-                                    sgd_step=state.global_step,
-                                )
                 except Exception:
                     pass
             
