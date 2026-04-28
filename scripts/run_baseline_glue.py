@@ -1918,10 +1918,14 @@ def run_single_experiment(
                             eps_slope_per_1k=2e-2,
                             alpha_mk=0.20)
     else:
-        slope_kwargs = dict(window_W=max(8, min(64, total_steps // 20)),
-                            ema_alpha=2.0 / (32 + 1),
-                            eps_slope_per_1k=5e-3,
-                            alpha_mk=0.10)
+        # Empirically the HF Trainer only feeds ~`total_steps // eval_steps`
+        # unique loss values to the dedup'd waste path (≈ 25 for SST-2),
+        # so window_W must scale with that, not with total_steps.
+        approx_unique_obs = max(8, total_steps // max(1, eval_steps))
+        slope_kwargs = dict(window_W=max(6, min(20, approx_unique_obs // 2)),
+                            ema_alpha=2.0 / (16 + 1),
+                            eps_slope_per_1k=2.0,   # was 5e-3 — calibrated for real fine-tuning noise
+                            alpha_mk=0.20)
 
     waste_quantifier = WasteQuantifier(
         ema_alpha=waste_ema_alpha,
