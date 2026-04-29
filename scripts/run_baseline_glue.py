@@ -1853,8 +1853,9 @@ def run_single_experiment(
     print(f"  Train samples: {len(train_ds)}, Eval samples: {len(eval_ds)}")
 
     # ── Compute total steps (needed by trackers below) ───────────────
+    n_gpu = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
     steps_per_epoch = len(train_ds) // (
-        hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"]
+        hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"] * n_gpu
     )
     total_steps = steps_per_epoch * num_epochs
     eval_steps = max(total_steps // 20, 10)
@@ -2237,7 +2238,8 @@ def run_single_experiment(
                 return control
 
             eval_loss = metrics.get("eval_loss", 0)
-            accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation", 0))
+            accuracy = metrics.get("eval_accuracy", metrics.get("eval_matthews_correlation",
+                                   metrics.get("eval_pearson", 0)))
 
             # Wire eval-metric into WasteQuantifier (eval-based waste ratio).
             # Pick the same metric the trainer uses for best-model selection.
@@ -2786,7 +2788,7 @@ def main():
             accs = []
             for r in task_results:
                 em = r.get("eval_metrics", {})
-                acc = em.get("eval_accuracy", em.get("eval_matthews_correlation", em.get("eval_pearsonr", 0)))
+                acc = em.get("eval_accuracy", em.get("eval_matthews_correlation", em.get("eval_pearson", 0)))
                 accs.append(acc)
             kwhs = [r.get("energy_kwh", 0) for r in task_results]
             gsnrs = [r.get("gsnr_final", {}).get("gsnr_global", 0) for r in task_results]
