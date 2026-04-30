@@ -135,6 +135,39 @@ TASK_HP_OVERRIDES = {
         "metric_for_best_model": "eval_pearson",
         "greater_is_better": True,
     },
+    # NEW: ModernBERT needs higher LR on large tasks (ModernBERT paper uses 8e-5)
+    "mnli": {
+        "learning_rate": 5e-5,   # ← will be updated after LR sweep (Step 5)
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "qqp": {
+        "learning_rate": 5e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "qnli": {
+        "learning_rate": 3e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "sst2": {
+        "learning_rate": 3e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
 }
 
 MODEL_NAME = "roberta-base"

@@ -100,13 +100,18 @@ class GSNRTracker:
         
         for name, _ in self.model.named_parameters():
             if not name.endswith('.bias'):  # Skip biases for cleaner analysis
-                if 'attention' in name or 'self_attn' in name or 'attn' in name:
+                low = name.lower()
+                # Attention: BERT/RoBERTa use 'attention/self_attn', ModernBERT uses 'attn.Wqkv/Wo'
+                if 'attention' in low or 'self_attn' in low or 'attn' in low:
                     mapping['attention'].append(name)
-                elif 'ffn' in name or 'intermediate' in name or 'output' in name:
+                # FFN: BERT/RoBERTa use 'intermediate/output', ModernBERT uses 'mlp.Wi/Wo'
+                elif ('ffn' in low or 'intermediate' in low
+                      or 'mlp.wi' in low or 'mlp.wo' in low
+                      or (low.endswith('output.dense') or 'output.dense' in low)):
                     mapping['ffn'].append(name)
-                elif 'embedding' in name or 'embeddings' in name:
+                elif 'embedding' in low or 'embeddings' in low or 'tok_embeddings' in low:
                     mapping['embeddings'].append(name)
-                elif 'classifier' in name or 'pooler' in name:
+                elif 'classifier' in low or 'pooler' in low or 'head.dense' in low:
                     mapping['classifier'].append(name)
                 else:
                     mapping['other'].append(name)
@@ -128,7 +133,16 @@ class GSNRTracker:
                 "ffn": {"mean": 0.95, "std": 0.14, "range": (0.75, 1.15)},
                 "embeddings": {"mean": 0.48, "std": 0.07, "range": (0.35, 0.62)},
                 "classifier": {"mean": 0.81, "std": 0.09, "range": (0.65, 0.92)},
-            }
+            },
+            "modernbert-base": {
+                # No published benchmarks for ModernBERT yet; use RoBERTa as proxy
+                # so validation doesn't silently skip. Widen ranges by 1.5x to
+                # acknowledge architectural difference (GeGLU MLP, RoPE).
+                "attention": {"mean": 0.88, "std": 0.17, "range": (0.45, 1.35)},
+                "ffn":       {"mean": 0.95, "std": 0.21, "range": (0.55, 1.50)},
+                "embeddings":{"mean": 0.48, "std": 0.11, "range": (0.25, 0.75)},
+                "classifier":{"mean": 0.81, "std": 0.14, "range": (0.50, 1.15)},
+            },
         }
     
     def _validate_initialization(self):
@@ -213,10 +227,12 @@ class GSNRTracker:
         """Validate computed GSNR against published benchmarks."""
         model_name = self.model.__class__.__name__.lower()
         
-        if "bert" in model_name:
-            benchmark_key = "bert-base-uncased"
+        if "modernbert" in model_name:
+            benchmark_key = "modernbert-base"
         elif "roberta" in model_name:
             benchmark_key = "roberta-base"
+        elif "bert" in model_name:
+            benchmark_key = "bert-base-uncased"
         else:
             return  # No benchmark for this model
         
@@ -454,7 +470,7 @@ class LERTracker:
             self._snapshot_params(model)
 
         if len(self.loss_history) >= 2:
-            loss_gain = abs(self.loss_history[-2] - self.loss_history[-1])
+            loss_gain = max(self.loss_history[-2] - self.loss_history[-1], 0.0)
             window_start = max(0, len(self.entropy_history) - self.window_size)
             avg_entropy = np.mean(self.entropy_history[window_start:])
 

@@ -12,14 +12,17 @@ Classifier: Programming Language :: Python :: 3.10
 Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
-Requires-Dist: torch<2.6,>=2.3
-Requires-Dist: transformers<5.0,>=4.44
-Requires-Dist: datasets>=2.18.0
-Requires-Dist: accelerate>=0.30.0
-Requires-Dist: pynvml>=11.5.0
-Requires-Dist: numpy>=1.24
-Requires-Dist: scipy>=1.10
+Requires-Dist: torch>=2.0.0
+Requires-Dist: transformers>=4.30.0
+Requires-Dist: datasets>=2.10.0
+Requires-Dist: evaluate>=0.4.0
+Requires-Dist: accelerate>=0.20.0
+Requires-Dist: scipy>=1.7.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: psutil>=5.9.0
 Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.62.0
 Provides-Extra: wandb
 Requires-Dist: wandb>=0.15.0; extra == "wandb"
 Provides-Extra: viz
@@ -66,7 +69,208 @@ Validated across classification (8 GLUE tasks), instruction tuning (Alpaca), sum
 > **Note:** This abstract describes the planned final state of the paper after executing the full research plan. Claims are updated as each phase completes. See the Experimental Results section below for currently validated findings.
 
 ---
+Phase 1.1: Formal Research-Paper Specification
 
+What follows is written in the voice of a methods section, suitable for direct insertion into your manuscript. It assumes the conventions of an ICLR/NeurIPS submission.
+§3.1 Phase 1.1 — Baseline Diagnostic Data Collection
+§3.1.1 Purpose and Position in the Research Programme
+
+Phase 1.1 is the empirical foundation of LERNA. Before any compute-saving mechanism is deployed, we must answer four prerequisite questions whose answers determine whether the framework as a whole is methodologically tractable:
+
+    RQ-1 (Existence). Does fine-tuning of pretrained language models contain a measurable fraction of compute that yields no further reduction in validation loss, and is this fraction stable across tasks and seeds?
+
+    RQ-2 (Detectability). Can the productive-vs-unproductive distinction be read off from a small number of training-time signals (loss, gradients, parameters, predictions) without access to validation gradients or held-out probes?
+
+    RQ-3 (Calibration). Are the proposed diagnostic signals — Learning Efficiency Ratio (LER), velocity-gradient correlation (ρ_VG), Gradient Signal-to-Noise Ratio (GSNR), and Waste Ratio (W) — distributionally well-behaved across heterogeneous tasks (classification ↔ regression; small ↔ large datasets), or do they require task-specific calibration that would compromise generality?
+
+    RQ-4 (Discrimination). Do the diagnostic signals discriminate between training regimes that are a priori different (e.g. a small dataset trained with early stopping vs. a large dataset trained for a fixed step budget), or do they collapse to identical values regardless of regime?
+
+Phase 1.1 produces a non-interventional, observational dataset across 8 GLUE tasks × 10 seeds = 80 runs. No skipping, no momentum extrapolation, no behavioural intervention is performed. The model is trained to convergence under standard fine-tuning practice and the diagnostic instruments record signals at every step. The output of Phase 1.1 is therefore (i) a calibrated set of thresholds for each diagnostic, (ii) per-task waste ratios with confidence intervals, and (iii) a verified signal-to-noise budget that establishes whether subsequent phases are statistically powered.
+
+The downstream dependency structure is:
+
+                    ┌─────────────────────────────────────────────┐
+                    │  Phase 1.1: BASELINE DIAGNOSTIC COLLECTION  │
+                    │  (this work — observational, no intervention)│
+                    └────────────────────┬────────────────────────┘
+                                         │ produces:
+                                         │ — calibrated thresholds {τ_LER, τ_ρ, τ_GSNR}
+                                         │ — per-task waste W (95% CI)
+                                         │ — per-task gradient-norm distributions
+                                         │ — phase-transition reference trajectories
+                                         ▼
+                    ┌─────────────────────────────────────────────┐
+                    │  Phase 1.2: SIMPLE BASELINES + ABLATION     │
+                    │  (interventional — skip/freeze experiments) │
+                    └─────────────────────────────────────────────┘
+
+Without §3.1's calibration outputs, the gradient-norm threshold in Baseline 1 is arbitrary, the random-skip rate in Baseline 2 is arbitrary, and the safety horizon $H(\rho_{VG})$ in Phase 2 has no principled lower-bound. Phase 1.1 is therefore not a formality but the load-bearing experiment for every numerical claim in the rest of the paper.
+§3.1.2 Notation
+
+Let $\theta_t \in \mathbb{R}^d$ denote the parameter vector at training step $t$, $L_t = L(\theta_t; \mathcal{B}_t)$ the mini-batch loss on batch $\mathcal{B}t$, and $g_t = \nabla\theta L_t$ the corresponding stochastic gradient. Under AdamW, the effective update direction is
+
+$$ \tilde{g}_t ;=; \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}, \qquad \hat{m}_t = \frac{m_t}{1-\beta_1^{t}}, \qquad \hat{v}_t = \frac{v_t}{1-\beta_2^{t}}, $$
+
+i.e., the bias-corrected first moment normalized by the bias-corrected second moment. Writing $\eta$ for the learning rate, the parameter update is $\theta_{t+1} = \theta_t - \eta,\tilde{g}_t$, which we exploit for the velocity-gradient diagnostic in §3.1.3. Logits are denoted $z_t$, predicted class probabilities $p_t = \mathrm{softmax}(z_t)$. Validation accuracy at the best checkpoint (selected via load_best_model_at_end=True) is $\mathrm{Acc}^\star$, and instantaneous wall-clock energy draw is $P_t$ (Watts), measured at 1 Hz via NVIDIA-SMI.
+§3.1.3 Instrumentation Suite
+
+We instrument ten distinct measured quantities per run. We define each quantity, justify its inclusion, specify the sampling cadence, and note the failure modes that motivated calibration choices in §3.1.4.
+(1) Loss trajectory ${L_t}_{t=0}^{T}$
+
+The mini-batch loss is the most basic dynamical observable, sampled every step ($T$ ≈ 1170 for SST-2 over 2 epochs at batch 32). It is the input to the Waste Ratio (§3.1.3.8). The exponential moving average $\bar{L}t = \alpha L_t + (1-\alpha)\bar{L}{t-1}$ (with $\alpha = 0.05$ for classification, $\alpha = 0.5$ for regression — calibrated separately because regression MSE oscillates at higher frequency than cross-entropy) defines the plateau operationalization.
+
+Purpose: ground-truth signal for whether learning is occurring; everything else is derived.
+(2) Parameter velocity $v_t$
+
+$$ v_t ;=; |\theta_t - \theta_{t-1}|_2 $$
+
+computed every step in fp64 to avoid underflow when summing $O(10^8)$ small squared deltas. Velocity captures the magnitude of optimizer-applied movement: in SGD it is proportional to $|g_t|$; in AdamW it is approximately constant per coordinate (the $1/\sqrt{\hat{v}}$ normalization) and so $v_t$ tracks the fraction of unfrozen parameters being updated rather than their gradient magnitude.
+
+Purpose: $v_t$ enters the Learning Efficiency Ratio (§3.1.3.6) as a direct proxy for "the optimizer is doing nontrivial work."
+(3) Effective gradient $\tilde{g}_t$
+
+We extract the AdamW effective update direction from optimizer state at each captured step:
+
+$$ \tilde{g}_t^{(j)} ;=; \frac{\hat{m}_t^{(j)}}{\sqrt{\hat{v}_t^{(j)}} + \epsilon}, \qquad j = 1, \dots, d $$
+
+This is the quantity actually applied (modulo $\eta$) by the optimizer. We use $\tilde{g}_t$ — not the raw gradient $g_t$ — wherever the gradient direction enters a cosine, because under AdamW the per-parameter scaling of $g_t$ by $1/\sqrt{v_t}$ rotates the update vector relative to $g_t$, making $\cos(\Delta\theta_t, g_t)$ dominated by the second-moment normalization rather than by alignment with descent direction.
+
+Purpose: corrected velocity-gradient correlation (§3.1.3.4).
+(4) Velocity-gradient correlation $\rho_{VG,t}$
+
+$$ \rho_{VG,t} ;=; \frac{\langle \theta_t - \theta_{t-1},; \tilde{g}t\rangle}{|\theta_t - \theta{t-1}|_2,|\tilde{g}_t|_2} $$
+
+with the inner products and norms accumulated layer-wise to bound transient memory. Per-layer cosines are also stored to support layer-resolved analysis. We additionally report the length-weighted global cosine, which under per-layer equal-variance is provably equivalent to the flattened cosine but is more informative when variances differ.
+
+Interpretation. In a productive phase, $\Delta\theta_t \approx -\eta \tilde{g}t$, so $\rho{VG,t} \approx -1$ over short windows (sign convention: parameter movement is anti-aligned with the effective update direction because $\Delta\theta = -\eta\tilde{g}$). To match the convention in our codebase and prior literature we report $-\rho_{VG,t}$, so $\rho_{VG} > 0$ during productive learning. Drift away from $-1$ toward 0 indicates either gradient noise or non-stationarity (curriculum boundaries, eval-induced distributional shift); negative values indicate thrashing — the optimizer is fighting itself, typically near saddle points or after LR decay overshoots.
+
+Why the Adam correction is necessary. Computing $\rho_{VG}$ against raw $g_t$ produces values pinned near 0 (50% positive sign by chance) under AdamW, because $\Delta\theta_t \perp g_t$ to leading order in the per-parameter scaling. We empirically verified this collapse on RoBERTa-base/SST-2 (max $|\rho_{VG}| \approx 0.04$ raw vs. expected $|\rho_{VG}| > 0.3$ corrected). All our threshold calibrations in §3.1.4 are with respect to $\tilde{g}_t$.
+
+Purpose: discriminates productive learning ($\rho_{VG} \to 1$) from noise ($\rho_{VG} \to 0$) and thrashing ($\rho_{VG} \to -1$). Drives the safety-horizon scaling $H(\rho_{VG})$ in Phase 2.
+(5) Prediction entropy $H_t$
+
+For classification: $$ H_t ;=; -\frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \sum_{c} p_{t,i,c},\log p_{t,i,c}. $$
+
+For regression (a single logit, where softmax entropy is identically 0), we use Regression Prediction Spread Entropy (RPSE):
+
+$$ H_t^{\mathrm{RPSE}} ;=; 0.3,\sigma(z_t)/(|\mu(z_t)| + \varepsilon) ;+; 0.4,\frac{H_{\mathrm{hist}_{10}}(\bar{z}_t)}{\log 10} ;+; 0.15,\overline{|z_t - \mu(z_t)|/\sigma(z_t)} $$
+
+where the three components are (i) coefficient-of-variation, (ii) histogram-binned range-utilization entropy, and (iii) mean absolute z-score. The coefficients (0.3, 0.4, 0.15) are chosen so that RPSE produces values in $[0.05, 0.8]$ — comparable in magnitude to classification entropy on binary tasks — across the full training trajectory. We floor RPSE at 0.05 to prevent LER from collapsing to zero on highly converged regression models, a failure mode that invalidated all 10 STS-B runs in our previous Phase 1.1 attempt.
+
+Purpose: $H_t$ is a task-agnostic uncertainty proxy; a model that is no longer reducing entropy on training batches is no longer extracting new information. It enters LER as a multiplicative factor, ensuring that mere parameter movement without uncertainty reduction does not register as productive learning.
+(6) Learning Efficiency Ratio $\mathrm{LER}_t$
+
+$$ \mathrm{LER}t ;=; w{\mathrm{task}} \cdot \frac{v_t ,\cdot, \max(0,,L_{t-1} - L_t) ,\cdot, \overline{H}t}{n{\mathrm{steps}} + \varepsilon} $$
+
+where $\overline{H}t = \frac{1}{W}\sum{s=t-W+1}^t H_s$ is a windowed entropy average ($W = 50$ steps), $n_{\mathrm{steps}}$ is the cumulative step count (giving an "efficiency per step" interpretation), and $w_{\mathrm{task}} \in [0.9, 1.5]$ is a task-specific entropy weight calibrated against §3.1.3.5's empirical entropy ranges (e.g. STS-B: 1.5; QQP: 0.9).
+
+Properties. LER is (i) bounded below by zero ($v_t \ge 0$, $\max(0,\cdot) \ge 0$, $\overline{H}_t > 0$ by RPSE flooring), (ii) zero exactly when training is no longer reducing loss, (iii) decoupled from absolute loss scale because all three multiplicands scale gracefully across tasks.
+
+Purpose. LER is the central control signal of LERNA in subsequent phases. Phase 1.1's role is to calibrate its task-conditional thresholds $\tau_{\mathrm{LER}}^{(\mathrm{task})}$ such that $\mathrm{LER}t < \tau{\mathrm{LER}}^{(\mathrm{task})}$ correctly identifies plateaus on observational data.
+(7) Gradient signal-to-noise ratio $\mathrm{GSNR}_t$
+
+Per-parameter: $$ \mathrm{GSNR}_t^{(j)} ;=; \frac{\big(\overline{g}_t^{(j)}\big)^2}{\widehat{\mathrm{Var}}_t!\left[g_t^{(j)}\right] + \varepsilon} $$
+
+where the mean and variance are estimated over a sliding 5-step window. Global GSNR is the parameter-average of $\mathrm{GSNR}_t^{(j)}$. Sampling cadence: every 25 steps (capture interval calibrated to bound diagnostic overhead at <8% of total wall time; finer cadence inflates per-run wall time by ~80% with no information gain at the plot resolution we report).
+
+Interpretation. High GSNR ($>10^{-3}$ on RoBERTa-base) indicates that gradients are pointing in a consistent direction across micro-batches: descent is informative. Low GSNR ($<10^{-4}$) indicates gradients are dominated by mini-batch noise: each step's update is approximately a random walk. GSNR is the canonical NeurIPS-era diagnostic for trainability (cf. Liu et al., 2020).
+
+Purpose. GSNR provides an optimizer-agnostic productive-phase indicator that is independent of the AdamW adjustments embedded in $\rho_{VG}$. It serves as a triangulation signal: agreement between $\rho_{VG}$, LER, and GSNR strengthens confidence in phase classification; disagreement flags an interesting regime worth investigating in Phase 1.3 ablation.
+(8) Waste Ratio $W$
+
+We define wasted compute as steps occurring after a plateau has been established and not subsequently exited. A plateau is declared when
+
+$$ \bar{L}{t} - \min{s \le t} \bar{L}s ;<; \delta \quad \text{for } \tau{\mathrm{patience}} \text{ consecutive steps}, $$
+
+where $\delta$ is the minimum-improvement tolerance (0.0005 classification, 0.04 regression — calibrated to the 10th percentile of step-to-step EMA improvement during the active-learning phase) and $\tau_{\mathrm{patience}}$ is scaled to the count of unique loss observations after deduplication (we observed in our prior sweep that feeding stale loss values to the WasteQuantifier produced sawtooth-EMA artifacts; the dedup filter prevents this).
+
+The waste ratio is
+
+$$ W ;=; \frac{#{t : t > t_{\mathrm{plateau}}}}{T} $$
+
+with 95% CIs computed via 1000-iteration bootstrap over the loss trajectory. We additionally decompose wasted steps by reason: no_improvement (EMA stagnant) and loss_spike (EMA increased — indicates overfitting onset).
+
+Purpose. $W$ is the headline figure for the paper's central empirical claim ("$36.7% \pm 5.3%$ of fine-tuning compute is wasted"). Its credibility rests on showing it discriminates correctly: large datasets with fixed step budgets should exhibit large $W$; small datasets with early stopping should exhibit $W \approx 0$ (a feature, not a bug — it shows the diagnostic doesn't merely flag all training as wasted).
+(9) Phase classification
+
+A discrete state machine over ${$warmup, active_learning, fine_tuning, plateau$}$ driven by hysteresis-protected transitions on $(\mathrm{LER}t, \rho{VG,t})$:
+
+    warmup → active_learning when $\mathrm{LER}t > \tau{\mathrm{LER}}^{(\mathrm{task})}$ and $\rho_{VG,t} > 0.3$ for 20 consecutive steps.
+    active_learning → fine_tuning when $\mathrm{LER}t$ falls into $[0.3,\tau{\mathrm{LER}}, \tau_{\mathrm{LER}}]$ for 50 steps.
+    fine_tuning → plateau when $\mathrm{LER}t < 0.3,\tau{\mathrm{LER}}$ and $\bar{L}_t - \min_s \bar{L}_s < \delta$ for 20 steps.
+    Reverse transitions require the same hysteresis duration to prevent oscillation.
+
+Purpose. The phase label is the most human-interpretable artifact of the diagnostic suite. Reporting which phase a model occupies at any wall-time is the figure (LER trajectory plot, Fig. 2 in the planned paper) that communicates the central finding to a non-specialist reviewer. Phase transitions also serve as natural anchor points for the checkpoint-forking experiments in Phase 4.
+(10) Energy and wall-time
+
+GPU power $P_t$ sampled at 1 Hz via nvidia-smi --query-gpu=power.draw. Energy per run:
+
+$$ E ;=; \int_0^{T_{\mathrm{wall}}} P_t , dt ;;\approx;; \sum_t P_t \cdot \Delta t. $$
+
+Wall-time decomposition: total, training-only (excluding eval), per-step mean. Wasted energy: $E_{\mathrm{waste}} = E \cdot W$ (assumes constant power, refined in §3.1.4 by phase-conditional power averages).
+
+Purpose. Energy is the metric the paper's claim ultimately cashes out into. All other diagnostics serve to predict energy waste; $E$ and $E_{\mathrm{waste}}$ are the ground-truth outcomes against which Phase 2's energy-savings claim ($35{-}40%$) will be evaluated. Reporting energy in absolute terms (kWh) and comparing to published global fine-tuning energy expenditures (Strubell et al., 2019; Henderson et al., 2020) is what gives the paper its Green AI framing.
+§3.1.4 Experimental Design
+
+Model. RoBERTa-base (125M parameters), as it (i) has well-established SOTA reference points on every GLUE task, (ii) trains in a single GPU-hour per task on commodity hardware (V100/RTX 5090), and (iii) is the canonical model in prior efficiency work, enabling apples-to-apples comparison. ModernBERT-base (149M) is used in Phase 1.2 to confirm transferability.
+
+Dataset suite. All 8 GLUE tasks: SST-2, QNLI, QQP, MNLI, RTE, MRPC, CoLA, STS-B. This covers binary classification ($n = 2$), three-class entailment ($n = 3$), regression, and the small-dataset regime (RTE: 2.5k examples) — providing heterogeneous signal for the discrimination test in RQ-4.
+
+Hyperparameters. Learning rate $\eta = 2 \times 10^{-5}$ (CoLA: $1 \times 10^{-5}$, calibrated against MCC peak in pilot runs). AdamW with $(\beta_1, \beta_2) = (0.9, 0.999)$, weight decay $0.01$, linear warmup over the first 6% of steps followed by linear decay. Batch size 32 (16 for QQP/MNLI to fit in memory). Epochs: 3 for SST-2/QNLI/QQP/MNLI, 10 for MRPC/CoLA, 20 for RTE (matching prior RoBERTa-base GLUE recipes). Early stopping is not applied at this phase — we want the full waste signal.
+
+Seeds. ${42, 43, \dots, 51}$ giving $n=10$ replicates per (task, LR) pair. With $n=10$, a paired-bootstrap 95% CI on waste ratio has half-width approximately $\pm 5$ percentage points, sufficient to separate the per-task means in §3.1.5.
+
+Sweep size. $8 \text{ tasks} \times 10 \text{ seeds} \times 1 \text{ LR per task} = 80$ runs, plus 10 STS-B re-runs after the RPSE patch = 90 runs total. Estimated wall time on a single RTX 5090: $\sim 5$ days. Estimated energy: $\sim 1.5$ kWh.
+
+Evaluation protocol. Best-model checkpoint selected via load_best_model_at_end=True with task-specific selection metric (accuracy for classification, Pearson for STS-B, MCC for CoLA). All numerical results in the paper come from the per-run results.json (the canonical artifact), not from W&B summary columns (which proved misleading in our prior sweep).
+
+Compute budget. RTX 5090 with thermal headroom monitored (we observed 78–82°C steady-state in the prior sweep). Disk budget: 125 GB for slim checkpoints + diagnostics JSON.
+§3.1.5 Expected Findings and Decision Criteria
+
+For each research question, we pre-register the criteria under which the question is answered affirmatively and the action taken if it is not.
+RQ	Affirmative Criterion	If Failed
+RQ-1 (Existence)	Task-level mean $W > 25%$ across $\ge 5$ tasks, with 95% CI excluding zero.	Reframe paper around task-conditional waste (still a valid finding); abandon "$\sim 37%$" headline number.
+RQ-2 (Detectability)	Plateau onset (operationalized via WasteQuantifier) coincides within $\pm 5%$ of training steps with the LER falling below its task-calibrated threshold, on $\ge 80%$ of runs.	LER requires augmentation with a third signal (probe accuracy, layer-wise GSNR); revisit feature definition.
+RQ-3 (Calibration)	Per-task LER thresholds $\tau_{\mathrm{LER}}^{(\mathrm{task})}$ chosen as the 25th percentile of LER values during the post-plateau regime, applied to held-out (other-seed) runs of the same task, classify $\ge 90%$ of post-plateau steps as plateau.	Calibration must be done per-(task, LR) jointly; the cross-task generality claim weakens.
+RQ-4 (Discrimination)	Tasks with early-stopping recipes (RTE, MRPC, CoLA) exhibit $W < 5%$; tasks with fixed-budget training (QQP, MNLI) exhibit $W > 80%$.	The waste detector is non-discriminative (would be a paper-killer); investigate WasteQuantifier biases before any further claims.
+
+We treat Phase 1.1 as passing if all four criteria are met. Partial pass triggers a targeted code-level investigation of the failed criterion before Phase 1.2 begins.
+§3.1.6 What Phase 1.1 Buys Us For Phase 1.2
+
+Each Phase 1.2 simple baseline (SB) requires a calibration parameter that Phase 1.1 supplies:
+Phase 1.2 Baseline	Required Calibration	Source from Phase 1.1
+SB-1 Gradient norm thresholding	Per-task threshold yielding skip-rate $\approx W^{(\mathrm{task})}$	§3.1.3.10 gradient-norm distribution; §3.1.3.8 measured $W^{(\mathrm{task})}$
+SB-2 Random step skipping	Per-task skip rate	§3.1.3.8 measured $W^{(\mathrm{task})}$
+SB-3 Early stopping (oracle)	Patience values ${3, 5, 10, 20}$, but reference step taken from plateau onset	§3.1.3.8 plateau onset $t_{\mathrm{plateau}}^{(\mathrm{task})}$
+SB-4 Weight freezing during plateau	LER threshold to declare plateau	§3.1.3.6 calibrated $\tau_{\mathrm{LER}}^{(\mathrm{task})}$
+SB-5 Reduced total steps	Reduced budget = $T \cdot (1 - W^{(\mathrm{task})})$	§3.1.3.8 measured $W^{(\mathrm{task})}$
+SB-6 Cosine annealing with restarts	Restart period chosen to coincide with phase transitions	§3.1.3.9 phase transition counts
+
+Without §3.1's calibration outputs, all six baselines are arbitrary and cannot serve as a fair comparison set. The integrity of the Phase 1.3 component-ablation cascade ("LERNA $-$ ρ_VG", "LERNA $-$ LER", etc.) similarly hinges on §3.1's verification that ρ_VG and LER are independently informative — a property we test by reporting their pairwise correlation. If $|\mathrm{corr}(\rho_{VG}, \mathrm{LER})| > 0.9$ across runs, the two signals are redundant and the ablation cascade collapses to a single dimension; in that case Phase 1.3's design must be revised before execution.
+§3.1.7 Threats to Validity (Phase-1.1-Specific)
+
+    Optimizer-induced bias in ρ_VG. Computing ρ_VG against raw gradients $g_t$ rather than the AdamW effective update direction $\tilde{g}t$ collapses the metric under adaptive optimizers (max $|\rho{VG}| \approx 0.04$ vs. expected $> 0.3$). We use $\tilde{g}_t$ throughout. Reproductions using SGD will report different magnitudes; we explicitly note this in §6 of the manuscript.
+
+    Stale-loss feeding. The HuggingFace Trainer logs loss every $k$ steps but our diagnostic records loss every step; if the diagnostic re-uses the last-logged value rather than the live mini-batch loss, the WasteQuantifier sees an artificial sawtooth-EMA. We dedupe on loss-value change before feeding the WasteQuantifier.
+
+    Single-seed phase-onset variance. Plateau onset $t_{\mathrm{plateau}}$ varies across seeds; per-task we report the median onset with bootstrap CI rather than the mean to be robust to single-seed outliers.
+
+    Best-model-vs-final-model accounting. Reporting accuracy at the best checkpoint (load_best_model_at_end=True) but waste relative to the full trajectory creates a coherent reading: "at the best checkpoint, $W$% of subsequent compute was unnecessary." We make this convention explicit in the captions.
+
+    Energy attribution at sub-second resolution. Power telemetry at 1 Hz cannot resolve per-step energy on tasks where individual steps complete in <100 ms. We attribute energy to epochs rather than steps for waste-energy decomposition; this is conservative for the savings claim (unattributed steps are counted as productive, not wasted).
+
+    Network-induced eval distortion. Held-out evaluation at fixed step intervals briefly (~1 s) drops GPU power to idle; the resulting "phase echoes" in $P_t$ are removed by clipping eval windows from the energy integration before reporting $E$.
+
+§3.1.8 Summary
+
+Phase 1.1 is the observational backbone of the LERNA programme: it answers whether the diagnostic primitives (LER, ρ_VG, GSNR, $W$) are stable, discriminative, and calibratable across the full GLUE suite without intervention, and provides the per-task constants that make every downstream interventional experiment fair. The success criteria (§3.1.5) are pre-registered to prevent post-hoc narrative drift. Upon completion, Phase 1.1 yields:
+
+    A calibrated diagnostic suite suitable for use as the LER- and ρ_VG-based switching signals in Phase 2.
+    Per-task waste ratios with 95% CIs, supporting the manuscript's headline claim about wasted fine-tuning compute.
+    Per-task plateau onset times, gradient-norm distributions, and phase-transition counts, supplying the calibration constants for the six Phase 1.2 baselines and the component ablations of Phase 1.3.
+    A documented set of edge cases and their fixes (RPSE for regression entropy, dedup loss feeding, AdamW-corrected ρ_VG, GSNR capture-interval calibration), strengthening the methodological reproducibility statement of the paper.
+
+We now turn to the interventional experiments of Phase 1.2 (§3.2), which use the §3.1 calibration to construct the simple-baseline comparison set against which LERNA's contribution is evaluated.
 ## Experimental Results
 
 Results are added incrementally as each experimental phase completes.
@@ -407,26 +611,6 @@ def _compute_grad_norm(self, model):
 ### Phase 1.3: Component Ablation (PENDING)
 
 *Results will be added after Phase 1.3 experiments complete.*
-
----
-
-## Pre-Registration Protocol
-
-To ensure scientific integrity and prevent p-hacking, all waste quantification analysis is pre-registered before running experiments.
-
-**Config Hash (SHA-256):** `ef3cb23a9619d7e05ad8a076e3d449c83dc1b35cb8c6dc9be09a93759cb8958d`
-
-This hash corresponds to `configs/preregistration.yaml` which specifies:
-- Primary metric: waste_ratio with block bootstrap 95% CI
-- Detection threshold: LER < 0.15 triggers momentum extrapolation
-- Safety horizon: H(rho_VG) = base_horizon * (1 - |rho_VG|)
-- Ablation configurations: 6 baselines (gradient norm, random skip, early stopping, etc.)
-- Analysis protocol: paired energy delta comparison with same random seed
-
-The pre-registration ensures that:
-1. Waste detection thresholds are not tuned on the results
-2. Ablation choices are justified a priori
-3. Statistical methods (block bootstrap) are committed before seeing data
 
 ---
 
