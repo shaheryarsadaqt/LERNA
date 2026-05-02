@@ -2616,7 +2616,7 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb-project", default="lerna-baseline", help="W&B project name")
     parser.add_argument("--wandb-group", default=None,
-    # W&B group: unique per invocation so runs are grouped properly
+                        help="W&B group name (default: auto-generated from mode + timestamp)")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap training samples per task (default: 2000 laptop, 25000 server-full, None for --unlimited)")
     parser.add_argument("--unlimited", action="store_true",
