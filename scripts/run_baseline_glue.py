@@ -2616,7 +2616,7 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb-project", default="lerna-baseline", help="W&B project name")
     parser.add_argument("--wandb-group", default=None,
-                        help="W&B group name (default: auto-generated from mode + timestamp)")
+    # W&B group: unique per invocation so runs are grouped properly
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap training samples per task (default: 2000 laptop, 25000 server-full, None for --unlimited)")
     parser.add_argument("--unlimited", action="store_true",
@@ -2640,7 +2640,13 @@ def main():
         tasks = args.tasks or ["sst2"]
         seeds = args.seeds or [42]
 
-    # ── W&B group: unique per invocation so runs are grouped properly ─
+    if args.tasks:
+        tasks = args.tasks
+
+    if args.seeds:
+        seeds = args.seeds
+
+    # W&B group: unique per invocation so runs are grouped properly
     wandb_group = args.wandb_group or f"{args.mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     print(f"\n  ═══════════════════════════════════════════════════════")
