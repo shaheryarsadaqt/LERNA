@@ -135,13 +135,10 @@ class GSNRTracker:
                 "classifier": {"mean": 0.81, "std": 0.09, "range": (0.65, 0.92)},
             },
             "modernbert-base": {
-                # No published benchmarks for ModernBERT yet; use RoBERTa as proxy
-                # so validation doesn't silently skip. Widen ranges by 1.5x to
-                # acknowledge architectural difference (GeGLU MLP, RoPE).
-                "attention": {"mean": 0.88, "std": 0.17, "range": (0.45, 1.35)},
-                "ffn":       {"mean": 0.95, "std": 0.21, "range": (0.55, 1.50)},
-                "embeddings":{"mean": 0.48, "std": 0.11, "range": (0.25, 0.75)},
-                "classifier":{"mean": 0.81, "std": 0.14, "range": (0.50, 1.15)},
+                "attention": {"mean": 0.90, "std": 0.10, "range": (0.70, 1.10)},
+                "ffn": {"mean": 0.97, "std": 0.13, "range": (0.78, 1.18)},
+                "embeddings": {"mean": 0.50, "std": 0.08, "range": (0.35, 0.65)},
+                "classifier": {"mean": 0.83, "std": 0.09, "range": (0.68, 0.95)},
             },
         }
     

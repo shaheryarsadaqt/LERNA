@@ -215,7 +215,7 @@ class LERFeedCallback(TrainerCallback):
 # Constants (identical to Phase 1.1 for reproducibility)
 # =============================================================================
 
-MODEL_NAME = "roberta-base"
+MODEL_NAME = "answerdotai/ModernBERT-base"
 
 GLUE_TASK_CONFIG = {
     "sst2":  {"keys": ("sentence", None),        "num_labels": 2, "metric": "accuracy"},
@@ -231,7 +231,7 @@ GLUE_TASK_CONFIG = {
 # Per-task hyperparameters (identical to Phase 1.1)
 TASK_HP_OVERRIDES = {
     "rte": {
-        "learning_rate": 2e-5,
+        "learning_rate": 1e-5,
         "num_epochs": 20,
         "warmup_ratio": 0.1,
         "early_stopping_patience": 15,
@@ -240,26 +240,26 @@ TASK_HP_OVERRIDES = {
         "init_from_mnli": True,
     },
     "cola": {
-        "learning_rate": 1e-5,
-        "num_epochs": 10,
+        "learning_rate": 5e-6,
+        "num_epochs": 15,
         "warmup_ratio": 0.1,
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 12,
         "metric_for_best_model": "eval_matthews_correlation",
         "greater_is_better": True,
     },
     "mrpc": {
-        "learning_rate": 2e-5,
-        "num_epochs": 10,
+        "learning_rate": 1e-5,
+        "num_epochs": 15,
         "warmup_ratio": 0.1,
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 12,
         "metric_for_best_model": "eval_accuracy",
         "greater_is_better": True,
     },
     "stsb": {
-        "learning_rate": 2e-5,
-        "num_epochs": 10,
+        "learning_rate": 1e-5,
+        "num_epochs": 15,
         "warmup_ratio": 0.1,
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 12,
         "metric_for_best_model": "eval_pearson",
         "greater_is_better": True,
     },
@@ -702,7 +702,7 @@ def run_single_baseline_experiment(
 
     # Resolve per-task hyperparameters
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
-    lr = task_hp.get("learning_rate", 2e-5)
+    lr = task_hp.get("learning_rate", 1e-5)
     num_epochs = task_hp.get("num_epochs", 3)
     warmup_ratio = task_hp.get("warmup_ratio", 0.1)
     default_patience = task_hp.get("early_stopping_patience", 5)
@@ -765,9 +765,15 @@ def run_single_baseline_experiment(
     )
     if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
         print(f"  [MNLI Transfer] Loading from {mnli_checkpoint_dir}")
-        mnli_model = AutoModelForSequenceClassification.from_pretrained(mnli_checkpoint_dir)
+        mnli_model = AutoModelForSequenceClassification.from_pretrained(
+            mnli_checkpoint_dir,
+            reference_compile=False,
+            attn_implementation="sdpa",
+        )
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME, num_labels=cfg["num_labels"],
+            reference_compile=False,
+            attn_implementation="sdpa",
         )
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                          if "classifier" not in k and "pooler" not in k}
@@ -781,6 +787,8 @@ def run_single_baseline_experiment(
             print(f"  [MNLI Transfer] WARNING: No checkpoint at {mnli_checkpoint_dir}, using pretrained")
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME, num_labels=cfg["num_labels"],
+            reference_compile=False,
+            attn_implementation="sdpa",
         )
 
     if hw_cfg["gradient_checkpointing"]:

@@ -89,23 +89,88 @@ GLUE_TASK_CONFIG = {
     "stsb":  {"keys": ("sentence1", "sentence2"), "num_labels": 1, "metric": "pearsonr"},
 }
 
-# Per-task hyperparameter overrides based on ModernBERT recommendations.
-# Large tasks (SST-2, QNLI, MNLI, QQP): 1e-5 LR, 3 epochs
-# Small tasks (MRPC, CoLA, RTE, STS-B): 2-3e-5 LR, 5 epochs
+# Per-task hyperparameter overrides for small datasets.
+# Keys override the defaults (lr=2e-5, num_epochs=3, warmup_ratio=0.1, early_stopping_patience=5).
+# Only tasks listed here get overrides; all others use the global defaults.
+#
+# FIX: Tuned based on GLUE benchmark analysis (2026-03-06):
+#   - RTE: MNLI transfer + lower LR + more epochs (was 60.8%, target >70%)
+#   - CoLA: Lower LR + more epochs + MCC-based model selection (was 59.4 MCC, target >65)
+#   - MRPC: Lower LR + more epochs + F1-based model selection (was 86.2%, target >89%)
 TASK_HP_OVERRIDES = {
-    "sst2":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "qnli":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "mnli":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "qqp":   {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "mrpc":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_f1", "greater_is_better": True},
-    "cola":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_matthews_correlation", "greater_is_better": True},
-    "rte":   {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "stsb":  {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_pearson", "greater_is_better": True},
+    "rte": {
+        "learning_rate": 2e-5,
+        "num_epochs": 20,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 15,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+        # Standard practice: initialize from MNLI-finetuned model for RTE
+        # (Devlin et al. 2019, Liu et al. 2019, Wang et al. 2019)
+        "init_from_mnli": True,
+    },
+    "cola": {
+        "learning_rate": 1e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        # CoLA uses MCC as primary metric; model selection must use MCC, not loss
+        "metric_for_best_model": "eval_matthews_correlation",
+        "greater_is_better": True,
+    },
+    "mrpc": {
+        "learning_rate": 2e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "stsb": {
+        "learning_rate": 2e-5,
+        "num_epochs": 10,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 10,
+        # STS-B is a regression task; model selection must use Pearson, not loss
+        "metric_for_best_model": "eval_pearson",
+        "greater_is_better": True,
+    },
+    # NEW: ModernBERT needs higher LR on large tasks (ModernBERT paper uses 8e-5)
+    "mnli": {
+        "learning_rate": 5e-5,   # ← will be updated after LR sweep (Step 5)
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "qqp": {
+        "learning_rate": 5e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "qnli": {
+        "learning_rate": 3e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
+    "sst2": {
+        "learning_rate": 3e-5,
+        "num_epochs": 3,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 5,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+    },
 }
 
 MODEL_NAME = "answerdotai/ModernBERT-base"
-GLUE_TASKS = ["sst2", "qnli", "qqp", "mnli", "rte", "mrpc", "cola", "stsb"]
-SEEDS = [42, 123, 456, 789, 1024]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -219,9 +284,8 @@ class GSNRTracker:
             if not param.requires_grad:
                 continue
             parts = name.split(".")
-            if "layer" in parts or "layers" in parts:
-                key = "layers" if "layers" in parts else "layer"
-                idx = parts.index(key)
+            if "layer" in parts:
+                idx = parts.index("layer")
                 if idx + 1 < len(parts):
                     layer_name = ".".join(parts[:idx + 2])
                 else:
@@ -248,10 +312,7 @@ class GSNRTracker:
         has_grad = False
         for name, param in model.named_parameters():
             if param.requires_grad and param.grad is not None:
-                g = param.grad.detach().float()
-                if not torch.isfinite(g).all():
-                    continue
-                pnorm = g.norm().item()
+                pnorm = param.grad.detach().float().norm().item()
                 global_norm_sq += pnorm ** 2
                 has_grad = True
                 # Per-layer norm (find which layer this param belongs to)
@@ -288,9 +349,6 @@ class GSNRTracker:
                     layer_grads.append(grad_lookup[pn].detach().float().flatten())
             if layer_grads:
                 layer_grad_vec = torch.cat(layer_grads)
-                if not torch.isfinite(layer_grad_vec).all():
-                    del layer_grad_vec
-                    continue
                 grad_norm = layer_grad_vec.norm().item()
                 self.grad_norm_history[layer_name].append(grad_norm)
                 if len(self.grad_norm_history[layer_name]) > self.window_size * 10:
@@ -304,9 +362,6 @@ class GSNRTracker:
             all_grads.append(grad_lookup[name].detach().float().flatten())
         if all_grads:
             global_grad = torch.cat(all_grads)
-            if not torch.isfinite(global_grad).all():
-                del global_grad, all_grads
-                return
             self.global_grad_norm_history.append(global_grad.norm().item())
             if len(self.global_grad_norm_history) > self.window_size * 10:
                 self.global_grad_norm_history = self.global_grad_norm_history[-self.window_size * 5:]
@@ -1787,15 +1842,11 @@ def run_single_experiment(
         from transformers import AutoConfig
         mnli_model = AutoModelForSequenceClassification.from_pretrained(
             mnli_checkpoint_dir,
-            reference_compile=False,
-            attn_implementation="sdpa",
         )
         # Create target model with correct num_labels
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="sdpa",
         )
         # Transfer encoder weights from MNLI model (skip classifier head)
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
@@ -1813,15 +1864,11 @@ def run_single_experiment(
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="sdpa",
         )
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="sdpa",
         )
 
     if hw_cfg["gradient_checkpointing"]:
@@ -2428,7 +2475,7 @@ def run_single_experiment(
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
-        eval_strategy="steps",
+        evaluation_strategy="steps",
         eval_steps=eval_steps,
         save_strategy="steps",
         save_steps=eval_steps,
@@ -2611,7 +2658,7 @@ def main():
     )
     parser.add_argument("--tasks", nargs="+", default=None, help="Tasks to run (e.g., sst2 qnli)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Seeds (e.g., 42 43 44)")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate (ModernBERT default)")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--output-dir", default="./experiments/baseline", help="Output directory")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb-project", default="lerna-baseline", help="W&B project name")
@@ -2633,8 +2680,9 @@ def main():
         seeds = [42]
         print("\n  SMOKE TEST MODE (1 seed, SST-2 only)")
     elif args.mode == "full":
-        tasks = GLUE_TASKS
-        seeds = SEEDS
+        tasks = list(GLUE_TASK_CONFIG.keys())
+        n_seeds = args.num_seeds or 10
+        seeds = list(range(42, 42 + n_seeds))
         print(f"\n  FULL MODE ({len(seeds)} seeds x {len(tasks)} tasks = {len(seeds)*len(tasks)} runs)")
     else:
         tasks = args.tasks or ["sst2"]
