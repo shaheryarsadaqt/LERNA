@@ -706,7 +706,7 @@ class WasteQuantifier:
             if (self._plateau_step is None
                     and self._slope_det.plateau_step is not None
                     and self._total_steps_seen >= self.min_steps_before_plateau):
-                self._plateau_step = self._total_steps_seen - 1
+                self._plateau_step = max(self._slope_det.plateau_step, self.min_steps_before_plateau)
                 self._plateau_step_train = self._slope_det.plateau_step
 
         # --- Legacy per-step comparison (kept as secondary metric) ---
@@ -1955,8 +1955,8 @@ def run_single_experiment(
         min_steps_pct = 0.30
     else:
         eps_slope_scale = 1.0
-        eps_frac = 0.20
-        min_steps_pct = 0.15
+        eps_frac = 0.10  # was 0.20 — too aggressive for non-modernbert
+        min_steps_pct = 0.30  # was 0.15 — delay plateau detection longer
 
     if is_regression:
         slope_kwargs = dict(window_W=max(6, min(20, total_steps // 20)),
