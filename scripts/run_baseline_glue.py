@@ -1981,6 +1981,15 @@ def run_single_experiment(
             alpha_mk=0.20,
             eps_slope_frac=eps_frac,
         )
+
+    waste_quantifier = WasteQuantifier(
+        ema_alpha=waste_ema_alpha,
+        plateau_patience=waste_patience,
+        plateau_min_improvement=waste_min_improvement,
+        min_steps_before_plateau=waste_min_steps,
+        detector="dual_signal",
+        slope_kwargs=slope_kwargs,
+    )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
     eta_estimator = ETAEstimator(total_steps)
