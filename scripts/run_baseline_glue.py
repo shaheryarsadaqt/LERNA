@@ -539,7 +539,8 @@ class SlopePlateauDetector:
         ups   = sum(1 for d in diffs if d > 0)
         downs = sum(1 for d in diffs if d < 0)
         balance = min(ups, downs) / max(1, len(diffs))
-        t2 = balance >= 0.20   # was 0.30 — calibrated to obs 20 (sgd=461)
+        # Require at least 35% balance to confirm plateau (20% fires on normal SGD noise)
+        t2 = balance >= 0.35
         if t2 and self.t2_fired_at is None:
             self.t2_fired_at = step
 
@@ -1926,11 +1927,11 @@ def run_single_experiment(
         waste_min_improvement = 0.04
         waste_ema_alpha = 0.5
     else:
-        if model_is_modernbert:
-            min_steps_pct = 0.30
+        # Scale-aware min_steps: 30% for short runs, 15% for long runs
+        if total_steps <= 500:
+            waste_min_steps = max(10, min(80, int(expected_unique_obs * 0.30)))
         else:
-            min_steps_pct = 0.15
-        waste_min_steps = max(8, min(50, int(expected_unique_obs * min_steps_pct)))
+            waste_min_steps = max(5, min(50, int(expected_unique_obs * 0.15)))
         waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
         waste_min_improvement = 0.0005
         target_window = max(4, 2 * waste_patience)
@@ -1970,13 +1971,14 @@ def run_single_experiment(
     else:
         approx_unique_obs = max(8, total_steps // max(1, eval_steps))
         if total_steps <= 500:
-            window_W = max(5, approx_unique_obs // 3)
+            # Wider window for short runs — need at least 40% of observations to judge slope
+            window_W = max(8, approx_unique_obs // 2)
             eps_slope = 1.5 * eps_slope_scale
-            sign_balance_min = 0.20
+            sign_balance_min = 0.35
         else:
-            window_W = max(6, min(20, approx_unique_obs // 2))
+            window_W = max(8, min(20, approx_unique_obs // 2))
             eps_slope = 2.5 * eps_slope_scale
-            sign_balance_min = 0.20
+            sign_balance_min = 0.35
         slope_kwargs = dict(
             window_W=window_W,
             ema_alpha=2.0 / (16 + 1),
