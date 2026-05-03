@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Sequence
 import numpy as np
 from scipy import stats
+from sklearn.mixture import GaussianMixture
 
 
 @dataclass
@@ -82,3 +83,46 @@ def run_all_paired_tests(results_by_baseline: dict[str, dict[str, list[float]]])
                 paired_t_test(lerna_scores[task], scores, baseline, task)
             )
     return out
+
+
+def report_bimodal_waste(task_wastes: list[float], task_name: str) -> str:
+    """Report waste with GMM-based bimodality detection.
+
+    Mean ± std is misleading for a bimodal distribution.
+    This function fits 1- and 2-component Gaussian Mixture Models
+    and uses BIC to decide whether the distribution is bimodal.
+    """
+    x = np.array(task_wastes).reshape(-1, 1)
+    if len(x) < 4:
+        return f"{task_name}: n<4, cannot fit mixture"
+
+    gmm1 = GaussianMixture(1, random_state=0).fit(x)
+    gmm2 = GaussianMixture(2, random_state=0).fit(x)
+    if gmm2.bic(x) < gmm1.bic(x) - 4:
+        means = gmm2.means_.flatten()
+        weights = gmm2.weights_
+        return (
+            f"{task_name}: BIMODAL — "
+            f"{weights[0]*100:.0f}% at {means[0]:.2%}, "
+            f"{weights[1]*100:.0f}% at {means[1]:.2%}"
+        )
+    return f"{task_name}: {x.mean():.2%} ± {x.std():.2%} (unimodal)"
+
+
+def summarize_waste_by_task(results_by_baseline: dict[str, dict[str, list[float]]]):
+    """Print bimodal-aware waste summary for each task and baseline."""
+    baselines = list(results_by_baseline.keys())
+    all_tasks = set()
+    for task_scores in results_by_baseline.values():
+        all_tasks.update(task_scores.keys())
+
+    for task in sorted(all_tasks):
+        print(f"\n=== {task} ===")
+        for baseline in baselines:
+            if task not in results_by_baseline[baseline]:
+                continue
+            wastes = results_by_baseline[baseline][task]
+            if not wastes:
+                continue
+            report = report_bimodal_waste(wastes, baseline)
+            print(f"  {report}")
