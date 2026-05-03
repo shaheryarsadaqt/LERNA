@@ -521,9 +521,12 @@ class SlopePlateauDetector:
         # True slope in units of log-loss per SGD step (use real step gaps, not array indices)
         slope_per_step = _theil_sen_slope(self._log_ema[-self.W:], self._steps[-self.W:])
         slope_per_1k = abs(slope_per_step) * 1000.0
-        # Adaptive threshold: plateau if slope < 20% of initial slope
+        # Adaptive threshold: plateau if slope < eps_slope_frac of initial slope
+        # Skip first 2 windows so initial slope reflects "normal early training",
+        # not the chaotic steep drop at the very start
         if self._initial_slope_per_1k is None and slope_per_1k > 0:
-            self._initial_slope_per_1k = slope_per_1k
+            if len(self._log_ema) >= self.W * 2:
+                self._initial_slope_per_1k = slope_per_1k
         adaptive_eps = max(self.eps_slope_per_1k,
                            self.eps_slope_frac * (self._initial_slope_per_1k or 0.0))
         t1 = slope_per_1k < adaptive_eps
