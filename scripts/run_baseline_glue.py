@@ -2581,7 +2581,10 @@ def run_single_experiment(
         "lr_loss_correlation": lr_loss_corr,
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
-        "evaluated_best_model": True,  # FIX #9 flag
+        "evaluated_best_model": True,
+        "waste_theoretical_max": waste_metrics.get("waste_theoretical_max"),
+        "detector_hit_floor": waste_metrics.get("detector_hit_floor"),
+        "early_stopping_callback_added": True,
     }
 
     results_path = os.path.join(output_dir, "results.json")
@@ -2609,11 +2612,14 @@ def run_single_experiment(
                     "final/gsnr_global": gsnr_tracker.gsnr_global_history[-1] if gsnr_tracker.gsnr_global_history else None,
                     "final/waste_ratio": waste_metrics["waste_ratio"],
                     "final/waste_ci_95": f"[{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}]",
+                    "final/waste_theoretical_max": waste_metrics.get("waste_theoretical_max"),
+                    "final/detector_hit_floor": waste_metrics.get("detector_hit_floor"),
                     "final/phase": phase_summary["current_phase"],
                     "final/num_phase_transitions": len(phase_summary["transitions"]),
                     "final/lr_loss_correlation": lr_loss_corr["correlation"] if lr_loss_corr else None,
                     "final/evaluated_best_model": True,
                     "final/mnli_init_used": init_from_mnli and os.path.exists(mnli_checkpoint_dir),
+                    "final/early_stopping_callback_added": True,
                 })
         except Exception:
             pass
