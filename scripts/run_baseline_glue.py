@@ -94,10 +94,10 @@ GLUE_TASK_CONFIG = {
 # Large tasks (SST-2, QNLI, MNLI, QQP): 1e-5 LR, 3 epochs
 # Small tasks (MRPC, CoLA, RTE, STS-B): 2-3e-5 LR, 5 epochs
 TASK_HP_OVERRIDES = {
-    "sst2":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "qnli":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "mnli":  {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
-    "qqp":   {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
+    "sst2":  {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.06, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
+    "qnli":  {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.06, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
+    "mnli":  {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.06, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
+    "qqp":   {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.06, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
     "mrpc":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_f1", "greater_is_better": True},
     "cola":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_matthews_correlation", "greater_is_better": True},
     "rte":  {
@@ -2785,11 +2785,11 @@ def main():
             task_greater_is_better = task_hp.get("greater_is_better", False)
             task_init_mnli = task_hp.get("init_from_mnli", False)
 
-            # Scale-aware LR: if max_samples is small, bump LR for tasks
-            # that don't have explicit HP overrides
-            if task not in TASK_HP_OVERRIDES and effective_max_samples and effective_max_samples < 5000:
-                task_lr = max(task_lr, 2e-5)  # don't let LR go below 2e-5 on small samples
-                task_epochs = max(task_epochs, 5)  # more passes over small data
+            # Scale-aware HP adjustment — applies to ALL tasks on small samples
+            if effective_max_samples and effective_max_samples < 5000:
+                task_lr = max(task_lr, 2e-5)
+                task_epochs = max(task_epochs, 5)
+                print(f"  [SCALE-AWARE] {task}: lr={task_lr}, epochs={task_epochs}")
 
             try:
                 result = run_single_experiment(
