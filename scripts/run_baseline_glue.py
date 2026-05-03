@@ -477,13 +477,15 @@ class SlopePlateauDetector:
                  eps_slope_per_1k=5e-3,
                  alpha_mk=0.10,
                  gsnr_gamma=0.10,
-                 gsnr_K=3):
+                 gsnr_K=3,
+                 eps_slope_frac=0.20):
         self.W = int(window_W)
         self.ema_alpha = float(ema_alpha)
         self.eps_slope_per_1k = float(eps_slope_per_1k)
         self.alpha_mk = float(alpha_mk)
         self.gsnr_gamma = float(gsnr_gamma)
         self.gsnr_K = int(gsnr_K)
+        self.eps_slope_frac = float(eps_slope_frac)
 
         self._raw = []
         self._log_ema = []
@@ -493,7 +495,6 @@ class SlopePlateauDetector:
         self._gsnr_peak = 0.0
         self._gsnr_below = 0
         self._initial_slope_per_1k = None
-        self.eps_slope_frac = 0.20   # plateau if |slope| < 20% of initial slope
 
         self.t1_fired_at = None
         self.t2_fired_at = None
@@ -843,10 +844,14 @@ class WasteQuantifier:
             "t1_fired_at": self._slope_det.t1_fired_at,
             "t2_fired_at": self._slope_det.t2_fired_at,
             "t3_fired_at": self._slope_det.t3_fired_at,
-            "detector_floor_suspected": bool(
-                waste_ratio > 0 and abs(waste_ratio - (1.0 - self.min_steps_before_plateau / max(1, n))) < 0.05
+            "waste_theoretical_max": float(
+                1.0 - max(self.min_steps_before_plateau, self._slope_det.W) / max(1, n)
             ),
-            "theoretical_floor": float(1.0 - self.min_steps_before_plateau / max(1, n)),
+            "detector_hit_floor": bool(
+                waste_ratio > 0 and abs(
+                    waste_ratio - (1.0 - max(self.min_steps_before_plateau, self._slope_det.W) / max(1, n))
+                ) < 0.03
+            ),
         }
 
 
@@ -1917,11 +1922,11 @@ def run_single_experiment(
         waste_min_improvement = 0.04
         waste_ema_alpha = 0.5
     else:
-        if "modernbert" in str(MODEL_NAME).lower():
+        if model_is_modernbert:
             min_steps_pct = 0.30
         else:
             min_steps_pct = 0.15
-        waste_min_steps = max(3, min(50, int(expected_unique_obs * min_steps_pct)))
+        waste_min_steps = max(8, min(50, int(expected_unique_obs * min_steps_pct)))
         waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
         waste_min_improvement = 0.0005
         target_window = max(4, 2 * waste_patience)
@@ -1943,20 +1948,24 @@ def run_single_experiment(
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
     # ── New: slope detector kwargs (paper default) ────────────────────
+    model_is_modernbert = "modernbert" in str(MODEL_NAME).lower()
+    if model_is_modernbert:
+        eps_slope_scale = 0.3
+        eps_frac = 0.10
+        min_steps_pct = 0.30
+    else:
+        eps_slope_scale = 1.0
+        eps_frac = 0.20
+        min_steps_pct = 0.15
+
     if is_regression:
         slope_kwargs = dict(window_W=max(6, min(20, total_steps // 20)),
                             ema_alpha=0.5,
                             eps_slope_per_1k=2e-2,
-                            alpha_mk=0.20)
-else:
+                            alpha_mk=0.20,
+                            eps_slope_frac=eps_frac)
+    else:
         approx_unique_obs = max(8, total_steps // max(1, eval_steps))
-        model_name_lower = str(MODEL_NAME).lower()
-        if "modernbert" in model_name_lower:
-            eps_slope_scale = 0.3
-            min_steps_pct = 0.30
-        else:
-            eps_slope_scale = 1.0
-            min_steps_pct = 0.15
         if total_steps <= 500:
             window_W = max(5, approx_unique_obs // 3)
             eps_slope = 1.5 * eps_slope_scale
@@ -1970,6 +1979,7 @@ else:
             ema_alpha=2.0 / (16 + 1),
             eps_slope_per_1k=eps_slope,
             alpha_mk=0.20,
+            eps_slope_frac=eps_frac,
         )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
