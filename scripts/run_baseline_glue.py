@@ -84,6 +84,7 @@ GLUE_TASK_CONFIG = {
     "qqp":   {"keys": ("question1", "question2"), "num_labels": 2, "metric": "accuracy"},
     "mnli":  {"keys": ("premise", "hypothesis"),   "num_labels": 3, "metric": "accuracy"},
     "rte":   {"keys": ("sentence1", "sentence2"), "num_labels": 2, "metric": "accuracy"},
+    "rte_modernbert_2e5": {"keys": ("sentence1", "sentence2"), "num_labels": 2, "metric": "accuracy"},
     "mrpc":  {"keys": ("sentence1", "sentence2"), "num_labels": 2, "metric": "accuracy"},
     "cola":  {"keys": ("sentence", None),          "num_labels": 2, "metric": "matthews_correlation"},
     "stsb":  {"keys": ("sentence1", "sentence2"), "num_labels": 1, "metric": "pearsonr"},
@@ -99,12 +100,29 @@ TASK_HP_OVERRIDES = {
     "qqp":   {"learning_rate": 1e-5, "num_epochs": 3,  "warmup_ratio": 0.1, "early_stopping_patience": 5, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
     "mrpc":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_f1", "greater_is_better": True},
     "cola":  {"learning_rate": 3e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_matthews_correlation", "greater_is_better": True},
-    "rte":   {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_accuracy", "greater_is_better": True},
+    "rte":  {
+        "learning_rate": 1e-5,
+        "num_epochs": 20,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 15,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+        "init_from_mnli": True,
+    },
+    "rte_modernbert_2e5": {
+        "learning_rate": 2e-5,
+        "num_epochs": 20,
+        "warmup_ratio": 0.1,
+        "early_stopping_patience": 15,
+        "metric_for_best_model": "eval_accuracy",
+        "greater_is_better": True,
+        "init_from_mnli": True,
+    },
     "stsb":  {"learning_rate": 2e-5, "num_epochs": 5,  "warmup_ratio": 0.1, "early_stopping_patience": 8, "metric_for_best_model": "eval_pearson", "greater_is_better": True},
 }
 
 MODEL_NAME = "answerdotai/ModernBERT-base"
-GLUE_TASKS = ["sst2", "qnli", "qqp", "mnli", "rte", "mrpc", "cola", "stsb"]
+GLUE_TASKS = ["sst2", "qnli", "qqp", "mnli", "rte", "rte_modernbert_2e5", "mrpc", "cola", "stsb"]
 SEEDS = [42, 123, 456, 789, 1024]
 
 
