@@ -2785,6 +2785,12 @@ def main():
             task_greater_is_better = task_hp.get("greater_is_better", False)
             task_init_mnli = task_hp.get("init_from_mnli", False)
 
+            # Scale-aware LR: if max_samples is small, bump LR for tasks
+            # that don't have explicit HP overrides
+            if task not in TASK_HP_OVERRIDES and effective_max_samples and effective_max_samples < 5000:
+                task_lr = max(task_lr, 2e-5)  # don't let LR go below 2e-5 on small samples
+                task_epochs = max(task_epochs, 5)  # more passes over small data
+
             try:
                 result = run_single_experiment(
                     task_name=task,
