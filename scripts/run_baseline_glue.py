@@ -2636,7 +2636,7 @@ def run_single_experiment(
     print(f"  Saved: {results_path}")
     print(f"  Best model evaluated: Yes (load_best_model_at_end=True)")
 
-    result["run_metadata"] = {
+    results["run_metadata"] = {
         "early_stopping_callback_added": True,
         "early_stopping_patience": early_stopping_patience,
         "load_best_model_at_end": True,
@@ -2648,7 +2648,7 @@ def run_single_experiment(
         "mnli_init_used": init_from_mnli and os.path.exists(mnli_checkpoint_dir),
     }
     if use_wandb and wandb.run is not None:
-        wandb.log({f"run_meta/{k}": v for k, v in result["run_metadata"].items()})
+        wandb.log({f"run_meta/{k}": v for k, v in results["run_metadata"].items()})
 
     # ── Cleanup ───────────────────────────────────────────────────────
     del model, trainer
