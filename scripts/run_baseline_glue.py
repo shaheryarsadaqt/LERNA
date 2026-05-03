@@ -2604,6 +2604,7 @@ def run_single_experiment(
                     "final/num_phase_transitions": len(phase_summary["transitions"]),
                     "final/lr_loss_correlation": lr_loss_corr["correlation"] if lr_loss_corr else None,
                     "final/evaluated_best_model": True,
+                    "final/mnli_init_used": init_from_mnli and os.path.exists(mnli_checkpoint_dir),
                 })
         except Exception:
             pass
@@ -2635,6 +2636,7 @@ def run_single_experiment(
         "stopped_early": float(trainer.state.epoch) < num_epochs - 0.05,
         "final_best_step": int(trainer.state.best_model_checkpoint.split("-")[-1])
                             if trainer.state.best_model_checkpoint else None,
+        "mnli_init_used": init_from_mnli and os.path.exists(mnli_checkpoint_dir),
     }
     if use_wandb and wandb.run is not None:
         wandb.log({f"run_meta/{k}": v for k, v in result["run_metadata"].items()})
