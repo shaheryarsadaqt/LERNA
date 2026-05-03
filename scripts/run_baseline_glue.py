@@ -843,6 +843,10 @@ class WasteQuantifier:
             "t1_fired_at": self._slope_det.t1_fired_at,
             "t2_fired_at": self._slope_det.t2_fired_at,
             "t3_fired_at": self._slope_det.t3_fired_at,
+            "detector_floor_suspected": bool(
+                waste_ratio > 0 and abs(waste_ratio - (1.0 - self.min_steps_before_plateau / max(1, n))) < 0.05
+            ),
+            "theoretical_floor": float(1.0 - self.min_steps_before_plateau / max(1, n)),
         }
 
 
@@ -1913,7 +1917,11 @@ def run_single_experiment(
         waste_min_improvement = 0.04
         waste_ema_alpha = 0.5
     else:
-        waste_min_steps = max(3, min(50, int(expected_unique_obs * 0.15)))
+        if "modernbert" in str(MODEL_NAME).lower():
+            min_steps_pct = 0.30
+        else:
+            min_steps_pct = 0.15
+        waste_min_steps = max(3, min(50, int(expected_unique_obs * min_steps_pct)))
         waste_patience = max(3, min(30, int(expected_unique_obs * 0.10)))
         waste_min_improvement = 0.0005
         target_window = max(4, 2 * waste_patience)
@@ -1940,29 +1948,29 @@ def run_single_experiment(
                             ema_alpha=0.5,
                             eps_slope_per_1k=2e-2,
                             alpha_mk=0.20)
-    else:
+else:
         approx_unique_obs = max(8, total_steps // max(1, eval_steps))
+        model_name_lower = str(MODEL_NAME).lower()
+        if "modernbert" in model_name_lower:
+            eps_slope_scale = 0.3
+            min_steps_pct = 0.30
+        else:
+            eps_slope_scale = 1.0
+            min_steps_pct = 0.15
         if total_steps <= 500:
             window_W = max(5, approx_unique_obs // 3)
-            eps_slope = 1.5
+            eps_slope = 1.5 * eps_slope_scale
             sign_balance_min = 0.20
         else:
             window_W = max(6, min(20, approx_unique_obs // 2))
-            eps_slope = 2.5
+            eps_slope = 2.5 * eps_slope_scale
             sign_balance_min = 0.20
-        slope_kwargs = dict(window_W=window_W,
-                            ema_alpha=2.0 / (16 + 1),
-                            eps_slope_per_1k=eps_slope,
-                            alpha_mk=0.20)
-
-    waste_quantifier = WasteQuantifier(
-        ema_alpha=waste_ema_alpha,
-        plateau_patience=waste_patience,
-        plateau_min_improvement=waste_min_improvement,
-        min_steps_before_plateau=waste_min_steps,
-        detector="dual_signal",          # NEW default; "relative" reproduces older runs bit-exactly
-        slope_kwargs=slope_kwargs,
-    )
+        slope_kwargs = dict(
+            window_W=window_W,
+            ema_alpha=2.0 / (16 + 1),
+            eps_slope_per_1k=eps_slope,
+            alpha_mk=0.20,
+        )
     phase_detector = PhaseTransitionDetector(smoothing_window=20, min_phase_duration=20)
     lr_loss_tracker = LRLossCorrelationTracker()
     eta_estimator = ETAEstimator(total_steps)
