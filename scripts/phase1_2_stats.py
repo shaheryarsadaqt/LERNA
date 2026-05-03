@@ -126,3 +126,71 @@ def summarize_waste_by_task(results_by_baseline: dict[str, dict[str, list[float]
                 continue
             report = report_bimodal_waste(wastes, baseline)
             print(f"  {report}")
+
+
+@dataclass
+class WasteReport:
+    raw_mean: float
+    raw_std: float
+    calibrated_mean: float
+    calibrated_std: float
+    n_total: int
+    n_hit_floor: int
+    pct_hit_floor: float
+
+    def __str__(self) -> str:
+        floor_note = f" ({self.pct_hit_floor:.0%} hit floor, excluded)" if self.n_hit_floor > 0 else ""
+        return (
+            f"raw={self.raw_mean:.1%}±{self.raw_std:.1%}  "
+            f"calibrated={self.calibrated_mean:.1%}±{self.calibrated_std:.1%}{floor_note}"
+        )
+
+
+def waste_report(
+    wastes: list[float],
+    hit_floor_flags: list[bool] | None = None,
+) -> WasteReport:
+    """Two-metric waste reporting: raw mean and calibrated mean (excl. floor hits).
+
+    Args:
+        wastes: List of waste ratio values (0-1) per seed.
+        hit_floor_flags: Optional list of bool flags for detector_hit_floor.
+                        If None, uses all values for raw and calibrated.
+    """
+    wastes = np.asarray(wastes, dtype=float)
+    n_total = len(wastes)
+
+    raw_mean = float(wastes.mean())
+    raw_std = float(wastes.std(ddof=1)) if n_total > 1 else 0.0
+
+    if hit_floor_flags is None:
+        return WasteReport(
+            raw_mean=raw_mean, raw_std=raw_std,
+            calibrated_mean=raw_mean, calibrated_std=raw_std,
+            n_total=n_total, n_hit_floor=0, pct_hit_floor=0.0,
+        )
+
+    floor_flags = np.asarray(hit_floor_flags, dtype=bool)
+    n_hit = int(floor_flags.sum())
+    pct_hit = float(n_hit / n_total) if n_total > 0 else 0.0
+
+    if n_hit == n_total or n_total - n_hit < 2:
+        calibrated_mean = float(wastes[~floor_flags].mean()) if n_total - n_hit > 0 else raw_mean
+        calibrated_std = 0.0
+    else:
+        calib_wastes = wastes[~floor_flags]
+        calibrated_mean = float(calib_wastes.mean())
+        calibrated_std = float(calib_wastes.std(ddof=1))
+
+    return WasteReport(
+        raw_mean=raw_mean, raw_std=raw_std,
+        calibrated_mean=calibrated_mean, calibrated_std=calibrated_std,
+        n_total=n_total, n_hit_floor=n_hit, pct_hit_floor=pct_hit,
+    )
+
+
+def report_task_waste(task_name: str, wastes: list[float], hit_floor_flags: list[bool] | None = None) -> str:
+    """Single-task waste report with raw + calibrated + bimodal framing."""
+    report = waste_report(wastes, hit_floor_flags)
+    bimodal = report_bimodal_waste(wastes, task_name)
+    return f"{bimodal}\n  raw={report.raw_mean:.1%}±{report.raw_std:.1%} | calibrated={report.calibrated_mean:.1%}±{report.calibrated_std:.1%} ({report.n_total - report.n_hit_floor}/{report.n_total} seeds)"
