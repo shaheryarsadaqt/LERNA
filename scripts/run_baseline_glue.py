@@ -1909,6 +1909,7 @@ def run_single_experiment(
     logging_steps = max(eval_steps // 5, 1)  # matches TrainingArguments.logging_steps
     expected_unique_obs = max(1, total_steps // logging_steps)
     is_regression = GLUE_TASK_CONFIG[task_name]["num_labels"] == 1
+    model_is_modernbert = "modernbert" in str(MODEL_NAME).lower()
     if is_regression:
         # Regression tasks produce very few unique loss values (~20-30)
         # due to MSE averaging. Use minimal parameters to ensure plateau
@@ -1948,7 +1949,6 @@ def run_single_experiment(
     # Classification tasks use 0.0005 (0.05%) which correctly detects
     # plateaus on QQP (98.8%), MNLI (98.9%), SST-2 (50.4%), QNLI (55.8%).
     # ── New: slope detector kwargs (paper default) ────────────────────
-    model_is_modernbert = "modernbert" in str(MODEL_NAME).lower()
     if model_is_modernbert:
         eps_slope_scale = 0.3
         eps_frac = 0.10
