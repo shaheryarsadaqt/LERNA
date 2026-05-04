@@ -2657,6 +2657,12 @@ def run_single_experiment(
     print(f"  Saved: {results_path}")
     print(f"  Best model evaluated: Yes (load_best_model_at_end=True)")
 
+    # Save MNLI checkpoint for transfer to RTE/MRPC
+    if task_name == "mnli":
+        mnli_save_dir = os.path.join(output_dir, "mnli_finetuned")
+        trainer.save_model(mnli_save_dir)
+        print(f"  [MNLI Transfer] Saved MNLI checkpoint to {mnli_save_dir}")
+
     results["run_metadata"] = {
         "early_stopping_callback_added": True,
         "early_stopping_patience": early_stopping_patience,
