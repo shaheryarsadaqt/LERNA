@@ -163,11 +163,10 @@ class _BaselineStatsMixin:
             f"baseline/{self.baseline_name}/skip_ratio": (
                 self.steps_skipped / max(state.global_step, 1)
             ),
-            "step": state.global_step,
         }
         if extra:
             data.update(extra)
-        wandb.log(data)
+        wandb.log(data, commit=False)
 
     def _on_evaluate_stats(self, metrics, state):
         if metrics and "eval_accuracy" in metrics:
@@ -796,8 +795,7 @@ class CosineAnnealingWarmRestartsCallback(TrainerCallback, _BaselineStatsMixin):
         if self.wandb_enabled and _wandb_active() and state.global_step % 10 == 0:
             wandb.log({
                 f"baseline/{self.baseline_name}/lr": new_lr,
-                "step": state.global_step,
-            })
+            }, commit=False)
 
         return control
 

@@ -236,7 +236,7 @@ class IESCallback(TrainerCallback):
         ler_plateau, ler_confidence = self.ler_tracker.get_ler_plateau_indicator()
         if ler_plateau and ler_confidence > 0.8 and not self.plateau_confirmed:
             print(f"\n⚠️  LER Plateau Indication (confidence: {ler_confidence:.2f})")
-            print(f"   LER: {self.ler_tracker.get_ler():.6f}")
+            print(f"   LER: {self.ler_tracker.get_ler():.2e}")
             print(f"   Phase: {self.ler_tracker.get_efficiency_phase()}")
         
         # Save checkpoint if this is the best so far
@@ -748,7 +748,7 @@ class EarlyStoppingWithLER(TrainerCallback):
         if self.patience_counter >= self.patience:
             print(f"\n🛑 LER Early Stopping triggered")
             print(f"   Step: {current_step}")
-            print(f"   LER: {current_ler:.6f} (threshold: {self.ler_threshold})")
+            print(f"   LER: {current_ler:.2e} (threshold: {self.ler_threshold:.2e})")
             print(f"   Best loss: {self.best_loss:.4f} at step {self.best_step}")
             
             self.should_stop = True

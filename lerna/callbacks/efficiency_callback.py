@@ -270,7 +270,7 @@ class EfficiencyMetricsCallback(TrainerCallback):
         recent = self.metrics_history[-10:]
         ler_vals = [m.get("efficiency/ler") for m in recent if m.get("efficiency/ler") is not None]
         gsnr_vals = [m.get("efficiency/gsnr") for m in recent if m.get("efficiency/gsnr") is not None]
-        ler_display = f"{np.mean(ler_vals):.6f}" if ler_vals else "N/A"
+        ler_display = f"{np.mean(ler_vals):.2e}" if ler_vals else "N/A"
         gsnr_display = f"{np.mean(gsnr_vals):.3f}" if gsnr_vals else "N/A"
         print(f"\n  Efficiency (Step {state.global_step}): LER={ler_display} GSNR={gsnr_display}")
 

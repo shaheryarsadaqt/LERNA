@@ -100,6 +100,7 @@ def run_ablation_single(
     seed: int,
     ablation_name: str,
     ablation_overrides: dict,
+    model_name: str,
     profile: str,
     base_output_dir: str,
     use_wandb: bool = False,
@@ -135,7 +136,7 @@ def run_ablation_single(
     os.makedirs(output_dir, exist_ok=True)
 
     if wandb_group is None:
-        wandb_group = args.wandb_group or f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        wandb_group = f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     if use_wandb:
         import wandb
@@ -173,17 +174,14 @@ def run_ablation_single(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    from lerna.utils.model_loader import load_model_and_tokenizer
     cfg = GLUE_TASK_CONFIG[task_name]
 
     mnli_checkpoint_dir = os.path.join(base_output_dir, "mnli_finetuned")
     if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
         from transformers import AutoConfig
-        mnli_model = AutoModelForSequenceClassification.from_pretrained(
-            mnli_checkpoint_dir, reference_compile=False, attn_implementation="sdpa")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=cfg["num_labels"],
-            reference_compile=False, attn_implementation="sdpa")
+        mnli_model, _ = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
+        model, _ = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                         if "classifier" not in k and "pooler" not in k}
         model.load_state_dict(encoder_state, strict=False)
@@ -192,9 +190,7 @@ def run_ablation_single(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     else:
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=cfg["num_labels"],
-            reference_compile=False, attn_implementation="sdpa")
+        model, tokenizer = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
 
     if hw_cfg["gradient_checkpointing"]:
         try:
@@ -535,6 +531,8 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="lerna-ablation")
     parser.add_argument("--wandb-group", default=None)
+    parser.add_argument("--model", default="modernbert", choices=["roberta", "modernbert", "deberta"],
+                        help="Model to use for ablation study")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--unlimited", action="store_true")
     args = parser.parse_args()
@@ -565,7 +563,9 @@ def main():
     if effective_max_samples is None and not args.unlimited:
         effective_max_samples = 2000 if profile != "server" else 25000
 
-    wandb_group = f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    from lerna.utils.model_loader import MODELS
+    model_name = MODELS[args.model]
+    wandb_group = args.wandb_group or f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     total_runs = len(tasks) * len(seeds) * len(ablations_to_run)
     print(f"\n  ═══════════════════════════════════════════════════════")
@@ -605,6 +605,7 @@ def main():
                         seed=seed,
                         ablation_name=ablation_name,
                         ablation_overrides=ABLATIONS[ablation_name],
+                        model_name=model_name,
                         profile=profile,
                         base_output_dir=args.output_dir,
                         use_wandb=args.wandb,
@@ -660,7 +661,7 @@ def main():
                 f"  {ablab:<15} {len(ab_results):>5} "
                 f"{np.mean(accs):>10.4f} {np.std(accs):>8.4f} "
                 f"{np.mean(kwhs):>10.6f} "
-                f"{np.mean(lers) if lers else 0:.6f}"
+                f"{np.mean(lers) if lers else 0:.2e}"
             )
 
     print(f"{'='*60}")

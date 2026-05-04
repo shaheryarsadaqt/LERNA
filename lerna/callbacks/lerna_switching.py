@@ -470,7 +470,10 @@ class LERNASwitchingCallback(TrainerCallback):
             self._optimizer = kwargs["optimizer"]
         if "model" in kwargs:
             self._model = kwargs["model"]
-        
+
+        if self.wandb_enabled and _wandb_active():
+            wandb.define_metric("lerna/*", step_metric="train/global_step")
+
         safety_info = f", safety_horizon={'enabled' if self.use_safety_horizon else 'disabled'}"
         energy_info = f", energy_tracking={'real' if self.use_real_energy else 'estimated'}"
         logger.info(
@@ -559,7 +562,6 @@ class LERNASwitchingCallback(TrainerCallback):
                         "lerna/safety_horizon_limit": state.global_step,
                         "lerna/consecutive_skips": self._consecutive_skips,
                         "lerna/max_safe_skips": max_safe_skips,
-                        "step": state.global_step
                     })
 
         if should_skip:
@@ -603,7 +605,6 @@ class LERNASwitchingCallback(TrainerCallback):
                     "lerna/grad_norm": self._current_grad_norm,
                     "lerna/active": 1,
                     "lerna/consecutive_skips": self._consecutive_skips,
-                    "step": state.global_step
                 }
                 # Add safety horizon diagnostics
                 if self.safety_horizon:
@@ -625,7 +626,6 @@ class LERNASwitchingCallback(TrainerCallback):
                             state.global_step - self.plateau_steps[-1]
                             if self.plateau_steps else 0
                         ),
-                        "step": state.global_step
                     })
             self.active_skipping = False
             if self.wandb_enabled and _wandb_active() and state.global_step % 10 == 0:
@@ -637,7 +637,6 @@ class LERNASwitchingCallback(TrainerCallback):
                     "lerna/grad_norm": self._current_grad_norm,
                     "lerna/active": 0,
                     "lerna/consecutive_skips": 0,
-                    "step": state.global_step
                 })
 
         return control
@@ -733,8 +732,7 @@ class LERNASwitchingCallback(TrainerCallback):
                         self.last_accuracy if not self.active_skipping else 0
                     ),
                     "lerna/skipping_active": int(self.active_skipping),
-                    "step": state.global_step
-                })
+                }, commit=False)
 
     def on_train_end(self, args, state, control, **kwargs):
         """Report and log final switching statistics."""
