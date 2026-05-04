@@ -376,17 +376,23 @@ class LERNASwitchingCallback(TrainerCallback):
         min_step: int = 100,
         wandb_enabled: bool = True,
         use_safety_horizon: bool = True,
+        use_rho_vg: bool = True,
+        use_ler: bool = True,
+        use_momentum_extrap: bool = True,
         use_real_energy: bool = True,
         gpu_id: int = 0,
     ):
         """Initialize LERNA switching callback.
-        
+
         Args:
             ler_tracker: LERTracker instance for computing LER
             threshold: LER threshold for plateau detection
             min_step: Minimum step before considering skipping
             wandb_enabled: Whether to log to W&B
             use_safety_horizon: Enable PL-based safety horizon (FLAW 5 FIX)
+            use_rho_vg: Enable rho_VG velocity-gradient correlation
+            use_ler: Enable LER tracking for plateau detection
+            use_momentum_extrap: Enable momentum extrapolation during skipping
             use_real_energy: Use real power telemetry for energy (FLAW 2 FIX)
             gpu_id: GPU index for power monitoring
         """
@@ -405,6 +411,11 @@ class LERNASwitchingCallback(TrainerCallback):
         self.use_safety_horizon = use_safety_horizon
         self.safety_horizon = SafetyHorizon() if use_safety_horizon else None
         self._consecutive_skips = 0
+
+        # Ablation toggles
+        self.use_rho_vg = use_rho_vg
+        self.use_ler = use_ler
+        self.use_momentum_extrap = use_momentum_extrap
         
         # FLAW 2 FIX: Real energy tracking
         self.use_real_energy = use_real_energy
@@ -521,8 +532,11 @@ class LERNASwitchingCallback(TrainerCallback):
             return control
 
         # Plateau detection
-        should_skip = self._current_ler < self.threshold
-        
+        if self.use_ler:
+            should_skip = self._current_ler < self.threshold
+        else:
+            should_skip = current_rho < 0.1
+
         # FLAW 5 FIX: Safety Horizon check
         if should_skip and self.use_safety_horizon and self.safety_horizon:
             # Compute loss improvement for PL constant estimation
@@ -531,7 +545,7 @@ class LERNASwitchingCallback(TrainerCallback):
                 loss_improvement = abs(self._loss_history[-2] - self._loss_history[-1])
             
             max_safe_skips = self.safety_horizon.compute_horizon(
-                rho_vg=current_rho,
+                rho_vg=current_rho if self.use_rho_vg else 0.0,
                 ler=self._current_ler,
                 grad_norm=self._current_grad_norm,
                 loss_improvement=loss_improvement,
@@ -671,23 +685,24 @@ class LERNASwitchingCallback(TrainerCallback):
         # Momentum extrapolation: update weights using momentum buffer.
         # This corrects the parameter update to use momentum direction
         # instead of the computed gradient direction.
-        with torch.no_grad():
-            for group in optimizer.param_groups:
-                for param in group['params']:
-                    if not param.requires_grad:
-                        continue
-                    if param not in optimizer.state:
-                        continue
-                    p_state = optimizer.state[param]
-                    # SGD-style momentum buffer
-                    if 'momentum_buffer' in p_state:
-                        momentum = p_state['momentum_buffer']
-                        param.data.add_(momentum, alpha=-lr)
-                    # Adam-style: use exp_avg (first moment) as momentum proxy
-                    elif 'exp_avg' in p_state:
-                        exp_avg = p_state['exp_avg']
-                        param.data.add_(exp_avg, alpha=-lr)
-                    # No momentum state available for this param; skip it
+        if self.use_momentum_extrap:
+            with torch.no_grad():
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if not param.requires_grad:
+                            continue
+                        if param not in optimizer.state:
+                            continue
+                        p_state = optimizer.state[param]
+                        # SGD-style momentum buffer
+                        if 'momentum_buffer' in p_state:
+                            momentum = p_state['momentum_buffer']
+                            param.data.add_(momentum, alpha=-lr)
+                        # Adam-style: use exp_avg (first moment) as momentum proxy
+                        elif 'exp_avg' in p_state:
+                            exp_avg = p_state['exp_avg']
+                            param.data.add_(exp_avg, alpha=-lr)
+                        # No momentum state available for this param; skip it
 
         # Clear any stale gradients
         optimizer.zero_grad(set_to_none=True)

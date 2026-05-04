@@ -348,6 +348,7 @@ class LERTracker:
         validate_correlation: bool = True,
         task_calibration: Optional[Dict] = None,
         min_phase_duration: int = 20,
+        use_hysteresis: bool = True,
     ):
         self.task = task
         self.window_size = window_size
@@ -380,6 +381,7 @@ class LERTracker:
         self._committed_phase: str = "warmup"
         self._candidate_phase: Optional[str] = None
         self._candidate_phase_count: int = 0
+        self.use_hysteresis = use_hysteresis
 
         if task_calibration is None:
             task_calibration = self._get_default_calibration()
@@ -688,6 +690,9 @@ class LERTracker:
         
         # Hysteresis: require min_phase_duration consecutive observations
         # of the same new phase before committing the transition.
+        if not self.use_hysteresis:
+            self._committed_phase = raw_phase
+            return raw_phase
         if raw_phase == self._committed_phase:
             # Still in the committed phase; reset any pending candidate
             self._candidate_phase = None
