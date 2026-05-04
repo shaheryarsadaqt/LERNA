@@ -2659,7 +2659,7 @@ def run_single_experiment(
 
     # Save MNLI checkpoint for transfer to RTE/MRPC
     if task_name == "mnli":
-        mnli_save_dir = os.path.join(output_dir, "mnli_finetuned")
+        mnli_save_dir = os.path.join(base_output_dir, "mnli_finetuned")
         trainer.save_model(mnli_save_dir)
         print(f"  [MNLI Transfer] Saved MNLI checkpoint to {mnli_save_dir}")
 
