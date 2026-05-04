@@ -48,6 +48,7 @@ from transformers import (
     EarlyStoppingCallback,
     DataCollatorWithPadding,
 )
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 import evaluate
 import numpy as np
@@ -93,6 +94,8 @@ ABLATIONS = {
     "no_hysteresis":    {"use_hysteresis": False},
     "no_momentum":      {"use_momentum_extrap": False},
 }
+
+ABLATION_GLUE_TASKS = [t for t in GLUE_TASKS if t != "rte_modernbert_2e5"]
 
 
 def run_ablation_single(
@@ -146,7 +149,7 @@ def run_ablation_single(
             name=run_id,
             group=wandb_group,
             job_type=f"ablation-{ablation_name}",
-            tags=[task_name, f"ablation-{ablation_name}", f"seed-{seed}", MODEL_NAME.split("/")[-1]],
+            tags=[task_name, f"ablation-{ablation_name}", f"seed-{seed}", model_name.split("/")[-1]],
             reinit=True,
             settings=wandb.Settings(init_timeout=120),
             config={
@@ -216,7 +219,7 @@ def run_ablation_single(
     use_hysteresis = ablation_overrides.get("use_hysteresis", True)
     use_momentum_extrap = ablation_overrides.get("use_momentum_extrap", True)
 
-    ler_tracker = LERTracker(task=task_name, window_size=5)
+    ler_tracker = LERTracker(task=task_name, window_size=5, use_hysteresis=use_hysteresis)
 
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
@@ -332,7 +335,7 @@ def run_ablation_single(
                 ler_val = diag.get("ler")
                 rho_val = diag.get("rho_vg")
                 phase = diag.get("phase", "?")
-                ler_str = f"{ler_val:.6f}" if ler_val is not None else "N/A"
+                ler_str = f"{ler_val:.2e}" if ler_val is not None else "N/A"
                 rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
                 print(
                     f"  [ABL step={state.global_step}] "
@@ -357,7 +360,7 @@ def run_ablation_single(
                                 "ablation/use_safety_horizon": self.use_safety_horizon,
                                 "ablation/use_hysteresis": self.use_hysteresis,
                                 "ablation/use_momentum_extrap": self.use_momentum_extrap,
-                            }, step=state.global_step)
+                            }, commit=False)
                     except Exception:
                         pass
             return control
@@ -373,6 +376,17 @@ def run_ablation_single(
             with open(diag_path, "w") as f:
                 json.dump(final, f, indent=2, default=str)
             print(f"  LER diagnostics saved: {diag_path}")
+
+    lerna_switching = LERNASwitchingCallback(
+        ler_tracker=ler_tracker,
+        threshold=1e-5,
+        min_step=100,
+        wandb_enabled=use_wandb,
+        use_safety_horizon=use_safety_horizon,
+        use_rho_vg=use_rho_vg,
+        use_ler=use_ler,
+        use_momentum_extrap=use_momentum_extrap,
+    )
 
     trainer_holder = [None]
 
@@ -447,6 +461,7 @@ def run_ablation_single(
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
             power_callback,
+            lerna_switching,
             diag_callback,
         ],
     )
@@ -477,6 +492,12 @@ def run_ablation_single(
         "energy_kwh": power_callback.cumulative_kwh,
         "power_avg_watts": avg_power,
         "ler_final": ler_tracker.get_diagnostics(),
+        "lerna_switching": {
+            "steps_skipped": lerna_switching.steps_skipped,
+            "skip_ratio": lerna_switching.steps_skipped / max(trainer.state.global_step, 1),
+            "plateau_steps": lerna_switching.plateau_steps,
+            "total_energy_saved": lerna_switching.total_energy_saved,
+        },
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
     }
@@ -498,6 +519,8 @@ def run_ablation_single(
                     "final/runtime_s": total_time,
                     "final/ler": ler_tracker.get_diagnostics().get("ler"),
                     "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
+                    "final/steps_skipped": lerna_switching.steps_skipped,
+                    "final/skip_ratio": lerna_switching.steps_skipped / max(trainer.state.global_step, 1),
                     "ablation/overrides": ablation_overrides,
                 })
         except Exception:
@@ -544,7 +567,7 @@ def main():
         seeds = [42]
         ablations_to_run = ["full_lerna", "no_ler", "no_safety"]
     elif args.mode == "full":
-        tasks = GLUE_TASKS
+        tasks = ABLATION_GLUE_TASKS
         seeds = SEEDS
         ablations_to_run = list(ABLATIONS.keys())
     else:
@@ -646,8 +669,8 @@ def main():
     print(f"  Total wall time: {timedelta(seconds=int(total_elapsed))}")
 
     if successful:
-        print(f"\n  {'Ablation':<15} {'Runs':>5} {'Avg Acc':>10} {'Std':>8} {'Avg kWh':>10} {'Avg LER':>10}")
-        print(f"  {'-'*60}")
+        print(f"\n  {'Ablation':<15} {'Runs':>5} {'Avg Acc':>10} {'Std':>8} {'Avg kWh':>10} {'Avg LER':>10} {'Skip%':>8}")
+        print(f"  {'-'*80}")
         for ablab in ablations_to_run:
             ab_results = [r for r in successful if r.get("ablation") == ablab]
             if not ab_results:
@@ -657,11 +680,13 @@ def main():
                 r.get("eval_metrics", {}).get("eval_pearson", 0))) for r in ab_results]
             kwhs = [r.get("energy_kwh", 0) for r in ab_results]
             lers = [r.get("ler_final", {}).get("ler") for r in ab_results if r.get("ler_final", {}).get("ler") is not None]
+            skip_ratios = [r.get("lerna_switching", {}).get("skip_ratio", 0) for r in ab_results]
             print(
                 f"  {ablab:<15} {len(ab_results):>5} "
                 f"{np.mean(accs):>10.4f} {np.std(accs):>8.4f} "
                 f"{np.mean(kwhs):>10.6f} "
-                f"{np.mean(lers) if lers else 0:.2e}"
+                f"{np.mean(lers) if lers else 0:.2e} "
+                f"{np.mean(skip_ratios) * 100:>7.1f}%"
             )
 
     print(f"{'='*60}")
