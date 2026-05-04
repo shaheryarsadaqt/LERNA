@@ -820,8 +820,13 @@ class WasteQuantifier:
         else:
             eval_waste_ratio = 0.0
 
+        # Primary metric selection — for fine-tuning, eval-metric waste is more
+        # reliable than train-loss plateau (train loss keeps dropping due to
+        # memorization even after eval quality plateaus).
+        primary_waste = eval_waste_ratio if eval_waste_ratio > 0 else waste_ratio
+
         return {
-            "waste_ratio": float(waste_ratio),
+            "waste_ratio": float(primary_waste),
             "ci_95_low": float(ci_low),
             "ci_95_high": float(ci_high),
             "total_steps": total_steps_sgd if self._sgd_step_at_obs else n,
@@ -838,7 +843,7 @@ class WasteQuantifier:
             "best_eval_step": self._best_eval_step,
             "best_eval_metric": self._best_eval_metric,
             "eval_waste_ratio": float(eval_waste_ratio),
-            # ── New paper-ready reporting fields ──────────────────────
+            # ── Paper-ready reporting fields ──────────────────────
             "detector_name": self.detector_name,
             "waste_ratio_train": float(waste_ratio),
             "waste_ratio_eval": float(eval_waste_ratio),
@@ -2618,6 +2623,8 @@ def run_single_experiment(
                     "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
                     "final/gsnr_global": gsnr_tracker.gsnr_global_history[-1] if gsnr_tracker.gsnr_global_history else None,
                     "final/waste_ratio": waste_metrics["waste_ratio"],
+                    "final/waste_ratio_train": waste_metrics.get("waste_ratio_train"),
+                    "final/waste_ratio_eval": waste_metrics.get("waste_ratio_eval"),
                     "final/waste_ci_95": f"[{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}]",
                     "final/waste_theoretical_max": waste_metrics.get("waste_theoretical_max"),
                     "final/detector_hit_floor": waste_metrics.get("detector_hit_floor"),
@@ -2637,9 +2644,10 @@ def run_single_experiment(
     print(f"  Time: {total_time:.1f}s")
     if gsnr_tracker.gsnr_global_history:
         print(f"  GSNR (global): {gsnr_tracker.gsnr_global_history[-1]:.4f}")
-    print(f"  Waste ratio (train-loss): {waste_metrics['waste_ratio']:.3f} "
+    print(f"  Waste ratio (primary): {waste_metrics['waste_ratio']:.3f} "
           f"(95% CI: [{waste_metrics['ci_95_low']:.3f}, {waste_metrics['ci_95_high']:.3f}])")
-    print(f"  Waste ratio (eval-metric): {waste_metrics.get('eval_waste_ratio', 0.0):.3f} "
+    print(f"  Waste ratio (train-loss): {waste_metrics.get('waste_ratio_train', 0.0):.3f} | "
+          f"(eval-metric): {waste_metrics.get('waste_ratio_eval', 0.0):.3f} "
           f"(best at step {waste_metrics.get('best_eval_step')})")
     print(f"  Phase: {phase_summary['current_phase']} "
           f"({len(phase_summary['transitions'])} transitions)")
