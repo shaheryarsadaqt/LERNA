@@ -478,7 +478,8 @@ class SlopePlateauDetector:
                  alpha_mk=0.10,
                  gsnr_gamma=0.10,
                  gsnr_K=3,
-                 eps_slope_frac=0.20):
+                 eps_slope_frac=0.20,
+                 sign_balance_min=0.28):
         self.W = int(window_W)
         self.ema_alpha = float(ema_alpha)
         self.eps_slope_per_1k = float(eps_slope_per_1k)
@@ -486,6 +487,7 @@ class SlopePlateauDetector:
         self.gsnr_gamma = float(gsnr_gamma)
         self.gsnr_K = int(gsnr_K)
         self.eps_slope_frac = float(eps_slope_frac)
+        self.sign_balance_min = float(sign_balance_min)
 
         self._raw = []
         self._log_ema = []
@@ -539,8 +541,8 @@ class SlopePlateauDetector:
         ups   = sum(1 for d in diffs if d > 0)
         downs = sum(1 for d in diffs if d < 0)
         balance = min(ups, downs) / max(1, len(diffs))
-        # Require at least 35% balance to confirm plateau (20% fires on normal SGD noise)
-        t2 = balance >= 0.35
+        # Require at least sign_balance_min balance to confirm plateau
+        t2 = balance >= self.sign_balance_min
         if t2 and self.t2_fired_at is None:
             self.t2_fired_at = step
 
@@ -1967,24 +1969,24 @@ def run_single_experiment(
                             ema_alpha=0.5,
                             eps_slope_per_1k=2e-2,
                             alpha_mk=0.20,
-                            eps_slope_frac=eps_frac)
+                            eps_slope_frac=eps_frac,
+                            sign_balance_min=0.28)
     else:
         approx_unique_obs = max(8, total_steps // max(1, eval_steps))
         if total_steps <= 500:
             # Wider window for short runs — need at least 40% of observations to judge slope
             window_W = max(8, approx_unique_obs // 2)
             eps_slope = 1.5 * eps_slope_scale
-            sign_balance_min = 0.35
         else:
             window_W = max(8, min(20, approx_unique_obs // 2))
             eps_slope = 2.5 * eps_slope_scale
-            sign_balance_min = 0.35
         slope_kwargs = dict(
             window_W=window_W,
             ema_alpha=2.0 / (16 + 1),
             eps_slope_per_1k=eps_slope,
             alpha_mk=0.20,
             eps_slope_frac=eps_frac,
+            sign_balance_min=0.28,
         )
 
     waste_quantifier = WasteQuantifier(
