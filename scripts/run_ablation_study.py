@@ -323,7 +323,7 @@ def run_ablation_single(
 
                 try:
                     self.ler_tracker.update(
-                        loss=self._last_loss,
+                        loss=eval_loss,
                         logits=real_logits,
                         accuracy=accuracy,
                         model=model,

@@ -2333,7 +2333,7 @@ def run_single_experiment(
                     num_labels = GLUE_TASK_CONFIG[task_name]["num_labels"]
                     real_logits = torch.randn(8, num_labels)
 
-            loss_for_ler = self._last_loss if self._last_loss is not None else eval_loss
+            loss_for_ler = eval_loss
 
             try:
                 self.ler_tracker.update(
@@ -2351,8 +2351,8 @@ def run_single_experiment(
             rho_val = diag.get("rho_vg")
             phase = diag.get("phase", "?")
 
-            ler_str = f"{ler_val:.6f}" if ler_val is not None else "warming"
-            vel_str = f"{vel_val:.6f}" if vel_val is not None else "N/A"
+            ler_str = f"{ler_val:.2e}" if ler_val is not None else "warming"
+            vel_str = f"{vel_val:.2e}" if vel_val is not None else "N/A"
             rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
 
             # Also get GSNR and waste info for the print

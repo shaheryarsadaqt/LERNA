@@ -469,7 +469,14 @@ class LERTracker:
             self._snapshot_params(model)
 
         if len(self.loss_history) >= 2:
-            loss_gain = max(self.loss_history[-2] - self.loss_history[-1], 0.0)
+            w = min(self.window_size, len(self.loss_history))
+            if w >= 4:
+                half = w // 2
+                older_mean = np.mean(self.loss_history[-w:-half])
+                newer_mean = np.mean(self.loss_history[-half:])
+                loss_gain = max(older_mean - newer_mean, 0.0)
+            else:
+                loss_gain = max(self.loss_history[-2] - self.loss_history[-1], 0.0)
             window_start = max(0, len(self.entropy_history) - self.window_size)
             avg_entropy = np.mean(self.entropy_history[window_start:])
 
