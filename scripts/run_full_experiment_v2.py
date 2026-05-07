@@ -430,10 +430,19 @@ def main():
     ap.add_argument("--min-disk-gb", type=float, default=DISK_MIN_GB,
                     help="Stop if free disk drops below this (default 15)")
     ap.add_argument("--skip-preflight", action="store_true")
+    ap.add_argument("--phase", default=None, help="Experiment phase label (e.g. baseline)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None,
+                    help="Explicit list of seeds (e.g. 42 123 456 789 1024). Overrides --num-seeds.")
+    ap.add_argument("--cleanup", action="store_true", help="Alias for --slim-checkpoints")
+    ap.add_argument("--cleanup-wandb", action="store_true",
+                    help="Remove W&B local runs folder after each completed run")
     args = ap.parse_args()
 
+    if args.cleanup:
+        args.slim_checkpoints = True
+
     tasks = args.tasks or GLUE_TASKS
-    seeds = list(range(42, 42 + args.num_seeds))
+    seeds = args.seeds if args.seeds else list(range(42, 42 + args.num_seeds))
     max_samples = None if args.max_samples == 0 else args.max_samples
     wg = make_wandb_group(args.output_dir, args.wandb_group)
     logger, log_file = setup_logging(args.output_dir)
@@ -459,7 +468,9 @@ def main():
     logger.info("  LERNA Orchestrator v2")
     logger.info("=" * 65)
     logger.info(f"  Tasks:       {tasks}")
-    logger.info(f"  Seeds:       {seeds[0]}-{seeds[-1]} ({len(seeds)})")
+    logger.info(f"  Seeds:       {seeds}")
+    if args.phase:
+        logger.info(f"  Phase:       {args.phase}")
     logger.info(f"  Per-task LR: { {t: f'{TASK_LR[t]:.0e}' for t in tasks} }")
     logger.info(f"  Total/Done/Pending: {total}/{len(done)}/{len(pending)}")
     cleanup_mode = "SLIM (keep weights)" if args.slim_checkpoints else ("FULL DELETE" if args.clean_checkpoints else "OFF")
@@ -530,7 +541,7 @@ def main():
                 tracker["done"].append((task, seed, lr))
                 tracker["durs"].append(dur)
                 # FIX 1: disk cleanup (slim = keep model weights, clean = delete all)
-                if args.slim_checkpoints:
+                if args.slim_checkpoints or args.cleanup_wandb:
                     freed = slim_checkpoints(str(Path(args.output_dir) / run_id), logger)
                     tracker["freed_gb"] += freed / 1024**3
                 elif args.clean_checkpoints:
