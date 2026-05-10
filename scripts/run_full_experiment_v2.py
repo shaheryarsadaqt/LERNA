@@ -46,18 +46,23 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import numpy as np
 
+try:
+    from scripts.run_baseline_glue import get_primary_eval_metric
+except ModuleNotFoundError:
+    from run_baseline_glue import get_primary_eval_metric
+
 # ======================================================================
 # FIX 2 -- Per-task learning rates (synced with TASK_HP_OVERRIDES)
 # ======================================================================
 TASK_LR = {
-    "sst2": 2e-05,
-    "qnli": 2e-05,
-    "qqp":  2e-05,
-    "mnli": 2e-05,
-    "rte":  2e-05,
-    "mrpc": 2e-05,
-    "cola": 1e-05,
-    "stsb": 2e-05,
+    "sst2": 2e-5,
+    "qnli": 2e-5,
+    "qqp":  2e-5,
+    "mnli": 2e-5,
+    "rte":  1e-5,
+    "mrpc": 3e-5,
+    "cola": 3e-5,
+    "stsb": 2e-5,
 }
 
 GLUE_TASKS = ["sst2", "qnli", "qqp", "mnli", "rte", "mrpc", "cola", "stsb"]
@@ -382,8 +387,7 @@ def generate_summary(output_dir, tasks, seeds, logger):
                 continue
             accs = []
             for r in tr:
-                em = r.get("eval_metrics", {})
-                accs.append(em.get("eval_accuracy", em.get("eval_matthews_correlation", em.get("eval_pearsonr", 0))))
+                accs.append(get_primary_eval_metric(r.get("eval_metrics", {}), task))
             kwhs = [r.get("energy_kwh", 0) for r in tr]
             wastes = [r.get("waste_metrics", {}).get("waste_ratio", 0) for r in tr]
             tlr = tr[0].get("learning_rate", TASK_LR.get(task, DEFAULT_LR))

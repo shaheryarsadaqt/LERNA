@@ -361,9 +361,7 @@ class AblationAdapter(PhaseAdapter):
         return self._run_fn(
             task_name=p["task"],
             seed=p["seed"],
-            ablation_name=p["ablation"],
-            ablation_overrides=self.ABLATIONS[p["ablation"]],
-            model_name=model_name,
+            lr=task_hp.get("learning_rate", args.lr),
             profile=profile,
             base_output_dir=args.output_dir,
             use_wandb=args.wandb,
@@ -425,7 +423,7 @@ class BaselineAdapter(PhaseAdapter):
         return self._run_fn(
             task_name=p["task"],
             seed=p["seed"],
-            model_name=model_name,
+            lr=task_hp.get("learning_rate", args.lr),
             profile=profile,
             base_output_dir=args.output_dir,
             use_wandb=args.wandb,
@@ -870,6 +868,8 @@ Examples:
     # Model & data
     parser.add_argument("--model", default="modernbert",
                         choices=["roberta", "modernbert", "deberta"])
+    parser.add_argument("--lr", type=float, default=2e-5,
+                        help="Default learning rate (default: 2e-5)")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--unlimited", action="store_true")
     # WandB

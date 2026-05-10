@@ -78,6 +78,21 @@ from datasets import load_dataset
 import evaluate
 
 
+def get_primary_eval_metric(em: dict, task: str = None) -> float:
+    if not em:
+        return 0.0
+    if task == "stsb":
+        return em.get("eval_pearson", em.get("eval_spearmanr", 0.0))
+    if task == "cola":
+        return em.get("eval_matthews_correlation", 0.0)
+    if task == "mrpc":
+        return em.get("eval_f1", em.get("eval_accuracy", 0.0))
+    return em.get("eval_accuracy",
+           em.get("eval_matthews_correlation",
+           em.get("eval_pearson",
+           em.get("eval_spearmanr", 0.0))))
+
+
 GLUE_TASK_CONFIG = {
     "sst2":  {"keys": ("sentence", None),        "num_labels": 2, "metric": "accuracy"},
     "qnli":  {"keys": ("question", "sentence"),   "num_labels": 2, "metric": "accuracy"},
@@ -1518,9 +1533,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
                 match = [r for r in successful if r["task"] == task and r["seed"] == seed]
                 if match:
                     em = match[0].get("eval_metrics", {})
-                    acc = em.get("eval_accuracy", em.get("eval_matthews_correlation",
-                                 em.get("eval_pearsonr", 0)))
-                    row.append(acc)
+                    row.append(get_primary_eval_metric(em, task))
                 else:
                     row.append(None)
             matrix.append(row)
@@ -1618,9 +1631,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
             kwhs = [r.get("energy_kwh", 0) for r in task_results]
             accs = []
             for r in task_results:
-                em = r.get("eval_metrics", {})
-                accs.append(em.get("eval_accuracy", em.get("eval_matthews_correlation",
-                            em.get("eval_pearsonr", 0))))
+                accs.append(get_primary_eval_metric(r.get("eval_metrics", {}), task))
             task_kwh[task] = np.mean(kwhs) if kwhs else 0
             task_kwh_std[task] = np.std(kwhs) if len(kwhs) > 1 else 0
             task_acc[task] = np.mean(accs) if accs else 0
@@ -1667,9 +1678,7 @@ def log_cross_run_summary(all_results, tasks, wandb_project, wandb_group):
                 continue
             accs = []
             for r in task_results:
-                em = r.get("eval_metrics", {})
-                accs.append(em.get("eval_accuracy", em.get("eval_matthews_correlation",
-                            em.get("eval_pearsonr", 0))))
+                accs.append(get_primary_eval_metric(r.get("eval_metrics", {}), task))
             kwhs = [r.get("energy_kwh", 0) for r in task_results]
             runtimes = [r.get("train_runtime_s", 0) for r in task_results]
             wastes = [r.get("waste_metrics", {}).get("waste_ratio", 0) for r in task_results]
@@ -2610,11 +2619,7 @@ def run_single_experiment(
             if wandb.run is not None:
                 wandb.summary.update({
                     "final/eval_loss": eval_result.get("eval_loss"),
-                    "final/eval_accuracy": eval_result.get(
-                        "eval_accuracy",
-                        eval_result.get("eval_matthews_correlation",
-                                        eval_result.get("eval_pearsonr")),
-                    ),
+                    "final/eval_accuracy": get_primary_eval_metric(eval_result, task_name),
                     "final/train_loss": train_result.training_loss,
                     "final/energy_kwh": power_callback.cumulative_kwh,
                     "final/power_avg_watts": avg_power,
