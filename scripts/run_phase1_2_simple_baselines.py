@@ -70,6 +70,7 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["WANDB_START_METHOD"] = "thread"
 os.environ["WANDB_LOG_MODEL"] = "false"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import sys
 import json
@@ -120,6 +121,16 @@ from lerna.callbacks.simple_baselines import (
     ReducedTotalStepsCallback,
     CosineAnnealingWarmRestartsCallback,
 )
+
+
+def safe_from_pretrained(*args, **kwargs):
+    try:
+        return AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
+    except TypeError as exc:
+        if "reference_compile" in str(exc) or "unexpected keyword argument" in str(exc):
+            kwargs.pop("reference_compile", None)
+            return AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
+        raise
 
 logger = logging.getLogger(__name__)
 
@@ -763,18 +774,16 @@ def run_single_baseline_experiment(
     mnli_checkpoint_dir = os.path.join(
         os.path.dirname(base_output_dir), "baseline", "mnli_finetuned"
     )
+    model_kwargs = {
+        "num_labels": cfg["num_labels"],
+        "attn_implementation": "sdpa",
+        "reference_compile": False,
+    }
+
     if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
         print(f"  [MNLI Transfer] Loading from {mnli_checkpoint_dir}")
-        mnli_model = AutoModelForSequenceClassification.from_pretrained(
-            mnli_checkpoint_dir,
-            reference_compile=False,
-            attn_implementation="sdpa",
-        )
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="sdpa",
-        )
+        mnli_model = safe_from_pretrained(mnli_checkpoint_dir, **model_kwargs)
+        model = safe_from_pretrained(MODEL_NAME, **model_kwargs)
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                          if "classifier" not in k and "pooler" not in k}
         model.load_state_dict(encoder_state, strict=False)
@@ -785,11 +794,8 @@ def run_single_baseline_experiment(
     else:
         if init_from_mnli:
             print(f"  [MNLI Transfer] WARNING: No checkpoint at {mnli_checkpoint_dir}, using pretrained")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=cfg["num_labels"],
-            reference_compile=False,
-            attn_implementation="sdpa",
-        )
+        model = safe_from_pretrained(MODEL_NAME, **model_kwargs)
+
 
     if hw_cfg["gradient_checkpointing"]:
         try:
@@ -894,6 +900,10 @@ def run_single_baseline_experiment(
         gradient_checkpointing=hw_cfg["gradient_checkpointing"],
         remove_unused_columns=True,
     )
+
+    if torch.cuda.is_available() and training_args._n_gpu > 1:
+        print("  [Phase1.2] Multiple GPUs detected; forcing single-GPU training to avoid unstable NCCL/DataParallel behavior.")
+        training_args._n_gpu = 1
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     compute_metrics = build_compute_metrics(task_name)
