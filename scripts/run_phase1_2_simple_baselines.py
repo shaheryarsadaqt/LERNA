@@ -109,9 +109,12 @@ from transformers import (
 from datasets import load_dataset
 import evaluate
 
-# Add project root to path
+# Project root for lerna package imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Scripts directory for importing Phase 1.1 GLUE config directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from run_baseline_glue import TASK_HP_OVERRIDES
 from lerna.utils.metrics import LERTracker
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
 from lerna.callbacks.simple_baselines import (
@@ -239,42 +242,8 @@ GLUE_TASK_CONFIG = {
     "stsb":  {"keys": ("sentence1", "sentence2"), "num_labels": 1, "metric": "pearsonr"},
 }
 
-# Per-task hyperparameters (identical to Phase 1.1)
-TASK_HP_OVERRIDES = {
-    "rte": {
-        "learning_rate": 1e-5,
-        "num_epochs": 20,
-        "warmup_ratio": 0.1,
-        "early_stopping_patience": 15,
-        "metric_for_best_model": "eval_accuracy",
-        "greater_is_better": True,
-        "init_from_mnli": True,
-    },
-    "cola": {
-        "learning_rate": 5e-6,
-        "num_epochs": 15,
-        "warmup_ratio": 0.1,
-        "early_stopping_patience": 12,
-        "metric_for_best_model": "eval_matthews_correlation",
-        "greater_is_better": True,
-    },
-    "mrpc": {
-        "learning_rate": 1e-5,
-        "num_epochs": 15,
-        "warmup_ratio": 0.1,
-        "early_stopping_patience": 12,
-        "metric_for_best_model": "eval_accuracy",
-        "greater_is_better": True,
-    },
-    "stsb": {
-        "learning_rate": 1e-5,
-        "num_epochs": 15,
-        "warmup_ratio": 0.1,
-        "early_stopping_patience": 12,
-        "metric_for_best_model": "eval_pearson",
-        "greater_is_better": True,
-    },
-}
+# Reuse Phase 1.1 per-task hyperparameter overrides directly to prevent drift.
+# Phase 1.2 must match Phase 1.1 exactly for a fair baseline comparison.
 
 # Phase 1.1 reference results for comparison.
 #
@@ -713,8 +682,8 @@ def run_single_baseline_experiment(
 
     # Resolve per-task hyperparameters
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
-    lr = task_hp.get("learning_rate", 1e-5)
-    num_epochs = task_hp.get("num_epochs", 3)
+    lr = task_hp.get("learning_rate", 2e-5)
+    num_epochs = task_hp.get("num_epochs", 5)
     warmup_ratio = task_hp.get("warmup_ratio", 0.1)
     default_patience = task_hp.get("early_stopping_patience", 5)
     metric_for_best_model = task_hp.get("metric_for_best_model", "eval_loss")
