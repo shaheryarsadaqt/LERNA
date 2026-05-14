@@ -124,6 +124,18 @@ from lerna.callbacks.simple_baselines import (
     ReducedTotalStepsCallback,
     CosineAnnealingWarmRestartsCallback,
 )
+from lerna.callbacks.ler_feed import LERFeedCallback   # [FIX #5]
+from lerna.trainers import (
+    TrueBackwardSkippingTrainer,
+    SchedulerStepPolicy,
+    ComputeSavingMechanism,
+)
+from lerna.trainers.policies import (
+    AlwaysFalsePolicy,
+    GradNormSkipPolicy,
+    RandomSkipPolicy,
+    LERPlateauPolicy,
+)
 
 
 def safe_from_pretrained(*args, **kwargs):
@@ -136,93 +148,6 @@ def safe_from_pretrained(*args, **kwargs):
         raise
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# LER Feed Callback: Feeds eval metrics into LERTracker during training
-# =============================================================================
-
-class LERFeedCallback(TrainerCallback):
-    """Feeds evaluation metrics into LERTracker during training.
-    
-    FIX (2026-04-15): The LERTracker was never updated during Phase 1.2
-    training because nobody called ler_tracker.update(). This caused
-    WeightFreezingCallback to never detect plateaus (LER was always None).
-    
-    This callback hooks into on_evaluate to feed loss, logits, and accuracy
-    into the LERTracker, enabling plateau detection for weight_freeze baseline.
-    
-    It also hooks into on_pre_optimizer_step to capture gradients for
-    rho_VG computation when gradients are still live.
-    """
-    
-    def __init__(self, ler_tracker: LERTracker, trainer_ref=None):
-        self.ler_tracker = ler_tracker
-        self._trainer_ref = trainer_ref
-        self._update_count = 0
-        self._model = None
-    
-    def on_train_begin(self, args, state, control, **kwargs):
-        if "model" in kwargs:
-            self._model = kwargs["model"]
-        return control
-    
-    def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        """Capture gradients for rho_VG while they are live."""
-        model = kwargs.get("model", self._model)
-        if model is not None:
-            self.ler_tracker.capture_step_gradients(model)
-        return control
-    
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Feed evaluation metrics into LERTracker."""
-        if metrics is None:
-            return control
-        
-        # Get the trainer reference for logits
-        trainer = self._trainer_ref
-        if trainer is None:
-            return control
-        
-        # Extract eval loss
-        eval_loss = metrics.get("eval_loss", 0.0)
-        
-        # Extract accuracy (task-dependent key)
-        accuracy = metrics.get("eval_accuracy",
-                    metrics.get("eval_matthews_correlation",
-                    metrics.get("eval_pearson",
-                    metrics.get("eval_pearsonr", None))))
-        
-        # Get logits from the trainer's last evaluation
-        # The Phase12Trainer captures logits in compute_loss
-        logits = getattr(trainer, '_last_real_logits', None)
-        if logits is None:
-            # Create dummy logits for LER computation
-            # This is a fallback; real logits are preferred
-            logits = torch.randn(32, 2)  # Dummy
-        
-        # Get model for velocity computation
-        model = kwargs.get("model", self._model)
-        
-        # Feed into LER tracker
-        self.ler_tracker.update(
-            loss=eval_loss,
-            logits=logits,
-            accuracy=accuracy,
-            model=model,
-            gradients=None,  # Gradients captured in on_pre_optimizer_step
-        )
-        self._update_count += 1
-        
-        # Log LER diagnostics
-        diag = self.ler_tracker.get_diagnostics()
-        if state.global_step % 50 == 0 or self._update_count <= 3:
-            print(f"  [LERFeed] Step {state.global_step}: LER={diag.get('ler', 'None')}, "
-                  f"phase={diag.get('phase', 'unknown')}, "
-                  f"rho_VG={diag.get('rho_vg', 'None')}, "
-                  f"updates={self._update_count}")
-        
-        return control
 
 
 # =============================================================================
@@ -419,241 +344,56 @@ def _ensure_wandb_finished():
 # =============================================================================
 # Custom Trainer (captures real logits for LER, same as Phase 1.1)
 # =============================================================================
+# ==============================================================================
+# Baseline utilities
+# ==============================================================================
 
-class Phase12Trainer(Trainer):
-    """Extended Trainer with gradient capture BEFORE clipping and optional backward skipping.
-    
-    FLAW 6 FIX: Captures gradient norm BEFORE clipping is applied.
-    The on_pre_optimizer_step callback sees CLIPPED gradients because HF Trainer
-    applies clipping BEFORE firing the callback. We override training_step to
-    capture the true gradient norm.
-    
-    FLAW 8 FIX: Implements TRUE backward-pass skipping.
-    When should_skip_backward is True, we skip loss.backward() and apply
-    momentum extrapolation instead, saving ~60% of compute.
-    
-    Attributes:
-        should_skip_backward: When True, skips backward pass and uses momentum
-        _pre_clip_grad_norm: Gradient norm BEFORE clipping (for calibration)
-        _last_real_logits: Captured logits for LER computation
+def parse_early_stop_patience(baseline_name: str, default_patience: int) -> int:
+    """[FIX #8] Keep early_stop_p<N> parsing even though create_baseline_callback
+    is gone. For non-early-stop baselines, fall back to the task default.
     """
-
-    def __init__(self, *args, ler_tracker=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._ler_tracker = ler_tracker
-        self._last_real_logits = None
-        self._pre_clip_grad_norm: float = 0.0
-        self.should_skip_backward: bool = False
-        self._skip_count: int = 0
-        # Add callback for gradient norm capture before optimizer step
-        self._grad_norm_callback = _GradientNormCaptureCallback(self)
-        self.add_callback(self._grad_norm_callback)
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-        if hasattr(outputs, "logits"):
-            self._last_real_logits = outputs.logits.detach()
-        elif isinstance(outputs, dict) and "logits" in outputs:
-            self._last_real_logits = outputs["logits"].detach()
-        return (loss, outputs) if return_outputs else loss
-
-    def _compute_pre_clip_grad_norm(self) -> float:
-        """Compute gradient norm BEFORE clipping is applied.
-        
-        This is called after backward() but before the Trainer's clipping logic.
-        Returns the total gradient norm across all parameters.
-        """
-        total_norm_sq = 0.0
-        for p in self.model.parameters():
-            if p.requires_grad and p.grad is not None:
-                param_norm = p.grad.detach().float().norm().item()
-                total_norm_sq += param_norm ** 2
-        return total_norm_sq ** 0.5
-
-    def _apply_momentum_extrapolation(self):
-        """Apply momentum-driven weight update without gradient computation.
-        
-        Uses the optimizer's momentum buffer (SGD) or first moment estimate
-        (Adam/AdamW) as a proxy for gradient direction.
-        """
-        lr = self.args.learning_rate
-        with torch.no_grad():
-            for group in self.optimizer.param_groups:
-                for param in group["params"]:
-                    if not param.requires_grad or param not in self.optimizer.state:
-                        continue
-                    p_state = self.optimizer.state[param]
-                    if "momentum_buffer" in p_state:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
-                    elif "exp_avg" in p_state:
-                        # Adam/AdamW: use first moment (bias-corrected)
-                        step = p_state.get("step", 1)
-                        exp_avg = p_state["exp_avg"]
-                        # Adam's bias correction
-                        beta1 = group.get("betas", (0.9, 0.999))[0]
-                        bias_correction = 1 - beta1 ** step
-                        corrected_exp_avg = exp_avg / bias_correction
-                        param.data.add_(corrected_exp_avg, alpha=-lr)
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override to implement TRUE backward-pass skipping.
-        
-        FLAW 6 FIX: Gradient norm captured via on_pre_optimizer_step callback.
-        
-        FLAW 8 FIX: When should_skip_backward is True (set by callback in
-        on_step_begin), we skip the backward pass entirely and apply momentum
-        extrapolation instead. This saves ~60% of compute per skipped step.
-        
-        FIX (2026-04-15): Added _freeze_weights_no_momentum flag for
-        WeightFreezingCallback. When set, skips backward but does NOT
-        apply momentum extrapolation (true weight freezing).
-        """
-        # Reset gradient norm before each step
-        self._pre_clip_grad_norm = None
-        
-        # Check if we should skip backward (set by callback in on_step_begin)
-        if self.should_skip_backward:
-            # Forward pass only - skip backward to save compute
-            model.train()
-            inputs = self._prepare_inputs(inputs)
-            
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            
-            # Check if this is a weight_freeze skip (no momentum) or
-            # a normal skip (with momentum extrapolation)
-            freeze_no_momentum = getattr(self, '_freeze_weights_no_momentum', False)
-            if not freeze_no_momentum:
-                # Apply momentum extrapolation instead of backward
-                self._apply_momentum_extrapolation()
-            # else: true weight freeze - no update at all
-            
-            self._skip_count += 1
-            
-            # Return detached loss (gradients not computed)
-            return loss.detach()
-        
-        # Normal training step with backward
-        loss = super().training_step(model, inputs, num_items_in_batch)
-        
-        # Capture pre-clip gradient norm for calibration
-        self._pre_clip_grad_norm = self._compute_pre_clip_grad_norm()
-        
-        return loss
+    if baseline_name.startswith("early_stop_p"):
+        import re
+        m = re.match(r"early_stop_p(\d+)", baseline_name)
+        if not m:
+            raise ValueError(f"Invalid early_stop baseline name: {baseline_name}")
+        return int(m.group(1))
+    if baseline_name == "reduced_steps":
+        return 999_999  # effectively disabled; reduced_steps controls cutoff
+    return default_patience
 
 
 class _GradientNormCaptureCallback(TrainerCallback):
-    """Internal callback to capture gradient norm before optimizer step."""
-    
-    def __init__(self, trainer: Phase12Trainer):
-        self.trainer = trainer
-    
+    """[FIX #7] Single owner of pre-clip grad-norm. Writes into:
+       - trainer._pre_clip_grad_norm  (general diagnostic, read-only for policies)
+       - policy.record_grad_norm(v)   (if policy supports it)
+    Policies must NOT read trainer._pre_clip_grad_norm to push values
+    into themselves — that produced double-counting.
+    """
+    def __init__(self):
+        self._owner = None  # set after trainer is built
+
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        """Capture gradient norm before optimizer.step() and any clipping."""
         model = kwargs.get("model")
         if model is None:
-            return
-        
-        # Compute total gradient norm (L2)
-        total_norm_sq = 0.0
+            return control
+        sq = 0.0
         for p in model.parameters():
             if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm_sq += param_norm.item() ** 2
-        
-        self.trainer._pre_clip_grad_norm = total_norm_sq ** 0.5
+                sq += float(p.grad.detach().float().norm().item()) ** 2
+        gn = sq ** 0.5
+        trainer = self._owner
+        if trainer is not None:
+            trainer._pre_clip_grad_norm = gn
+            pol = getattr(trainer, "skip_policy", None)
+            if pol is not None and hasattr(pol, "record_grad_norm"):
+                pol.record_grad_norm(gn)
+        return control
 
 
-# =============================================================================
-# Baseline Factory
-# =============================================================================
-
-def create_baseline_callback(
-    baseline_name: str,
-    task_name: str,
-    total_steps: int,
-    base_lr: float,
-    seed: int,
-    ler_tracker: Optional[LERTracker] = None,
-    target_skip_rate: float = 0.33,
-    wandb_enabled: bool = True,
-) -> Tuple[Optional[Any], Optional[int]]:
-    """
-    Create the appropriate callback for a given baseline.
-
-    Returns:
-        (callback_instance, early_stopping_patience_override)
-        - For early_stop baselines: callback=None, patience=N
-        - For other baselines: callback=instance, patience=None (use task default)
-    """
-    if baseline_name == "grad_norm":
-        # Adaptive calibration: use 20% of total steps or min 20, max 200
-        calibration_steps = max(20, min(200, total_steps // 5))
-        recalibrate_every = max(100, total_steps // 2)
-        # Adaptive min samples: 25% of calibration window or min 10
-        min_calibration_samples = max(10, calibration_steps // 4)
-        return GradientNormSkippingCallback(
-            target_skip_rate=target_skip_rate,
-            calibration_steps=calibration_steps,
-            recalibrate_every=recalibrate_every,
-            min_step=0,
-            wandb_enabled=wandb_enabled,
-            min_calibration_samples=min_calibration_samples,
-        ), None
-
-    elif baseline_name == "random_skip":
-        return RandomStepSkippingCallback(
-            target_skip_rate=target_skip_rate,
-            min_step=100,
-            seed=seed,
-            wandb_enabled=wandb_enabled,
-        ), None
-
-    elif baseline_name.startswith("early_stop_p"):
-        import re
-        match = re.match(r"early_stop_p(\d+)", baseline_name)
-        if not match:
-            raise ValueError(
-                f"Invalid early_stop baseline name: '{baseline_name}'. "
-                f"Expected format: early_stop_p<N> (e.g., early_stop_p3)"
-            )
-        patience = int(match.group(1))
-        return None, patience
-
-    elif baseline_name == "weight_freeze":
-        if ler_tracker is None:
-            raise ValueError("weight_freeze baseline requires ler_tracker")
-        return WeightFreezingCallback(
-            ler_tracker=ler_tracker,
-            threshold=1e-5,
-            min_step=100,
-            wandb_enabled=wandb_enabled,
-        ), None
-
-    elif baseline_name == "reduced_steps":
-        return ReducedTotalStepsCallback(
-            reduction_fraction=target_skip_rate,
-            total_steps=total_steps,
-            wandb_enabled=wandb_enabled,
-        ), None
-
-    elif baseline_name == "cosine_restarts":
-        return CosineAnnealingWarmRestartsCallback(
-            T_0=max(total_steps // 10, 50),
-            T_mult=2,
-            eta_min=1e-7,
-            base_lr=base_lr,
-            wandb_enabled=wandb_enabled,
-        ), None
-
-    else:
-        raise ValueError(f"Unknown baseline: {baseline_name}")
-
-
-# =============================================================================
+# ==============================================================================
 # Core: Run a single baseline experiment
-# =============================================================================
+# ==============================================================================
 
 def run_single_baseline_experiment(
     baseline_name: str,
@@ -790,54 +530,68 @@ def run_single_baseline_experiment(
     # --- Initialize LER tracker (needed for weight_freeze & diagnostics) ---
     ler_tracker = LERTracker(task=task_name, window_size=5)
 
-    # --- Create baseline callback ---
-    baseline_callback, patience_override = create_baseline_callback(
-        baseline_name=baseline_name,
-        task_name=task_name,
-        total_steps=total_steps,
-        base_lr=lr,
-        seed=seed,
-        ler_tracker=ler_tracker,
-        target_skip_rate=target_skip_rate,
-        wandb_enabled=use_wandb,
-    )
+    # --- Skip policy selection ---
+    target_skip = target_skip_rate
+    calibration_steps = max(20, min(200, total_steps // 5))
+    recalibrate_every = max(100, total_steps // 2)
 
-    # --- Determine early stopping patience ---
-    # FIX (2026-04-15): For early_stop baselines, the patience IS the baseline.
-    # For reduced_steps, we must DISABLE early stopping so it doesn't
-    # pre-empt the reduced steps cutoff.
-    if patience_override is not None:
-        # Early stopping baseline: use the specified patience
-        es_patience = patience_override
+    if baseline_name == "grad_norm":
+        skip_policy = GradNormSkipPolicy(
+            target_skip_rate=target_skip,
+            calibration_steps=calibration_steps,
+            recalibrate_every=recalibrate_every,
+            min_step=0,
+            min_calibration_samples=max(10, calibration_steps // 4),
+            max_consecutive_skips=1,  # [IMP-3] probe rule: skip-one-compute-one
+        )
+        mechanism = ComputeSavingMechanism.BACKWARD_SKIPPING
+    elif baseline_name == "random_skip":
+        skip_policy = RandomSkipPolicy(target_skip_rate=target_skip, min_step=100, seed=seed)
+        mechanism = ComputeSavingMechanism.BACKWARD_SKIPPING
+    elif baseline_name == "weight_freeze":
+        skip_policy = LERPlateauPolicy(ler_tracker=ler_tracker, threshold=1e-5, min_step=100)
+        mechanism = ComputeSavingMechanism.BACKWARD_SKIPPING
+    elif baseline_name.startswith("early_stop_p"):
+        skip_policy = AlwaysFalsePolicy()
+        mechanism = ComputeSavingMechanism.EARLY_STOPPING
     elif baseline_name == "reduced_steps":
-        # Reduced steps: disable early stopping by setting huge patience
-        es_patience = 999999
-        print(f"  [Phase1.2] Disabled early stopping for reduced_steps baseline")
+        skip_policy = AlwaysFalsePolicy()
+        mechanism = ComputeSavingMechanism.REDUCED_TOTAL_STEPS  # [FIX #9]
     else:
-        # Other baselines: use task default
-        es_patience = default_patience
+        skip_policy = AlwaysFalsePolicy()
+        mechanism = ComputeSavingMechanism.NONE
 
-    # --- Power telemetry ---
-    power_callback = PowerTelemetryCallback(
-        sample_interval_s=1.0,
-        output_dir=os.path.join(output_dir, "power"),
-        wandb_enabled=use_wandb,
-        log_frequency=50,
-    )
+    # ---- Diagnostic-only callbacks for non-skipping baselines ----
+    diagnostic_callback = None
+    if baseline_name == "reduced_steps":
+        diagnostic_callback = ReducedTotalStepsCallback(
+            reduction_fraction=target_skip,
+            total_steps=total_steps,
+            wandb_enabled=use_wandb,
+        )
+    elif baseline_name == "cosine_restarts":
+        diagnostic_callback = CosineAnnealingWarmRestartsCallback(
+            T_0=max(total_steps // 10, 50), T_mult=2, eta_min=1e-7,
+            base_lr=lr, wandb_enabled=use_wandb,
+        )
 
-    # --- LER Feed callback (feeds eval metrics into LERTracker) ---
-    # FIX (2026-04-15): Without this, LERTracker.update() is never called,
-    # so WeightFreezingCallback always sees LER=None and never activates.
+    # ---- Early stopping patience (FIX #8) ----
+    es_patience = parse_early_stop_patience(baseline_name, default_patience)
+
+    # ---- Shared LER feed (from lerna.callbacks.ler_feed) [FIX #5] ----
     ler_feed_callback = LERFeedCallback(ler_tracker=ler_tracker)
 
-    # --- Assemble callbacks ---
+    # ---- Single-owner grad-norm capture (FIX #7) ----
+    grad_capture = _GradientNormCaptureCallback()
+
     callbacks = [
         EarlyStoppingCallback(early_stopping_patience=es_patience),
         power_callback,
-        ler_feed_callback,  # Always present to feed LER tracker
+        ler_feed_callback,
+        grad_capture,
     ]
-    if baseline_callback is not None:
-        callbacks.append(baseline_callback)
+    if diagnostic_callback is not None:
+        callbacks.append(diagnostic_callback)
 
     # --- Training arguments (identical to Phase 1.1) ---
     training_args = TrainingArguments(
@@ -878,44 +632,33 @@ def run_single_baseline_experiment(
     compute_metrics = build_compute_metrics(task_name)
 
     # --- Create trainer ---
-    trainer = Phase12Trainer(
+    trainer = TrueBackwardSkippingTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        ler_tracker=ler_tracker,
         callbacks=callbacks,
+        skip_policy=skip_policy,
+        scheduler_step_policy=SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP,
+        instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
+        compute_saving_mechanism=mechanism,                # [FIX #9]
+        capture_logits=True,
     )
 
-    # --- Inject model reference into baseline callback ---
-    if baseline_callback is not None and hasattr(baseline_callback, '_model'):
-        baseline_callback._model = model
-        print(f'  [Phase1.2] Model injected into {baseline_callback.baseline_name}: {type(model).__name__}')
-
-    # --- Pass trainer reference to ALL callbacks that need it ---
-    # FIX (2026-04-15): All skip-based baselines need trainer reference
-    # for setting should_skip_backward. Cosine needs it for optimizer access.
-    if baseline_callback is not None:
-        baseline_callback._trainer = trainer
-        print(f"  [Phase1.2] Trainer linked to {baseline_callback.baseline_name}")
-
-    # --- Link LER feed callback to trainer ---
-    ler_feed_callback._trainer_ref = trainer
-    ler_feed_callback._model = model
-
-    # --- Add gradient norm capture callback ---
-    grad_capture_callback = _GradientNormCaptureCallback(trainer)
-    trainer.add_callback(grad_capture_callback)
+    grad_capture._owner = trainer
+    ler_feed_callback.attach(trainer=trainer)
+    if diagnostic_callback is not None and hasattr(diagnostic_callback, '_trainer'):
+        diagnostic_callback._trainer = trainer
 
     # --- Train ---
     start_time = time.time()
     print(f"  Starting training: ~{total_steps} steps, eval every {eval_steps} steps")
     print(f"  Baseline: {BASELINE_REGISTRY[baseline_name]['description']}")
     print(f"  Early stopping patience: {es_patience}")
-    if baseline_name == "reduced_steps":
-        print(f"  Reduced steps max: {baseline_callback.max_steps} (of {total_steps})")
+    if baseline_name == "reduced_steps" and diagnostic_callback is not None and hasattr(diagnostic_callback, 'max_steps'):
+        print(f"  Reduced steps max: {diagnostic_callback.max_steps} (of {total_steps})")
 
     train_result = trainer.train()
     train_time = time.time() - start_time
@@ -924,24 +667,11 @@ def run_single_baseline_experiment(
     print(f"  Evaluating best model...")
     eval_result = trainer.evaluate()
 
+    instrumentation = trainer.get_instrumentation()
+
     # --- Post-run baseline activation validation ---
     # FIX (2026-04-15): Verify each baseline actually activated.
     # This catches silent failures where callbacks are present but inert.
-    if baseline_callback is not None and hasattr(baseline_callback, 'get_activation_summary'):
-        activation = baseline_callback.get_activation_summary()
-        print(f"\n  --- Baseline Activation Check ---")
-        for k, v in activation.items():
-            print(f"    {k}: {v}")
-        
-        # Warn if baseline didn't activate
-        if not activation.get('activated', True):
-            if baseline_name in ('grad_norm', 'random_skip', 'weight_freeze'):
-                print(f"  *** WARNING: {baseline_name} baseline did NOT activate! ***")
-                print(f"  *** This means the baseline is NOT testing what it should. ***")
-            elif baseline_name == 'cosine_restarts':
-                print(f"  *** WARNING: cosine_restarts did NOT override any LR! ***")
-                print(f"  *** Check optimizer capture in on_train_begin. ***")
-    
     # Also check LER feed callback
     print(f"  LER feed updates: {ler_feed_callback._update_count}")
     ler_diag = ler_tracker.get_diagnostics()
@@ -956,13 +686,6 @@ def run_single_baseline_experiment(
 
     # Get baseline-specific stats
     baseline_stats = {}
-    if baseline_callback is not None and hasattr(baseline_callback, 'steps_skipped'):
-        baseline_stats = {
-            "steps_skipped": baseline_callback.steps_skipped,
-            "skip_ratio": baseline_callback.steps_skipped / max(trainer.state.global_step, 1),
-            "energy_saved_kwh": baseline_callback.total_energy_saved,
-        }
-
     # Extract the primary metric
     primary_metric_key = {
         "accuracy": "eval_accuracy",
@@ -994,6 +717,22 @@ def run_single_baseline_experiment(
         "early_stopping_patience": es_patience,
         "baseline_stats": baseline_stats,
         "target_skip_rate": target_skip_rate,
+        "compute_saving_mechanism": instrumentation["compute_saving_mechanism"],  # [FIX #9]
+        "true_skip_instrumentation": instrumentation,
+        "precision_mode": instrumentation["precision_mode"],
+        "true_backward_skipping_enabled": instrumentation["true_backward_skipping_enabled"],
+        "scheduler_step_policy": instrumentation["scheduler_step_policy"],
+        "policy_name": instrumentation["policy_name"],
+        "skipped_backward_steps": instrumentation["skipped_backward_steps"],
+        "optimizer_step_attempts": instrumentation["optimizer_step_attempts"],  # [IMP-4] renamed
+        "batches_seen": instrumentation["batches_seen"],
+        "skipped_batches": instrumentation["skipped_batches"],
+        "forward_calls": instrumentation["forward_calls"],
+        "backward_calls": instrumentation["backward_calls"],
+        "grad_scaler_step_calls": instrumentation["grad_scaler_step_calls"],
+        "scheduler_step_calls": instrumentation["scheduler_step_calls"],
+        "skip_ratio_by_batch": instrumentation["skip_ratio_by_batch"],
+        "skip_ratio_by_optimizer_opportunity": instrumentation["skip_ratio_by_optimizer_opportunity"],
         "timestamp": datetime.now().isoformat(),
     }
 

@@ -53,9 +53,10 @@ from datasets import load_dataset
 import evaluate
 import numpy as np
 
-from lerna.callbacks.lerna_switching import LERNASwitchingCallback, LERNATrainer
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
+from lerna.callbacks.ler_feed import LERFeedCallback
 from lerna.utils.metrics import LERTracker
+from lerna.trainers import LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy
 
 try:
     from scripts.run_baseline_glue import (
@@ -96,6 +97,200 @@ ABLATIONS = {
 }
 
 ABLATION_GLUE_TASKS = [t for t in GLUE_TASKS if t != "rte_modernbert_2e5"]
+
+
+class AblationTrainer(LERNAMomentumTrainer):
+    """Trainer subclass that captures real logits for LER computation."""
+
+    def __init__(self, *args, ler_tracker=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ler_tracker = ler_tracker
+        self._last_real_logits = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        if hasattr(outputs, "logits"):
+            self._last_real_logits = outputs.logits.detach()
+        elif isinstance(outputs, dict) and "logits" in outputs:
+            self._last_real_logits = outputs["logits"].detach()
+        return (loss, outputs) if return_outputs else loss
+
+
+class AblationDiagnosticsCallback:
+    def __init__(
+        self,
+        ler_trk,
+        model_ref,
+        trainer_ref_holder,
+        greater_is_better,
+        use_rho_vg,
+        use_ler,
+        use_hysteresis,
+        use_safety_horizon,
+        use_momentum_extrap,
+        ablation_name,
+        ablation_overrides,
+        output_dir,
+        use_wandb,
+        task_cfg,
+        eval_ds,
+        tokenizer,
+    ):
+        self.ler_tracker = ler_trk
+        self._model = model_ref
+        self._trainer_holder = trainer_ref_holder
+        self._greater_is_better = greater_is_better
+        self.use_rho_vg = use_rho_vg
+        self.use_ler = use_ler
+        self.use_hysteresis = use_hysteresis
+        self.use_safety_horizon = use_safety_horizon
+        self.use_momentum_extrap = use_momentum_extrap
+        self.ablation_name = ablation_name
+        self.ablation_overrides = ablation_overrides
+        self.output_dir = output_dir
+        self.use_wandb = use_wandb
+        self._task_cfg = task_cfg
+        self._eval_ds = eval_ds
+        self._tokenizer = tokenizer
+        self._last_loss = None
+        self._step_count = 0
+
+    def on_init_end(self, args, state, control, **kwargs):
+        return control
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        return control
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        return control
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        return control
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        return control
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        return control
+
+    def on_predict(self, args, state, control, **kwargs):
+        return control
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        return control
+
+    def on_prediction_step(self, args, state, control, **kwargs):
+        return control
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        opt = kwargs.get("optimizer", None)
+        if opt is not None and hasattr(self.ler_tracker, "set_optimizer"):
+            self.ler_tracker.set_optimizer(opt)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._save_diagnostics()
+        return control
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is not None:
+            self._last_loss = logs.get("loss", self._last_loss)
+        return control
+
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        if metrics is None:
+            return control
+
+        accuracy = metrics.get(
+            "eval_accuracy",
+            metrics.get("eval_matthews_correlation",
+                        metrics.get("eval_pearson", 0)),
+        )
+        eval_loss = metrics.get("eval_loss", 0)
+
+        if self._last_loss is not None and self.use_ler:
+            trainer = self._trainer_holder[0] if self._trainer_holder else None
+            real_logits = None
+            if trainer is not None and hasattr(trainer, "_last_real_logits") and trainer._last_real_logits is not None:
+                real_logits = trainer._last_real_logits
+            elif model is not None:
+                try:
+                    model.eval()
+                    dl = DataLoader(
+                        self._eval_ds.select(range(min(8, len(self._eval_ds)))),
+                        batch_size=min(8, len(self._eval_ds)),
+                        collate_fn=DataCollatorWithPadding(tokenizer=self._tokenizer, pad_to_multiple_of=8),
+                    )
+                    batch = next(iter(dl))
+                    batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    real_logits = outputs.logits.detach()
+                except Exception:
+                    real_logits = torch.randn(8, self._task_cfg["num_labels"])
+
+            try:
+                self.ler_tracker.update(
+                    loss=eval_loss,
+                    logits=real_logits,
+                    accuracy=accuracy,
+                    model=model,
+                )
+            except Exception:
+                pass
+
+            diag = self.ler_tracker.get_diagnostics()
+            ler_val = diag.get("ler")
+            rho_val = diag.get("rho_vg")
+            phase = diag.get("phase", "?")
+            ler_str = f"{ler_val:.2e}" if ler_val is not None else "N/A"
+            rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
+            print(
+                f"  [ABL step={state.global_step}] "
+                f"LER={ler_str} | "
+                f"rho_VG={rho_str} | "
+                f"phase={phase} | acc={accuracy:.3f}"
+            )
+
+            if self.use_wandb:
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log({
+                            "lerna/ler": ler_val,
+                            "lerna/rho_vg": rho_val,
+                            "lerna/phase": phase,
+                            "lerna/eval_accuracy": accuracy,
+                            "lerna/eval_loss": eval_loss,
+                            "ablation/ablation_name": self.ablation_name,
+                            "ablation/use_rho_vg": self.use_rho_vg,
+                            "ablation/use_ler": self.use_ler,
+                            "ablation/use_safety_horizon": self.use_safety_horizon,
+                            "ablation/use_hysteresis": self.use_hysteresis,
+                            "ablation/use_momentum_extrap": self.use_momentum_extrap,
+                        }, commit=False)
+                except Exception:
+                    pass
+        return control
+
+    def _save_diagnostics(self):
+        diag_path = os.path.join(self.output_dir, "ler_diagnostics.json")
+        final = self.ler_tracker.get_diagnostics()
+        final["ler_history"] = self.ler_tracker.ler_history
+        final["rho_vg_history"] = self.ler_tracker.rho_vg_history
+        final["velocity_history"] = self.ler_tracker.velocity_history
+        final["ablation_name"] = self.ablation_name
+        final["ablation_overrides"] = self.ablation_overrides
+        with open(diag_path, "w") as f:
+            json.dump(final, f, indent=2, default=str)
+        print(f"  LER diagnostics saved: {diag_path}")
 
 
 def run_ablation_single(
@@ -228,164 +423,19 @@ def run_ablation_single(
         log_frequency=50,
     )
 
-    class AblationDiagnosticsCallback:
-        def __init__(self, ler_trk, model_ref, trainer_ref_holder, greater_is_better,
-                     use_rho_vg, use_ler, use_hysteresis, use_safety_horizon, use_momentum_extrap):
-            self.ler_tracker = ler_trk
-            self._model = model_ref
-            self._trainer_holder = trainer_ref_holder
-            self._greater_is_better = greater_is_better
-            self.use_rho_vg = use_rho_vg
-            self.use_ler = use_ler
-            self.use_hysteresis = use_hysteresis
-            self.use_safety_horizon = use_safety_horizon
-            self.use_momentum_extrap = use_momentum_extrap
-            self._last_loss = None
-            self._step_count = 0
-
-        def on_init_end(self, args, state, control, **kwargs):
-            return control
-
-        def on_epoch_begin(self, args, state, control, **kwargs):
-            return control
-
-        def on_epoch_end(self, args, state, control, **kwargs):
-            return control
-
-        def on_step_begin(self, args, state, control, **kwargs):
-            return control
-
-        def on_optimizer_step(self, args, state, control, **kwargs):
-            return control
-
-        def on_step_end(self, args, state, control, **kwargs):
-            return control
-
-        def on_substep_end(self, args, state, control, **kwargs):
-            return control
-
-        def on_save(self, args, state, control, **kwargs):
-            return control
-
-        def on_predict(self, args, state, control, **kwargs):
-            return control
-
-        def on_pre_optimizer_step(self, args, state, control, **kwargs):
-            return control
-
-        def on_prediction_step(self, args, state, control, **kwargs):
-            return control
-
-        def on_train_begin(self, args, state, control, **kwargs):
-            opt = kwargs.get("optimizer", None)
-            if opt is not None and hasattr(self.ler_tracker, "set_optimizer"):
-                self.ler_tracker.set_optimizer(opt)
-            return control
-
-        def on_train_end(self, args, state, control, **kwargs):
-            self._save_diagnostics()
-            return control
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs is not None:
-                self._last_loss = logs.get("loss", self._last_loss)
-            return control
-
-        def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
-            if metrics is None:
-                return control
-
-            accuracy = metrics.get("eval_accuracy",
-                metrics.get("eval_matthews_correlation",
-                metrics.get("eval_pearson", 0)))
-            eval_loss = metrics.get("eval_loss", 0)
-
-            if self._last_loss is not None and self.use_ler:
-                trainer = self._trainer_holder[0] if self._trainer_holder else None
-                real_logits = None
-                if trainer is not None and hasattr(trainer, "_last_real_logits") and trainer._last_real_logits is not None:
-                    real_logits = trainer._last_real_logits
-                elif model is not None:
-                    try:
-                        model.eval()
-                        dl = DataLoader(
-                            eval_ds.select(range(min(8, len(eval_ds)))),
-                            batch_size=min(8, len(eval_ds)),
-                            collate_fn=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8),
-                        )
-                        batch = next(iter(dl))
-                        batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                        with torch.no_grad():
-                            outputs = model(**batch)
-                        real_logits = outputs.logits.detach()
-                    except Exception:
-                        real_logits = torch.randn(8, cfg["num_labels"])
-
-                try:
-                    self.ler_tracker.update(
-                        loss=eval_loss,
-                        logits=real_logits,
-                        accuracy=accuracy,
-                        model=model,
-                    )
-                except Exception:
-                    pass
-
-                diag = self.ler_tracker.get_diagnostics()
-                ler_val = diag.get("ler")
-                rho_val = diag.get("rho_vg")
-                phase = diag.get("phase", "?")
-                ler_str = f"{ler_val:.2e}" if ler_val is not None else "N/A"
-                rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
-                print(
-                    f"  [ABL step={state.global_step}] "
-                    f"LER={ler_str} | "
-                    f"rho_VG={rho_str} | "
-                    f"phase={phase} | acc={accuracy:.3f}"
-                )
-
-                if use_wandb:
-                    try:
-                        import wandb
-                        if wandb.run is not None:
-                            wandb.log({
-                                "lerna/ler": ler_val,
-                                "lerna/rho_vg": rho_val,
-                                "lerna/phase": phase,
-                                "lerna/eval_accuracy": accuracy,
-                                "lerna/eval_loss": eval_loss,
-                                "ablation/ablation_name": ablation_name,
-                                "ablation/use_rho_vg": self.use_rho_vg,
-                                "ablation/use_ler": self.use_ler,
-                                "ablation/use_safety_horizon": self.use_safety_horizon,
-                                "ablation/use_hysteresis": self.use_hysteresis,
-                                "ablation/use_momentum_extrap": self.use_momentum_extrap,
-                            }, commit=False)
-                    except Exception:
-                        pass
-            return control
-
-        def _save_diagnostics(self):
-            diag_path = os.path.join(output_dir, "ler_diagnostics.json")
-            final = self.ler_tracker.get_diagnostics()
-            final["ler_history"] = self.ler_tracker.ler_history
-            final["rho_vg_history"] = self.ler_tracker.rho_vg_history
-            final["velocity_history"] = self.ler_tracker.velocity_history
-            final["ablation_name"] = ablation_name
-            final["ablation_overrides"] = ablation_overrides
-            with open(diag_path, "w") as f:
-                json.dump(final, f, indent=2, default=str)
-            print(f"  LER diagnostics saved: {diag_path}")
-
-    lerna_switching = LERNASwitchingCallback(
+    skip_policy = LERNAPolicy(
         ler_tracker=ler_tracker,
         threshold=1e-5,
         min_step=100,
-        wandb_enabled=use_wandb,
-        use_safety_horizon=use_safety_horizon,
-        use_rho_vg=use_rho_vg,
         use_ler=use_ler,
-        use_momentum_extrap=use_momentum_extrap,
+        use_rho_vg=use_rho_vg,
+        use_safety_horizon=use_safety_horizon,
+        use_hysteresis=use_hysteresis,
+    )
+
+    ler_feed_callback = LERFeedCallback(
+        ler_tracker=ler_tracker,
+        policy_ref=skip_policy,
     )
 
     trainer_holder = [None]
@@ -400,6 +450,13 @@ def run_ablation_single(
         use_hysteresis=use_hysteresis,
         use_safety_horizon=use_safety_horizon,
         use_momentum_extrap=use_momentum_extrap,
+        ablation_name=ablation_name,
+        ablation_overrides=ablation_overrides,
+        output_dir=output_dir,
+        use_wandb=use_wandb,
+        task_cfg=task_cfg,
+        eval_ds=eval_ds,
+        tokenizer=tokenizer,
     )
 
     training_args = TrainingArguments(
@@ -432,23 +489,13 @@ def run_ablation_single(
         remove_unused_columns=True,
     )
 
+    # Force single-GPU to avoid unstable NCCL/DataParallel on DGX multi-GPU
+    if torch.cuda.is_available() and training_args._n_gpu > 1:
+        print(f"  [Ablation] Multiple GPUs detected ({training_args._n_gpu}); forcing single-GPU training.")
+        training_args._n_gpu = 1
+
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     compute_metrics = build_compute_metrics(task_name)
-
-    class AblationTrainer(Trainer):
-        def __init__(self, *args, ler_tracker=None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._ler_tracker = ler_tracker
-            self._last_real_logits = None
-
-        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-            outputs = model(**inputs)
-            loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-            if hasattr(outputs, "logits"):
-                self._last_real_logits = outputs.logits.detach()
-            elif isinstance(outputs, dict) and "logits" in outputs:
-                self._last_real_logits = outputs["logits"].detach()
-            return (loss, outputs) if return_outputs else loss
 
     trainer = AblationTrainer(
         model=model,
@@ -458,13 +505,18 @@ def run_ablation_single(
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
+        skip_policy=skip_policy,
+        compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
+        instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
+        capture_logits=True,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
             power_callback,
-            lerna_switching,
+            ler_feed_callback,
             diag_callback,
         ],
     )
+    ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
 
     start_time = time.time()
@@ -477,6 +529,8 @@ def run_ablation_single(
 
     avg_power = (float(np.mean([s["power_w"] for s in power_callback._power_samples]))
                  if power_callback._power_samples else 0)
+
+    instrumentation = trainer.get_instrumentation()
 
     results = {
         "task": task_name,
@@ -492,12 +546,7 @@ def run_ablation_single(
         "energy_kwh": power_callback.cumulative_kwh,
         "power_avg_watts": avg_power,
         "ler_final": ler_tracker.get_diagnostics(),
-        "lerna_switching": {
-            "steps_skipped": lerna_switching.steps_skipped,
-            "skip_ratio": lerna_switching.steps_skipped / max(trainer.state.global_step, 1),
-            "plateau_steps": lerna_switching.plateau_steps,
-            "total_energy_saved": lerna_switching.total_energy_saved,
-        },
+        "true_skip_instrumentation": instrumentation,
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
     }
@@ -519,8 +568,8 @@ def run_ablation_single(
                     "final/runtime_s": total_time,
                     "final/ler": ler_tracker.get_diagnostics().get("ler"),
                     "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
-                    "final/steps_skipped": lerna_switching.steps_skipped,
-                    "final/skip_ratio": lerna_switching.steps_skipped / max(trainer.state.global_step, 1),
+                    "final/steps_skipped": instrumentation["skipped_backward_steps"],
+                    "final/skip_ratio": instrumentation["skip_ratio_by_batch"],
                     "ablation/overrides": ablation_overrides,
                 })
         except Exception:
@@ -680,7 +729,7 @@ def main():
                 r.get("eval_metrics", {}).get("eval_pearson", 0))) for r in ab_results]
             kwhs = [r.get("energy_kwh", 0) for r in ab_results]
             lers = [r.get("ler_final", {}).get("ler") for r in ab_results if r.get("ler_final", {}).get("ler") is not None]
-            skip_ratios = [r.get("lerna_switching", {}).get("skip_ratio", 0) for r in ab_results]
+            skip_ratios = [r.get("true_skip_instrumentation", {}).get("skip_ratio_by_batch", 0) for r in ab_results]
             print(
                 f"  {ablab:<15} {len(ab_results):>5} "
                 f"{np.mean(accs):>10.4f} {np.std(accs):>8.4f} "
