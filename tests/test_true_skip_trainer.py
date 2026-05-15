@@ -131,14 +131,10 @@ def test_scheduler_does_not_advance_on_skip():
 def test_fp16_skip_step_updates_scaler_state():
     class FakeScaler:
         def __init__(self):
-            self.updated = 0
-            self.unscaled = 0
+            # Simulate internal per-optimizer state mapping used by GradScaler
+            self._per_optimizer_states = {"dummy_opt": object()}
 
-        def unscale_(self, opt):
-            self.unscaled += 1
-
-        def update(self):
-            self.updated += 1
+        # Provide clearable mapping; wrapper should clear this dict.
 
     class FakeTrainer:
         def __init__(self):
@@ -153,8 +149,7 @@ def test_fp16_skip_step_updates_scaler_state():
     result = wrapper()
     assert result is None
     assert fake_trainer._skip_optimizer_step is False
-    assert fake_trainer._scaler_ref.unscaled == 1
-    assert fake_trainer._scaler_ref.updated == 1
+    assert fake_trainer._scaler_ref._per_optimizer_states == {}
     assert fake_trainer.instr.optimizer_step_attempts == 0
 
 

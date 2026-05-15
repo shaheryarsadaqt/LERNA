@@ -36,19 +36,18 @@ class _OptimizerStepWrapper:
                     accel = getattr(self._trainer, "accelerator", None)
                     if accel is not None:
                         scaler = getattr(accel, "scaler", None)
-                if scaler is not None:
+                # Clear per-optimizer states directly. This avoids calling
+                # scaler.update() which asserts that inf checks were recorded
+                # (not true when grads are None on skipped steps). Clearing
+                # _per_optimizer_states leaves the scaler ready for the next
+                # unscale_/step cycle (defaultdict will recreate READY entries).
+                if scaler is not None and hasattr(scaler, "_per_optimizer_states"):
                     try:
-                        # Ensure an unscale_() record exists for this optimizer
-                        # before calling update(), otherwise update() will
-                        # raise "No inf checks were recorded prior to update.".
-                        scaler.unscale_(self._trainer.optimizer)
-                    except RuntimeError:
-                        # Already unscaled by clip_grad_norm_ — that's fine.
+                        scaler._per_optimizer_states.clear()
+                    except Exception:
+                        # Be conservative: don't let a scaler internals error
+                        # crash the training loop; treat as best-effort.
                         pass
-                    # Reset GradScaler state to READY so subsequent unscale_
-                    # calls don't crash with "already been called".
-                    if hasattr(scaler, "update"):
-                        scaler.update()
             return None
         self._trainer.instr.optimizer_step_attempts += 1
         return self._trainer._orig_opt_step(*args, **kwargs)
