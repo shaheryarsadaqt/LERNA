@@ -17,6 +17,7 @@ from transformers import TrainingArguments
 
 from lerna.trainers import TrueBackwardSkippingTrainer
 from lerna.trainers.policies import AlwaysFalsePolicy, RandomSkipPolicy
+from lerna.trainers.true_skip_trainer import _OptimizerStepWrapper
 
 
 class _TinyDS(Dataset):
@@ -60,7 +61,7 @@ def _run(policy, td):
         save_strategy="no",
         report_to="none",
         remove_unused_columns=False,
-        no_cuda=True,
+        use_cpu=True,
         fp16=False,
         bf16=False,
     )
@@ -127,6 +128,36 @@ def test_scheduler_does_not_advance_on_skip():
         assert i["optimizer_step_attempts"] == 0
 
 
+def test_fp16_skip_step_updates_scaler_state():
+    class FakeScaler:
+        def __init__(self):
+            self.updated = 0
+            self.unscaled = 0
+
+        def unscale_(self, opt):
+            self.unscaled += 1
+
+        def update(self):
+            self.updated += 1
+
+    class FakeTrainer:
+        def __init__(self):
+            self._skip_optimizer_step = True
+            self._scaler_ref = FakeScaler()
+            self.optimizer = None
+            self.instr = type("I", (), {"precision_mode": "fp16", "optimizer_step_attempts": 0})()
+            self._orig_opt_step = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("should not be called"))
+
+    fake_trainer = FakeTrainer()
+    wrapper = _OptimizerStepWrapper(fake_trainer)
+    result = wrapper()
+    assert result is None
+    assert fake_trainer._skip_optimizer_step is False
+    assert fake_trainer._scaler_ref.unscaled == 1
+    assert fake_trainer._scaler_ref.updated == 1
+    assert fake_trainer.instr.optimizer_step_attempts == 0
+
+
 def test_scheduler_advances_on_real_steps():
     """Verify scheduler DOES advance on non-skipped steps."""
     with tempfile.TemporaryDirectory() as td:
@@ -149,7 +180,7 @@ def test_grad_accum_guard():
             save_strategy="no",
             report_to="none",
             remove_unused_columns=False,
-            no_cuda=True,
+            use_cpu=True,
         )
         with pytest.raises(ValueError):
             TrueBackwardSkippingTrainer(

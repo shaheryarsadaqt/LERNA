@@ -30,6 +30,25 @@ class _OptimizerStepWrapper:
     def __call__(self, *args, **kwargs):
         if self._trainer._skip_optimizer_step:
             self._trainer._skip_optimizer_step = False
+            if self._trainer.instr.precision_mode == "fp16":
+                scaler = self._trainer._scaler_ref
+                if scaler is None:
+                    accel = getattr(self._trainer, "accelerator", None)
+                    if accel is not None:
+                        scaler = getattr(accel, "scaler", None)
+                if scaler is not None:
+                    try:
+                        # Ensure an unscale_() record exists for this optimizer
+                        # before calling update(), otherwise update() will
+                        # raise "No inf checks were recorded prior to update.".
+                        scaler.unscale_(self._trainer.optimizer)
+                    except RuntimeError:
+                        # Already unscaled by clip_grad_norm_ — that's fine.
+                        pass
+                    # Reset GradScaler state to READY so subsequent unscale_
+                    # calls don't crash with "already been called".
+                    if hasattr(scaler, "update"):
+                        scaler.update()
             return None
         self._trainer.instr.optimizer_step_attempts += 1
         return self._trainer._orig_opt_step(*args, **kwargs)
