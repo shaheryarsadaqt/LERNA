@@ -81,12 +81,16 @@ class GradNormSkipPolicy:
         self._threshold: Optional[float] = None
         self._last_calibration_step = 0
         self._consecutive_skips: int = 0   # [IMP-3] counter
+        self._grad_norm_skip_decisions: int = 0
+        self._grad_norm_forced_probe_count: int = 0
+        self._grad_norm_last: Optional[float] = None
 
     # Called by GradientNormCaptureCallback only.
     def record_grad_norm(self, value: float) -> None:
         v = float(value)
         if v <= 0:
             return
+        self._grad_norm_last = v
         self._grad_norms.append(v)
         self._rolling.append(v)
         if len(self._rolling) > self.rolling_window_size:
@@ -120,12 +124,14 @@ class GradNormSkipPolicy:
         # in a row, force a real backward step to refresh the gradient norm.
         if self._consecutive_skips >= self.max_consecutive_skips:
             self._consecutive_skips = 0  # reset; this step will be real
+            self._grad_norm_forced_probe_count += 1
             return False
 
         want_skip = float(self._grad_norms[-1]) < float(self._threshold)
 
         if want_skip:
             self._consecutive_skips += 1
+            self._grad_norm_skip_decisions += 1
         else:
             self._consecutive_skips = 0
 

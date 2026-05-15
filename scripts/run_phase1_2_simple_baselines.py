@@ -538,10 +538,11 @@ def run_single_baseline_experiment(
     if baseline_name == "grad_norm":
         skip_policy = GradNormSkipPolicy(
             target_skip_rate=target_skip,
-            calibration_steps=calibration_steps,
-            recalibrate_every=recalibrate_every,
+            calibration_steps=50,
+            recalibrate_every=max(100, total_steps // 2),
             min_step=0,
-            min_calibration_samples=max(10, calibration_steps // 4),
+            min_calibration_samples=20,
+            rolling_window_size=1000,
             max_consecutive_skips=1,  # [IMP-3] probe rule: skip-one-compute-one
         )
         mechanism = ComputeSavingMechanism.BACKWARD_SKIPPING
@@ -693,7 +694,27 @@ def run_single_baseline_experiment(
     )
 
     # Get baseline-specific stats
-    baseline_stats = {}
+    baseline_stats = {
+        "skip_ratio": instrumentation["skip_ratio_by_batch"],
+    }
+    if baseline_name == "grad_norm" and isinstance(skip_policy, GradNormSkipPolicy):
+        baseline_stats.update({
+            "grad_norm_samples_collected": len(skip_policy._grad_norms),
+            "grad_norm_threshold": skip_policy._threshold,
+            "grad_norm_calibrated": skip_policy._threshold is not None,
+            "grad_norm_calibration_step": skip_policy._last_calibration_step,
+            "grad_norm_min": float(min(skip_policy._grad_norms)) if skip_policy._grad_norms else None,
+            "grad_norm_max": float(max(skip_policy._grad_norms)) if skip_policy._grad_norms else None,
+            "grad_norm_mean": float(np.mean(skip_policy._grad_norms)) if skip_policy._grad_norms else None,
+            "grad_norm_last": float(skip_policy._grad_norm_last) if skip_policy._grad_norm_last is not None else None,
+            "grad_norm_forced_probe_count": skip_policy._grad_norm_forced_probe_count,
+            "grad_norm_skip_decisions": skip_policy._grad_norm_skip_decisions,
+        })
+
+        print(f"  [grad_norm] samples collected: {baseline_stats['grad_norm_samples_collected']}")
+        print(f"  [grad_norm] threshold: {baseline_stats['grad_norm_threshold']}")
+        print(f"  [grad_norm] calibrated: {baseline_stats['grad_norm_calibrated']}")
+        print(f"  [grad_norm] skipped: {instrumentation['skipped_backward_steps']}")
     # Extract the primary metric
     primary_metric_key = {
         "accuracy": "eval_accuracy",
@@ -794,7 +815,11 @@ def generate_comparison_summary(
         agg[key]["energy"].append(r["energy_kwh"])
         agg[key]["time"].append(r["train_runtime_s"])
         agg[key]["steps"].append(r["train_steps"])
-        skip_ratio = r.get("baseline_stats", {}).get("skip_ratio", 0)
+        skip_ratio = r.get("baseline_stats", {}).get("skip_ratio")
+        if skip_ratio is None:
+            skip_ratio = r.get("skip_ratio_by_batch")
+        if skip_ratio is None:
+            skip_ratio = r.get("true_skip_instrumentation", {}).get("skip_ratio_by_batch", 0)
         agg[key]["skip_ratio"].append(skip_ratio)
 
     # --- Build summary rows ---
