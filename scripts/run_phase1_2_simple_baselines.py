@@ -581,6 +581,14 @@ def run_single_baseline_experiment(
     # ---- Shared LER feed (from lerna.callbacks.ler_feed) [FIX #5] ----
     ler_feed_callback = LERFeedCallback(ler_tracker=ler_tracker)
 
+    # ---- Power telemetry callback ----
+    power_callback = PowerTelemetryCallback(
+        sample_interval_s=1.0,
+        output_dir=os.path.join(output_dir, "power"),
+        wandb_enabled=use_wandb,
+        log_frequency=50,
+    )
+
     # ---- Single-owner grad-norm capture (FIX #7) ----
     grad_capture = _GradientNormCaptureCallback()
 
