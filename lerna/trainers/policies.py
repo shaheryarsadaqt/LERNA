@@ -10,6 +10,7 @@ Changes from original v1:
 
 from __future__ import annotations
 
+import math
 import random
 from typing import List, Optional
 
@@ -82,17 +83,23 @@ class GradNormSkipPolicy:
         self._last_calibration_step = 0
         self._consecutive_skips: int = 0   # [IMP-3] counter
         self._grad_norm_skip_decisions: int = 0
+        self._forced_probe_count: int = 0
         self._grad_norm_forced_probe_count: int = 0
         self._grad_norm_last: Optional[float] = None
 
     # Called by GradientNormCaptureCallback only.
     def record_grad_norm(self, value: float) -> None:
-        v = float(value)
-        if v <= 0:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
             return
-        self._grad_norm_last = v
+
+        if not math.isfinite(v) or v <= 0:
+            return
+
         self._grad_norms.append(v)
         self._rolling.append(v)
+
         if len(self._rolling) > self.rolling_window_size:
             self._rolling = self._rolling[-self.rolling_window_size:]
 
@@ -101,7 +108,7 @@ class GradNormSkipPolicy:
               else self._grad_norms
         if len(src) < self.min_calibration_samples:
             return False
-        self._threshold = float(np.percentile(src, self.target_skip_rate * 100))
+        self._threshold = float(np.nanpercentile(src, self.target_skip_rate * 100))
         return True
 
     def should_skip(self, trainer, model, inputs) -> bool:
@@ -136,6 +143,27 @@ class GradNormSkipPolicy:
             self._consecutive_skips = 0
 
         return want_skip
+
+    def get_diagnostics(self) -> dict:
+        finite_norms = [
+            float(x)
+            for x in self._grad_norms
+            if x is not None and math.isfinite(float(x))
+        ]
+
+        return {
+            "grad_norm_samples_collected": len(self._grad_norms),
+            "grad_norm_finite_samples": len(finite_norms),
+            "grad_norm_threshold": self._threshold,
+            "grad_norm_calibrated": self._threshold is not None,
+            "grad_norm_calibration_step": self._last_calibration_step,
+            "grad_norm_min": min(finite_norms) if finite_norms else None,
+            "grad_norm_max": max(finite_norms) if finite_norms else None,
+            "grad_norm_mean": float(np.mean(finite_norms)) if finite_norms else None,
+            "grad_norm_last": finite_norms[-1] if finite_norms else None,
+            "grad_norm_forced_probe_count": self._grad_norm_forced_probe_count,
+            "grad_norm_skip_decisions": self._grad_norm_skip_decisions,
+        }
 
 
 # ---------------------------------------------------------------------------

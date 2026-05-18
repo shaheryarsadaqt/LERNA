@@ -117,6 +117,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_baseline_glue import TASK_HP_OVERRIDES
 from lerna.utils.metrics import LERTracker
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
+from lerna.callbacks.comprehensive_metrics import (
+    ComprehensiveMetricsCallback,
+    GradNormDetailedCallback,
+)
+from lerna.callbacks.all_charts import AllChartsMetricsCallback
 from lerna.callbacks.simple_baselines import (
     GradientNormSkippingCallback,
     RandomStepSkippingCallback,
@@ -266,10 +271,11 @@ def get_training_config(profile: str) -> dict:
             "max_samples": None,
         }
     else:
+        gradient_accumulation_steps = 1 if profile in ("smoke", "cpu") else 4
         return {
             "per_device_train_batch_size": 4,
             "per_device_eval_batch_size": 8,
-            "gradient_accumulation_steps": 4,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "fp16": True, "bf16": False,
             "gradient_checkpointing": True,
             "dataloader_num_workers": 0,
@@ -593,11 +599,31 @@ def run_single_baseline_experiment(
     # ---- Single-owner grad-norm capture (FIX #7) ----
     grad_capture = _GradientNormCaptureCallback()
 
+    # ---- Comprehensive metrics for W&B visualizations ----
+    comprehensive_metrics = ComprehensiveMetricsCallback(
+        log_frequency=10,
+        histogram_frequency=100,
+        table_frequency=500,
+        wandb_enabled=use_wandb,
+    )
+    grad_norm_detailed = GradNormDetailedCallback(
+        wandb_enabled=use_wandb,
+        log_frequency=10,
+    )
+
+    all_charts_metrics = AllChartsMetricsCallback(
+        log_frequency=20,
+        wandb_enabled=use_wandb,
+    )
+
     callbacks = [
         EarlyStoppingCallback(early_stopping_patience=es_patience),
         power_callback,
         ler_feed_callback,
         grad_capture,
+        comprehensive_metrics,
+        grad_norm_detailed,
+        all_charts_metrics,
     ]
     if diagnostic_callback is not None:
         callbacks.append(diagnostic_callback)
@@ -769,6 +795,52 @@ def run_single_baseline_experiment(
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
+
+    # --- Log custom metrics to wandb ---
+    if use_wandb:
+        try:
+            import wandb
+
+            custom_logs = {
+                "results/primary_metric": primary_value,
+                "results/energy_kwh": power_callback.cumulative_kwh,
+                "results/train_time_s": train_time,
+                "results/train_steps": trainer.state.global_step,
+                "results/skip_ratio": instrumentation["skip_ratio_by_batch"],
+                "results/skipped_backward_steps": instrumentation["skipped_backward_steps"],
+                "results/batches_seen": instrumentation["batches_seen"],
+                "results/forward_calls": instrumentation["forward_calls"],
+                "results/backward_calls": instrumentation["backward_calls"],
+            }
+
+            if baseline_name == "grad_norm" and isinstance(skip_policy, GradNormSkipPolicy):
+                pol_diag = skip_policy.get_diagnostics()
+                custom_logs.update({
+                    "grad_norm/samples_collected": pol_diag.get("grad_norm_samples_collected", 0),
+                    "grad_norm/finite_samples": pol_diag.get("grad_norm_finite_samples", 0),
+                    "grad_norm/threshold": pol_diag.get("grad_norm_threshold"),
+                    "grad_norm/calibrated": pol_diag.get("grad_norm_calibrated", False),
+                    "grad_norm/min": pol_diag.get("grad_norm_min"),
+                    "grad_norm/max": pol_diag.get("grad_norm_max"),
+                    "grad_norm/mean": pol_diag.get("grad_norm_mean"),
+                    "grad_norm/last": pol_diag.get("grad_norm_last"),
+                    "grad_norm/forced_probe_count": pol_diag.get("grad_norm_forced_probe_count", 0),
+                    "grad_norm/skip_decisions": pol_diag.get("grad_norm_skip_decisions", 0),
+                })
+
+            wandb.log(custom_logs)
+
+            wandb.define_metric("train/global_step")
+            wandb.define_metric("results/*", step_metric="train/global_step")
+
+            wandb.log({
+                "summary/energy_kwh": power_callback.cumulative_kwh,
+                "summary/primary_metric": primary_value,
+                "summary/skip_ratio": instrumentation["skip_ratio_by_batch"],
+            })
+
+        except Exception as e:
+            print(f"  [W&B] Custom logging failed: {e}")
 
     # Print summary
     print(f"\n  --- Results ---")

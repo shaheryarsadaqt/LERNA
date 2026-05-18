@@ -337,7 +337,7 @@ class GradientNormSkippingCallback(TrainerCallback, _BaselineStatsMixin):
         if len(norms) < self.min_calibration_samples:
             return None, 0.0, False
         percentile = self.target_skip_rate * 100
-        threshold = float(np.percentile(norms, percentile))
+        threshold = float(np.nanpercentile(norms, percentile))
         norms_arr = np.array(norms)
         actual_skip_rate = np.sum(norms_arr < threshold) / len(norms_arr)
         is_valid = abs(actual_skip_rate - self.target_skip_rate) < 0.10
