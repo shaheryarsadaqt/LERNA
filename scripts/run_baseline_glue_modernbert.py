@@ -200,6 +200,11 @@ class _EMAWelfordAccumulator:
 
     def update(self, grad_vec: torch.Tensor):
         """Incorporate a new gradient vector (already on CPU, float32)."""
+        if grad_vec is None or grad_vec.numel() == 0:
+            return
+        if not torch.isfinite(grad_vec).all():
+            return
+
         self.n += 1
         if self._ema_mean is None:
             self._ema_mean = grad_vec.clone()
@@ -221,11 +226,22 @@ class _EMAWelfordAccumulator:
 
     def compute_gsnr(self) -> float:
         """Return GSNR = ||E[g]||^2 / sum(Var[g_i])."""
-        if self.n < 2 or self._ema_mean is None:
-            return 0.0
+        if self.n < 2 or self._ema_mean is None or self._ema_var is None:
+            return None
+
+        if not torch.isfinite(self._ema_mean).all() or not torch.isfinite(self._ema_var).all():
+            return None
+
         signal = self._ema_mean.norm().item() ** 2
         noise = self._ema_var.sum().item()
-        return signal / (noise + 1e-10)
+
+        if not math.isfinite(signal) or not math.isfinite(noise):
+            return None
+        if noise <= 0:
+            return None
+
+        value = signal / (noise + 1e-10)
+        return value if math.isfinite(value) else None
 
     def compute_fisher_info(self) -> float:
         """Return trace of empirical Fisher Information: E[||g||^2].
@@ -377,13 +393,15 @@ class GSNRTracker:
                 acc = self._layer_accum.get(layer_name)
                 if acc is not None and acc.ready:
                     gsnr = acc.compute_gsnr()
-                    results[layer_name] = gsnr
-                    self.gsnr_per_layer_history[layer_name].append(gsnr)
+                    if gsnr is not None and math.isfinite(float(gsnr)):
+                        results[layer_name] = gsnr
+                        self.gsnr_per_layer_history[layer_name].append(gsnr)
 
             if self._global_accum.ready:
                 global_gsnr = self._global_accum.compute_gsnr()
-                results["__global__"] = global_gsnr
-                self.gsnr_global_history.append(global_gsnr)
+                if global_gsnr is not None and math.isfinite(float(global_gsnr)):
+                    results["__global__"] = global_gsnr
+                    self.gsnr_global_history.append(global_gsnr)
         except (RuntimeError, MemoryError) as e:
             print(f"  [GSNR warn] compute_gsnr failed: {e}")
         return results
@@ -2573,8 +2591,11 @@ def run_single_experiment(
         "power_avg_watts": avg_power,
         "ler_final": ler_tracker.get_diagnostics(),
         "gsnr_final": {
-            "gsnr_global": gsnr_final.get("gsnr_per_layer", {}).get("__global__", 
-                           gsnr_tracker.gsnr_global_history[-1] if gsnr_tracker.gsnr_global_history else None),
+            "gsnr_global": (
+                gsnr_final.get("gsnr_global")
+                if gsnr_final.get("gsnr_global") is not None
+                else (gsnr_tracker.gsnr_global_history[-1] if gsnr_tracker.gsnr_global_history else None)
+            ),
             "num_layers_tracked": gsnr_final["num_layers_tracked"],
             "step": gsnr_final["step"],
         },
