@@ -2359,7 +2359,7 @@ def run_single_experiment(
             rho_val = diag.get("rho_vg")
             phase = diag.get("phase", "?")
 
-            ler_str = f"{ler_val:.6f}" if ler_val is not None else "warming"
+            ler_str = f"{ler_val:.3e}" if ler_val is not None else "warming"
             vel_str = f"{vel_val:.6f}" if vel_val is not None else "N/A"
             rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
 
