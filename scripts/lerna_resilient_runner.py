@@ -361,7 +361,9 @@ class AblationAdapter(PhaseAdapter):
         return self._run_fn(
             task_name=p["task"],
             seed=p["seed"],
-            lr=task_hp.get("learning_rate", args.lr),
+            ablation_name=p["ablation"],
+            ablation_overrides=self.ABLATIONS[p["ablation"]],
+            model_name=model_name,
             profile=profile,
             base_output_dir=args.output_dir,
             use_wandb=args.wandb,
