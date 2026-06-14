@@ -11,6 +11,7 @@ from .policies import (
     RandomSkipPolicy,
     LERPlateauPolicy,
     LERNAPolicy,
+    LERNACalibratedPolicy,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "RandomSkipPolicy",
     "LERPlateauPolicy",
     "LERNAPolicy",
+    "LERNACalibratedPolicy",
 ]

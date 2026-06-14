@@ -275,6 +275,20 @@ class TrueBackwardSkippingTrainer(Trainer):
     def on_skipped_backward_step(self, loss, model, inputs) -> None:
         return None
 
+    # ----------------------------------------------------- online LER update (FIX P0-3)
+    def _online_ler_update(self, loss_value, logits, model, every: int = 1):
+        """Dense, per-step LER feed using the TRAIN batch already computed.
+        Cheap: reuses logits/loss; param-velocity uses tracker's own snapshot."""
+        trk = getattr(self, "ler_tracker", None) or getattr(self, "_ler_tracker", None)
+        if trk is None or logits is None:
+            return
+        if self.state.global_step % every != 0:
+            return
+        try:
+            trk.update(loss=float(loss_value), logits=logits, accuracy=None, model=model)
+        except Exception as exc:
+            logger.debug(f"[TrueSkip] online LER update failed: {exc!r}")
+
     # ----------------------------------------------------- core training
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
@@ -287,6 +301,7 @@ class TrueBackwardSkippingTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # [FIX P0-3] Forward ALWAYS happens before skip decision (R3).
         # [CRIT-1] Always clear both flags at start of each step (safety net).
         self._skip_optimizer_step = False
         self._skip_scheduler_step = False
@@ -295,6 +310,17 @@ class TrueBackwardSkippingTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
         self.instr.batches_seen += 1
 
+        # [FIX P0-3] Forward ALWAYS happens first.
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        self.instr.forward_calls += 1
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+
+        # [FIX P0-3] Feed current-step diagnostics ONLINE before deciding (R2/R3).
+        self._online_ler_update(loss.detach(), self._last_real_logits, model)
+
+        # [FIX P0-3] Decide AFTER the current forward.
         try:
             should_skip = bool(self.skip_policy.should_skip(self, model, inputs))
         except Exception as exc:
@@ -306,15 +332,6 @@ class TrueBackwardSkippingTrainer(Trainer):
             self._skip_optimizer_step = True
             self._skip_scheduler_step = True
             self.instr.skipped_batches += 1
-
-        # Forward (always)
-        with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
-        self.instr.forward_calls += 1
-        if self.args.n_gpu > 1:
-            loss = loss.mean()
-
-        if should_skip:
             # AMP rule: no backward => no scaler inf checks => optimizer.step
             # wrapper will no-op (Verdict Issue #1, primary safety).
             self.instr.skipped_backward_steps += 1

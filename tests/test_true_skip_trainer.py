@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
-from lerna.trainers import TrueBackwardSkippingTrainer
+from lerna.trainers import TrueBackwardSkippingTrainer, LERNAMomentumTrainer
 from lerna.trainers.policies import AlwaysFalsePolicy, RandomSkipPolicy
 from lerna.trainers.true_skip_trainer import _OptimizerStepWrapper
 
@@ -185,3 +185,156 @@ def test_grad_accum_guard():
                 data_collator=_collate,
                 skip_policy=RandomSkipPolicy(target_skip_rate=0.5),
             )
+
+
+def test_momentum_extrapolation_weights_frozen_when_disabled():
+    """[FIX P2-2] With apply_momentum=False, weights must be byte-identical before/after a skipped step."""
+    from lerna.trainers import LERNAMomentumTrainer
+
+    class NoMomentumTrainer(LERNAMomentumTrainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, apply_momentum=False, **kwargs)
+
+    with tempfile.TemporaryDirectory() as td:
+        model = _TinyModel()
+        w0 = model.fc.weight.data.clone()
+        b0 = model.fc.bias.data.clone()
+
+        args = TrainingArguments(
+            output_dir=td,
+            num_train_epochs=1,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-3,
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            remove_unused_columns=False,
+            use_cpu=True,
+            fp16=False,
+            bf16=False,
+        )
+        trainer = NoMomentumTrainer(
+            model=model,
+            args=args,
+            train_dataset=_TinyDS(),
+            data_collator=_collate,
+            skip_policy=RandomSkipPolicy(target_skip_rate=1.0, min_step=0, seed=0),
+            instrumentation_path=os.path.join(td, "instrumentation.json"),
+        )
+        trainer.train()
+        i = trainer.get_instrumentation()
+
+        w1 = model.fc.weight.data.clone()
+        b1 = model.fc.bias.data.clone()
+
+        assert torch.equal(w0, w1), (
+            f"Weights changed on fully-skipped run with apply_momentum=False"
+        )
+
+def test_momentum_extrapolation_applies_correct_delta():
+    """[FIX P2-2] With apply_momentum=True, verify weight delta from momentum extrapolation."""
+    with tempfile.TemporaryDirectory() as td:
+        model = _TinyModel()
+        args = TrainingArguments(
+            output_dir=td,
+            num_train_epochs=2,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-3,
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            remove_unused_columns=False,
+            use_cpu=True,
+            fp16=False,
+            bf16=False,
+        )
+        trainer = LERNAMomentumTrainer(
+            model=model,
+            args=args,
+            train_dataset=_TinyDS(),
+            data_collator=_collate,
+            skip_policy=RandomSkipPolicy(target_skip_rate=0.5, min_step=0, seed=42),
+            apply_momentum=True,
+            instrumentation_path=os.path.join(td, "instrumentation.json"),
+        )
+        trainer.train()
+        i = trainer.get_instrumentation()
+        assert i["skipped_backward_steps"] > 0, (
+            "No steps skipped; cannot verify momentum extrapolation."
+        )
+        assert i["forward_calls"] == i["backward_calls"] + i["skipped_backward_steps"]
+
+
+def test_no_momentum_differs_from_momentum():
+    """[FIX P2-2] With skipping rate > 0, no_momentum and momentum runs diverge."""
+    import copy
+
+    with tempfile.TemporaryDirectory() as td_m, tempfile.TemporaryDirectory() as td_nm:
+        model_m = _TinyModel()
+        args_m = TrainingArguments(
+            output_dir=td_m,
+            num_train_epochs=2,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-3,
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            remove_unused_columns=False,
+            use_cpu=True,
+            fp16=False,
+            bf16=False,
+        )
+        trainer_m = LERNAMomentumTrainer(
+            model=model_m,
+            args=args_m,
+            train_dataset=_TinyDS(),
+            data_collator=_collate,
+            skip_policy=RandomSkipPolicy(target_skip_rate=0.5, min_step=0, seed=42),
+            apply_momentum=True,
+            instrumentation_path=os.path.join(td_m, "instrumentation.json"),
+        )
+        trainer_m.train()
+        i_m = trainer_m.get_instrumentation()
+
+        model_nm = copy.deepcopy(model_m)
+        args_nm = TrainingArguments(
+            output_dir=td_nm,
+            num_train_epochs=2,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-3,
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            remove_unused_columns=False,
+            use_cpu=True,
+            fp16=False,
+            bf16=False,
+        )
+        trainer_nm = LERNAMomentumTrainer(
+            model=model_nm,
+            args=args_nm,
+            train_dataset=_TinyDS(),
+            data_collator=_collate,
+            skip_policy=RandomSkipPolicy(target_skip_rate=0.5, min_step=0, seed=42),
+            apply_momentum=False,
+            instrumentation_path=os.path.join(td_nm, "instrumentation.json"),
+        )
+        trainer_nm.train()
+        i_nm = trainer_nm.get_instrumentation()
+
+        assert i_m["skipped_backward_steps"] > 0
+        assert i_nm["skipped_backward_steps"] > 0
+
+        w_m = list(model_m.parameters())
+        w_nm = list(model_nm.parameters())
+        total_diff = sum((wm - wn).abs().sum().item() for wm, wn in zip(w_m, w_nm))
+        assert total_diff > 0, (
+            f"Weights identical between momentum and no-momentum runs "
+            f"despite {i_m['skipped_backward_steps']} skipped steps. "
+            f"apply_momentum flag is NOT being wired (R5 regression)."
+        )
+

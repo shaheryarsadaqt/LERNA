@@ -311,3 +311,137 @@ class LERNAPolicy:
         else:
             self._consecutive_skips = 0
         return base
+
+
+# ---------------------------------------------------------------------------
+# 6) Phase 1.3b: LERNACalibratedPolicy — target-skip-rate, quantile-calibrated,
+#    confidence-gated LERNA controller.
+#
+# Directly attacks the two primary root causes identified in the ablation
+# post-mortem:
+#   R1 — Threshold is ~1000× too strict (was hardcoded 1e-5 vs real LER scale
+#         of 0.008–0.015). Quantile calibration fixes this automatically.
+#   R2 — LER was updated only at eval time. Per-step _online_ler_update
+#         (in the trainer) now fills _ler_window densely.
+#   R4 — Safety horizon collapsed to 0. Replaced with confidence-gated burst
+#         skipping and forced probes.
+#
+# LERNACalibratedPolicy needs the per-step online LER feed from the trainer
+# (P0-3 fix) to function correctly.
+# ---------------------------------------------------------------------------
+
+class LERNACalibratedPolicy:
+    """Phase 1.3b: target-skip-rate, quantile-calibrated, confidence-gated LERNA.
+
+    Uses the target_skip_rate-th percentile of observed LER (or rho_VG) as
+    the dynamic threshold. Includes confidence-gated burst skipping and
+    forced periodic probes to prevent stale diagnostics.
+    """
+    name = "lerna_calibrated"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.25,
+        fallback_threshold: float = 0.01,
+        min_step: int = 50,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,
+        use_ler: bool = True,
+        use_rho_vg: bool = True,
+        use_safety_horizon: bool = True,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
+        rho_vg_skip_below: float = 0.1,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = target_skip_rate
+        self.threshold = fallback_threshold
+        self._calibrated = False
+        self.min_step = min_step
+        self.calibration_steps = calibration_steps
+        self.recalibrate_every = recalibrate_every
+        self.use_ler = use_ler
+        self.use_rho_vg = use_rho_vg
+        self.use_safety_horizon = use_safety_horizon
+        self.max_consecutive_skips = max_consecutive_skips
+        self.probe_interval = probe_interval
+        self.rho_vg_skip_below = rho_vg_skip_below
+
+        self._ler_window: List[float] = []
+        self._last_calib_step = 0
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+        self._skips = 0
+        self._opportunities = 0
+
+    def _calibrate(self):
+        """Set threshold to the target_skip_rate-th percentile of observed LER."""
+        if len(self._ler_window) < max(20, self.calibration_steps // 2):
+            return
+        # primary signal: LER if enabled, else rho_VG
+        self.threshold = float(np.nanpercentile(
+            self._ler_window, self.target_skip_rate * 100
+        ))
+        self._calibrated = True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        step = trainer.state.global_step
+        self._opportunities += 1
+        if step < self.min_step:
+            self._consecutive_skips = 0
+            return False
+
+        diag = self.trk.get_diagnostics()
+        ler = diag.get("ler")
+        rho = diag.get("rho_vg", 0.0) or 0.0
+
+        # Collect signal for calibration (dense now, thanks to online update)
+        sig = ler if (self.use_ler and ler is not None) else (rho if self.use_rho_vg else None)
+        if sig is not None:
+            self._ler_window.append(float(sig))
+            if len(self._ler_window) > 2000:
+                self._ler_window = self._ler_window[-2000:]
+
+        if not self._calibrated and len(self._ler_window) >= self.calibration_steps:
+            self._calibrate()
+            self._last_calib_step = step
+            return False
+        if not self._calibrated:
+            return False
+        if self.recalibrate_every and (step - self._last_calib_step) >= self.recalibrate_every:
+            self._calibrate()
+            self._last_calib_step = step
+
+        # Base low-utility decision (quantile-calibrated, not 1e-5)
+        if self.use_ler and ler is not None:
+            base = ler < self.threshold
+        elif self.use_rho_vg:
+            base = rho < self.rho_vg_skip_below
+        else:
+            base = False
+
+        # (R4 fix) Confidence-gated burst + forced probe instead of brittle horizon
+        if base and self.use_safety_horizon:
+            # high confidence = strong rho_VG alignment -> allow burst; else probe sooner
+            conf_cap = self.max_consecutive_skips if rho > 0.2 else max(1, self.max_consecutive_skips // 2)
+            if self._consecutive_skips >= conf_cap or self._steps_since_probe >= self.probe_interval:
+                base = False  # force a real backward (probe) to refresh diagnostics
+
+        if base:
+            self._consecutive_skips += 1
+            self._steps_since_probe += 1
+            self._skips += 1
+        else:
+            self._consecutive_skips = 0
+            self._steps_since_probe = 0
+        return base
+
+    def get_diagnostics(self):
+        denom = max(self._opportunities, 1)
+        return {
+            "calibrated": self._calibrated,
+            "threshold": self.threshold,
+            "observed_skip_rate": self._skips / denom,
+            "n_calib_samples": len(self._ler_window),
+        }

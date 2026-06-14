@@ -56,7 +56,7 @@ import numpy as np
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
 from lerna.callbacks.ler_feed import LERFeedCallback
 from lerna.utils.metrics import LERTracker
-from lerna.trainers import LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy
+from lerna.trainers import LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy, LERNACalibratedPolicy
 
 try:
     from scripts.run_baseline_glue import (
@@ -423,15 +423,35 @@ def run_ablation_single(
         log_frequency=50,
     )
 
-    skip_policy = LERNAPolicy(
-        ler_tracker=ler_tracker,
-        threshold=1e-5,
-        min_step=100,
-        use_ler=use_ler,
-        use_rho_vg=use_rho_vg,
-        use_safety_horizon=use_safety_horizon,
-        use_hysteresis=use_hysteresis,
-    )
+    # [FIX P0-2] Pull the task-calibrated LER threshold instead of hardcoded 1e-5 (R1)
+    task_cal = ler_tracker.task_calibration.get(task_name, {})
+    base_thr = task_cal.get("ler_threshold", 0.01)
+
+    if ablation_name == "full_lerna":
+        skip_policy = LERNACalibratedPolicy(
+            ler_tracker=ler_tracker,
+            target_skip_rate=0.25,
+            fallback_threshold=base_thr,
+            min_step=50,
+            calibration_steps=60,
+            recalibrate_every=200,
+            use_ler=use_ler,
+            use_rho_vg=use_rho_vg,
+            use_safety_horizon=use_safety_horizon,
+            max_consecutive_skips=4,
+            probe_interval=8,
+        )
+    else:
+        # Keep old LERNAPolicy for non-full_lerna ablations for backward compat
+        skip_policy = LERNAPolicy(
+            ler_tracker=ler_tracker,
+            threshold=base_thr,  # use calibrated threshold, not 1e-5
+            min_step=50,
+            use_ler=use_ler,
+            use_rho_vg=use_rho_vg,
+            use_safety_horizon=use_safety_horizon,
+            use_hysteresis=use_hysteresis,
+        )
 
     ler_feed_callback = LERFeedCallback(
         ler_tracker=ler_tracker,
@@ -506,6 +526,7 @@ def run_ablation_single(
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
         skip_policy=skip_policy,
+        apply_momentum=use_momentum_extrap,  # [FIX P0-1] Wire the momentum flag (R5)
         compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
         capture_logits=True,

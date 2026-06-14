@@ -97,6 +97,7 @@ class SafetyHorizon:
         max_horizon: int = 50,
         convergence_epsilon: float = 1e-4,
         rho_vg_threshold: float = 0.1,
+        min_horizon: int = 1,  # [FIX P1-1] floor to prevent horizon collapse to 0
     ):
         """
         Args:
@@ -104,11 +105,13 @@ class SafetyHorizon:
             max_horizon: Maximum allowed consecutive skip steps
             convergence_epsilon: Target loss improvement threshold
             rho_vg_threshold: Minimum ρ_VG for productive learning
+            min_horizon: Minimum safety horizon floor (prevents collapse to 0)
         """
         self.min_pl_constant = min_pl_constant
         self.max_horizon = max_horizon
         self.convergence_epsilon = convergence_epsilon
         self.rho_vg_threshold = rho_vg_threshold
+        self.min_horizon = min_horizon  # [FIX P1-1]
         
         # Running estimate of PL constant
         self._pl_constant_ema: float = min_pl_constant
@@ -164,15 +167,15 @@ class SafetyHorizon:
             # Standard PL-based bound
             raw_horizon = int(math.log(1.0 / self.convergence_epsilon) / mu)
         else:
-            # Fallback: use ρ_VG as proxy
-            raw_horizon = int(max(rho_vg, 0.01) * self.max_horizon)
+            # Fallback: use ρ_VG as proxy with min_horizon floor (FIX P1-1)
+            raw_horizon = max(self.min_horizon, int(max(rho_vg, 0.0) * self.max_horizon))
         
         # Modulate by LER: lower LER = shorter horizon
         ler_factor = min(ler / 1e-4, 1.0) if ler > 0 else 0.1
         horizon = int(raw_horizon * ler_factor)
         
-        # Apply bounds
-        horizon = max(0, min(horizon, self.max_horizon))
+        # Apply bounds with min_horizon floor (FIX P1-1)
+        horizon = max(self.min_horizon, min(horizon, self.max_horizon))
         
         self.horizon_history.append(horizon)
         return horizon
