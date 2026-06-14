@@ -215,69 +215,33 @@ class AblationDiagnosticsCallback:
         )
         eval_loss = metrics.get("eval_loss", 0)
 
-        if self._last_loss is not None and self.use_ler:
-            trainer = self._trainer_holder[0] if self._trainer_holder else None
-            real_logits = None
-            if trainer is not None and hasattr(trainer, "_last_real_logits") and trainer._last_real_logits is not None:
-                real_logits = trainer._last_real_logits
-            elif model is not None:
-                try:
-                    model.eval()
-                    dl = DataLoader(
-                        self._eval_ds.select(range(min(8, len(self._eval_ds)))),
-                        batch_size=min(8, len(self._eval_ds)),
-                        collate_fn=DataCollatorWithPadding(tokenizer=self._tokenizer, pad_to_multiple_of=8),
-                    )
-                    batch = next(iter(dl))
-                    batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                    with torch.no_grad():
-                        outputs = model(**batch)
-                    real_logits = outputs.logits.detach()
-                except Exception:
-                    real_logits = torch.randn(8, self._task_cfg["num_labels"])
+        # [CLEAN CHANNEL] Do NOT call ler_tracker.update() here. Read-only log.
+        diag = self.ler_tracker.get_diagnostics()
+        ler_val = diag.get("ler")
+        rho_val = diag.get("rho_vg")
+        phase = diag.get("phase", "?")
+        ler_str = f"{ler_val:.2e}" if ler_val is not None else "N/A"
+        rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
+        print(
+            f"  [ABL step={state.global_step}] "
+            f"LER={ler_str} | rho_VG={rho_str} | phase={phase} | "
+            f"eval_loss={eval_loss:.4f} | acc={accuracy:.3f}"
+        )
 
+        if self.use_wandb:
             try:
-                self.ler_tracker.update(
-                    loss=eval_loss,
-                    logits=real_logits,
-                    accuracy=accuracy,
-                    model=model,
-                )
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "lerna/ler": ler_val,
+                        "lerna/rho_vg": rho_val,
+                        "lerna/phase": phase,
+                        "lerna/eval_accuracy": accuracy,
+                        "lerna/eval_loss": eval_loss,
+                        "ablation/ablation_name": self.ablation_name,
+                    }, commit=False)
             except Exception:
                 pass
-
-            diag = self.ler_tracker.get_diagnostics()
-            ler_val = diag.get("ler")
-            rho_val = diag.get("rho_vg")
-            phase = diag.get("phase", "?")
-            ler_str = f"{ler_val:.2e}" if ler_val is not None else "N/A"
-            rho_str = f"{rho_val:.4f}" if rho_val is not None else "N/A"
-            print(
-                f"  [ABL step={state.global_step}] "
-                f"LER={ler_str} | "
-                f"rho_VG={rho_str} | "
-                f"phase={phase} | acc={accuracy:.3f}"
-            )
-
-            if self.use_wandb:
-                try:
-                    import wandb
-                    if wandb.run is not None:
-                        wandb.log({
-                            "lerna/ler": ler_val,
-                            "lerna/rho_vg": rho_val,
-                            "lerna/phase": phase,
-                            "lerna/eval_accuracy": accuracy,
-                            "lerna/eval_loss": eval_loss,
-                            "ablation/ablation_name": self.ablation_name,
-                            "ablation/use_rho_vg": self.use_rho_vg,
-                            "ablation/use_ler": self.use_ler,
-                            "ablation/use_safety_horizon": self.use_safety_horizon,
-                            "ablation/use_hysteresis": self.use_hysteresis,
-                            "ablation/use_momentum_extrap": self.use_momentum_extrap,
-                        }, commit=False)
-                except Exception:
-                    pass
         return control
 
     def _save_diagnostics(self):
@@ -313,6 +277,7 @@ def run_ablation_single(
     metric_for_best_model: str = "eval_loss",
     greater_is_better: bool = False,
     init_from_mnli: bool = False,
+    disable_early_stopping: bool = False,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -530,12 +495,11 @@ def run_ablation_single(
         compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
         capture_logits=True,
-        callbacks=[
-            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
-            power_callback,
-            ler_feed_callback,
-            diag_callback,
-        ],
+        callbacks=(
+            ([] if disable_early_stopping
+             else [EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)])
+            + [power_callback, ler_feed_callback, diag_callback]
+        ),
     )
     ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
@@ -568,6 +532,10 @@ def run_ablation_single(
         "power_avg_watts": avg_power,
         "ler_final": ler_tracker.get_diagnostics(),
         "true_skip_instrumentation": instrumentation,
+        "policy_diagnostics": (
+            skip_policy.get_diagnostics()
+            if hasattr(skip_policy, "get_diagnostics") else {}
+        ),
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
     }
@@ -628,6 +596,8 @@ def main():
                         help="Model to use for ablation study")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--unlimited", action="store_true")
+    parser.add_argument("--no-early-stopping", action="store_true",
+                        help="Run full fixed epochs so arms are compute-comparable")
     args = parser.parse_args()
 
     profile = detect_device_profile()
@@ -713,6 +683,7 @@ def main():
                         metric_for_best_model=task_hp.get("metric_for_best_model", "eval_loss"),
                         greater_is_better=task_hp.get("greater_is_better", False),
                         init_from_mnli=task_hp.get("init_from_mnli", False),
+                        disable_early_stopping=args.no_early_stopping,
                     )
                     all_results.append(result)
                 except Exception as e:

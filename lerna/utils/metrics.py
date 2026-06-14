@@ -488,6 +488,11 @@ class LERTracker:
             if self.task in self.task_calibration:
                 ler *= self.task_calibration[self.task]["entropy_weight"]
 
+            # [SIGNAL HYGIENE] Floor + light EMA so noisy per-step loss_gain=0
+            # doesn't flood the quantile calibration window with exact zeros.
+            ler = max(float(ler), 1e-8)
+            if self.ler_history:
+                ler = 0.7 * self.ler_history[-1] + 0.3 * ler
             self.ler_history.append(ler)
 
             if accuracy is not None and self.validate_correlation:

@@ -68,43 +68,8 @@ class LERFeedCallback(TrainerCallback):
         return control
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if metrics is None:
-            return control
-        trainer = self._trainer_ref
-        if trainer is None:
-            return control
-        eval_loss = metrics.get("eval_loss", 0.0)
-        accuracy = metrics.get("eval_accuracy",
-                    metrics.get("eval_matthews_correlation",
-                    metrics.get("eval_pearson",
-                    metrics.get("eval_pearsonr", None))))
-        logits = getattr(trainer, "_last_real_logits", None)
-
-        # [IMP-5] Do NOT feed random dummy logits into LERTracker. If logits
-        # are missing, skip this update entirely. Random logits corrupt entropy
-        # computation and poison skip decisions.
-        if logits is None:
-            global _MISSING_LOGITS_WARNED
-            if not _MISSING_LOGITS_WARNED:
-                logger.warning(
-                    "LERFeedCallback: logits unavailable at eval step %d; "
-                    "skipping LER update. This may happen if compute_loss "
-                    "does not capture logits or if no eval batch ran. "
-                    "LER-dependent policies will use stale data until logits "
-                    "become available. (This warning is shown once.)",
-                    state.global_step,
-                )
-                _MISSING_LOGITS_WARNED = True
-            self._skipped_updates += 1
-            return control
-
-        model = kwargs.get("model", self._model)
-        try:
-            self.ler_tracker.update(
-                loss=eval_loss, logits=logits, accuracy=accuracy,
-                model=model, gradients=None,
-            )
-            self._update_count += 1
-        except Exception as exc:
-            logger.warning(f"LERFeedCallback: ler_tracker.update() failed: {exc!r}")
+        # [CLEAN CHANNEL] Logging-only. The skip-decision LER signal comes
+        # solely from the trainer's per-step _online_ler_update (train batch).
+        # Pushing eval-scale loss/logits here mixed two different loss scales
+        # into loss_history and corrupted the calibration window.
         return control

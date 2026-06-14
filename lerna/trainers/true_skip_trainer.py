@@ -457,23 +457,35 @@ class LERNAMomentumTrainer(TrueBackwardSkippingTrainer):
 
     def on_skipped_backward_step(self, loss, model, inputs):
         if not self.apply_momentum:
-            return
+            return  # no_momentum ablation: pure weight freeze
         opt = self.optimizer
         if opt is None:
             return
         with torch.no_grad():
             for group in opt.param_groups:
                 lr = group.get("lr", self.args.learning_rate)
+                beta1, beta2 = group.get("betas", (0.9, 0.999))
+                eps = group.get("eps", 1e-8)
                 for param in group["params"]:
                     if not param.requires_grad or param not in opt.state:
                         continue
-                    p_state = opt.state[param]
-                    if "momentum_buffer" in p_state and p_state["momentum_buffer"] is not None:
-                        param.data.add_(p_state["momentum_buffer"], alpha=-lr)
-                    elif "exp_avg" in p_state:
-                        exp_avg = p_state["exp_avg"]
-                        step = p_state.get("step", 1)
-                        step_val = step.item() if hasattr(step, "item") else int(step)
-                        beta1 = group.get("betas", (0.9, 0.999))[0]
-                        bc = 1 - beta1 ** max(step_val, 1)
-                        param.data.add_(exp_avg / bc if bc > 0 else exp_avg, alpha=-lr)
+                    st = opt.state[param]
+                    # SGD-with-momentum path (unchanged)
+                    buf = st.get("momentum_buffer")
+                    if buf is not None:
+                        param.data.add_(buf, alpha=-lr)
+                        continue
+                    # AdamW path: reuse the STALE (un-refreshed) moments. On a
+                    # skipped step v is not updated, so reusing v_hat is the
+                    # consistent inertial extrapolation. Mirrors metrics.py:570.
+                    m = st.get("exp_avg")
+                    v = st.get("exp_avg_sq")
+                    if m is None or v is None:
+                        continue
+                    step = st.get("step", 1)
+                    t = float(step.item() if torch.is_tensor(step) else step)
+                    t = max(t, 1.0)
+                    m_hat = m / (1.0 - beta1 ** t)
+                    v_hat = v / (1.0 - beta2 ** t)
+                    update = m_hat / (v_hat.sqrt() + eps)   # full AdamW direction
+                    param.data.add_(update, alpha=-lr)
