@@ -487,5 +487,8 @@ class LERNAMomentumTrainer(TrueBackwardSkippingTrainer):
                     t = max(t, 1.0)
                     m_hat = m / (1.0 - beta1 ** t)
                     v_hat = v / (1.0 - beta2 ** t)
+                    wd = group.get("weight_decay", 0.0)
+                    if wd:
+                        param.data.add_(param.data, alpha=-lr * wd)
                     update = m_hat / (v_hat.sqrt() + eps)   # full AdamW direction
                     param.data.add_(update, alpha=-lr)

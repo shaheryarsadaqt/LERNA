@@ -56,7 +56,11 @@ import numpy as np
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
 from lerna.callbacks.ler_feed import LERFeedCallback
 from lerna.utils.metrics import LERTracker
-from lerna.trainers import LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy, LERNACalibratedPolicy
+from lerna.trainers import (
+    LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
+    LERNACalibratedPolicy, LERNAHybridPolicy, RandomSkipPolicy, GradNormSkipPolicy,
+)
+from transformers import TrainerCallback
 
 try:
     from scripts.run_baseline_glue import (
@@ -94,9 +98,30 @@ ABLATIONS = {
     "no_safety":        {"use_safety_horizon": False},
     "no_hysteresis":    {"use_hysteresis": False},
     "no_momentum":      {"use_momentum_extrap": False},
+    # matched-budget controls — the credibility bar ("surpass old methods")
+    "random_skip":      {"control": "random_skip"},
+    "grad_norm":        {"control": "grad_norm"},
 }
 
 ABLATION_GLUE_TASKS = [t for t in GLUE_TASKS if t != "rte_modernbert_2e5"]
+
+
+class _GradNormCapture(TrainerCallback):
+    """Feed pre-clip grad norm to policies exposing record_grad_norm()."""
+    def __init__(self, policy):
+        self._policy = policy
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+        if model is None or not hasattr(self._policy, "record_grad_norm"):
+            return control
+        sq = 0.0
+        for p in model.parameters():
+            if p.requires_grad and p.grad is not None:
+                sq += float(p.grad.detach().float().norm().item()) ** 2
+        if sq > 0:
+            self._policy.record_grad_norm(sq ** 0.5)
+        return control
 
 
 class AblationTrainer(LERNAMomentumTrainer):
@@ -278,6 +303,10 @@ def run_ablation_single(
     greater_is_better: bool = False,
     init_from_mnli: bool = False,
     disable_early_stopping: bool = False,
+    target_skip_rate: float = 0.20,
+    max_consecutive_skips: int = 4,
+    probe_interval: int = 8,
+    policy: str = "hybrid",
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -392,10 +421,24 @@ def run_ablation_single(
     task_cal = ler_tracker.task_calibration.get(task_name, {})
     base_thr = task_cal.get("ler_threshold", 0.01)
 
-    if ablation_name == "full_lerna":
-        skip_policy = LERNACalibratedPolicy(
+    control = ablation_overrides.get("control")
+    if control == "random_skip":
+        skip_policy = RandomSkipPolicy(
+            target_skip_rate=args.target_skip_rate, min_step=50, seed=seed,
+        )
+    elif control == "grad_norm":
+        skip_policy = GradNormSkipPolicy(
+            target_skip_rate=args.target_skip_rate, min_step=50,
+            calibration_steps=60, recalibrate_every=200,
+            max_consecutive_skips=args.max_consecutive_skips,
+        )
+    else:
+        # ALL LERNA arms (full_lerna + every ablation) share ONE controller.
+        # Each ablation toggles exactly one flag => deltas are attributable.
+        PolicyCls = LERNAHybridPolicy if args.policy == "hybrid" else LERNACalibratedPolicy
+        skip_policy = PolicyCls(
             ler_tracker=ler_tracker,
-            target_skip_rate=0.25,
+            target_skip_rate=args.target_skip_rate,
             fallback_threshold=base_thr,
             min_step=50,
             calibration_steps=60,
@@ -403,19 +446,8 @@ def run_ablation_single(
             use_ler=use_ler,
             use_rho_vg=use_rho_vg,
             use_safety_horizon=use_safety_horizon,
-            max_consecutive_skips=4,
-            probe_interval=8,
-        )
-    else:
-        # Keep old LERNAPolicy for non-full_lerna ablations for backward compat
-        skip_policy = LERNAPolicy(
-            ler_tracker=ler_tracker,
-            threshold=base_thr,  # use calibrated threshold, not 1e-5
-            min_step=50,
-            use_ler=use_ler,
-            use_rho_vg=use_rho_vg,
-            use_safety_horizon=use_safety_horizon,
-            use_hysteresis=use_hysteresis,
+            max_consecutive_skips=args.max_consecutive_skips,
+            probe_interval=args.probe_interval,
         )
 
     ler_feed_callback = LERFeedCallback(
@@ -503,6 +535,9 @@ def run_ablation_single(
     )
     ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
+
+    if hasattr(skip_policy, "record_grad_norm"):
+        trainer.add_callback(_GradNormCapture(skip_policy))
 
     start_time = time.time()
     print(f"\n  Starting ablation [{ablation_name}]: {total_steps} steps, eval every {eval_steps}")
@@ -598,6 +633,10 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
+    parser.add_argument("--policy", choices=["calibrated", "hybrid"], default="hybrid")
+    parser.add_argument("--target-skip-rate", type=float, default=0.20)
+    parser.add_argument("--max-consecutive-skips", type=int, default=4)
+    parser.add_argument("--probe-interval", type=int, default=8)
     args = parser.parse_args()
 
     profile = detect_device_profile()
@@ -684,6 +723,10 @@ def main():
                         greater_is_better=task_hp.get("greater_is_better", False),
                         init_from_mnli=task_hp.get("init_from_mnli", False),
                         disable_early_stopping=args.no_early_stopping,
+                        target_skip_rate=args.target_skip_rate,
+                        max_consecutive_skips=args.max_consecutive_skips,
+                        probe_interval=args.probe_interval,
+                        policy=args.policy,
                     )
                     all_results.append(result)
                 except Exception as e:
@@ -718,7 +761,8 @@ def main():
                 continue
             accs = [r.get("eval_metrics", {}).get("eval_accuracy",
                 r.get("eval_metrics", {}).get("eval_matthews_correlation",
-                r.get("eval_metrics", {}).get("eval_pearson", 0))) for r in ab_results]
+                r.get("eval_metrics", {}).get("eval_pearson",
+                r.get("eval_metrics", {}).get("eval_f1", 0)))) for r in ab_results]
             kwhs = [r.get("energy_kwh", 0) for r in ab_results]
             lers = [r.get("ler_final", {}).get("ler") for r in ab_results if r.get("ler_final", {}).get("ler") is not None]
             skip_ratios = [r.get("true_skip_instrumentation", {}).get("skip_ratio_by_batch", 0) for r in ab_results]

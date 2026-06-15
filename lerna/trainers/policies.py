@@ -413,13 +413,9 @@ class LERNACalibratedPolicy:
             self._calibrate()
             self._last_calib_step = step
 
-        # Base low-utility decision (quantile-calibrated, not 1e-5)
-        if self.use_ler and ler is not None:
-            base = ler < self.threshold
-        elif self.use_rho_vg:
-            base = rho < self.rho_vg_skip_below
-        else:
-            base = False
+        # Base low-utility decision against the SAME quantile-calibrated
+        # threshold regardless of which signal is active (low signal => skip).
+        base = (sig is not None) and (float(sig) < self.threshold)
 
         # (R4 fix) Confidence-gated burst + forced probe instead of brittle horizon
         if base and self.use_safety_horizon:
@@ -445,3 +441,171 @@ class LERNACalibratedPolicy:
             "observed_skip_rate": self._skips / denom,
             "n_calib_samples": len(self._ler_window),
         }
+
+
+# ---------------------------------------------------------------------------
+# 7) Phase 1.3b+: LERNAHybridPolicy — multi-signal, z-scored, quantile-calibrated.
+#    Beats random/grad_norm by being MORE selective at the SAME skip budget:
+#    skip only steps that are jointly low-utility across LER + rho_VG +
+#    grad_norm + loss-slope. grad_norm is included because it was the strongest
+#    Phase 1.2 signal, so the hybrid is >= grad_norm by design, + LER awareness.
+# ---------------------------------------------------------------------------
+
+class _RollingZ:
+    def __init__(self, maxlen: int = 500):
+        self.buf: List[float] = []
+        self.maxlen = maxlen
+
+    def push_and_z(self, x) -> float:
+        if x is None or not math.isfinite(float(x)):
+            return 0.0
+        self.buf.append(float(x))
+        if len(self.buf) > self.maxlen:
+            self.buf = self.buf[-self.maxlen:]
+        if len(self.buf) < 10:
+            return 0.0
+        mu = float(np.mean(self.buf))
+        sd = float(np.std(self.buf)) + 1e-8
+        return (float(x) - mu) / sd
+
+
+class LERNAHybridPolicy:
+    name = "lerna_hybrid"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        fallback_threshold: float = 0.01,
+        min_step: int = 50,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,
+        use_ler: bool = True,
+        use_rho_vg: bool = True,
+        use_grad_norm: bool = True,
+        use_loss_slope: bool = True,
+        use_safety_horizon: bool = True,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
+        w_ler: float = 1.0,
+        w_rho: float = 1.0,
+        w_grad: float = 1.0,
+        w_slope: float = 1.0,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = target_skip_rate
+        self.min_step = min_step
+        self.calibration_steps = calibration_steps
+        self.recalibrate_every = recalibrate_every
+        self.use_ler = use_ler
+        self.use_rho_vg = use_rho_vg
+        self.use_grad_norm = use_grad_norm
+        self.use_loss_slope = use_loss_slope
+        self.use_safety_horizon = use_safety_horizon
+        self.max_consecutive_skips = max_consecutive_skips
+        self.probe_interval = probe_interval
+        self.w_ler, self.w_rho = w_ler, w_rho
+        self.w_grad, self.w_slope = w_grad, w_slope
+
+        self._zl, self._zr = _RollingZ(), _RollingZ()
+        self._zg, self._zs = _RollingZ(), _RollingZ()
+        self._score_window: List[float] = []
+        self._threshold: Optional[float] = None
+        self._calibrated = False
+        self._last_calib = 0
+        self._grad_norm_last: Optional[float] = None
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+        self._skips = 0
+        self._opportunities = 0
+
+    # Fed by _GradNormCapture on real backward steps.
+    def record_grad_norm(self, v) -> None:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0:
+            self._grad_norm_last = v
+
+    def _utility(self, ler, rho) -> Optional[float]:
+        """HIGH utility (productive) => HIGH score. Skip when score < threshold."""
+        parts: List[float] = []
+        if self.use_ler and ler is not None:
+            parts.append(self.w_ler * self._zl.push_and_z(ler))
+        if self.use_rho_vg and rho is not None:
+            parts.append(self.w_rho * self._zr.push_and_z(rho))
+        if self.use_grad_norm and self._grad_norm_last is not None:
+            parts.append(self.w_grad * self._zg.push_and_z(self._grad_norm_last))
+        if self.use_loss_slope:
+            lh = getattr(self.trk, "loss_history", None)
+            if lh and len(lh) >= 2:
+                slope = float(lh[-2]) - float(lh[-1])
+                parts.append(self.w_slope * self._zs.push_and_z(slope))
+        if not parts:
+            return None
+        return float(np.mean(parts))
+
+    def _recalibrate(self):
+        if len(self._score_window) >= max(20, self.calibration_steps // 2):
+            self._threshold = float(np.nanpercentile(
+                self._score_window, self.target_skip_rate * 100))
+            self._calibrated = True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        step = trainer.state.global_step
+        self._opportunities += 1
+        if step < self.min_step:
+            self._consecutive_skips = 0
+            return False
+
+        diag = self.trk.get_diagnostics()
+        ler = diag.get("ler")
+        rho = diag.get("rho_vg", 0.0) or 0.0
+
+        score = self._utility(ler, rho)
+        if score is not None:
+            self._score_window.append(score)
+            if len(self._score_window) > 2000:
+                self._score_window = self._score_window[-2000:]
+
+        if not self._calibrated and len(self._score_window) >= self.calibration_steps:
+            self._recalibrate()
+            self._last_calib = step
+            return False
+        if not self._calibrated:
+            return False
+        if self.recalibrate_every and (step - self._last_calib) >= self.recalibrate_every:
+            self._recalibrate()
+            self._last_calib = step
+
+        base = (score is not None) and (score < self._threshold)
+
+        # Confidence-gated burst + forced probe.
+        if base and self.use_safety_horizon:
+            cap = self.max_consecutive_skips if rho > 0.2 else max(1, self.max_consecutive_skips // 2)
+            if self._consecutive_skips >= cap or self._steps_since_probe >= self.probe_interval:
+                base = False
+
+        if base:
+            self._consecutive_skips += 1
+            self._steps_since_probe += 1
+            self._skips += 1
+        else:
+            self._consecutive_skips = 0
+            self._steps_since_probe = 0
+        return base
+
+    def get_diagnostics(self) -> dict:
+        denom = max(self._opportunities, 1)
+        return {
+            "calibrated": self._calibrated,
+            "threshold": self._threshold,
+            "observed_skip_rate": self._skips / denom,
+            "n_calib_samples": len(self._score_window),
+            "signals": {
+                "ler": self.use_ler, "rho_vg": self.use_rho_vg,
+                "grad_norm": self.use_grad_norm, "loss_slope": self.use_loss_slope,
+            },
+        }
+
