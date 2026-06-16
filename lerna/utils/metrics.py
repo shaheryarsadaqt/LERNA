@@ -358,6 +358,7 @@ class LERTracker:
         self.loss_history: List[float] = []
         self.entropy_history: List[float] = []
         self.ler_history: List[float] = []
+        self.ler_raw_history: List[float] = []  # pre-EMA, pre-window (per-step ranking)
         self.accuracy_history: List[float] = []
         
         self.velocity_history: List[float] = []
@@ -491,6 +492,7 @@ class LERTracker:
             # [SIGNAL HYGIENE] Floor + light EMA so noisy per-step loss_gain=0
             # doesn't flood the quantile calibration window with exact zeros.
             ler = max(float(ler), 1e-8)
+            self.ler_raw_history.append(ler)        # NEW: store BEFORE smoothing
             if self.ler_history:
                 ler = 0.7 * self.ler_history[-1] + 0.3 * ler
             self.ler_history.append(ler)
@@ -834,7 +836,9 @@ class LERTracker:
         
         return {
             "ler": ler,
+            "ler_raw": self.ler_raw_history[-1] if self.ler_raw_history else None,
             "rho_vg": rho_vg,
+            "rho_vg_raw": self.rho_vg_history[-1] if self.rho_vg_history else None,
             "param_velocity": velocity,
             "phase": phase,
             "is_plateau": is_plateau,

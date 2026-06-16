@@ -302,7 +302,7 @@ def run_ablation_single(
     metric_for_best_model: str = "eval_loss",
     greater_is_better: bool = False,
     init_from_mnli: bool = False,
-    disable_early_stopping: bool = False,
+    no_early_stopping: bool = False,
     target_skip_rate: float = 0.20,
     max_consecutive_skips: int = 4,
     probe_interval: int = 8,
@@ -424,21 +424,24 @@ def run_ablation_single(
     control = ablation_overrides.get("control")
     if control == "random_skip":
         skip_policy = RandomSkipPolicy(
-            target_skip_rate=args.target_skip_rate, min_step=50, seed=seed,
+            target_skip_rate=target_skip_rate,
+            min_step=50,
+            seed=seed,
+            total_steps=total_steps,
         )
     elif control == "grad_norm":
         skip_policy = GradNormSkipPolicy(
-            target_skip_rate=args.target_skip_rate, min_step=50,
-            calibration_steps=60, recalibrate_every=200,
-            max_consecutive_skips=args.max_consecutive_skips,
+            target_skip_rate=target_skip_rate,
+            min_step=50,
+            calibration_steps=60,
+            recalibrate_every=200,
+            max_consecutive_skips=max_consecutive_skips,
         )
     else:
-        # ALL LERNA arms (full_lerna + every ablation) share ONE controller.
-        # Each ablation toggles exactly one flag => deltas are attributable.
-        PolicyCls = LERNAHybridPolicy if args.policy == "hybrid" else LERNACalibratedPolicy
+        PolicyCls = LERNAHybridPolicy if policy == "hybrid" else LERNACalibratedPolicy
         skip_policy = PolicyCls(
             ler_tracker=ler_tracker,
-            target_skip_rate=args.target_skip_rate,
+            target_skip_rate=target_skip_rate,
             fallback_threshold=base_thr,
             min_step=50,
             calibration_steps=60,
@@ -446,8 +449,8 @@ def run_ablation_single(
             use_ler=use_ler,
             use_rho_vg=use_rho_vg,
             use_safety_horizon=use_safety_horizon,
-            max_consecutive_skips=args.max_consecutive_skips,
-            probe_interval=args.probe_interval,
+            max_consecutive_skips=max_consecutive_skips,
+            probe_interval=probe_interval,
         )
 
     ler_feed_callback = LERFeedCallback(
@@ -527,17 +530,22 @@ def run_ablation_single(
         compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
         capture_logits=True,
-        callbacks=(
-            ([] if disable_early_stopping
-             else [EarlyStoppingCallback(early_stopping_patience=early_stopping_patience)])
-            + [power_callback, ler_feed_callback, diag_callback]
-        ),
+        callbacks=[
+            power_callback,
+            ler_feed_callback,
+            diag_callback,
+        ] if no_early_stopping else [
+            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
+            power_callback,
+            ler_feed_callback,
+            diag_callback,
+        ],
     )
     ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
 
-    if hasattr(skip_policy, "record_grad_norm"):
-        trainer.add_callback(_GradNormCapture(skip_policy))
+    # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
+    # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
 
     start_time = time.time()
     print(f"\n  Starting ablation [{ablation_name}]: {total_steps} steps, eval every {eval_steps}")
@@ -722,7 +730,7 @@ def main():
                         metric_for_best_model=task_hp.get("metric_for_best_model", "eval_loss"),
                         greater_is_better=task_hp.get("greater_is_better", False),
                         init_from_mnli=task_hp.get("init_from_mnli", False),
-                        disable_early_stopping=args.no_early_stopping,
+                        no_early_stopping=args.no_early_stopping,
                         target_skip_rate=args.target_skip_rate,
                         max_consecutive_skips=args.max_consecutive_skips,
                         probe_interval=args.probe_interval,

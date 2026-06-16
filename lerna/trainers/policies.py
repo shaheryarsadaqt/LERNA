@@ -173,15 +173,71 @@ class GradNormSkipPolicy:
 class RandomSkipPolicy:
     name = "random_skip"
 
-    def __init__(self, target_skip_rate: float = 0.22, min_step: int = 100, seed: int = 42):
-        self.target_skip_rate = target_skip_rate
-        self.min_step = min_step
+    def __init__(
+        self,
+        target_skip_rate: float = 0.22,
+        min_step: int = 100,
+        seed: int = 42,
+        total_steps: Optional[int] = None,
+    ):
+        self.target_skip_rate = float(target_skip_rate)
+        self.min_step = int(min_step)
+        self.total_steps = total_steps
         self._rng = random.Random(seed)
 
+        self._skip_set = None
+        self._quota_total_steps = None
+        self._quota_size = None
+
+        self._decision_idx = -1
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+
+    def _build_skip_set(self, total_steps: int):
+        total_steps = int(total_steps)
+        eligible = list(range(self.min_step, total_steps))
+
+        # Match the reported overall skip ratio, not only post-warmup ratio.
+        k = int(round(self.target_skip_rate * total_steps))
+        k = min(k, len(eligible))
+
+        self._skip_set = set(self._rng.sample(eligible, k)) if k > 0 else set()
+        self._quota_total_steps = total_steps
+        self._quota_size = k
+
     def should_skip(self, trainer, model, inputs) -> bool:
-        if trainer.state.global_step < self.min_step:
+        self._decision_idx += 1
+        self._decisions_seen += 1
+
+        if self._decision_idx < self.min_step:
             return False
-        return self._rng.random() < self.target_skip_rate
+
+        if self._skip_set is None:
+            runtime_total = getattr(getattr(trainer, "state", None), "max_steps", None)
+            total = runtime_total or self.total_steps
+            if total is not None and int(total) > self.min_step:
+                self._build_skip_set(int(total))
+
+        if self._skip_set is not None:
+            decision = self._decision_idx in self._skip_set
+        else:
+            decision = self._rng.random() < self.target_skip_rate
+
+        if decision:
+            self._skip_decisions += 1
+
+        return decision
+
+    def get_diagnostics(self):
+        return {
+            "target_skip_rate": self.target_skip_rate,
+            "min_step": self.min_step,
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "realized_skip_rate": self._skip_decisions / max(1, self._decisions_seen),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -487,10 +543,10 @@ class LERNAHybridPolicy:
         use_safety_horizon: bool = True,
         max_consecutive_skips: int = 4,
         probe_interval: int = 8,
-        w_ler: float = 1.0,
-        w_rho: float = 1.0,
-        w_grad: float = 1.0,
-        w_slope: float = 1.0,
+        w_ler: float = 0.5,    # weak/smooth signal — keep small
+        w_rho: float = 0.0,    # rho_VG moved to SAFETY VETO, not utility
+        w_grad: float = 2.0,   # strongest signal once it's the TRUE pre-clip norm
+        w_slope: float = 1.5,  # only genuinely per-step signal (raw loss slope)
     ):
         self.trk = ler_tracker
         self.target_skip_rate = target_skip_rate
@@ -529,12 +585,12 @@ class LERNAHybridPolicy:
             self._grad_norm_last = v
 
     def _utility(self, ler, rho) -> Optional[float]:
-        """HIGH utility (productive) => HIGH score. Skip when score < threshold."""
+        """HIGH utility (productive) => HIGH score. Skip when score < threshold.
+        rho_VG is intentionally NOT a utility term here — it is used as a
+        safety veto in should_skip() instead (low/negative rho = thrashing)."""
         parts: List[float] = []
-        if self.use_ler and ler is not None:
+        if self.use_ler and self.w_ler > 0 and ler is not None:
             parts.append(self.w_ler * self._zl.push_and_z(ler))
-        if self.use_rho_vg and rho is not None:
-            parts.append(self.w_rho * self._zr.push_and_z(rho))
         if self.use_grad_norm and self._grad_norm_last is not None:
             parts.append(self.w_grad * self._zg.push_and_z(self._grad_norm_last))
         if self.use_loss_slope:
@@ -560,8 +616,8 @@ class LERNAHybridPolicy:
             return False
 
         diag = self.trk.get_diagnostics()
-        ler = diag.get("ler")
-        rho = diag.get("rho_vg", 0.0) or 0.0
+        ler = diag.get("ler_raw", diag.get("ler"))            # per-step, not smoothed
+        rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
 
         score = self._utility(ler, rho)
         if score is not None:
@@ -580,6 +636,11 @@ class LERNAHybridPolicy:
             self._last_calib = step
 
         base = (score is not None) and (score < self._threshold)
+
+        # SAFETY VETO: never skip when velocity fights the update (thrashing),
+        # because momentum extrapolation on a skipped step is then risky.
+        if base and rho < 0.0:
+            base = False
 
         # Confidence-gated burst + forced probe.
         if base and self.use_safety_horizon:

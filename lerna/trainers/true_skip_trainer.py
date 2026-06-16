@@ -357,6 +357,17 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.accelerator.backward(loss)
         self.instr.backward_calls += 1
 
+        # --- SINGLE SOURCE OF TRUTH: pre-clip grad norm (before HF clips) ---
+        with torch.no_grad():
+            sq = 0.0
+            for p in model.parameters():
+                if p.requires_grad and p.grad is not None:
+                    sq += float(p.grad.detach().float().norm()) ** 2
+            self._pre_clip_grad_norm = sq ** 0.5
+        pol = self.skip_policy
+        if hasattr(pol, "record_grad_norm"):
+            pol.record_grad_norm(self._pre_clip_grad_norm)
+
         # Return the un-scaled detached loss for logging consistency.
         return loss.detach()
 
