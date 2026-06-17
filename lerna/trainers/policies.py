@@ -937,3 +937,299 @@ class LERNAQuotaHybridPolicy:
             "non_skip_score_mean": float(np.mean(self._nonselected)) if self._nonselected else None,
         }
 
+
+# ---------------------------------------------------------------------------
+# 9) Fix 8: LERNAGuardedStochasticPolicy — Guarded Stratified Random LERNA
+# ---------------------------------------------------------------------------
+
+class LERNAGuardedStochasticPolicy:
+    """Fix 8: Guarded Stratified Random LERNA (--policy guarded_hybrid).
+
+    Keep random's diversity; use LERNA signals ONLY as hard vetoes that forbid
+    skipping clearly-important steps. Among SAFE candidates, skip stochastically
+    at budget pressure with per-window stratification (matched budget + spread).
+
+    Signals are rolling PERCENTILE RANKS (relative to recent history) so vetoes
+    are scale-free and do not bias skips toward late training.
+
+    risk_gamma == 0.0  -> pure guarded random (strongest hypothesis)
+    risk_gamma  > 0.0  -> soft, budget-preserving bias toward lower-harm steps
+    """
+    name = "lerna_guarded_hybrid"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        window_size: int = 40,
+        window_quota_slack: int = 1,          # [#4] headroom so cap isn't razor-tight
+        max_consecutive_skips: int = 1,
+        probe_interval: int = 8,
+        grad_rank_veto: float = 0.80,
+        loss_rank_veto: float = 0.75,
+        ler_rank_veto: float = 0.80,
+        rho_veto_threshold: float = -0.2,
+        spike_factor: float = 0.25,
+        use_grad_norm: bool = True,
+        use_loss_rank: bool = True,
+        use_ler: bool = True,
+        use_rho_vg: bool = True,
+        use_safety_horizon: bool = True,      # [#3] threaded from ablation overrides
+        risk_gamma: float = 0.0,
+        guard_mode: str = "on",              # "on" = full guarded logic; "off" = pure quota random (debug)
+        # ctor-compat (unused) so the runner can pass shared kwargs
+        fallback_threshold: float = 0.01,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = float(target_skip_rate)
+        self.total_steps = total_steps
+        self.min_step = int(min_step)
+        self.window_size = int(window_size)
+        self.window_quota_slack = int(window_quota_slack)
+        self.max_consecutive_skips = int(max_consecutive_skips)
+        self.probe_interval = int(probe_interval)
+        self.grad_rank_veto = float(grad_rank_veto)
+        self.loss_rank_veto = float(loss_rank_veto)
+        self.ler_rank_veto = float(ler_rank_veto)
+        self.rho_veto_threshold = float(rho_veto_threshold)
+        self.spike_factor = float(spike_factor)
+        self.use_grad_norm = use_grad_norm
+        self.use_loss_rank = use_loss_rank
+        self.use_ler = use_ler
+        self.use_rho_vg = use_rho_vg
+        self.use_safety_horizon = use_safety_horizon
+        self.risk_gamma = float(risk_gamma)
+        self.guard_mode = guard_mode
+
+        self._rng = random.Random(seed)
+        self._rg = _RollingRank()      # grad norm
+        self._rloss = _RollingRank()   # current loss
+        self._rler = _RollingRank()    # LER
+
+        self._grad_norm_last: Optional[float] = None
+        self._grad_norm_is_stale = False
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+
+        self._quota_total_steps: Optional[int] = None
+
+        self._warmup_veto = self._rho_veto = self._grad_veto = 0
+        self._loss_veto = self._ler_veto = self._spike_veto = 0
+        self._max_consec_veto = self._probe_veto = self._missing_veto = 0
+        self._window_cap_veto = self._quota_exhausted = self._forced_tail = 0
+        self._random_safe_skip = self._safe_candidates_seen = 0
+
+        self._last_harm = None
+        self._grad_rank_last = self._loss_rank_last = self._ler_rank_last = None
+        self._rho_last = None
+        self._selected: List[float] = []
+        self._nonselected: List[float] = []
+
+    # fed by TrueBackwardSkippingTrainer.training_step on real backward steps
+    def record_grad_norm(self, v) -> None:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0:
+            self._grad_norm_last = v
+            self._grad_norm_is_stale = False
+
+    def record_loss(self, v) -> None:   # ctor-compat with LERFeedCallback
+        pass
+
+    def _mark_real(self):
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+
+    def _do_skip(self):
+        self._skip_decisions += 1
+        self._window_skips += 1
+        self._consecutive_skips += 1
+        self._steps_since_probe += 1
+        self._grad_norm_is_stale = True
+        if self._last_harm is not None:
+            self._selected.append(self._last_harm)
+        return True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        di = self._decisions_seen
+        self._decisions_seen += 1
+
+        self._quota_size: Optional[int] = None
+        self._window_quota = 1
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._cur_window = -1
+        self._window_skips = 0
+
+        # lazy EXACT quota from runtime max_steps (same source as random_skip)
+        if self._quota_size is None:
+            rt = getattr(getattr(trainer, "state", None), "max_steps", None)
+            total = rt or self.total_steps
+            if total:
+                self._quota_total_steps = int(total)
+                self._quota_size = int(round(self.target_skip_rate * int(total)))
+                self._window_quota = max(
+                    1, int(math.ceil(self.target_skip_rate * self.window_size))
+                       + self.window_quota_slack)
+
+        if di < self.min_step:
+            self._warmup_veto += 1
+            self._mark_real(); return False
+
+        # ---- guard_mode "off": pure quota random (debug bypass) ----
+        if self.guard_mode == "off":
+            if self._quota_size is not None and self._skip_decisions >= self._quota_size:
+                self._quota_exhausted += 1
+                self._mark_real()
+                return False
+
+            if self.use_safety_horizon and self._consecutive_skips >= self.max_consecutive_skips:
+                self._max_consec_veto += 1
+                self._mark_real()
+                return False
+
+            remaining_skips = self._quota_size - self._skip_decisions
+            remaining_decisions = max(self._quota_total_steps - self._decisions_seen, 1)
+
+            if remaining_skips >= remaining_decisions:
+                self._forced_tail += 1
+                return self._do_skip()
+
+            p = remaining_skips / remaining_decisions
+            if self._rng.random() < p:
+                self._random_safe_skip += 1
+                return self._do_skip()
+
+            self._mark_real()
+            return False
+
+        diag = self.trk.get_diagnostics()
+        ler = diag.get("ler_raw", diag.get("ler"))
+        rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
+        self._rho_last = rho
+
+        if self.use_safety_horizon:
+            if self._consecutive_skips >= self.max_consecutive_skips:
+                self._max_consec_veto += 1; self._mark_real(); return False
+            if self._steps_since_probe >= self.probe_interval:
+                self._probe_veto += 1; self._mark_real(); return False
+
+        grad_rank = self._rg.push_and_rank(self._grad_norm_last) if self.use_grad_norm else 0.5
+        lh = getattr(self.trk, "loss_history", None)
+        cur_loss = float(lh[-1]) if lh else None
+        loss_rank = (self._rloss.push_and_rank(cur_loss)
+                     if (self.use_loss_rank and cur_loss is not None) else 0.5)
+        ler_rank = self._rler.push_and_rank(ler) if self.use_ler else 0.5
+
+        if grad_rank is None:
+            self._missing_veto += 1; self._mark_real(); return False
+        lr_ = loss_rank if loss_rank is not None else 0.5
+        er_ = ler_rank if ler_rank is not None else 0.5
+
+        harm = 0.5 * grad_rank + 0.3 * lr_ + 0.2 * er_
+        self._last_harm = harm
+        self._grad_rank_last, self._loss_rank_last, self._ler_rank_last = grad_rank, lr_, er_
+
+        spike = False
+        if lh and len(lh) >= 6 and cur_loss is not None:
+            ema = float(np.mean(lh[-6:-1]))
+            spike = cur_loss > ema * (1.0 + self.spike_factor)
+
+        # ---- HARD SAFETY VETOES: never skip a clearly-important step ----
+        if self.use_rho_vg and rho < self.rho_veto_threshold:
+            self._rho_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+        if self.use_grad_norm and grad_rank > self.grad_rank_veto:
+            self._grad_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+        if self.use_loss_rank and lr_ > self.loss_rank_veto:
+            self._loss_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+        if self.use_ler and er_ > self.ler_rank_veto:
+            self._ler_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+        if spike:
+            self._spike_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+
+
+        self._safe_candidates_seen += 1
+
+        # ---- quota accounting ----
+        remaining_skips = (self._quota_size - self._skip_decisions) if self._quota_size is not None else None
+        if remaining_skips is not None and remaining_skips <= 0:
+            self._quota_exhausted += 1; self._mark_real(); self._nonselected.append(harm); return False
+        remaining_decisions = (max(self._quota_total_steps - self._decisions_seen, 0)
+                               if self._quota_total_steps is not None else None)
+
+        # window bookkeeping
+        w = di // self.window_size
+        if w != self._cur_window:
+            self._cur_window = w
+            self._window_skips = 0
+
+        # [#4] force-skip tail FIRST so exact global quota beats stratification
+        if (remaining_skips is not None and remaining_decisions is not None
+                and remaining_skips >= remaining_decisions):
+            self._forced_tail += 1
+            return self._do_skip()
+
+        # window cap (stratification) — prevents late-training skip bursts
+        if self._window_skips >= self._window_quota:
+            self._window_cap_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+
+        # ---- stochastic acceptance at budget pressure (DIVERSITY) ----
+        if remaining_decisions and remaining_decisions > 0 and remaining_skips is not None:
+            pressure = remaining_skips / remaining_decisions
+        else:
+            pressure = self.target_skip_rate
+        p = pressure * (1.0 + self.risk_gamma * (0.5 - harm))   # gamma=0 -> pure guarded random
+        p = min(max(p, 0.0), 1.0)
+
+        if self._rng.random() < p:
+            self._random_safe_skip += 1
+            return self._do_skip()
+        self._mark_real(); self._nonselected.append(harm); return False
+
+    def get_diagnostics(self) -> dict:
+        denom = max(self._decisions_seen, 1)
+        return {
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "window_size": self.window_size,
+            "window_quota": self._window_quota,
+            "current_window": self._cur_window,
+            "window_skips": self._window_skips,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "realized_skip_rate": self._skip_decisions / denom,
+            "safe_candidates_seen": self._safe_candidates_seen,
+            "warmup_veto_count": self._warmup_veto,
+            "rho_veto_count": self._rho_veto,
+            "grad_veto_count": self._grad_veto,
+            "loss_veto_count": self._loss_veto,
+            "ler_veto_count": self._ler_veto,
+            "spike_veto_count": self._spike_veto,
+            "max_consecutive_veto_count": self._max_consec_veto,
+            "probe_veto_count": self._probe_veto,
+            "missing_signal_veto_count": self._missing_veto,
+            "window_cap_veto_count": self._window_cap_veto,
+            "quota_exhausted_count": self._quota_exhausted,
+            "forced_tail_skip_count": self._forced_tail,
+            "random_safe_skip_count": self._random_safe_skip,
+            "risk_gamma": self.risk_gamma,
+            "guard_mode": self.guard_mode,
+            "grad_rank_last": self._grad_rank_last,
+            "loss_rank_last": self._loss_rank_last,
+            "ler_rank_last": self._ler_rank_last,
+            "rho_last": self._rho_last,
+            "grad_norm_last": self._grad_norm_last,
+            "grad_norm_is_stale": self._grad_norm_is_stale,
+            "skipped_risk_mean": float(np.mean(self._selected)) if self._selected else None,
+            "non_skipped_risk_mean": float(np.mean(self._nonselected)) if self._nonselected else None,
+        }
+

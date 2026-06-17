@@ -59,6 +59,7 @@ from lerna.utils.metrics import LERTracker
 from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
+    LERNAGuardedStochasticPolicy,
     RandomSkipPolicy, GradNormSkipPolicy,
 )
 from transformers import TrainerCallback
@@ -309,6 +310,7 @@ def run_ablation_single(
     probe_interval: int = 8,
     policy: str = "hybrid",
     rho_veto_threshold: float = -0.2,
+    risk_gamma: float = 0.0,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -440,7 +442,22 @@ def run_ablation_single(
             max_consecutive_skips=max_consecutive_skips,
         )
     else:
-        if policy == "quota_hybrid":
+        if policy == "guarded_hybrid":
+            skip_policy = LERNAGuardedStochasticPolicy(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                min_step=50,
+                seed=seed,
+                max_consecutive_skips=max_consecutive_skips,
+                probe_interval=probe_interval,
+                rho_veto_threshold=rho_veto_threshold,
+                use_ler=use_ler,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,   # [#3]
+                risk_gamma=risk_gamma,                   # [#1] from func param
+            )
+        elif policy == "quota_hybrid":
             skip_policy = LERNAQuotaHybridPolicy(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
@@ -668,8 +685,9 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
-    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid"], default="hybrid")
+    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid"], default="hybrid")
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
+    parser.add_argument("--risk-gamma", type=float, default=0.0)
     parser.add_argument("--target-skip-rate", type=float, default=0.20)
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
@@ -764,6 +782,7 @@ def main():
                         probe_interval=args.probe_interval,
                         policy=args.policy,
                         rho_veto_threshold=args.rho_veto_threshold,
+                        risk_gamma=args.risk_gamma,
                     )
                     all_results.append(result)
                 except Exception as e:

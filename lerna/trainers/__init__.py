@@ -14,6 +14,7 @@ from .policies import (
     LERNACalibratedPolicy,
     LERNAHybridPolicy,
     LERNAQuotaHybridPolicy,
+    LERNAGuardedStochasticPolicy,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "LERNACalibratedPolicy",
     "LERNAHybridPolicy",
     "LERNAQuotaHybridPolicy",
+    "LERNAGuardedStochasticPolicy",
 ]
