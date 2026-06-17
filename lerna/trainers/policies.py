@@ -1017,6 +1017,17 @@ class LERNAGuardedStochasticPolicy:
         self._steps_since_probe = 0
 
         self._quota_total_steps: Optional[int] = None
+        self._quota_size: Optional[int] = None
+        self._window_quota = 1
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._cur_window = -1
+        self._window_skips = 0
+
+        self._pressure_last = None
+        self._probability_last = None
+        self._random_draw_last = None
+        self._reached_sampling_count = 0
 
         self._warmup_veto = self._rho_veto = self._grad_veto = 0
         self._loss_veto = self._ler_veto = self._spike_veto = 0
@@ -1060,13 +1071,6 @@ class LERNAGuardedStochasticPolicy:
     def should_skip(self, trainer, model, inputs) -> bool:
         di = self._decisions_seen
         self._decisions_seen += 1
-
-        self._quota_size: Optional[int] = None
-        self._window_quota = 1
-        self._decisions_seen = 0
-        self._skip_decisions = 0
-        self._cur_window = -1
-        self._window_skips = 0
 
         # lazy EXACT quota from runtime max_steps (same source as random_skip)
         if self._quota_size is None:
