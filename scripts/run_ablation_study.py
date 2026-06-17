@@ -311,7 +311,7 @@ def run_ablation_single(
     policy: str = "hybrid",
     rho_veto_threshold: float = -0.2,
     risk_gamma: float = 0.0,
-    guard_mode: str = "off",
+    guard_mode: str = "on",
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -457,7 +457,7 @@ def run_ablation_single(
                 use_rho_vg=use_rho_vg,
                 use_safety_horizon=use_safety_horizon,   # [#3]
                 risk_gamma=risk_gamma,                   # [#1] from func param
-                guard_mode=guard_mode,                   # "on"/"off" from CLI
+                guard_mode=guard_mode,                   # [Fix 8c] on=guarded, off=pure quota random
             )
         elif policy == "quota_hybrid":
             skip_policy = LERNAQuotaHybridPolicy(
@@ -690,8 +690,8 @@ def main():
     parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid"], default="hybrid")
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--risk-gamma", type=float, default=0.0)
-    parser.add_argument("--guard-mode", choices=["on", "off"], default="off",
-                        help="guarded_hybrid: 'on'=full guard logic, 'off'=pure quota random (debug)")
+    parser.add_argument("--guard-mode", choices=["on", "off"], default="on",
+                        help="on=full guarded stochastic LERNA; off=pure exact-quota random (debug parity check)")
     parser.add_argument("--target-skip-rate", type=float, default=0.20)
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
