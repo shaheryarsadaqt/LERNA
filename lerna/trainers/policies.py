@@ -1162,39 +1162,49 @@ class LERNAGuardedStochasticPolicy:
             ema = float(np.mean(lh[-6:-1]))
             spike = cur_loss > ema * (1.0 + self.spike_factor)
 
-        # ---- HARD SAFETY VETOES: never skip a clearly-important step ----
-        if self.use_rho_vg and rho < self.rho_veto_threshold:
-            self._rho_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
-        if self.use_grad_norm and grad_rank > self.grad_rank_veto:
-            self._grad_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
-        if self.use_loss_rank and lr_ > self.loss_rank_veto:
-            self._loss_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
-        if self.use_ler and er_ > self.ler_rank_veto:
-            self._ler_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
-        if spike:
-            self._spike_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
-
-
-        self._safe_candidates_seen += 1
-
-        # ---- quota accounting ----
+        # ---- quota accounting (computed BEFORE soft vetoes so the global
+        #      budget can always be met at the tail) ----
         remaining_skips = (self._quota_size - self._skip_decisions) if self._quota_size is not None else None
         if remaining_skips is not None and remaining_skips <= 0:
             self._quota_exhausted += 1; self._mark_real(); self._nonselected.append(harm); return False
         remaining_decisions = (max(self._quota_total_steps - self._decisions_seen, 0)
                                if self._quota_total_steps is not None else None)
 
+        # forced-tail regime: not enough decisions left to hit the quota
+        # otherwise. Here the matched budget takes priority over the SOFT
+        # rank vetoes (grad/loss/ler) and the window cap — but NOT over the
+        # genuine-danger guards (rho, spike, max_consecutive) above/below.
+        forced_tail = (remaining_skips is not None and remaining_decisions is not None
+                       and remaining_skips >= remaining_decisions)
+
+        # ---- HARD danger vetoes: never skip these, even at the tail ----
+        if self.use_rho_vg and rho < self.rho_veto_threshold:
+            self._rho_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+        if spike:
+            self._spike_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+
+        # ---- SOFT rank vetoes: the actual "guarding". Bypassed only in the
+        #      forced-tail regime so matched budget is preserved. ----
+        if not forced_tail:
+            if self.use_grad_norm and grad_rank > self.grad_rank_veto:
+                self._grad_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+            if self.use_loss_rank and lr_ > self.loss_rank_veto:
+                self._loss_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+            if self.use_ler and er_ > self.ler_rank_veto:
+                self._ler_veto += 1; self._mark_real(); self._nonselected.append(harm); return False
+
+        self._safe_candidates_seen += 1
+
+        # [#4] force-skip tail so exact global quota beats stratification
+        if forced_tail:
+            self._forced_tail += 1
+            return self._do_skip()
+
         # window bookkeeping
         w = di // self.window_size
         if w != self._cur_window:
             self._cur_window = w
             self._window_skips = 0
-
-        # [#4] force-skip tail FIRST so exact global quota beats stratification
-        if (remaining_skips is not None and remaining_decisions is not None
-                and remaining_skips >= remaining_decisions):
-            self._forced_tail += 1
-            return self._do_skip()
 
         # window cap (stratification) — prevents late-training skip bursts
         if self._window_skips >= self._window_quota:
