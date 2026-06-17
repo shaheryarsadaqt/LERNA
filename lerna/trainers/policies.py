@@ -1106,15 +1106,24 @@ class LERNAGuardedStochasticPolicy:
                 self._mark_real()
                 return False
 
-            remaining_skips = self._quota_size - self._skip_decisions
-            remaining_decisions = max(self._quota_total_steps - self._decisions_seen, 1)
+            remaining_skips = (self._quota_size - self._skip_decisions
+                               if self._quota_size is not None else 0)
+            remaining_decisions = (max(self._quota_total_steps - self._decisions_seen, 1)
+                                   if self._quota_total_steps is not None else 1)
 
+            self._reached_sampling_count += 1
             if remaining_skips >= remaining_decisions:
+                self._pressure_last = 1.0
+                self._probability_last = 1.0
                 self._forced_tail += 1
                 return self._do_skip()
 
             p = remaining_skips / remaining_decisions
-            if self._rng.random() < p:
+            self._pressure_last = p
+            self._probability_last = p
+            draw = self._rng.random()
+            self._random_draw_last = draw
+            if draw < p:
                 self._random_safe_skip += 1
                 return self._do_skip()
 
