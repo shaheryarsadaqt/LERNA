@@ -670,3 +670,270 @@ class LERNAHybridPolicy:
             },
         }
 
+
+
+# ---------------------------------------------------------------------------
+# 8) Fix 7: LERNAQuotaHybridPolicy — exact-quota, two-stage (filter -> rank).
+#    Stage 1 safety vetoes (rho = SAFETY only). Stage 2 fills an exact skip
+#    budget with the LOWEST predicted-harm steps using rolling PERCENTILE RANKS
+#    (robust to heavy-tailed grad norms) + online quota pressure.
+# ---------------------------------------------------------------------------
+
+class _RollingRank:
+    """Rolling percentile-rank estimator. Robust to heavy tails (rank-based)."""
+    def __init__(self, maxlen: int = 500, warmup: int = 5):
+        self.buf: List[float] = []
+        self.maxlen = maxlen
+        self.warmup = warmup
+
+    def push_and_rank(self, x) -> Optional[float]:
+        if x is None:
+            return None
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(x):
+            return None
+        if len(self.buf) < self.warmup:
+            self.buf.append(x)
+            return 0.5  # neutral until enough history
+        rank = sum(1 for v in self.buf if v <= x) / len(self.buf)
+        self.buf.append(x)
+        if len(self.buf) > self.maxlen:
+            self.buf = self.buf[-self.maxlen:]
+        return rank
+
+
+class LERNAQuotaHybridPolicy:
+    name = "lerna_quota_hybrid"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        fallback_threshold: float = 0.01,   # accepted for ctor-compat (unused)
+        min_step: int = 50,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,       # accepted for ctor-compat (unused)
+        use_ler: bool = True,
+        use_rho_vg: bool = True,            # accepted for ctor-compat
+        use_grad_norm: bool = True,
+        use_loss_slope: bool = True,
+        use_safety_horizon: bool = True,
+        max_consecutive_skips: int = 1,
+        probe_interval: int = 8,
+        total_steps: Optional[int] = None,
+        rho_veto_threshold: float = -0.2,
+        w_grad: float = 0.65,
+        w_slope: float = 0.25,
+        w_ler: float = 0.10,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = float(target_skip_rate)
+        self.min_step = int(min_step)
+        self.calibration_steps = int(calibration_steps)
+        self.use_ler = use_ler
+        self.use_rho_vg = use_rho_vg
+        self.use_grad_norm = use_grad_norm
+        self.use_loss_slope = use_loss_slope
+        self.use_safety_horizon = use_safety_horizon
+        self.max_consecutive_skips = int(max_consecutive_skips)
+        self.probe_interval = int(probe_interval)
+        self.total_steps = total_steps
+        self.rho_veto_threshold = float(rho_veto_threshold)
+        self.w_grad, self.w_slope, self.w_ler = w_grad, w_slope, w_ler
+
+        self._rg, self._rs, self._rl = _RollingRank(), _RollingRank(), _RollingRank()
+        self._harm_window: List[float] = []
+        self._grad_norm_last: Optional[float] = None
+        self._grad_norm_is_stale = False
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+
+        self._quota_total_steps: Optional[int] = None
+        self._quota_size: Optional[int] = None
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._safe_candidates_seen = 0
+
+        self._warmup_veto = self._rho_veto = self._probe_veto = 0
+        self._max_consec_veto = self._missing_veto = self._quota_exhausted = 0
+
+        self._dynamic_threshold: Optional[float] = None
+        self._last_harm: Optional[float] = None
+        self._grad_rank_last = self._slope_rank_last = self._ler_rank_last = None
+        self._rho_last: Optional[float] = None
+        self._selected: List[float] = []
+        self._nonselected: List[float] = []
+
+    # Fed by the trainer on real backward steps (single source of truth).
+    def record_grad_norm(self, v) -> None:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0:
+            self._grad_norm_last = v
+            self._grad_norm_is_stale = False
+
+    def record_loss(self, v) -> None:  # ctor-compat with LERFeedCallback
+        pass
+
+    def _mark_real(self):
+        self._consecutive_skips = 0
+        self._steps_since_probe = 0
+
+    def _do_skip(self):
+        self._skip_decisions += 1
+        self._consecutive_skips += 1
+        self._steps_since_probe += 1
+        self._grad_norm_is_stale = True  # next decision's grad norm is now stale
+        if self._last_harm is not None:
+            self._selected.append(self._last_harm)
+        return True
+
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        decision_idx = self._decisions_seen  # 0-based this decision
+        self._decisions_seen += 1
+
+        # Lazily fix the EXACT quota from runtime max_steps (like random_skip).
+        if self._quota_size is None:
+            rt = getattr(getattr(trainer, "state", None), "max_steps", None)
+            total = rt or self.total_steps
+            if total:
+                self._quota_total_steps = int(total)
+                self._quota_size = int(round(self.target_skip_rate * int(total)))
+
+        # ---------- STAGE 1: SAFETY FILTER ----------
+        # [FIX 1] Use internal decision counter, not trainer.state.global_step.
+        if decision_idx < self.min_step:
+            self._warmup_veto += 1
+            self._mark_real()
+            return False
+
+        diag = self.trk.get_diagnostics()
+        ler = diag.get("ler_raw", diag.get("ler"))
+        rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
+        self._rho_last = rho
+
+        # [FIX 3] Gate safety-specific vetoes behind use_safety_horizon.
+        if self.use_safety_horizon:
+            if self._consecutive_skips >= self.max_consecutive_skips:
+                self._max_consec_veto += 1
+                self._mark_real()
+                return False
+            if self._steps_since_probe >= self.probe_interval:
+                self._probe_veto += 1
+                self._mark_real()
+                return False
+
+        # [FIX 2] rho veto is gated by use_rho_vg for clean ablations.
+        if self.use_rho_vg and rho < self.rho_veto_threshold:
+            self._rho_veto += 1
+            self._mark_real()
+            return False
+
+        # ---------- harm score from PERCENTILE RANKS ----------
+        grad_rank = self._rg.push_and_rank(self._grad_norm_last) if self.use_grad_norm else 0.5
+        slope = None
+        lh = getattr(self.trk, "loss_history", None)
+        if self.use_loss_slope and lh and len(lh) >= 2:
+            slope = float(lh[-2]) - float(lh[-1])  # +ve = improving
+        slope_rank = self._rs.push_and_rank(slope)
+        ler_rank = self._rl.push_and_rank(ler) if self.use_ler else 0.5
+
+        if grad_rank is None:  # grad norm is the dominant signal; don't skip blind
+            self._missing_veto += 1
+            self._mark_real()
+            return False
+
+        sr = slope_rank if slope_rank is not None else 0.5
+        lr_ = ler_rank if ler_rank is not None else 0.5
+        harm = self.w_grad * grad_rank + self.w_slope * sr + self.w_ler * lr_
+        self._last_harm = harm
+        self._grad_rank_last, self._slope_rank_last, self._ler_rank_last = grad_rank, sr, lr_
+        self._safe_candidates_seen += 1
+
+        # ---------- STAGE 2: QUOTA-AWARE RANK SELECTION ----------
+        remaining_skips = (self._quota_size - self._skip_decisions) if self._quota_size is not None else None
+        remaining_decisions = (max(self._quota_total_steps - self._decisions_seen, 0)
+                               if self._quota_total_steps is not None else None)
+
+        if remaining_skips is not None and remaining_skips <= 0:
+            self._quota_exhausted += 1
+            self._mark_real()
+            self._nonselected.append(harm)
+            return False
+
+        # need a harm-history warmup for a meaningful dynamic threshold
+        if len(self._harm_window) < self.calibration_steps:
+            self._harm_window.append(harm)
+            if len(self._harm_window) > 2000:
+                self._harm_window = self._harm_window[-2000:]
+            self._mark_real()
+            self._nonselected.append(harm)
+            return False
+
+        # force-skip tail: must skip everything safe that remains
+        if (remaining_skips is not None and remaining_decisions is not None
+                and remaining_skips >= remaining_decisions):
+            self._harm_window.append(harm)
+            if len(self._harm_window) > 2000:
+                self._harm_window = self._harm_window[-2000:]
+            return self._do_skip()
+
+        if remaining_decisions and remaining_decisions > 0 and remaining_skips is not None:
+            pressure = remaining_skips / remaining_decisions
+        else:
+            pressure = self.target_skip_rate
+        pressure = min(max(pressure, 0.0), 1.0)
+        # [FIX 4] Compute threshold from PREVIOUS harm window (before appending current).
+        self._dynamic_threshold = float(np.nanpercentile(self._harm_window, pressure * 100.0))
+
+        if harm <= self._dynamic_threshold:
+            self._harm_window.append(harm)
+            if len(self._harm_window) > 2000:
+                self._harm_window = self._harm_window[-2000:]
+            return self._do_skip()
+        self._harm_window.append(harm)
+        if len(self._harm_window) > 2000:
+            self._harm_window = self._harm_window[-2000:]
+        self._mark_real()
+        self._nonselected.append(harm)
+        return False
+
+    def get_diagnostics(self) -> dict:
+        hw = self._harm_window
+        denom = max(self._decisions_seen, 1)
+        return {
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "remaining_skips": (self._quota_size - self._skip_decisions) if self._quota_size else None,
+            "realized_skip_rate": self._skip_decisions / denom,
+            "dynamic_threshold": self._dynamic_threshold,
+            "safe_candidates_seen": self._safe_candidates_seen,
+            "warmup_veto_count": self._warmup_veto,
+            "rho_veto_count": self._rho_veto,
+            "probe_veto_count": self._probe_veto,
+            "max_consecutive_veto_count": self._max_consec_veto,
+            "missing_signal_veto_count": self._missing_veto,
+            "quota_exhausted_count": self._quota_exhausted,
+            "harm_score_min": float(np.min(hw)) if hw else None,
+            "harm_score_max": float(np.max(hw)) if hw else None,
+            "harm_score_mean": float(np.mean(hw)) if hw else None,
+            "grad_rank_last": self._grad_rank_last,
+            "slope_rank_last": self._slope_rank_last,
+            "ler_rank_last": self._ler_rank_last,
+            "rho_last": self._rho_last,
+            "grad_norm_last": self._grad_norm_last,
+            "grad_norm_is_stale": self._grad_norm_is_stale,
+            "selected_skip_score_mean": float(np.mean(self._selected)) if self._selected else None,
+            "non_skip_score_mean": float(np.mean(self._nonselected)) if self._nonselected else None,
+        }
+

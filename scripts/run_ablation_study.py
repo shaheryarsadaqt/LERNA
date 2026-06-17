@@ -58,7 +58,8 @@ from lerna.callbacks.ler_feed import LERFeedCallback
 from lerna.utils.metrics import LERTracker
 from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
-    LERNACalibratedPolicy, LERNAHybridPolicy, RandomSkipPolicy, GradNormSkipPolicy,
+    LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
+    RandomSkipPolicy, GradNormSkipPolicy,
 )
 from transformers import TrainerCallback
 
@@ -307,6 +308,7 @@ def run_ablation_single(
     max_consecutive_skips: int = 4,
     probe_interval: int = 8,
     policy: str = "hybrid",
+    rho_veto_threshold: float = -0.2,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -438,20 +440,37 @@ def run_ablation_single(
             max_consecutive_skips=max_consecutive_skips,
         )
     else:
-        PolicyCls = LERNAHybridPolicy if policy == "hybrid" else LERNACalibratedPolicy
-        skip_policy = PolicyCls(
-            ler_tracker=ler_tracker,
-            target_skip_rate=target_skip_rate,
-            fallback_threshold=base_thr,
-            min_step=50,
-            calibration_steps=60,
-            recalibrate_every=200,
-            use_ler=use_ler,
-            use_rho_vg=use_rho_vg,
-            use_safety_horizon=use_safety_horizon,
-            max_consecutive_skips=max_consecutive_skips,
-            probe_interval=probe_interval,
-        )
+        if policy == "quota_hybrid":
+            skip_policy = LERNAQuotaHybridPolicy(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                fallback_threshold=base_thr,
+                min_step=50,
+                calibration_steps=60,
+                recalibrate_every=200,
+                use_ler=use_ler,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                max_consecutive_skips=max_consecutive_skips,
+                probe_interval=probe_interval,
+                total_steps=total_steps,
+                rho_veto_threshold=rho_veto_threshold,
+            )
+        else:
+            PolicyCls = LERNAHybridPolicy if policy == "hybrid" else LERNACalibratedPolicy
+            skip_policy = PolicyCls(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                fallback_threshold=base_thr,
+                min_step=50,
+                calibration_steps=60,
+                recalibrate_every=200,
+                use_ler=use_ler,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                max_consecutive_skips=max_consecutive_skips,
+                probe_interval=probe_interval,
+            )
 
     ler_feed_callback = LERFeedCallback(
         ler_tracker=ler_tracker,
@@ -582,6 +601,14 @@ def run_ablation_single(
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
     }
+    _instr = instrumentation or {}
+    results["skip_ratio"] = _instr.get("skip_ratio_by_batch")
+    results["backward_calls"] = _instr.get("backward_calls")
+    results["skipped_backward_steps"] = _instr.get("skipped_backward_steps")
+    results["forward_calls"] = _instr.get("forward_calls")
+    results["policy_name"] = _instr.get("policy_name") or getattr(skip_policy, "name", None)
+
+
 
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
@@ -641,7 +668,8 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
-    parser.add_argument("--policy", choices=["calibrated", "hybrid"], default="hybrid")
+    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid"], default="hybrid")
+    parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--target-skip-rate", type=float, default=0.20)
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
@@ -735,6 +763,7 @@ def main():
                         max_consecutive_skips=args.max_consecutive_skips,
                         probe_interval=args.probe_interval,
                         policy=args.policy,
+                        rho_veto_threshold=args.rho_veto_threshold,
                     )
                     all_results.append(result)
                 except Exception as e:

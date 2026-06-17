@@ -35,6 +35,9 @@ lightning_logs/
 experiments/
 wandb/
 lightning_logs/
+exp/
+smoke_out/
+smoke_out_nomomentum/
 *.log
 *.csv
 *.json
