@@ -1208,7 +1208,12 @@ class LERNAGuardedStochasticPolicy:
         p = pressure * (1.0 + self.risk_gamma * (0.5 - harm))   # gamma=0 -> pure guarded random
         p = min(max(p, 0.0), 1.0)
 
-        if self._rng.random() < p:
+        self._reached_sampling_count += 1
+        self._pressure_last = pressure
+        self._probability_last = p
+        draw = self._rng.random()
+        self._random_draw_last = draw
+        if draw < p:
             self._random_safe_skip += 1
             return self._do_skip()
         self._mark_real(); self._nonselected.append(harm); return False
