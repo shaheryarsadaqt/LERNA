@@ -1017,6 +1017,12 @@ class LERNAGuardedStochasticPolicy:
         self._steps_since_probe = 0
 
         self._quota_total_steps: Optional[int] = None
+
+        # [Fix 8c] Per-run state counters MUST live in __init__ (they were
+        # erroneously being reset to 0 at the top of every should_skip() call,
+        # which both (a) forced di=0<min_step -> permanent warmup veto and
+        # (b) raised AttributeError before the guard_mode branch was ever
+        # reached -> trainer caught it and never skipped -> skip_ratio=0.0).
         self._quota_size: Optional[int] = None
         self._window_quota = 1
         self._decisions_seen = 0
@@ -1024,9 +1030,10 @@ class LERNAGuardedStochasticPolicy:
         self._cur_window = -1
         self._window_skips = 0
 
-        self._pressure_last = None
-        self._probability_last = None
-        self._random_draw_last = None
+        # debug diagnostics for the stochastic sampler
+        self._pressure_last: Optional[float] = None
+        self._probability_last: Optional[float] = None
+        self._random_draw_last: Optional[float] = None
         self._reached_sampling_count = 0
 
         self._warmup_veto = self._rho_veto = self._grad_veto = 0
