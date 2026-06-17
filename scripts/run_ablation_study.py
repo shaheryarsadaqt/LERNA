@@ -534,7 +534,7 @@ def run_ablation_single(
         save_strategy="steps",
         save_steps=eval_steps,
         save_total_limit=3,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not no_early_stopping,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=greater_is_better,
         logging_steps=max(eval_steps // 5, 1),
