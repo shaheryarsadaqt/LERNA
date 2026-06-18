@@ -59,7 +59,7 @@ from lerna.utils.metrics import LERTracker
 from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
-    LERNAGuardedStochasticPolicy,
+    LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
     RandomSkipPolicy, GradNormSkipPolicy,
 )
 from transformers import TrainerCallback
@@ -466,7 +466,7 @@ def run_ablation_single(
                 fallback_threshold=base_thr,
                 min_step=50,
                 calibration_steps=60,
-                recalibrate_every=200,
+                recalibr_every=200,
                 use_ler=use_ler,
                 use_rho_vg=use_rho_vg,
                 use_safety_horizon=use_safety_horizon,
@@ -474,6 +474,19 @@ def run_ablation_single(
                 probe_interval=probe_interval,
                 total_steps=total_steps,
                 rho_veto_threshold=rho_veto_threshold,
+            )
+        elif policy == "phase_strat":
+            skip_policy = LERNAPhaseStratifiedPolicy(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                min_step=50,
+                seed=seed,
+                max_consecutive_skips=max_consecutive_skips,
+                rho_veto_threshold=rho_veto_threshold,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                risk_gamma=risk_gamma,
             )
         else:
             PolicyCls = LERNAHybridPolicy if policy == "hybrid" else LERNACalibratedPolicy
@@ -629,6 +642,25 @@ def run_ablation_single(
 
 
 
+    try:
+        import subprocess
+        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                  cwd=os.path.dirname(__file__)).decode().strip()
+    except Exception:
+        git_sha = "unknown"
+
+    results["code_git_sha"] = git_sha
+    results["run_config"] = {
+        "policy": policy,
+        "target_skip_rate": target_skip_rate,
+        "max_consecutive_skips": max_consecutive_skips,
+        "probe_interval": probe_interval,
+        "guard_mode": guard_mode,
+        "risk_gamma": risk_gamma,
+        "no_early_stopping": no_early_stopping,
+        "num_epochs": num_epochs,
+    }
+
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
@@ -687,7 +719,7 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
-    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid"], default="hybrid")
+    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid", "phase_strat"], default="hybrid")
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--risk-gamma", type=float, default=0.0)
     parser.add_argument("--guard-mode", choices=["on", "off"], default="on",

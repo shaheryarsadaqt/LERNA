@@ -1005,6 +1005,11 @@ class LERNAGuardedStochasticPolicy:
         self.use_safety_horizon = use_safety_horizon
         self.risk_gamma = float(risk_gamma)
         self.guard_mode = guard_mode
+        self.name = f"lerna_guarded_hybrid_{self.guard_mode}"
+
+        self._off_seed = seed
+        self._off_skip_set = None
+        self._off_skip_set_size = None
 
         self._rng = random.Random(seed)
         self._rg = _RollingRank()      # grad norm
@@ -1079,6 +1084,41 @@ class LERNAGuardedStochasticPolicy:
         di = self._decisions_seen
         self._decisions_seen += 1
 
+        if getattr(self, "guard_mode", None) == "off":
+            if self._off_skip_set is None:
+                total = (
+                    self._quota_total_steps
+                    or getattr(getattr(trainer, "state", None), "max_steps", None)
+                    or getattr(getattr(trainer, "args", None), "max_steps", None)
+                    or self.total_steps
+                )
+
+                if total is None or int(total) <= self.min_step:
+                    raise ValueError(
+                        f"guard_mode=off could not resolve total_steps: "
+                        f"state.max_steps={getattr(getattr(trainer, 'state', None), 'max_steps', None)}, "
+                        f"args.max_steps={getattr(getattr(trainer, 'args', None), 'max_steps', None)}, "
+                        f"self.total_steps={self.total_steps}, "
+                        f"min_step={self.min_step}"
+                    )
+
+                total = int(total)
+                eligible = list(range(self.min_step, total))
+                k = min(int(round(self.target_skip_rate * total)), len(eligible))
+
+                rng = random.Random(self._off_seed)
+                self._off_skip_set = set(rng.sample(eligible, k)) if k > 0 else set()
+
+                self._quota_total_steps = total
+                self._quota_size = k
+                self._off_skip_set_size = len(self._off_skip_set)
+
+            decision = di in self._off_skip_set
+            if decision:
+                self._skip_decisions += 1
+                self._random_safe_skip += 1
+            return decision
+
         # lazy EXACT quota from runtime max_steps (same source as random_skip)
         if self._quota_size is None:
             rt = getattr(getattr(trainer, "state", None), "max_steps", None)
@@ -1093,42 +1133,6 @@ class LERNAGuardedStochasticPolicy:
         if di < self.min_step:
             self._warmup_veto += 1
             self._mark_real(); return False
-
-        # ---- guard_mode "off": pure quota random (debug bypass) ----
-        if self.guard_mode == "off":
-            if self._quota_size is not None and self._skip_decisions >= self._quota_size:
-                self._quota_exhausted += 1
-                self._mark_real()
-                return False
-
-            if self.use_safety_horizon and self._consecutive_skips >= self.max_consecutive_skips:
-                self._max_consec_veto += 1
-                self._mark_real()
-                return False
-
-            remaining_skips = (self._quota_size - self._skip_decisions
-                               if self._quota_size is not None else 0)
-            remaining_decisions = (max(self._quota_total_steps - self._decisions_seen, 1)
-                                   if self._quota_total_steps is not None else 1)
-
-            self._reached_sampling_count += 1
-            if remaining_skips >= remaining_decisions:
-                self._pressure_last = 1.0
-                self._probability_last = 1.0
-                self._forced_tail += 1
-                return self._do_skip()
-
-            p = remaining_skips / remaining_decisions
-            self._pressure_last = p
-            self._probability_last = p
-            draw = self._rng.random()
-            self._random_draw_last = draw
-            if draw < p:
-                self._random_safe_skip += 1
-                return self._do_skip()
-
-            self._mark_real()
-            return False
 
         diag = self.trk.get_diagnostics()
         ler = diag.get("ler_raw", diag.get("ler"))
@@ -1257,7 +1261,8 @@ class LERNAGuardedStochasticPolicy:
             "forced_tail_skip_count": self._forced_tail,
             "random_safe_skip_count": self._random_safe_skip,
             "risk_gamma": self.risk_gamma,
-            "guard_mode": self.guard_mode,
+            "guard_mode": getattr(self, "guard_mode", None),
+            "off_skip_set_size": getattr(self, "_off_skip_set_size", None),
             "pressure_last": self._pressure_last,
             "probability_last": self._probability_last,
             "random_draw_last": self._random_draw_last,
@@ -1270,5 +1275,233 @@ class LERNAGuardedStochasticPolicy:
             "grad_norm_is_stale": self._grad_norm_is_stale,
             "skipped_risk_mean": float(np.mean(self._selected)) if self._selected else None,
             "non_skipped_risk_mean": float(np.mean(self._nonselected)) if self._nonselected else None,
+        }
+
+
+class LERNAPhaseStratifiedPolicy:
+    """Phase-Stratified Guarded Random LERNA  (--policy phase_strat).
+
+    Thesis: step inequality is mostly PHASE inequality. Protect high-utility
+    (early) updates; spend the skip budget preferentially on low-utility
+    (late/plateau) phases; keep within-phase skipping RANDOM (unbiased) so we
+    inherit random's strength instead of fighting it.
+
+    Budget split across P phases by `phase_weights` (must sum to ~1). Within a
+    phase, skip stochastically at that phase's local pressure. LERNA signals
+    are HARD danger vetoes only (loss spike / rho thrashing), never an
+    easy-step selector. Optional tiny `risk_gamma` biases within-phase choice
+    toward redundant steps without breaking the matched budget.
+    """
+    name = "lerna_phase_strat"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        n_phases: int = 4,
+        phase_weights: Optional[List[float]] = None,
+        max_consecutive_skips: int = 1,
+        rho_veto_threshold: float = -0.2,
+        spike_factor: float = 1.0,
+        use_rho_vg: bool = True,
+        use_safety_horizon: bool = True,
+        risk_gamma: float = 0.0,
+        fallback_threshold: float = 0.01,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,
+        probe_interval: int = 8,
+        use_ler: bool = True,
+        use_grad_norm: bool = True,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = float(target_skip_rate)
+        self.total_steps = total_steps
+        self.min_step = int(min_step)
+        self.n_phases = int(n_phases)
+        if phase_weights is None:
+            # still phase-aware, but much milder per-phase bias
+            phase_weights = [0.22, 0.24, 0.26, 0.28][:self.n_phases]
+        s = sum(phase_weights) or 1.0
+        self.phase_weights = [w / s for w in phase_weights]
+        self.max_consecutive_skips = int(max_consecutive_skips)
+        self.rho_veto_threshold = float(rho_veto_threshold)
+        self.spike_factor = float(spike_factor)
+        self.use_rho_vg = use_rho_vg
+        self.use_safety_horizon = use_safety_horizon
+        self.risk_gamma = float(risk_gamma)
+        self.use_ler = use_ler
+        self.use_grad_norm = use_grad_norm
+
+        self._rng = random.Random(seed)
+        self._rg = _RollingRank()
+
+        self._quota_total_steps: Optional[int] = None
+        self._quota_size: Optional[int] = None
+        self._phase_bounds: List[int] = []
+        self._phase_quota: List[int] = []
+        self._phase_skips: List[int] = []
+        self._phase_eligible: List[int] = []
+
+        self._grad_norm_last: Optional[float] = None
+        self._consecutive_skips = 0
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._cur_phase = -1
+
+        self._rho_last = None
+        self._spike_veto = self._rho_veto = self._max_consec_veto = 0
+        self._warmup_veto = self._quota_exhausted = self._forced_tail = 0
+        self._random_safe_skip = 0
+        self._selected: List[float] = []
+
+    def record_grad_norm(self, v) -> None:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0:
+            self._grad_norm_last = v
+
+    def record_loss(self, v) -> None:
+        pass
+
+    def _lazy_init(self, trainer):
+        if self._quota_size is not None:
+            return
+        rt = getattr(getattr(trainer, "state", None), "max_steps", None)
+        total = rt or self.total_steps
+        if not total:
+            total = getattr(getattr(trainer, "args", None), "max_steps", None)
+        if not total:
+            raise RuntimeError(
+                "phase_strat could not resolve total_steps; pass total_steps from runner"
+            )
+        total = int(total)
+        self._quota_total_steps = total
+        self._quota_size = int(round(self.target_skip_rate * total))
+
+        eligible = list(range(self.min_step, total))
+        n_elig = len(eligible)
+        edges = [self.min_step + int(round(n_elig * i / self.n_phases))
+                 for i in range(self.n_phases + 1)]
+        self._phase_bounds = edges
+        self._phase_eligible = [edges[i + 1] - edges[i] for i in range(self.n_phases)]
+
+        raw = [self._quota_size * w for w in self.phase_weights]
+        q = [int(math.floor(x)) for x in raw]
+        q = [min(q[i], self._phase_eligible[i]) for i in range(self.n_phases)]
+        rem = self._quota_size - sum(q)
+        order = sorted(range(self.n_phases), key=lambda i: raw[i] - q[i], reverse=True)
+        idx = 0
+        while rem > 0 and idx < 10 * self.n_phases:
+            i = order[idx % self.n_phases]
+            if q[i] < self._phase_eligible[i]:
+                q[i] += 1
+                rem -= 1
+            idx += 1
+        self._phase_quota = q
+        self._phase_skips = [0] * self.n_phases
+
+    def _phase_of(self, di: int) -> int:
+        for i in range(self.n_phases):
+            if self._phase_bounds[i] <= di < self._phase_bounds[i + 1]:
+                return i
+        return self.n_phases - 1
+
+    def _do_skip(self, ph: int) -> bool:
+        self._skip_decisions += 1
+        self._phase_skips[ph] += 1
+        self._consecutive_skips += 1
+        if self._grad_norm_last is not None:
+            self._selected.append(self._grad_norm_last)
+        return True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        di = self._decisions_seen
+        self._decisions_seen += 1
+        self._lazy_init(trainer)
+
+        if di < self.min_step or self._quota_size is None:
+            self._warmup_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        ph = self._phase_of(di)
+        self._cur_phase = ph
+
+        diag = self.trk.get_diagnostics()
+        rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
+        self._rho_last = rho
+        lh = getattr(self.trk, "loss_history", None)
+        cur_loss = float(lh[-1]) if lh else None
+
+        if self.use_safety_horizon and self._consecutive_skips >= self.max_consecutive_skips:
+            self._max_consec_veto += 1
+            self._consecutive_skips = 0
+            return False
+        if self.use_rho_vg and rho < self.rho_veto_threshold:
+            self._rho_veto += 1
+            self._consecutive_skips = 0
+            return False
+        if lh and len(lh) >= 6 and cur_loss is not None:
+            ema = float(np.mean(lh[-6:-1]))
+            if cur_loss > ema * (1.0 + self.spike_factor):
+                self._spike_veto += 1
+                self._consecutive_skips = 0
+                return False
+
+        q_left = self._phase_quota[ph] - self._phase_skips[ph]
+        if q_left <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+        decisions_left_in_phase = max(self._phase_bounds[ph + 1] - di, 1)
+
+        if q_left >= decisions_left_in_phase:
+            self._forced_tail += 1
+            return self._do_skip(ph)
+
+        pressure = q_left / decisions_left_in_phase
+        if self.risk_gamma > 0.0 and self._grad_norm_last is not None:
+            grad_rank = self._rg.push_and_rank(self._grad_norm_last) or 0.5
+            pressure = pressure * (1.0 + self.risk_gamma * (0.5 - grad_rank))
+        p = min(max(pressure, 0.0), 1.0)
+
+        if self._rng.random() < p:
+            self._random_safe_skip += 1
+            return self._do_skip(ph)
+        self._consecutive_skips = 0
+        return False
+
+    def get_diagnostics(self) -> dict:
+        denom = max(self._decisions_seen, 1)
+        return {
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "n_phases": self.n_phases,
+            "phase_weights": self.phase_weights,
+            "phase_bounds": self._phase_bounds,
+            "phase_quota": self._phase_quota,
+            "phase_skips": self._phase_skips,
+            "phase_eligible": self._phase_eligible,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "realized_skip_rate": self._skip_decisions / denom,
+            "current_phase": self._cur_phase,
+            "warmup_veto_count": self._warmup_veto,
+            "rho_veto_count": self._rho_veto,
+            "spike_veto_count": self._spike_veto,
+            "max_consecutive_veto_count": self._max_consec_veto,
+            "quota_exhausted_count": self._quota_exhausted,
+            "forced_tail_skip_count": self._forced_tail,
+            "random_safe_skip_count": self._random_safe_skip,
+            "risk_gamma": self.risk_gamma,
+            "grad_norm_last": self._grad_norm_last,
+            "skipped_grad_mean": float(np.mean(self._selected)) if self._selected else None,
         }
 
