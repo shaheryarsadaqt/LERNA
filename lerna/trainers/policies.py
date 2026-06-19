@@ -1375,9 +1375,9 @@ class LERNAPhaseStratifiedPolicy:
         total = rt or self.total_steps
         if not total:
             total = getattr(getattr(trainer, "args", None), "max_steps", None)
-        if not total:
+        if not total or int(total) <= self.min_step:
             raise RuntimeError(
-                "phase_strat could not resolve total_steps; pass total_steps from runner"
+                "random_veto_deferral could not resolve total_steps; pass total_steps from runner"
             )
         total = int(total)
         self._quota_total_steps = total
@@ -1503,5 +1503,420 @@ class LERNAPhaseStratifiedPolicy:
             "risk_gamma": self.risk_gamma,
             "grad_norm_last": self._grad_norm_last,
             "skipped_grad_mean": float(np.mean(self._selected)) if self._selected else None,
+        }
+
+
+class LERNARandomVetoDeferralPolicy:
+    """Sparse random skip with vetoes and deferred danger protection.
+
+    This policy preserves exact global skip budget while applying sparse
+    danger vetoes. Within the non-dangerous subset, skips are random.
+    """
+    name = "random_veto_deferral"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        use_loss_spike_veto: bool = False,
+        spike_factor: float = 1.0,
+        spike_ema_window: int = 20,
+        use_rho_vg_veto: bool = False,
+        rho_veto_threshold: float = -0.05,
+        use_grad_norm_veto: bool = False,
+        grad_rank_veto: float = 0.95,
+        use_margin_veto: bool = False,
+        margin_rank_floor: float = 0.10,
+        use_novelty_veto: bool = False,
+        novelty_rank_veto: float = 0.90,
+        mem_bank_size: int = 64,
+        target_veto_rate: float = 0.15,
+        repay_mode: str = "spread",
+        repay_protect_dangerous: bool = True,
+        use_phase_protection: bool = False,
+        n_phases: int = 4,
+        early_protect_phases: int = 1,
+        max_consecutive_skips: int = 4,
+        use_safety_horizon: bool = True,
+        probe_interval: int = 8,
+        use_ler: bool = True,
+        use_rho_vg: bool = True,
+        use_grad_norm: bool = True,
+        fallback_threshold: float = 0.01,
+        calibration_steps: int = 60,
+        recalibrate_every: int = 200,
+        risk_gamma: float = 0.0,
+    ):
+        self.trk = ler_tracker
+        self.target_skip_rate = float(target_skip_rate)
+        self.total_steps = total_steps
+        self.min_step = int(min_step)
+        self.seed = int(seed)
+        self.use_loss_spike_veto = use_loss_spike_veto
+        self.spike_factor = float(spike_factor)
+        self.spike_ema_window = int(spike_ema_window)
+        self.use_rho_vg_veto = use_rho_vg_veto
+        self.rho_veto_threshold = float(rho_veto_threshold)
+        self.use_grad_norm_veto = use_grad_norm_veto
+        self.grad_rank_veto = float(grad_rank_veto)
+        self.use_margin_veto = use_margin_veto
+        self.margin_rank_floor = float(margin_rank_floor)
+        self.use_novelty_veto = use_novelty_veto
+        self.novelty_rank_veto = float(novelty_rank_veto)
+        self.mem_bank_size = int(mem_bank_size)
+        self.target_veto_rate = float(target_veto_rate)
+        self.repay_mode = repay_mode
+        self.repay_protect_dangerous = repay_protect_dangerous
+        self.use_phase_protection = use_phase_protection
+        self.n_phases = int(n_phases)
+        self.early_protect_phases = int(early_protect_phases)
+        self.max_consecutive_skips = int(max_consecutive_skips)
+        self.use_safety_horizon = use_safety_horizon
+        self.probe_interval = int(probe_interval)
+        self.use_ler = use_ler
+        self.use_rho_vg = use_rho_vg
+        self.use_grad_norm = use_grad_norm
+        self.fallback_threshold = fallback_threshold
+        self.calibration_steps = calibration_steps
+        self.recalibrate_every = recalibrate_every
+        self.risk_gamma = float(risk_gamma)
+
+        self._rng = random.Random(self.seed)
+        self._skip_set = None
+        self._quota_total_steps: Optional[int] = None
+        self._quota_size: Optional[int] = None
+        self._candidate_set_size: Optional[int] = None
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._accepted_random_skips = 0
+        self._candidate_indices_seen: set[int] = set()
+        self._deferred_pool: List[int] = []
+        self._deferred_pool_peak = 0
+        self._random_candidate_count = 0
+        self._vetoed_skips = 0
+        self._repaid_skips = 0
+        self._danger_veto_counts_by_type = {
+            "loss_spike": 0,
+            "rho_thrash": 0,
+            "grad_explosion": 0,
+            "low_margin": 0,
+            "novel_batch": 0,
+        }
+        self._rg = _RollingRank()
+        self._rm = _RollingRank()
+        self._rn = _RollingRank()
+        self._grad_norm_last: Optional[float] = None
+        self._margin_last: Optional[float] = None
+        self._margin_available_count = 0
+        self._margin_missing_count = 0
+        self._grad_norm_is_stale = False
+        self._mem: List[np.ndarray] = []
+        self._consecutive_skips = 0
+        self._phase_bounds: List[int] = []
+        self._phase_skips: List[int] = []
+        self._current_phase = -1
+
+        self._warmup_veto = 0
+        self._spike_veto = 0
+        self._rho_veto = 0
+        self._grad_veto = 0
+        self._margin_veto = 0
+        self._novelty_veto = 0
+        self._max_consec_veto = 0
+        self._quota_exhausted = 0
+        self._forced_tail = 0
+        self._random_safe_skip = 0
+        self._deferred_count = 0
+
+    def record_grad_norm(self, v) -> None:
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0:
+            self._grad_norm_last = v
+            self._grad_norm_is_stale = False
+
+    def record_loss(self, v) -> None:
+        pass
+
+    def _lazy_init(self, trainer):
+        if self._quota_size is not None:
+            return
+
+        rt = getattr(getattr(trainer, "state", None), "max_steps", None)
+        total = rt or self.total_steps or getattr(getattr(trainer, "args", None), "max_steps", None)
+
+        if not total or int(total) <= self.min_step:
+            raise RuntimeError(
+                "random_veto_deferral could not resolve total_steps; pass total_steps from runner"
+            )
+
+        total = int(total)
+        eligible = list(range(self.min_step, total))
+        k = min(int(round(self.target_skip_rate * total)), len(eligible))
+
+        rng = random.Random(self.seed)
+        self._skip_set = set(rng.sample(eligible, k)) if k > 0 else set()
+
+        self._quota_total_steps = total
+        self._quota_size = k
+        self._candidate_set_size = len(self._skip_set)
+
+        if self._candidate_set_size != self._quota_size:
+            raise RuntimeError(
+                f"RVD candidate set size mismatch: candidate_set_size={self._candidate_set_size}, quota_size={self._quota_size}"
+            )
+
+        if self.use_phase_protection:
+            self._phase_bounds = [
+                self.min_step + int(round(len(eligible) * i / self.n_phases))
+                for i in range(self.n_phases + 1)
+            ]
+
+        self._phase_skips = [0] * max(self.n_phases, 1)
+
+    def _step_margin(self, trainer):
+        logits = getattr(trainer, "_last_real_logits", None)
+        if logits is None:
+            logits = getattr(trainer, "_last_logits", None)
+        if logits is None:
+            logits = getattr(trainer, "last_logits", None)
+
+        if logits is None:
+            self._margin_missing_count += 1
+            return None
+
+        try:
+            if isinstance(logits, (tuple, list)):
+                logits = logits[0]
+
+            if logits.dim() == 2 and logits.size(-1) >= 2:
+                top2 = torch.topk(logits.detach().float(), 2, dim=-1).values
+                margin = float((top2[:, 0] - top2[:, 1]).mean().item())
+                self._margin_available_count += 1
+                return margin
+        except Exception:
+            return None
+
+        return None
+
+    def _is_dangerous(self, trainer):
+        dangerous = False
+        danger_types = {
+            "loss_spike": False,
+            "rho_thrash": False,
+            "grad_explosion": False,
+            "low_margin": False,
+            "novel_batch": False,
+        }
+        diag = self.trk.get_diagnostics()
+        rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
+        lh = getattr(self.trk, "loss_history", None)
+        cur_loss = float(lh[-1]) if lh else None
+        if self.use_loss_spike_veto and cur_loss is not None and lh and len(lh) >= self.spike_ema_window + 1:
+            ema = float(np.mean(lh[-self.spike_ema_window - 1:-1]))
+            if cur_loss > ema * (1.0 + self.spike_factor):
+                dangerous = True
+                danger_types["loss_spike"] = True
+        if self.use_rho_vg_veto and rho < self.rho_veto_threshold:
+            dangerous = True
+            danger_types["rho_thrash"] = True
+        grad_rank = None
+        if self.use_grad_norm_veto and self._grad_norm_last is not None:
+            grad_rank = self._rg.push_and_rank(self._grad_norm_last)
+            if grad_rank is not None and grad_rank > self.grad_rank_veto:
+                dangerous = True
+                danger_types["grad_explosion"] = True
+        margin = None
+        if self.use_margin_veto:
+            margin = self._step_margin(trainer)
+            self._margin_last = margin
+            if margin is not None:
+                margin_rank = self._rm.push_and_rank(margin)
+                if margin_rank is not None and margin_rank < self.margin_rank_floor:
+                    dangerous = True
+                    danger_types["low_margin"] = True
+        if self.use_novelty_veto:
+            emb = getattr(trainer, "_last_cls_embedding", None)
+            if emb is not None:
+                try:
+                    vec = np.asarray(emb, dtype=float).flatten()
+                except Exception:
+                    vec = None
+                if vec is not None and vec.size:
+                    if len(self._mem) >= self.mem_bank_size:
+                        self._mem.pop(0)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                        if self._mem:
+                            sims = [float(np.dot(vec, m)) for m in self._mem]
+                            sim = max(sims)
+                        else:
+                            sim = 0.0
+                        novelty_rank = self._rn.push_and_rank(sim)
+                        if novelty_rank is not None and novelty_rank > self.novelty_rank_veto:
+                            dangerous = True
+                            danger_types["novel_batch"] = True
+                        self._mem.append(vec)
+        return dangerous, danger_types
+
+    def _all_vetoes_disabled(self) -> bool:
+        return not (
+            self.use_loss_spike_veto
+            or self.use_rho_vg_veto
+            or self.use_grad_norm_veto
+            or self.use_margin_veto
+            or self.use_novelty_veto
+            or self.use_phase_protection
+        )
+
+    def _do_skip(self, idx=None):
+        if self._deferred_pool:
+            self._repaid_skips += 1
+            self._deferred_pool.pop(0)
+        self._skip_decisions += 1
+        self._consecutive_skips += 1
+        self._random_safe_skip += 1
+        return True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        idx = self._decisions_seen
+        self._decisions_seen += 1
+        self._lazy_init(trainer)
+
+        if idx < self.min_step or self._quota_size is None:
+            self._warmup_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        if self._all_vetoes_disabled():
+            decision = (self._skip_set is not None) and (idx in self._skip_set)
+
+            if decision:
+                self._random_candidate_count += 1
+                self._candidate_indices_seen.add(idx)
+                self._accepted_random_skips += 1
+                return self._do_skip(idx)
+
+            self._consecutive_skips = 0
+            return False
+
+        idx = self._decisions_seen - 1
+        is_candidate = self._skip_set is not None and idx in self._skip_set
+
+        remaining_skips = (self._quota_size - self._skip_decisions) if self._quota_size is not None else 0
+        remaining_decisions = max((self._quota_total_steps - self._decisions_seen), 1) if self._quota_total_steps is not None else 1
+        if remaining_skips <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+
+        if is_candidate:
+            self._random_candidate_count += 1
+            self._candidate_indices_seen.add(idx)
+            dangerous, danger_types = self._is_dangerous(trainer)
+            if dangerous:
+                for key, flagged in danger_types.items():
+                    if flagged:
+                        self._danger_veto_counts_by_type[key] += 1
+                self._vetoed_skips += 1
+                self._deferred_pool.append(idx)
+                self._deferred_pool_peak = max(self._deferred_pool_peak, len(self._deferred_pool))
+                self._deferred_count += 1
+                self._consecutive_skips = 0
+                return False
+
+            self._accepted_random_skips += 1
+            return self._do_skip(idx)
+
+        if self._deferred_pool:
+            if self.repay_mode == "asap":
+                return self._do_skip(idx)
+
+            p_repay = min(
+                max(4.0 * len(self._deferred_pool) / max(remaining_decisions, 1), 0.0),
+                1.0,
+            )
+            if self._rng.random() < p_repay:
+                return self._do_skip(idx)
+
+        tail_window = max(5, int(0.02 * self._quota_total_steps))
+        if (
+            remaining_skips >= remaining_decisions
+            and idx >= self._quota_total_steps - tail_window
+        ):
+            self._forced_tail += 1
+            return self._do_skip(idx)
+
+        self._consecutive_skips = 0
+        return False
+
+    def get_diagnostics(self) -> dict:
+        denom = max(self._decisions_seen, 1)
+        full_backward_steps = self._decisions_seen - self._skip_decisions
+        quota_ok = True
+        if self._quota_total_steps is not None:
+            quota_ok = (
+                self._skip_decisions + full_backward_steps == self._decisions_seen
+                and self._decisions_seen <= self._quota_total_steps
+            )
+        return {
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "target_veto_rate": self.target_veto_rate,
+            "realized_skip_rate": self._skip_decisions / denom,
+            "all_vetoes_disabled": self._all_vetoes_disabled(),
+            "use_loss_spike_veto": self.use_loss_spike_veto,
+            "use_rho_vg_veto": self.use_rho_vg_veto,
+            "use_grad_norm_veto": self.use_grad_norm_veto,
+            "use_margin_veto": self.use_margin_veto,
+            "margin_rank_floor": self.margin_rank_floor,
+            "margin_last": self._margin_last,
+            "use_novelty_veto": self.use_novelty_veto,
+            "use_phase_protection": self.use_phase_protection,
+            "candidate_set_size": self._candidate_set_size,
+            "skip_set_contains_min_step": self.min_step in self._skip_set if self._skip_set is not None else None,
+            "skip_set_sample": sorted(list(self._skip_set))[:10] if self._skip_set is not None else None,
+            "random_candidate_skips": self._random_candidate_count,
+            "unique_candidate_indices_seen": len(self._candidate_indices_seen),
+            "accepted_random_skips": self._accepted_random_skips,
+            "vetoed_skips": self._vetoed_skips,
+            "veto_rate_vs_candidates": (
+                self._vetoed_skips / max(1, self._random_candidate_count)
+            ),
+            "deferred_pool_now": len(self._deferred_pool),
+            "deferred_pool_peak": self._deferred_pool_peak,
+            "repaid_skips": self._repaid_skips,
+            "forced_tail_skips": self._forced_tail,
+            "danger_veto_counts_by_type": dict(self._danger_veto_counts_by_type),
+            "phase_skip_distribution": self._phase_skips if self._phase_skips else None,
+            "warmup_veto_count": self._warmup_veto,
+            "quota_exhausted_count": self._quota_exhausted,
+            "max_consecutive_veto_count": self._max_consec_veto,
+            "full_backward_steps": full_backward_steps,
+            "compute_normalized_budget": (
+                full_backward_steps / self._quota_total_steps
+                if self._quota_total_steps else None
+            ),
+            "invariant_skip_accounting_ok": (
+                self._skip_decisions
+                == self._accepted_random_skips + self._repaid_skips + self._forced_tail
+            ),
+            "invariant_candidate_count_ok": (
+                self._candidate_set_size is None
+                or self._random_candidate_count <= self._candidate_set_size
+            ),
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "random_safe_skip_count": self._random_safe_skip,
+            "deferred_count": self._deferred_count,
+            "risk_gamma": self.risk_gamma,
         }
 

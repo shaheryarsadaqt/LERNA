@@ -260,6 +260,8 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # Diagnostics
         self._last_real_logits: Optional[torch.Tensor] = None
+        self._last_logits: Optional[torch.Tensor] = None
+        self.last_logits: Optional[torch.Tensor] = None
         self._pre_clip_grad_norm: Optional[float] = None  # written by external callback
 
         # Wrapper bookkeeping
@@ -294,10 +296,13 @@ class TrueBackwardSkippingTrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
         if self.capture_logits:
-            if hasattr(outputs, "logits"):
-                self._last_real_logits = outputs.logits.detach()
-            elif isinstance(outputs, dict) and "logits" in outputs:
-                self._last_real_logits = outputs["logits"].detach()
+            logits = getattr(outputs, "logits", None)
+            if logits is None and isinstance(outputs, dict):
+                logits = outputs.get("logits")
+            logits = logits.detach() if logits is not None else None
+            self._last_real_logits = logits
+            self._last_logits = logits
+            self.last_logits = logits
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
@@ -312,7 +317,16 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # [FIX P0-3] Forward ALWAYS happens first.
         with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs)
+            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
+        logits = getattr(outputs, "logits", None)
+        if logits is None and isinstance(outputs, dict):
+            logits = outputs.get("logits")
+        logits = logits.detach() if logits is not None else None
+        self._last_real_logits = logits
+        self._last_logits = logits
+        self.last_logits = logits
+
         self.instr.forward_calls += 1
         if self.args.n_gpu > 1:
             loss = loss.mean()

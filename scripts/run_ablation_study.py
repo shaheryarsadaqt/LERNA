@@ -60,6 +60,7 @@ from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
+    LERNARandomVetoDeferralPolicy,
     RandomSkipPolicy, GradNormSkipPolicy,
 )
 from transformers import TrainerCallback
@@ -488,6 +489,35 @@ def run_ablation_single(
                 use_safety_horizon=use_safety_horizon,
                 risk_gamma=risk_gamma,
             )
+        elif policy == "random_veto_deferral":
+            skip_policy = LERNARandomVetoDeferralPolicy(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                min_step=50,
+                seed=seed,
+
+                use_loss_spike_veto=False,
+                use_rho_vg_veto=False,
+                use_grad_norm_veto=False,
+                use_margin_veto=True,
+                use_novelty_veto=False,
+                use_phase_protection=False,
+                spike_factor=1.0,
+                margin_rank_floor=0.20,
+                repay_mode="asap",
+
+                rho_veto_threshold=rho_veto_threshold,
+                max_consecutive_skips=max_consecutive_skips,
+                probe_interval=probe_interval,
+                use_ler=use_ler,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                fallback_threshold=base_thr,
+                calibration_steps=60,
+                recalibrate_every=200,
+                risk_gamma=risk_gamma,
+            )
         else:
             PolicyCls = LERNAHybridPolicy if policy == "hybrid" else LERNACalibratedPolicy
             skip_policy = PolicyCls(
@@ -719,7 +749,7 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
-    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid", "phase_strat"], default="hybrid")
+    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid", "phase_strat", "random_veto_deferral"], default="hybrid")
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--risk-gamma", type=float, default=0.0)
     parser.add_argument("--guard-mode", choices=["on", "off"], default="on",
