@@ -78,7 +78,9 @@ import time
 import argparse
 import gc
 import logging
+import shutil
 import numpy as np
+from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional, Any, Tuple, List
@@ -153,6 +155,120 @@ def safe_from_pretrained(*args, **kwargs):
         raise
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Phase 1.2 cleanup utilities
+# =============================================================================
+
+PHASE1_2_KEEP_FILENAMES = {
+    "results.json",
+    "instrumentation.json",
+    "power_telemetry_report.json",
+}
+
+PHASE1_2_KEEP_PREFIXES = (
+    "baseline_",
+)
+
+PHASE1_2_DELETE_FILENAMES = {
+    "optimizer.pt",
+    "scheduler.pt",
+    "rng_state.pth",
+    "scaler.pt",
+    "trainer_state.json",
+    "training_args.bin",
+    "pytorch_model.bin",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.txt",
+    "merges.txt",
+    "config.json",
+    "generation_config.json",
+}
+
+PHASE1_2_DELETE_DIRNAMES = {
+    "__pycache__",
+    "all_data",
+}
+
+
+def release_cuda_memory() -> None:
+    """Best-effort release of Python and CUDA allocator memory between runs."""
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def cleanup_phase1_2_run_dir(
+    run_dir: str,
+    keep_power_samples: bool = False,
+    keep_debug_artifacts: bool = False,
+) -> dict:
+    """Delete nonessential artifacts after a Phase 1.2 run."""
+    root = Path(run_dir)
+    summary = {"files_removed": 0, "dirs_removed": 0, "bytes_removed": 0}
+    if not root.exists():
+        return summary
+
+    def remove_file(path: Path) -> None:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            summary["files_removed"] += 1
+            summary["bytes_removed"] += size
+        except OSError:
+            pass
+
+    def remove_dir(path: Path) -> None:
+        try:
+            size = sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+            shutil.rmtree(path, ignore_errors=True)
+            summary["dirs_removed"] += 1
+            summary["bytes_removed"] += size
+        except OSError:
+            pass
+
+    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        rel_parts = path.relative_to(root).parts
+        name = path.name
+
+        if path.is_dir():
+            if name.startswith("checkpoint-") or name in PHASE1_2_DELETE_DIRNAMES:
+                remove_dir(path)
+            continue
+
+        if name in PHASE1_2_KEEP_FILENAMES or name.startswith(PHASE1_2_KEEP_PREFIXES):
+            continue
+        if keep_power_samples and name == "power_samples.json":
+            continue
+        if keep_debug_artifacts and name.endswith(".json"):
+            continue
+
+        if name in PHASE1_2_DELETE_FILENAMES:
+            remove_file(path)
+            continue
+        if rel_parts and rel_parts[0] in {"runs", "wandb"}:
+            remove_file(path)
+            continue
+        if name in {"power_samples.json", "training_summary.json"}:
+            remove_file(path)
+
+    return summary
 
 
 # =============================================================================
@@ -414,6 +530,9 @@ def run_single_baseline_experiment(
     wandb_project: str = "lerna-phase1.2",
     wandb_group: str = "phase1.2-baselines",
     target_skip_rate: float = 0.33,
+    cleanup_artifacts: bool = True,
+    keep_power_samples: bool = False,
+    keep_debug_artifacts: bool = False,
 ) -> dict:
     """
     Run a single Phase 1.2 baseline experiment.
@@ -853,10 +972,22 @@ def run_single_baseline_experiment(
     print(f"  Saved: {results_path}")
 
     # --- Cleanup ---
-    del model, trainer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    del model, trainer, tokenizer, train_ds, eval_ds, data_collator, compute_metrics
+    release_cuda_memory()
+
+    if cleanup_artifacts:
+        cleanup = cleanup_phase1_2_run_dir(
+            output_dir,
+            keep_power_samples=keep_power_samples,
+            keep_debug_artifacts=keep_debug_artifacts,
+        )
+        if cleanup["files_removed"] or cleanup["dirs_removed"]:
+            print(
+                "  Cleanup: removed "
+                f"{cleanup['files_removed']} files, {cleanup['dirs_removed']} dirs, "
+                f"{cleanup['bytes_removed'] / (1024 ** 2):.1f} MB"
+            )
+
     if use_wandb:
         _ensure_wandb_finished()
 
@@ -1044,6 +1175,18 @@ Examples:
         "--target-skip-rate", type=float, default=0.33,
         help="Target skip rate for baselines that need it (default: 0.33)",
     )
+    parser.add_argument(
+        "--no-cleanup-artifacts", action="store_true",
+        help="Keep checkpoints/model weights/raw telemetry after each run",
+    )
+    parser.add_argument(
+        "--keep-power-samples", action="store_true",
+        help="Keep raw power/power_samples.json in addition to the compact power report",
+    )
+    parser.add_argument(
+        "--keep-debug-artifacts", action="store_true",
+        help="Keep per-run debug JSON files such as comprehensive/all-chart histories",
+    )
     args = parser.parse_args()
 
     profile = detect_device_profile()
@@ -1156,6 +1299,9 @@ Examples:
                         wandb_project=args.wandb_project,
                         wandb_group=wandb_group,
                         target_skip_rate=args.target_skip_rate,
+                        cleanup_artifacts=not args.no_cleanup_artifacts,
+                        keep_power_samples=args.keep_power_samples,
+                        keep_debug_artifacts=args.keep_debug_artifacts,
                     )
                     all_results.append(result)
 
@@ -1170,6 +1316,27 @@ Examples:
                         "error": str(e),
                         "timestamp": datetime.now().isoformat(),
                     })
+
+                    run_dir = os.path.join(
+                        args.output_dir,
+                        baseline_name,
+                        f"{task}_s{seed}_lr{TASK_HP_OVERRIDES.get(task, {}).get('learning_rate', 2e-5):.0e}",
+                    )
+
+                    if not args.no_cleanup_artifacts:
+                        cleanup = cleanup_phase1_2_run_dir(
+                            run_dir,
+                            keep_power_samples=args.keep_power_samples,
+                            keep_debug_artifacts=args.keep_debug_artifacts,
+                        )
+                        if cleanup["files_removed"] or cleanup["dirs_removed"]:
+                            print(
+                                "  Cleanup after failed run: removed "
+                                f"{cleanup['files_removed']} files, {cleanup['dirs_removed']} dirs, "
+                                f"{cleanup['bytes_removed'] / (1024 ** 2):.1f} MB"
+                            )
+
+                    release_cuda_memory()
                     if args.wandb:
                         _ensure_wandb_finished()
 
