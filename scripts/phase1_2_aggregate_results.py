@@ -124,6 +124,17 @@ def _parse_phase1_1_run(path: Path) -> RunRecord | None:
     )
 
 
+def _coerce_float(value) -> float | None:
+    """results.json uses json.dump(default=str), so numpy scalars / NaN can
+    arrive as strings. Return a float, or None if not numeric."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_phase1_2_run(path: Path) -> RunRecord | None:
     """Phase 1.2 (baseline) results.json schema."""
     try:
@@ -132,10 +143,10 @@ def _parse_phase1_2_run(path: Path) -> RunRecord | None:
         log.warning(f"  failed to read {path}: {e}")
         return None
 
-    # phase 1.2 stores the primary metric directly
-    primary = data.get("primary_metric")
+    # phase 1.2 stores the primary metric directly (may be stringified by default=str)
+    primary = _coerce_float(data.get("primary_metric"))
     key = data.get("primary_metric_name") or "missing"
-    if primary is None or (isinstance(primary, float) and np.isnan(primary)):
+    if primary is None or np.isnan(primary):
         eval_metrics = data.get("eval_metrics", {}) or {}
         primary, key = _extract_primary_metric(eval_metrics)
     if primary is None or np.isnan(primary):
@@ -151,7 +162,7 @@ def _parse_phase1_2_run(path: Path) -> RunRecord | None:
         train_runtime_s=float(data.get("train_runtime_s", 0.0) or 0.0),
         train_steps=int(data.get("train_steps", 0) or 0),
         skip_ratio=float(bstats.get("skip_ratio", 0.0) or 0.0),
-        steps_skipped=int(bstats.get("steps_skipped", 0) or 0),
+        steps_skipped=int(data.get("skipped_backward_steps", bstats.get("steps_skipped", 0)) or 0),
         power_avg_watts=float(data.get("power_avg_watts", 0.0) or 0.0),
         learning_rate=float(data.get("learning_rate", 0.0) or 0.0),
         primary_metric_name=key,

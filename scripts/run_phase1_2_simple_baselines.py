@@ -814,12 +814,21 @@ def run_single_baseline_experiment(
     if baseline_name == "reduced_steps" and diagnostic_callback is not None and hasattr(diagnostic_callback, 'max_steps'):
         print(f"  Reduced steps max: {diagnostic_callback.max_steps} (of {total_steps})")
 
-    train_result = trainer.train()
-    train_time = time.time() - start_time
+    try:
+        train_result = trainer.train()
+        train_time = time.time() - start_time
 
-    # --- Evaluate best model ---
-    print(f"  Evaluating best model...")
-    eval_result = trainer.evaluate()
+        # --- Evaluate best model ---
+        print(f"  Evaluating best model...")
+        eval_result = trainer.evaluate()
+    finally:
+        # HF skips on_train_end if train()/evaluate() raises, leaking the
+        # nvidia-smi daemon thread. _stop_sampling() is idempotent, so the
+        # success path (already stopped in on_train_end) is unaffected.
+        try:
+            power_callback._stop_sampling()
+        except Exception:
+            pass
 
     instrumentation = trainer.get_instrumentation()
 
