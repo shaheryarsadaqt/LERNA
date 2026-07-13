@@ -518,12 +518,18 @@ class PowerTelemetryCallback(TrainerCallback):
 
     def __init__(self, sample_interval_s=1.0, gpu_index=0,
                  output_dir="./experiments/power_telemetry",
-                 wandb_enabled=True, log_frequency=25):
+                 wandb_enabled=True, log_frequency=25,
+                 require_measured_power: bool = True):
         self.sample_interval_s = sample_interval_s
         self.gpu_index = gpu_index
+        self.gpu_selector = os.environ.get(
+            "LERNA_NVIDIA_SMI_GPU",
+            str(self.gpu_index),
+        )
         self.output_dir = output_dir
         self.wandb_enabled = wandb_enabled
         self.log_frequency = log_frequency
+        self.require_measured_power = require_measured_power
         os.makedirs(output_dir, exist_ok=True)
 
         self._power_samples: List[Dict] = []
@@ -537,13 +543,18 @@ class PowerTelemetryCallback(TrainerCallback):
         self._gpu_name = ""
         self.cumulative_kwh = 0.0
         self.step_energies: List[Dict] = []
+        self.energy_valid = False
+        self.energy_invalid_reason = "not_evaluated"
+        self.energy_measurement_source = "invalid"
+        self._nvidia_smi_success_count = 0
+        self._nvidia_smi_query_count = 0
 
     # --- GPU detection ---
 
     def _detect_gpu(self):
         try:
             result = subprocess.run(
-                ["nvidia-smi", f"--id={self.gpu_index}", "--query-gpu=name", "--format=csv,noheader"],
+                ["nvidia-smi", "-i", str(self.gpu_index), "--query-gpu=name", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 self._gpu_name = result.stdout.strip()
@@ -567,7 +578,7 @@ class PowerTelemetryCallback(TrainerCallback):
     def _query_nvidia_smi(self) -> Optional[Dict]:
         try:
             result = subprocess.run(
-                ["nvidia-smi", f"--id={self.gpu_index}",
+                ["nvidia-smi", "-i", str(self.gpu_index),
                  "--query-gpu=power.draw,temperature.gpu,utilization.gpu",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5)
@@ -591,7 +602,7 @@ class PowerTelemetryCallback(TrainerCallback):
         util, temp = 80.0, 0.0
         try:
             result = subprocess.run(
-                ["nvidia-smi", f"--id={self.gpu_index}",
+                ["nvidia-smi", "-i", str(self.gpu_index),
                  "--query-gpu=utilization.gpu,temperature.gpu",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=3)
@@ -605,7 +616,7 @@ class PowerTelemetryCallback(TrainerCallback):
             pass
         tdp = self._fallback_tdp or 350.0
         idle = tdp * 0.08
-        return {"power_w": idle + (tdp - idle) * (util / 100.0), "temp_c": temp, "util_pct": util}
+        return {"power_w": idle + (tdp - idle) * (util / 100.0), "temp_c": temp, "util_pct": util, "measurement_source": "estimate"}
 
     # --- Background sampling thread ---
 
@@ -613,15 +624,20 @@ class PowerTelemetryCallback(TrainerCallback):
         while not self._stop_event.is_set():
             try:
                 sample = self._query_nvidia_smi()
-                if sample is None:
+                self._nvidia_smi_query_count += 1
+                if sample is not None:
+                    self._nvidia_smi_success_count += 1
+                    sample["measurement_source"] = "nvidia-smi"
+                    sample["timestamp"] = time.time()
+                    self._power_samples.append(sample)
+                    self._consecutive_errors = 0
+                elif not self.require_measured_power:
                     self._consecutive_errors += 1
                     if self._consecutive_errors <= self._max_consecutive_errors:
                         sample = self._estimate_power()
-                else:
-                    self._consecutive_errors = 0
-                if sample is not None:
-                    sample["timestamp"] = time.time()
-                    self._power_samples.append(sample)
+                        if sample is not None:
+                            sample["timestamp"] = time.time()
+                            self._power_samples.append(sample)
             except Exception:
                 pass
             self._stop_event.wait(self.sample_interval_s)
@@ -654,6 +670,22 @@ class PowerTelemetryCallback(TrainerCallback):
         except Exception:
             return 0.0
 
+    def _validate_energy(self) -> bool:
+        if self._nvidia_smi_query_count == 0:
+            self.energy_invalid_reason = "no_power_samples"
+            return False
+        success_rate = self._nvidia_smi_success_count / self._nvidia_smi_query_count
+        if success_rate < 0.90:
+            self.energy_invalid_reason = f"nvidia_smi_success_rate_below_90pct ({success_rate:.2%})"
+            return False
+        direct_samples = sum(1 for s in self._power_samples if s.get("measurement_source") == "nvidia-smi")
+        if direct_samples < 2:
+            self.energy_invalid_reason = f"insufficient_direct_samples ({direct_samples})"
+            return False
+        self.energy_valid = True
+        self.energy_measurement_source = "nvidia-smi"
+        return True
+
     # --- Trainer hooks (NEVER crash) ---
 
     def on_train_begin(self, args, state, control, **kwargs):
@@ -670,9 +702,9 @@ class PowerTelemetryCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         try:
             current_idx = len(self._power_samples)
+            self._step_energy_start_idx = max(0, current_idx - 1)
             step_kwh = self._compute_energy_kwh(self._step_energy_start_idx, current_idx)
             self.cumulative_kwh += step_kwh
-            self._step_energy_start_idx = current_idx
             self.step_energies.append({"step": state.global_step, "step_kwh": step_kwh, "cumulative_kwh": self.cumulative_kwh})
 
             if state.global_step % self.log_frequency == 0:
@@ -699,11 +731,57 @@ class PowerTelemetryCallback(TrainerCallback):
             self._stop_sampling()
             total_time_s = time.time() - self._training_start if self._training_start else 0
             total_samples = len(self._power_samples)
+
+            self.cumulative_kwh = self._compute_energy_kwh(0, total_samples) if total_samples >= 2 else 0.0
+
+            if total_samples >= 2:
+                sampled_duration_s = (
+                    self._power_samples[-1]["timestamp"]
+                    - self._power_samples[0]["timestamp"]
+                )
+            else:
+                sampled_duration_s = 0.0
+
+            coverage_ratio = (
+                sampled_duration_s / total_time_s
+                if total_time_s > 0
+                else 0.0
+            )
+
+            energy_valid = (
+                total_samples >= 2
+                and all(
+                    sample.get("measurement_source") == "nvidia-smi"
+                    for sample in self._power_samples
+                )
+                and coverage_ratio >= 0.90
+            )
+            self.energy_valid = energy_valid
+            self.energy_invalid_reason = (
+                "ok" if energy_valid else
+                f"insufficient_coverage:{coverage_ratio:.2f}"
+                if total_samples >= 2
+                else "insufficient_samples"
+            )
+            self.energy_measurement_source = "nvidia-smi" if energy_valid else "invalid"
+
+            time_weighted_avg_watts = (
+                self.cumulative_kwh * 3_600_000 / sampled_duration_s
+                if sampled_duration_s > 0
+                else 0.0
+            )
+
             all_power = [s["power_w"] for s in self._power_samples] if self._power_samples else [0]
 
             report = {
                 "gpu_name": self._gpu_name, "total_training_time_s": total_time_s,
                 "total_energy_kwh": self.cumulative_kwh, "total_power_samples": total_samples,
+                "sampled_duration_s": sampled_duration_s,
+                "sampling_coverage_ratio": coverage_ratio,
+                "energy_valid": energy_valid,
+                "time_weighted_avg_watts": time_weighted_avg_watts,
+                "energy_invalid_reason": self.energy_invalid_reason,
+                "energy_measurement_source": self.energy_measurement_source,
                 "power_statistics": {
                     "mean_watts": float(np.mean(all_power)), "max_watts": float(np.max(all_power)),
                     "min_watts": float(np.min(all_power)), "std_watts": float(np.std(all_power)),
@@ -723,6 +801,7 @@ class PowerTelemetryCallback(TrainerCallback):
             print(f"{'='*60}")
             print(f"  GPU: {self._gpu_name or 'unknown'}")
             print(f"  Total energy: {self.cumulative_kwh:.6f} kWh")
+            print(f"  Energy valid: {self.energy_valid} ({self.energy_measurement_source})")
             print(f"  Training time: {total_time_s:.1f}s ({total_time_s/3600:.3f}h)")
             print(f"  Avg power draw: {np.mean(all_power):.1f}W")
             print(f"  Peak power draw: {np.max(all_power):.1f}W")

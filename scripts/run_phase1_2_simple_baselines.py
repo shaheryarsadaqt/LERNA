@@ -33,10 +33,10 @@ Usage:
   python scripts/run_phase1_2_simple_baselines.py --mode quick
 
   # Full run: all baselines x 4 representative tasks x 5 seeds (~12 hours)
-  python scripts/run_phase1_2_simple_baselines.py --mode full --wandb
+  python scripts/run_phase1_2_simple_baselines.py --mode full
 
   # Production: all baselines x 8 tasks x 10 seeds (~5 days)
-  python scripts/run_phase1_2_simple_baselines.py --mode production --wandb
+  python scripts/run_phase1_2_simple_baselines.py --mode production
 
   # Custom: pick baselines, tasks, seeds
   python scripts/run_phase1_2_simple_baselines.py \
@@ -68,7 +68,10 @@ import os
 # Must be set before any torch import
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["WANDB_START_METHOD"] = "thread"
+if not os.environ.get("HF_HUB_OFFLINE") and not os.environ.get("TRANSFORMERS_OFFLINE"):
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["WANDB_MODE"] = "disabled"
 os.environ["WANDB_LOG_MODEL"] = "false"
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -275,7 +278,8 @@ def cleanup_phase1_2_run_dir(
 # Constants (identical to Phase 1.1 for reproducibility)
 # =============================================================================
 
-MODEL_NAME = "answerdotai/ModernBERT-base"
+MODEL_NAME = "jhu-clsp/ettin-encoder-150m"
+MODEL_REVISION = "45d08642849e5c5701b162671ac811b7654bfd9f"
 
 GLUE_TASK_CONFIG = {
     "sst2":  {"keys": ("sentence", None),        "num_labels": 2, "metric": "accuracy"},
@@ -314,6 +318,10 @@ PHASE_1_1_RESULTS = {
 
 # Baseline definitions
 BASELINE_REGISTRY = {
+    "full_finetune": {
+        "description": "Full fine-tuning control with no compute-saving intervention",
+        "tests": "Reference quality, runtime, and backward-call count",
+    },
     "grad_norm": {
         "description": "Skip backward pass when ||g|| < threshold",
         "tests": "Whether LER is better than its simplest component",
@@ -351,6 +359,19 @@ BASELINE_REGISTRY = {
         "tests": "Whether phase-aware LR scheduling captures the same benefit",
     },
 }
+
+BASELINES = [
+    "full_finetune",
+    "grad_norm",
+    "random_skip",
+    "weight_freeze",
+    "reduced_steps",
+    "cosine_restarts",
+    "early_stop_p3",
+    "early_stop_p5",
+    "early_stop_p10",
+    "early_stop_p20",
+]
 
 
 # =============================================================================
@@ -453,16 +474,6 @@ def build_compute_metrics(task_name):
     return compute_metrics
 
 
-def _ensure_wandb_finished():
-    """Safely finish any active W&B run."""
-    try:
-        import wandb
-        if wandb.run is not None:
-            wandb.finish(quiet=True)
-    except ImportError:
-        pass
-
-
 # =============================================================================
 # Custom Trainer (captures real logits for LER, same as Phase 1.1)
 # =============================================================================
@@ -470,47 +481,16 @@ def _ensure_wandb_finished():
 # Baseline utilities
 # ==============================================================================
 
-def parse_early_stop_patience(baseline_name: str, default_patience: int) -> int:
-    """[FIX #8] Keep early_stop_p<N> parsing even though create_baseline_callback
-    is gone. For non-early-stop baselines, fall back to the task default.
-    """
-    if baseline_name.startswith("early_stop_p"):
-        import re
-        m = re.match(r"early_stop_p(\d+)", baseline_name)
-        if not m:
-            raise ValueError(f"Invalid early_stop baseline name: {baseline_name}")
-        return int(m.group(1))
-    if baseline_name == "reduced_steps":
-        return 999_999  # effectively disabled; reduced_steps controls cutoff
-    return default_patience
+def parse_early_stop_patience(name):
+    if not name.startswith("early_stop_p"):
+        return None
+    return int(name.removeprefix("early_stop_p"))
 
 
 class _GradientNormCaptureCallback(TrainerCallback):
-    """[FIX #7] Single owner of pre-clip grad-norm. Writes into:
-       - trainer._pre_clip_grad_norm  (general diagnostic, read-only for policies)
-       - policy.record_grad_norm(v)   (if policy supports it)
-    Policies must NOT read trainer._pre_clip_grad_norm to push values
-    into themselves — that produced double-counting.
+    """[REMOVED] This callback caused double recording of grad norm.
+    Retained here only as a placeholder. Do not instantiate.
     """
-    def __init__(self):
-        self._owner = None  # set after trainer is built
-
-    def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        if model is None:
-            return control
-        sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                sq += float(p.grad.detach().float().norm().item()) ** 2
-        gn = sq ** 0.5
-        trainer = self._owner
-        if trainer is not None:
-            trainer._pre_clip_grad_norm = gn
-            pol = getattr(trainer, "skip_policy", None)
-            if pol is not None and hasattr(pol, "record_grad_norm"):
-                pol.record_grad_norm(gn)
-        return control
 
 
 # ==============================================================================
@@ -523,16 +503,16 @@ def run_single_baseline_experiment(
     seed: int,
     profile: str,
     base_output_dir: str,
-    use_wandb: bool = False,
     max_samples_override: Optional[int] = None,
     run_idx: int = 0,
     total_runs: int = 0,
-    wandb_project: str = "lerna-phase1.2",
-    wandb_group: str = "phase1.2-baselines",
     target_skip_rate: float = 0.33,
     cleanup_artifacts: bool = True,
     keep_power_samples: bool = False,
     keep_debug_artifacts: bool = False,
+    model_name: str = MODEL_NAME,
+    model_revision: str = MODEL_REVISION,
+    unlimited: bool = False,
 ) -> dict:
     """
     Run a single Phase 1.2 baseline experiment.
@@ -542,8 +522,13 @@ def run_single_baseline_experiment(
     tracked identically for direct comparison.
     """
     hw_cfg = get_training_config(profile)
-    if max_samples_override is not None:
+    if unlimited:
+        hw_cfg["max_samples"] = None
+    elif max_samples_override is not None:
         hw_cfg["max_samples"] = max_samples_override
+
+    if not model_revision:
+        raise ValueError("A pinned Hugging Face model revision is required")
 
     # Resolve per-task hyperparameters
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
@@ -553,38 +538,10 @@ def run_single_baseline_experiment(
     default_patience = task_hp.get("early_stopping_patience", 5)
     metric_for_best_model = task_hp.get("metric_for_best_model", "eval_loss")
     greater_is_better = task_hp.get("greater_is_better", False)
-    init_from_mnli = task_hp.get("init_from_mnli", False)
 
     run_id = f"{baseline_name}/{task_name}_s{seed}_lr{lr:.0e}"
     output_dir = os.path.join(base_output_dir, run_id)
     os.makedirs(output_dir, exist_ok=True)
-
-    # --- W&B ---
-    if use_wandb:
-        import wandb
-        _ensure_wandb_finished()
-        wandb.init(
-            project=wandb_project,
-            name=f"{baseline_name}-{task_name}-s{seed}",
-            group=wandb_group,
-            job_type="baseline",
-            tags=[baseline_name, task_name, f"seed-{seed}", "phase1.2"],
-            reinit=True,
-            config={
-                "phase": "1.2",
-                "baseline": baseline_name,
-                "task": task_name,
-                "seed": seed,
-                "learning_rate": lr,
-                "model": MODEL_NAME,
-                "profile": profile,
-                "target_skip_rate": target_skip_rate,
-            },
-        )
-        try:
-            wandb.define_metric("*", step_metric="train/global_step", step_sync=False)
-        except Exception:
-            pass
 
     print(f"\n{'=' * 70}")
     print(f"  Phase 1.2 | Baseline: {baseline_name} | Task: {task_name} | Seed: {seed}")
@@ -601,34 +558,18 @@ def run_single_baseline_experiment(
         torch.cuda.manual_seed_all(seed)
 
     # --- Model & Tokenizer ---
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        revision=model_revision,
+    )
     cfg = GLUE_TASK_CONFIG[task_name]
 
-    # MNLI transfer for RTE (same as Phase 1.1)
-    mnli_checkpoint_dir = os.path.join(
-        os.path.dirname(base_output_dir), "baseline", "mnli_finetuned"
-    )
     model_kwargs = {
         "num_labels": cfg["num_labels"],
         "attn_implementation": "sdpa",
         "reference_compile": False,
     }
-
-    if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
-        print(f"  [MNLI Transfer] Loading from {mnli_checkpoint_dir}")
-        mnli_model = safe_from_pretrained(mnli_checkpoint_dir, **model_kwargs)
-        model = safe_from_pretrained(MODEL_NAME, **model_kwargs)
-        encoder_state = {k: v for k, v in mnli_model.state_dict().items()
-                         if "classifier" not in k and "pooler" not in k}
-        model.load_state_dict(encoder_state, strict=False)
-        del mnli_model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    else:
-        if init_from_mnli:
-            print(f"  [MNLI Transfer] WARNING: No checkpoint at {mnli_checkpoint_dir}, using pretrained")
-        model = safe_from_pretrained(MODEL_NAME, **model_kwargs)
+    model = safe_from_pretrained(model_name, revision=model_revision, **model_kwargs)
 
 
     if hw_cfg["gradient_checkpointing"]:
@@ -660,7 +601,10 @@ def run_single_baseline_experiment(
     calibration_steps = max(20, min(200, total_steps // 5))
     recalibrate_every = max(100, total_steps // 2)
 
-    if baseline_name == "grad_norm":
+    if baseline_name == "full_finetune":
+        skip_policy = AlwaysFalsePolicy()
+        mechanism = ComputeSavingMechanism.NONE
+    elif baseline_name == "grad_norm":
         skip_policy = GradNormSkipPolicy(
             target_skip_rate=target_skip,
             calibration_steps=50,
@@ -693,16 +637,16 @@ def run_single_baseline_experiment(
         diagnostic_callback = ReducedTotalStepsCallback(
             reduction_fraction=target_skip,
             total_steps=total_steps,
-            wandb_enabled=use_wandb,
+            wandb_enabled=False,
         )
     elif baseline_name == "cosine_restarts":
         diagnostic_callback = CosineAnnealingWarmRestartsCallback(
             T_0=max(total_steps // 10, 50), T_mult=2, eta_min=1e-7,
-            base_lr=lr, wandb_enabled=use_wandb,
+            base_lr=lr, wandb_enabled=False,
         )
 
     # ---- Early stopping patience (FIX #8) ----
-    es_patience = parse_early_stop_patience(baseline_name, default_patience)
+    es_patience = parse_early_stop_patience(baseline_name)
 
     # ---- Shared LER feed (from lerna.callbacks.ler_feed) [FIX #5] ----
     ler_feed_callback = LERFeedCallback(ler_tracker=ler_tracker)
@@ -711,41 +655,44 @@ def run_single_baseline_experiment(
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
         output_dir=os.path.join(output_dir, "power"),
-        wandb_enabled=use_wandb,
+        wandb_enabled=False,
         log_frequency=50,
+        require_measured_power=True,
     )
-
-    # ---- Single-owner grad-norm capture (FIX #7) ----
-    grad_capture = _GradientNormCaptureCallback()
 
     # ---- Comprehensive metrics for W&B visualizations ----
     comprehensive_metrics = ComprehensiveMetricsCallback(
         log_frequency=10,
         histogram_frequency=100,
         table_frequency=500,
-        wandb_enabled=use_wandb,
+        wandb_enabled=False,
     )
     grad_norm_detailed = GradNormDetailedCallback(
-        wandb_enabled=use_wandb,
+        wandb_enabled=False,
         log_frequency=10,
     )
 
     all_charts_metrics = AllChartsMetricsCallback(
         log_frequency=20,
-        wandb_enabled=use_wandb,
+        wandb_enabled=False,
     )
 
     callbacks = [
-        EarlyStoppingCallback(early_stopping_patience=es_patience),
         power_callback,
         ler_feed_callback,
-        grad_capture,
         comprehensive_metrics,
         grad_norm_detailed,
         all_charts_metrics,
     ]
     if diagnostic_callback is not None:
         callbacks.append(diagnostic_callback)
+
+    es_patience = parse_early_stop_patience(baseline_name)
+    if es_patience is not None:
+        callbacks.insert(
+            0,
+            EarlyStoppingCallback(early_stopping_patience=es_patience),
+        )
 
     # --- Training arguments (identical to Phase 1.1) ---
     training_args = TrainingArguments(
@@ -769,14 +716,19 @@ def run_single_baseline_experiment(
         metric_for_best_model=metric_for_best_model,
         greater_is_better=greater_is_better,
         logging_steps=max(eval_steps // 5, 1),
-        report_to="wandb" if use_wandb else "none",
-        run_name=f"{baseline_name}-{task_name}-s{seed}" if use_wandb else None,
+        report_to=[],
+        run_name=None,
         seed=seed,
         dataloader_num_workers=hw_cfg["dataloader_num_workers"],
         dataloader_pin_memory=(profile == "server"),
         gradient_checkpointing=hw_cfg["gradient_checkpointing"],
         remove_unused_columns=True,
     )
+
+    if profile == "server" and training_args.device.type != "cuda":
+        raise RuntimeError(
+            f"Server profile requires CUDA, got {training_args.device}"
+        )
 
     if torch.cuda.is_available() and training_args._n_gpu > 1:
         print("  [Phase1.2] Multiple GPUs detected; forcing single-GPU training to avoid unstable NCCL/DataParallel behavior.")
@@ -801,8 +753,8 @@ def run_single_baseline_experiment(
         capture_logits=True,
     )
 
-    grad_capture._owner = trainer
     ler_feed_callback.attach(trainer=trainer)
+    trainer.ler_tracker = ler_tracker
     if diagnostic_callback is not None and hasattr(diagnostic_callback, '_trainer'):
         diagnostic_callback._trainer = trainer
 
@@ -881,22 +833,34 @@ def run_single_baseline_experiment(
         eval_result.get("eval_pearsonr", eval_result.get("eval_accuracy", 0))
     )
 
+    training_used_cuda = training_args.device.type == "cuda"
+    energy_valid = power_callback.energy_valid and training_used_cuda
+
     results = {
         "phase": "1.2",
         "baseline": baseline_name,
         "task": task_name,
         "seed": seed,
         "learning_rate": lr,
-        "model": MODEL_NAME,
+        "model": model_name,
+        "model_revision": model_revision,
         "profile": profile,
+        "training_device": str(training_args.device),
+        "cuda_available": torch.cuda.is_available(),
         "primary_metric": primary_value,
         "primary_metric_name": primary_metric_key,
         "eval_metrics": eval_result,
         "train_loss": train_result.training_loss,
         "train_runtime_s": train_time,
         "train_steps": trainer.state.global_step,
-        "energy_kwh": power_callback.cumulative_kwh,
+        "energy_kwh": power_callback.cumulative_kwh if energy_valid else None,
+        "energy_valid": energy_valid,
+        "energy_invalid_reason": power_callback.energy_invalid_reason if energy_valid else "training did not use CUDA",
+        "energy_measurement_source": power_callback.energy_measurement_source,
         "power_avg_watts": avg_power,
+        "max_samples": hw_cfg.get("max_samples"),
+        "dataset_scope": "full GLUE" if hw_cfg.get("max_samples") is None else "sample-capped",
+        "early_stopping_enabled": es_patience is not None,
         "early_stopping_patience": es_patience,
         "baseline_stats": baseline_stats,
         "target_skip_rate": target_skip_rate,
@@ -906,6 +870,7 @@ def run_single_baseline_experiment(
         "true_backward_skipping_enabled": instrumentation["true_backward_skipping_enabled"],
         "scheduler_step_policy": instrumentation["scheduler_step_policy"],
         "policy_name": instrumentation["policy_name"],
+        "last_grad_scale": getattr(trainer, "_last_grad_scale", None),
         "skipped_backward_steps": instrumentation["skipped_backward_steps"],
         "optimizer_step_attempts": instrumentation["optimizer_step_attempts"],  # [IMP-4] renamed
         "batches_seen": instrumentation["batches_seen"],
@@ -923,52 +888,6 @@ def run_single_baseline_experiment(
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
-
-    # --- Log custom metrics to wandb ---
-    if use_wandb:
-        try:
-            import wandb
-
-            custom_logs = {
-                "results/primary_metric": primary_value,
-                "results/energy_kwh": power_callback.cumulative_kwh,
-                "results/train_time_s": train_time,
-                "results/train_steps": trainer.state.global_step,
-                "results/skip_ratio": instrumentation["skip_ratio_by_batch"],
-                "results/skipped_backward_steps": instrumentation["skipped_backward_steps"],
-                "results/batches_seen": instrumentation["batches_seen"],
-                "results/forward_calls": instrumentation["forward_calls"],
-                "results/backward_calls": instrumentation["backward_calls"],
-            }
-
-            if baseline_name == "grad_norm" and isinstance(skip_policy, GradNormSkipPolicy):
-                pol_diag = skip_policy.get_diagnostics()
-                custom_logs.update({
-                    "grad_norm/samples_collected": pol_diag.get("grad_norm_samples_collected", 0),
-                    "grad_norm/finite_samples": pol_diag.get("grad_norm_finite_samples", 0),
-                    "grad_norm/threshold": pol_diag.get("grad_norm_threshold"),
-                    "grad_norm/calibrated": pol_diag.get("grad_norm_calibrated", False),
-                    "grad_norm/min": pol_diag.get("grad_norm_min"),
-                    "grad_norm/max": pol_diag.get("grad_norm_max"),
-                    "grad_norm/mean": pol_diag.get("grad_norm_mean"),
-                    "grad_norm/last": pol_diag.get("grad_norm_last"),
-                    "grad_norm/forced_probe_count": pol_diag.get("grad_norm_forced_probe_count", 0),
-                    "grad_norm/skip_decisions": pol_diag.get("grad_norm_skip_decisions", 0),
-                })
-
-            wandb.log(custom_logs)
-
-            wandb.define_metric("train/global_step")
-            wandb.define_metric("results/*", step_metric="train/global_step")
-
-            wandb.log({
-                "summary/energy_kwh": power_callback.cumulative_kwh,
-                "summary/primary_metric": primary_value,
-                "summary/skip_ratio": instrumentation["skip_ratio_by_batch"],
-            })
-
-        except Exception as e:
-            print(f"  [W&B] Custom logging failed: {e}")
 
     # Print summary
     print(f"\n  --- Results ---")
@@ -996,9 +915,6 @@ def run_single_baseline_experiment(
                 f"{cleanup['files_removed']} files, {cleanup['dirs_removed']} dirs, "
                 f"{cleanup['bytes_removed'] / (1024 ** 2):.1f} MB"
             )
-
-    if use_wandb:
-        _ensure_wandb_finished()
 
     return results
 
@@ -1169,7 +1085,8 @@ Examples:
         "--output-dir", default="./experiments/phase1_2_baselines",
         help="Base output directory",
     )
-    parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--model-name", default=MODEL_NAME)
+    parser.add_argument("--model-revision", default=MODEL_REVISION)
     parser.add_argument("--wandb-project", default="lerna-phase1.2")
     parser.add_argument("--wandb-group", default=None)
     parser.add_argument(
@@ -1199,6 +1116,11 @@ Examples:
     args = parser.parse_args()
 
     profile = detect_device_profile()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable. Refusing to run official Phase 1.2 on CPU."
+        )
 
     # --- Mode presets ---
     if args.mode == "smoke":
@@ -1237,7 +1159,10 @@ Examples:
         max_samples = 2000
 
     total_runs = len(baselines) * len(tasks) * len(seeds)
-    wandb_group = args.wandb_group or f"phase1.2-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    # --- Lock environment ---
+    from lock_environment import check_environment
+    check_environment(args.output_dir)
 
     # --- Print experiment plan ---
     print(f"\n{'=' * 70}")
@@ -1253,9 +1178,6 @@ Examples:
     print(f"  Max samples/task: {max_samples or 'unlimited'}")
     print(f"  Target skip rate: {args.target_skip_rate}")
     print(f"  Output: {args.output_dir}")
-    if args.wandb:
-        print(f"  W&B project: {args.wandb_project}")
-        print(f"  W&B group: {wandb_group}")
     print(f"{'=' * 70}")
     print(f"\n  Baselines to evaluate:")
     for b in baselines:
@@ -1272,7 +1194,7 @@ Examples:
 
     # --- Ensure no stale W&B run ---
     if args.wandb:
-        _ensure_wandb_finished()
+        raise ValueError("W&B is disabled for Phase 1.2")
 
     # --- Main experiment loop ---
     all_results = []
@@ -1301,16 +1223,16 @@ Examples:
                         seed=seed,
                         profile=profile,
                         base_output_dir=args.output_dir,
-                        use_wandb=args.wandb,
                         max_samples_override=max_samples,
                         run_idx=run_idx,
                         total_runs=total_runs,
-                        wandb_project=args.wandb_project,
-                        wandb_group=wandb_group,
                         target_skip_rate=args.target_skip_rate,
                         cleanup_artifacts=not args.no_cleanup_artifacts,
                         keep_power_samples=args.keep_power_samples,
                         keep_debug_artifacts=args.keep_debug_artifacts,
+                        model_name=args.model_name,
+                        model_revision=args.model_revision,
+                        unlimited=args.unlimited,
                     )
                     all_results.append(result)
 
@@ -1346,8 +1268,6 @@ Examples:
                             )
 
                     release_cuda_memory()
-                    if args.wandb:
-                        _ensure_wandb_finished()
 
     # --- Generate summary ---
     os.makedirs(args.output_dir, exist_ok=True)
