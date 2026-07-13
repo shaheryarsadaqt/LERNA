@@ -13,7 +13,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.0.0",
-        "transformers>=4.30.0",
+        "transformers>=4.48.0",
         "datasets>=2.10.0",
         "evaluate>=0.4.0",
         "accelerate>=0.20.0",

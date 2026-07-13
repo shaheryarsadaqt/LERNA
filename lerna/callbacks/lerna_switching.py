@@ -244,7 +244,7 @@ class EnergyTracker:
         try:
             import subprocess
             result = subprocess.run(
-                ["nvidia-smi", f"--id={self.gpu_id}", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                ["nvidia-smi", "-i", str(self.gpu_id), "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=2
             )
             if result.returncode == 0:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
@@ -263,6 +264,7 @@ class TrueBackwardSkippingTrainer(Trainer):
         self._last_logits: Optional[torch.Tensor] = None
         self.last_logits: Optional[torch.Tensor] = None
         self._pre_clip_grad_norm: Optional[float] = None  # written by external callback
+        self._last_grad_scale: float = 1.0
 
         # Wrapper bookkeeping
         self._orig_opt_step = None
@@ -373,11 +375,26 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # --- SINGLE SOURCE OF TRUTH: pre-clip grad norm (before HF clips) ---
         with torch.no_grad():
-            sq = 0.0
+            squared_norm = 0.0
             for p in model.parameters():
                 if p.requires_grad and p.grad is not None:
-                    sq += float(p.grad.detach().float().norm()) ** 2
-            self._pre_clip_grad_norm = sq ** 0.5
+                    pn = float(p.grad.detach().float().norm().item())
+                    squared_norm += pn ** 2
+            grad_norm = squared_norm ** 0.5
+
+        scaler = getattr(
+            getattr(self, "accelerator", None),
+            "scaler",
+            None,
+        )
+        grad_scale = 1.0
+        if scaler is not None:
+            candidate_scale = float(scaler.get_scale())
+            if math.isfinite(candidate_scale) and candidate_scale > 0:
+                grad_scale = candidate_scale
+
+        self._pre_clip_grad_norm = grad_norm / grad_scale
+        self._last_grad_scale = grad_scale
         pol = self.skip_policy
         if hasattr(pol, "record_grad_norm"):
             pol.record_grad_norm(self._pre_clip_grad_norm)
