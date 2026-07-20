@@ -124,6 +124,53 @@ class ComputeSavingMechanism:
     NONE = "none"
 
 
+SKIP_UPDATE_MODE_FREEZE = "freeze"
+SKIP_UPDATE_MODE_MOMENTUM = "momentum"
+VALID_SKIP_UPDATE_MODES = (SKIP_UPDATE_MODE_FREEZE, SKIP_UPDATE_MODE_MOMENTUM)
+
+_SKIP_UPDATE_MECHANISM_DESC = {
+    SKIP_UPDATE_MODE_FREEZE: (
+        "freeze: skipped-backward steps perform no parameter update and "
+        "no optimizer-state update"
+    ),
+    SKIP_UPDATE_MODE_MOMENTUM: (
+        "momentum: skipped-backward steps update parameters by extrapolating "
+        "from stale optimizer state (SGD momentum_buffer, or bias-corrected "
+        "AdamW exp_avg/exp_avg_sq); no gradient is computed and optimizer "
+        "state itself is not refreshed"
+    ),
+}
+
+
+def normalize_skip_update_mode(explicit_mode=None, legacy_use_momentum_extrap=None):
+    """Single source of truth for the skipped-step parameter-update mode.
+
+    Returns (effective_mode, used_legacy_compat).
+    Raises ValueError on an invalid mode or a conflicting explicit/legacy pair.
+    """
+    if explicit_mode is not None and explicit_mode not in VALID_SKIP_UPDATE_MODES:
+        raise ValueError(
+            f"Invalid skip_update_mode={explicit_mode!r}; "
+            f"expected one of {VALID_SKIP_UPDATE_MODES}."
+        )
+    if legacy_use_momentum_extrap is None:
+        return (explicit_mode or SKIP_UPDATE_MODE_FREEZE, False)
+    legacy_mode = (
+        SKIP_UPDATE_MODE_MOMENTUM if legacy_use_momentum_extrap
+        else SKIP_UPDATE_MODE_FREEZE
+    )
+    if explicit_mode is None:
+        return (legacy_mode, True)
+    if explicit_mode != legacy_mode:
+        raise ValueError(
+            f"Conflicting skip-update settings: explicit skip_update_mode="
+            f"{explicit_mode!r} vs legacy use_momentum_extrap="
+            f"{legacy_use_momentum_extrap} (implies {legacy_mode!r}). "
+            f"Remove one of the two sources of truth."
+        )
+    return (explicit_mode, True)
+
+
 # ----------------------------------------------------------------------------
 # Instrumentation container
 # ----------------------------------------------------------------------------
@@ -144,6 +191,10 @@ class SkipInstrumentation:
     policy_name: str = ""
     compute_saving_mechanism: str = ComputeSavingMechanism.BACKWARD_SKIPPING
     grad_accumulation_steps: int = 1
+    skip_update_mode: str = SKIP_UPDATE_MODE_FREEZE
+    parameters_may_change_on_skipped_step: bool = False
+    skip_update_mechanism: str = _SKIP_UPDATE_MECHANISM_DESC[SKIP_UPDATE_MODE_FREEZE]
+    skip_update_mode_legacy_compat_used: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -175,6 +226,14 @@ class SkipInstrumentation:
             "HF state.global_step counts training-loop iterations (batches), "
             "not real optimizer updates. Use optimizer_step_attempts for "
             "actual (attempted) parameter updates."
+        )
+        d["skip_update_mode"] = self.skip_update_mode
+        d["parameters_may_change_on_skipped_step"] = (
+            self.parameters_may_change_on_skipped_step
+        )
+        d["skip_update_mechanism"] = self.skip_update_mechanism
+        d["skip_update_mode_legacy_compat_used"] = (
+            self.skip_update_mode_legacy_compat_used
         )
         return d
 
@@ -490,16 +549,54 @@ class TrueBackwardSkippingTrainer(Trainer):
 # ---------------------------------------------------------------------------
 
 class LERNAMomentumTrainer(TrueBackwardSkippingTrainer):
-    """apply_momentum=True   -> full LERNA (extrapolate via exp_avg / momentum_buffer)
-       apply_momentum=False  -> 'no_momentum' ablation: pure weight freeze."""
+    """Momentum-aware backward-skipping trainer with explicit mode control.
 
-    def __init__(self, *args, apply_momentum: bool = True, **kwargs):
+    Modes (via ``skip_update_mode``):
+        "freeze"   -> pure weight freeze on skipped steps (default).
+        "momentum" -> extrapolate via stale AdamW/SGD moments on skipped steps.
+
+    Legacy ``apply_momentum`` (bool):
+        Accepted for backwards compatibility. Derived from ``skip_update_mode``
+        as ``apply_momentum = (skip_update_mode == "momentum")``. Not a source
+        of truth; ``skip_update_mode`` remains the only behavioral gate.
+    """
+
+    def __init__(
+        self,
+        *args,
+        skip_update_mode: Optional[str] = None,
+        apply_momentum: Optional[bool] = None,   # legacy compatibility only
+        **kwargs,
+    ):
+        # Normalize BEFORE super().__init__ so conflicts fail fast.
+        effective_mode, used_legacy = normalize_skip_update_mode(
+            explicit_mode=skip_update_mode,
+            legacy_use_momentum_extrap=apply_momentum,
+        )
         super().__init__(*args, **kwargs)
-        self.apply_momentum = apply_momentum
+        self.skip_update_mode = effective_mode
+        self.skip_update_mode_legacy_compat_used = used_legacy
+        # Derived compatibility boolean for old readers. Behavior is
+        # gated only on ``skip_update_mode``.
+        self.apply_momentum = (
+            effective_mode == SKIP_UPDATE_MODE_MOMENTUM
+        )
+        if used_legacy:
+            logger.warning(
+                "LERNAMomentumTrainer: legacy 'apply_momentum=%s' normalized "
+                "to skip_update_mode=%r. Migrate to skip_update_mode.",
+                apply_momentum, effective_mode,
+            )
+        self.instr.skip_update_mode = effective_mode
+        self.instr.parameters_may_change_on_skipped_step = (
+            effective_mode == SKIP_UPDATE_MODE_MOMENTUM
+        )
+        self.instr.skip_update_mechanism = _SKIP_UPDATE_MECHANISM_DESC[effective_mode]
+        self.instr.skip_update_mode_legacy_compat_used = used_legacy
 
     def on_skipped_backward_step(self, loss, model, inputs):
-        if not self.apply_momentum:
-            return  # no_momentum ablation: pure weight freeze
+        if self.skip_update_mode != SKIP_UPDATE_MODE_MOMENTUM:
+            return  # freeze: no parameter update, no optimizer-state update
         opt = self.optimizer
         if opt is None:
             return

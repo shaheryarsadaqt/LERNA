@@ -62,6 +62,7 @@ from lerna.trainers import (
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
     LERNARandomVetoDeferralPolicy,
     RandomSkipPolicy, GradNormSkipPolicy,
+    normalize_skip_update_mode,
 )
 from transformers import TrainerCallback
 
@@ -156,7 +157,8 @@ class AblationDiagnosticsCallback:
         use_ler,
         use_hysteresis,
         use_safety_horizon,
-        use_momentum_extrap,
+        skip_update_mode,
+        skip_update_mode_legacy_compat_used,
         ablation_name,
         ablation_overrides,
         output_dir,
@@ -173,7 +175,8 @@ class AblationDiagnosticsCallback:
         self.use_ler = use_ler
         self.use_hysteresis = use_hysteresis
         self.use_safety_horizon = use_safety_horizon
-        self.use_momentum_extrap = use_momentum_extrap
+        self.skip_update_mode = skip_update_mode
+        self.skip_update_mode_legacy_compat_used = skip_update_mode_legacy_compat_used
         self.ablation_name = ablation_name
         self.ablation_overrides = ablation_overrides
         self.output_dir = output_dir
@@ -280,6 +283,8 @@ class AblationDiagnosticsCallback:
         final["velocity_history"] = self.ler_tracker.velocity_history
         final["ablation_name"] = self.ablation_name
         final["ablation_overrides"] = self.ablation_overrides
+        final["skip_update_mode"] = self.skip_update_mode
+        final["skip_update_mode_legacy_compat_used"] = self.skip_update_mode_legacy_compat_used
         with open(diag_path, "w") as f:
             json.dump(final, f, indent=2, default=str)
         print(f"  LER diagnostics saved: {diag_path}")
@@ -313,6 +318,7 @@ def run_ablation_single(
     rho_veto_threshold: float = -0.2,
     risk_gamma: float = 0.0,
     guard_mode: str = "on",
+    skip_update_mode: str = None,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -332,6 +338,23 @@ def run_ablation_single(
     run_id = f"{task_name}_s{seed}_ab-{ablation_name}"
     output_dir = os.path.join(base_output_dir, ablation_name, run_id)
     os.makedirs(output_dir, exist_ok=True)
+
+    # [Phase 1.3 Piece 1] Explicit skipped-step update mode.
+    # Legacy 'use_momentum_extrap' overrides are supported ONLY as a logged
+    # compatibility path; conflicts with an explicit CLI mode are rejected.
+    legacy_momentum_flag = ablation_overrides.get("use_momentum_extrap", None)
+    effective_skip_update_mode, skip_mode_legacy_compat_used = (
+        normalize_skip_update_mode(
+            explicit_mode=skip_update_mode,
+            legacy_use_momentum_extrap=legacy_momentum_flag,
+        )
+    )
+    if skip_mode_legacy_compat_used:
+        print(
+            f"  [compat] legacy ablation override "
+            f"'use_momentum_extrap={legacy_momentum_flag}' normalized to "
+            f"skip_update_mode='{effective_skip_update_mode}'"
+        )
 
     if wandb_group is None:
         wandb_group = f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -364,6 +387,8 @@ def run_ablation_single(
     print(f"\n{'='*60}")
     print(f"  Ablation [{ablation_name}]: {task_name} | seed={seed} | lr={lr}")
     print(f"  Overrides: {ablation_overrides}")
+    print(f"  Skip-update mode: {effective_skip_update_mode}"
+          + ("  (legacy use_momentum_extrap compat)" if skip_mode_legacy_compat_used else ""))
     print(f"  Profile: {profile} | Output: {output_dir}")
     print(f"{'='*60}")
 
@@ -412,7 +437,6 @@ def run_ablation_single(
     use_ler = ablation_overrides.get("use_ler", True)
     use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
     use_hysteresis = ablation_overrides.get("use_hysteresis", True)
-    use_momentum_extrap = ablation_overrides.get("use_momentum_extrap", True)
 
     ler_tracker = LERTracker(task=task_name, window_size=5, use_hysteresis=use_hysteresis)
 
@@ -550,7 +574,8 @@ def run_ablation_single(
         use_ler=use_ler,
         use_hysteresis=use_hysteresis,
         use_safety_horizon=use_safety_horizon,
-        use_momentum_extrap=use_momentum_extrap,
+        skip_update_mode=effective_skip_update_mode,
+        skip_update_mode_legacy_compat_used=skip_mode_legacy_compat_used,
         ablation_name=ablation_name,
         ablation_overrides=ablation_overrides,
         output_dir=output_dir,
@@ -607,7 +632,8 @@ def run_ablation_single(
         compute_metrics=compute_metrics,
         ler_tracker=ler_tracker,
         skip_policy=skip_policy,
-        apply_momentum=use_momentum_extrap,  # [FIX P0-1] Wire the momentum flag (R5)
+        skip_update_mode=effective_skip_update_mode,
+        apply_momentum=legacy_momentum_flag,  # None when CLI path; preserves legacy provenance
         compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
         capture_logits=True,
@@ -669,6 +695,8 @@ def run_ablation_single(
     results["skipped_backward_steps"] = _instr.get("skipped_backward_steps")
     results["forward_calls"] = _instr.get("forward_calls")
     results["policy_name"] = _instr.get("policy_name") or getattr(skip_policy, "name", None)
+    results["skip_update_mode"] = effective_skip_update_mode
+    results["skip_update_mode_legacy_compat_used"] = skip_mode_legacy_compat_used
 
 
 
@@ -689,6 +717,8 @@ def run_ablation_single(
         "risk_gamma": risk_gamma,
         "no_early_stopping": no_early_stopping,
         "num_epochs": num_epochs,
+        "skip_update_mode": effective_skip_update_mode,
+        "skip_update_mode_legacy_compat_used": skip_mode_legacy_compat_used,
     }
 
     results_path = os.path.join(output_dir, "results.json")
@@ -757,6 +787,16 @@ def main():
     parser.add_argument("--target-skip-rate", type=float, default=0.20)
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
+    parser.add_argument(
+        "--skip-update-mode",
+        choices=["freeze", "momentum"],
+        default=None,
+        help="Parameter behavior on skipped-backward steps. "
+             "'freeze' (effective default): no parameter update and no "
+             "optimizer-state update on skipped steps. "
+             "'momentum': LERNAMomentumTrainer extrapolation from stale "
+             "optimizer state. Omitting the flag resolves to 'freeze'.",
+    )
     args = parser.parse_args()
 
     profile = detect_device_profile()
@@ -850,6 +890,7 @@ def main():
                         rho_veto_threshold=args.rho_veto_threshold,
                         risk_gamma=args.risk_gamma,
                         guard_mode=args.guard_mode,
+                        skip_update_mode=args.skip_update_mode,
                     )
                     all_results.append(result)
                 except Exception as e:

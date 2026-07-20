@@ -4,6 +4,9 @@ from .true_skip_trainer import (
     SkipPolicy,
     SchedulerStepPolicy,
     ComputeSavingMechanism,
+    normalize_skip_update_mode,
+    SKIP_UPDATE_MODE_FREEZE,
+    SKIP_UPDATE_MODE_MOMENTUM,
 )
 from .policies import (
     AlwaysFalsePolicy,
@@ -25,6 +28,9 @@ __all__ = [
     "SkipPolicy",
     "SchedulerStepPolicy",
     "ComputeSavingMechanism",
+    "normalize_skip_update_mode",
+    "SKIP_UPDATE_MODE_FREEZE",
+    "SKIP_UPDATE_MODE_MOMENTUM",
     "AlwaysFalsePolicy",
     "GradNormSkipPolicy",
     "RandomSkipPolicy",
