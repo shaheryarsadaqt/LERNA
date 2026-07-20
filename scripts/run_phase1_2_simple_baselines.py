@@ -842,7 +842,7 @@ def run_single_baseline_experiment(
         "task": task_name,
         "seed": seed,
         "learning_rate": lr,
-        "model": model_name,
+        "model_name": model_name,
         "model_revision": model_revision,
         "profile": profile,
         "training_device": str(training_args.device),
