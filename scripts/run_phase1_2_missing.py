@@ -107,15 +107,6 @@ def append_line(path: Path, text: str):
         f.write(text.rstrip() + "\n")
 
 
-def cleanup_wandb_local(root: Path):
-    wandb_dir = root / "wandb"
-    if not wandb_dir.exists():
-        return
-    for path in wandb_dir.glob("run-*"):
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-
-
 def execute(args, pending, skipped, manifest):
     sys.path.insert(0, str(ROOT))
     from scripts.run_phase1_2_simple_baselines import (
@@ -123,7 +114,6 @@ def execute(args, pending, skipped, manifest):
         detect_device_profile,
         release_cuda_memory,
         run_single_baseline_experiment,
-        _ensure_wandb_finished,
     )
 
     profile = args.profile or detect_device_profile()
@@ -131,12 +121,12 @@ def execute(args, pending, skipped, manifest):
     if max_samples is None and not args.unlimited:
         max_samples = None if profile == "server" else 2000
 
+    from lock_environment import check_environment
+    check_environment(args.output_dir)
+
     total = len(pending) + len(skipped)
     start = time.time()
     succeeded = failed = 0
-
-    if args.wandb:
-        _ensure_wandb_finished()
 
     for idx, run in enumerate(pending, 1):
         if free_gb(args.output_dir) < args.min_disk_gb:
@@ -161,16 +151,14 @@ def execute(args, pending, skipped, manifest):
                 seed=run["seed"],
                 profile=profile,
                 base_output_dir=str(args.output_dir),
-                use_wandb=args.wandb,
                 max_samples_override=max_samples,
                 run_idx=len(skipped) + idx,
                 total_runs=total,
-                wandb_project=args.wandb_project,
-                wandb_group=args.wandb_group,
                 target_skip_rate=args.target_skip_rate,
                 cleanup_artifacts=not args.no_cleanup_artifacts,
                 keep_power_samples=args.keep_power_samples,
                 keep_debug_artifacts=args.keep_debug_artifacts,
+                unlimited=args.unlimited,
             )
             result_path = find_existing_result(args.output_dir, run)
             manifest.setdefault("runs", {})[key] = {
@@ -196,22 +184,9 @@ def execute(args, pending, skipped, manifest):
                         keep_power_samples=args.keep_power_samples,
                         keep_debug_artifacts=args.keep_debug_artifacts,
                     )
-            release_cuda_memory()
-            manifest.setdefault("runs", {})[key] = {
-                "status": "failed",
-                "error": str(exc),
-                "failed_at": datetime.now().isoformat(),
-                "results_path": str(result_path) if result_path else None,
-            }
-            save_manifest(args.manifest, manifest)
-            append_line(args.failed_log, f"FAILED {run['baseline']} {run['task']} seed={run['seed']} error={exc}")
-            failed += 1
-            if args.wandb:
-                _ensure_wandb_finished()
+                    release_cuda_memory()
 
         finally:
-            if args.cleanup_wandb_local:
-                cleanup_wandb_local(ROOT)
             release_cuda_memory()
 
     print("=" * 72)
@@ -228,9 +203,6 @@ def main():
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     p.add_argument("--completed-log", type=Path, default=ROOT / "completed_phase1_2_resume.txt")
     p.add_argument("--failed-log", type=Path, default=ROOT / "failed_phase1_2_resume.txt")
-    p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb-project", default="lerna-phase1.2")
-    p.add_argument("--wandb-group", default=None)
     p.add_argument("--target-skip-rate", type=float, default=0.33)
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--unlimited", action="store_true")
@@ -239,7 +211,6 @@ def main():
     p.add_argument("--no-cleanup-artifacts", action="store_true")
     p.add_argument("--keep-power-samples", action="store_true")
     p.add_argument("--keep-debug-artifacts", action="store_true")
-    p.add_argument("--cleanup-wandb-local", action="store_true")
     p.add_argument("--min-disk-gb", type=float, default=30.0)
     p.add_argument("--status", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -247,8 +218,6 @@ def main():
 
     args.output_dir = args.output_dir.resolve()
     args.manifest = args.manifest.resolve()
-    if args.wandb_group is None:
-        args.wandb_group = f"phase1.2-resume-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     runs = load_missing(args.missing_file)
     manifest = load_manifest(args.manifest)
