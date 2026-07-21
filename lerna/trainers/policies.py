@@ -1598,6 +1598,12 @@ class LERNARandomVetoDeferralPolicy:
         self._random_candidate_count = 0
         self._vetoed_skips = 0
         self._repaid_skips = 0
+        self._skip_source_counts = {
+            "accepted_candidate": 0,
+            "ordinary_repayment": 0,
+            "forced_tail": 0,
+        }
+        self._forced_tail_debt_repayments = 0
         self._danger_veto_counts_by_type = {
             "loss_spike": 0,
             "rho_thrash": 0,
@@ -1775,10 +1781,29 @@ class LERNARandomVetoDeferralPolicy:
             or self.use_phase_protection
         )
 
-    def _do_skip(self, idx=None):
-        if self._deferred_pool:
-            self._repaid_skips += 1
+    _VALID_SKIP_SOURCES = ("accepted_candidate", "ordinary_repayment", "forced_tail")
+
+    def _do_skip(self, idx=None, *, source):
+        """Execute a skip with exactly one closed, validated source."""
+        if source not in self._VALID_SKIP_SOURCES:
+            raise ValueError(f"invalid skip source: {source!r}")
+
+        if source == "accepted_candidate":
+            self._accepted_random_skips += 1
+        elif source == "ordinary_repayment":
+            if not self._deferred_pool:
+                raise RuntimeError(
+                    "ordinary_repayment skip requested with no outstanding debt"
+                )
             self._deferred_pool.pop(0)
+            self._repaid_skips += 1
+        else:  # forced_tail
+            self._forced_tail += 1
+            if self._deferred_pool:
+                self._deferred_pool.pop(0)
+                self._forced_tail_debt_repayments += 1
+
+        self._skip_source_counts[source] += 1
         self._skip_decisions += 1
         self._consecutive_skips += 1
         self._random_safe_skip += 1
@@ -1800,8 +1825,7 @@ class LERNARandomVetoDeferralPolicy:
             if decision:
                 self._random_candidate_count += 1
                 self._candidate_indices_seen.add(idx)
-                self._accepted_random_skips += 1
-                return self._do_skip(idx)
+                return self._do_skip(idx, source="accepted_candidate")
 
             self._consecutive_skips = 0
             return False
@@ -1831,27 +1855,25 @@ class LERNARandomVetoDeferralPolicy:
                 self._consecutive_skips = 0
                 return False
 
-            self._accepted_random_skips += 1
-            return self._do_skip(idx)
+            return self._do_skip(idx, source="accepted_candidate")
 
         if self._deferred_pool:
             if self.repay_mode == "asap":
-                return self._do_skip(idx)
+                return self._do_skip(idx, source="ordinary_repayment")
 
             p_repay = min(
                 max(4.0 * len(self._deferred_pool) / max(remaining_decisions, 1), 0.0),
                 1.0,
             )
             if self._rng.random() < p_repay:
-                return self._do_skip(idx)
+                return self._do_skip(idx, source="ordinary_repayment")
 
         tail_window = max(5, int(0.02 * self._quota_total_steps))
         if (
             remaining_skips >= remaining_decisions
             and idx >= self._quota_total_steps - tail_window
         ):
-            self._forced_tail += 1
-            return self._do_skip(idx)
+            return self._do_skip(idx, source="forced_tail")
 
         self._consecutive_skips = 0
         return False
@@ -1893,6 +1915,11 @@ class LERNARandomVetoDeferralPolicy:
             "deferred_pool_peak": self._deferred_pool_peak,
             "repaid_skips": self._repaid_skips,
             "forced_tail_skips": self._forced_tail,
+            "skip_source_counts": dict(self._skip_source_counts),
+            "outstanding_debt": len(self._deferred_pool),
+            "debt_created": self._deferred_count,
+            "ordinary_debt_repayments": self._repaid_skips,
+            "forced_tail_debt_repayments": self._forced_tail_debt_repayments,
             "danger_veto_counts_by_type": dict(self._danger_veto_counts_by_type),
             "phase_skip_distribution": self._phase_skips if self._phase_skips else None,
             "warmup_veto_count": self._warmup_veto,
@@ -1903,10 +1930,26 @@ class LERNARandomVetoDeferralPolicy:
                 full_backward_steps / self._quota_total_steps
                 if self._quota_total_steps else None
             ),
+            # Compatibility alias for the source decomposition invariant.
             "invariant_skip_accounting_ok": (
                 self._skip_decisions
-                == self._accepted_random_skips + self._repaid_skips + self._forced_tail
+                == self._skip_source_counts["accepted_candidate"]
+                + self._skip_source_counts["ordinary_repayment"]
+                + self._skip_source_counts["forced_tail"]
             ),
+            "invariant_skip_source_decomposition_ok": (
+                self._skip_decisions
+                == self._skip_source_counts["accepted_candidate"]
+                + self._skip_source_counts["ordinary_repayment"]
+                + self._skip_source_counts["forced_tail"]
+            ),
+            "invariant_debt_conservation_ok": (
+                self._deferred_count
+                == self._repaid_skips
+                + self._forced_tail_debt_repayments
+                + len(self._deferred_pool)
+            ),
+            "invariant_debt_nonnegative_ok": len(self._deferred_pool) >= 0,
             "invariant_candidate_count_ok": (
                 self._candidate_set_size is None
                 or self._random_candidate_count <= self._candidate_set_size
