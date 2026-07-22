@@ -1568,6 +1568,11 @@ class LERNARandomVetoDeferralPolicy:
         self.novelty_rank_veto = float(novelty_rank_veto)
         self.mem_bank_size = int(mem_bank_size)
         self.target_veto_rate = float(target_veto_rate)
+        if repay_mode not in self._VALID_REPAY_MODES:
+            raise ValueError(
+                f"unsupported repay_mode: {repay_mode!r}; "
+                f"expected one of {self._VALID_REPAY_MODES}"
+            )
         self.repay_mode = repay_mode
         self.repay_protect_dangerous = repay_protect_dangerous
         self.use_phase_protection = use_phase_protection
@@ -1636,6 +1641,11 @@ class LERNARandomVetoDeferralPolicy:
         self._forced_tail = 0
         self._random_safe_skip = 0
         self._deferred_count = 0
+        self._forced_dangerous_candidate_count = 0
+        self._dangerous_repayment_deferred_count = 0
+        self._forced_dangerous_repayment_count = 0
+        self._forced_max_consecutive_override_count = 0
+        self._max_consec_repayment_veto = 0
 
     def record_grad_norm(self, v) -> None:
         try:
@@ -1782,6 +1792,7 @@ class LERNARandomVetoDeferralPolicy:
         )
 
     _VALID_SKIP_SOURCES = ("accepted_candidate", "ordinary_repayment", "forced_tail")
+    _VALID_REPAY_MODES = ("asap", "spread")
 
     def _do_skip(self, idx=None, *, source):
         """Execute a skip with exactly one closed, validated source."""
@@ -1819,61 +1830,118 @@ class LERNARandomVetoDeferralPolicy:
             self._consecutive_skips = 0
             return False
 
+        # Preserve exact RandomSkipPolicy behavior for the pure-random control.
         if self._all_vetoes_disabled():
             decision = (self._skip_set is not None) and (idx in self._skip_set)
-
             if decision:
                 self._random_candidate_count += 1
                 self._candidate_indices_seen.add(idx)
                 return self._do_skip(idx, source="accepted_candidate")
-
             self._consecutive_skips = 0
             return False
 
-        idx = self._decisions_seen - 1
         is_candidate = self._skip_set is not None and idx in self._skip_set
+        remaining_after_current = self._quota_total_steps - (idx + 1)
+        remaining_skips = self._quota_size - self._skip_decisions
+        must_skip_now = remaining_skips > remaining_after_current
 
-        remaining_skips = (self._quota_size - self._skip_decisions) if self._quota_size is not None else 0
-        remaining_decisions = max((self._quota_total_steps - self._decisions_seen), 1) if self._quota_total_steps is not None else 1
         if remaining_skips <= 0:
             self._quota_exhausted += 1
             self._consecutive_skips = 0
             return False
 
+        at_consec_limit = (
+            self.use_safety_horizon
+            and self.max_consecutive_skips > 0
+            and self._consecutive_skips >= self.max_consecutive_skips
+        )
+
+        danger_cache = {}
+
+        def danger_once():
+            if "result" not in danger_cache:
+                danger_cache["result"] = self._is_dangerous(trainer)
+            return danger_cache["result"]
+
         if is_candidate:
             self._random_candidate_count += 1
             self._candidate_indices_seen.add(idx)
-            dangerous, danger_types = self._is_dangerous(trainer)
+            dangerous, danger_types = danger_once()
+
             if dangerous:
+                if must_skip_now:
+                    self._forced_dangerous_candidate_count += 1
+                    if at_consec_limit:
+                        self._forced_max_consecutive_override_count += 1
+                    return self._do_skip(idx, source="accepted_candidate")
                 for key, flagged in danger_types.items():
                     if flagged:
                         self._danger_veto_counts_by_type[key] += 1
                 self._vetoed_skips += 1
                 self._deferred_pool.append(idx)
-                self._deferred_pool_peak = max(self._deferred_pool_peak, len(self._deferred_pool))
+                self._deferred_pool_peak = max(
+                    self._deferred_pool_peak, len(self._deferred_pool)
+                )
+                self._deferred_count += 1
+                self._consecutive_skips = 0
+                return False
+
+            if at_consec_limit:
+                if must_skip_now:
+                    self._forced_max_consecutive_override_count += 1
+                    return self._do_skip(idx, source="accepted_candidate")
+                self._max_consec_veto += 1
+                self._vetoed_skips += 1
+                self._deferred_pool.append(idx)
+                self._deferred_pool_peak = max(
+                    self._deferred_pool_peak, len(self._deferred_pool)
+                )
                 self._deferred_count += 1
                 self._consecutive_skips = 0
                 return False
 
             return self._do_skip(idx, source="accepted_candidate")
 
+        if must_skip_now:
+            if self.repay_protect_dangerous:
+                dangerous, _ = danger_once()
+                if dangerous:
+                    self._forced_dangerous_repayment_count += 1
+            if at_consec_limit:
+                self._forced_max_consecutive_override_count += 1
+            return self._do_skip(idx, source="forced_tail")
+
         if self._deferred_pool:
             if self.repay_mode == "asap":
-                return self._do_skip(idx, source="ordinary_repayment")
+                wants_repay = True
+            else:
+                remaining_decisions = max(
+                    self._quota_total_steps - self._decisions_seen, 1
+                )
+                p_repay = min(
+                    max(
+                        4.0
+                        * len(self._deferred_pool)
+                        / max(remaining_decisions, 1),
+                        0.0,
+                    ),
+                    1.0,
+                )
+                wants_repay = self._rng.random() < p_repay
 
-            p_repay = min(
-                max(4.0 * len(self._deferred_pool) / max(remaining_decisions, 1), 0.0),
-                1.0,
-            )
-            if self._rng.random() < p_repay:
+            if wants_repay:
+                if at_consec_limit:
+                    self._max_consec_veto += 1
+                    self._max_consec_repayment_veto += 1
+                    self._consecutive_skips = 0
+                    return False
+                if self.repay_protect_dangerous:
+                    dangerous, _ = danger_once()
+                    if dangerous:
+                        self._dangerous_repayment_deferred_count += 1
+                        self._consecutive_skips = 0
+                        return False
                 return self._do_skip(idx, source="ordinary_repayment")
-
-        tail_window = max(5, int(0.02 * self._quota_total_steps))
-        if (
-            remaining_skips >= remaining_decisions
-            and idx >= self._quota_total_steps - tail_window
-        ):
-            return self._do_skip(idx, source="forced_tail")
 
         self._consecutive_skips = 0
         return False
@@ -1961,5 +2029,38 @@ class LERNARandomVetoDeferralPolicy:
             "random_safe_skip_count": self._random_safe_skip,
             "deferred_count": self._deferred_count,
             "risk_gamma": self.risk_gamma,
+            "repay_mode": self.repay_mode,
+            "repay_protect_dangerous": self.repay_protect_dangerous,
+            "forced_dangerous_candidate_count": (
+                self._forced_dangerous_candidate_count
+            ),
+            "dangerous_repayment_deferred_count": (
+                self._dangerous_repayment_deferred_count
+            ),
+            "forced_dangerous_repayment_count": (
+                self._forced_dangerous_repayment_count
+            ),
+            "forced_max_consecutive_override_count": (
+                self._forced_max_consecutive_override_count
+            ),
+            "max_consecutive_repayment_veto_count": (
+                self._max_consec_repayment_veto
+            ),
+            "invariant_debt_never_negative_ok": (
+                len(self._deferred_pool) >= 0
+                and (
+                    self._repaid_skips
+                    + self._forced_tail_debt_repayments
+                )
+                <= self._deferred_count
+            ),
+            "invariant_forced_tail_no_double_count_ok": (
+                self._forced_tail_debt_repayments
+                <= self._skip_source_counts["forced_tail"]
+            ),
+            "invariant_repayment_single_source_ok": (
+                self._repaid_skips
+                == self._skip_source_counts["ordinary_repayment"]
+            ),
         }
 
