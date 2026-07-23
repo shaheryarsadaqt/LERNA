@@ -61,9 +61,10 @@ from lerna.trainers import (
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
     LERNARandomVetoDeferralPolicy,
-    RandomSkipPolicy, GradNormSkipPolicy,
+    AlwaysFalsePolicy, RandomSkipPolicy, GradNormSkipPolicy,
     normalize_skip_update_mode,
 )
+from lerna.trainers.policies import build_exact_random_skip_set
 from transformers import TrainerCallback
 
 try:
@@ -102,12 +103,169 @@ ABLATIONS = {
     "no_safety":        {"use_safety_horizon": False},
     "no_hysteresis":    {"use_hysteresis": False},
     "no_momentum":      {"use_momentum_extrap": False},
-    # matched-budget controls — the credibility bar ("surpass old methods")
-    "random_skip":      {"control": "random_skip"},
+    "full_finetune":    {"control": "full_finetune"},
+    "exact_random":     {"control": "exact_random"},
+    "rvd":              {"control": "rvd"},
     "grad_norm":        {"control": "grad_norm"},
+    # Compatibility alias for old invocations; excluded from default matrices.
+    "random_skip":      {"control": "exact_random", "alias_of": "exact_random"},
 }
 
+POLICY_MIN_STEP = 50
+SKIPPING_CONTROLS = {"exact_random", "random_skip", "rvd", "grad_norm"}
+DEFAULT_ABLATIONS = [
+    name for name, config in ABLATIONS.items() if "alias_of" not in config
+]
 ABLATION_GLUE_TASKS = [t for t in GLUE_TASKS if t != "rte_modernbert_2e5"]
+
+
+def build_rvd_controller_config(
+    *,
+    veto_mode: str,
+    margin_rank_floor: float,
+    spike_factor: float,
+    spike_ema_window: int,
+    repay_mode: str,
+    repay_protect_dangerous: bool,
+    policy_seed,
+    training_seed: int,
+    max_consecutive_skips: int,
+) -> dict:
+    """Normalize the supported RVD controller modes without hidden vetoes."""
+    if veto_mode not in ("none", "margin", "loss_spike"):
+        raise ValueError(f"Unknown RVD veto mode: {veto_mode!r}")
+    if repay_mode not in ("asap", "spread"):
+        raise ValueError(f"Unknown RVD repay mode: {repay_mode!r}")
+    margin_rank_floor = float(margin_rank_floor)
+    spike_factor = float(spike_factor)
+    spike_ema_window = int(spike_ema_window)
+    max_consecutive_skips = int(max_consecutive_skips)
+    if not 0.0 <= margin_rank_floor <= 1.0:
+        raise ValueError("rvd_margin_rank_floor must be in [0, 1]")
+    if not math.isfinite(spike_factor) or spike_factor < 0.0:
+        raise ValueError("rvd_spike_factor must be finite and >= 0")
+    if spike_ema_window < 1:
+        raise ValueError("rvd_spike_ema_window must be >= 1")
+    if max_consecutive_skips < 0:
+        raise ValueError("max_consecutive_skips must be >= 0")
+
+    return {
+        "veto_mode": veto_mode,
+        "use_margin_veto": veto_mode == "margin",
+        "use_loss_spike_veto": veto_mode == "loss_spike",
+        "use_rho_vg_veto": False,
+        "use_grad_norm_veto": False,
+        "use_novelty_veto": False,
+        "use_phase_protection": False,
+        "margin_rank_floor": margin_rank_floor,
+        "spike_factor": spike_factor,
+        "spike_ema_window": spike_ema_window,
+        "repay_mode": repay_mode,
+        "repay_protect_dangerous": bool(repay_protect_dangerous),
+        "policy_seed": int(training_seed if policy_seed is None else policy_seed),
+        "policy_seed_defaulted_to_training_seed": policy_seed is None,
+        "max_consecutive_skips": max_consecutive_skips,
+    }
+
+
+def assert_fixed_budget(
+    *,
+    ablation_name: str,
+    control,
+    no_early_stopping: bool,
+    allow_early_stopping_with_skipping: bool,
+) -> dict:
+    """Reject early stopping for skipping arms and report budget provenance."""
+    normalized_control = "exact_random" if control == "random_skip" else control
+    is_skipping_arm = (
+        normalized_control in SKIPPING_CONTROLS
+        or normalized_control is None
+    )
+    early_stopping_active = not no_early_stopping
+    if (
+        is_skipping_arm
+        and early_stopping_active
+        and not allow_early_stopping_with_skipping
+    ):
+        raise RuntimeError(
+            f"Fixed-budget violation: arm {ablation_name!r} skips backward "
+            "steps while early stopping is active. Use --no-early-stopping "
+            "for controller comparisons. The explicit "
+            "--allow-early-stopping-with-skipping override creates an "
+            "unmatched exploratory run."
+        )
+    return {
+        "is_skipping_arm": is_skipping_arm,
+        "early_stopping_active": early_stopping_active,
+        # Any early-stopped arm is not a fixed-horizon matched-budget run.
+        "matched_budget": not early_stopping_active,
+    }
+
+
+def build_skip_policy(
+    *,
+    control: str,
+    ler_tracker,
+    target_skip_rate: float,
+    total_steps: int,
+    controller_cfg: dict,
+    rho_veto_threshold: float,
+    probe_interval: int,
+    use_ler: bool,
+    use_rho_vg: bool,
+    use_safety_horizon: bool,
+    fallback_threshold: float,
+    risk_gamma: float,
+):
+    """Construct one explicit baseline/RVD control arm."""
+    control = "exact_random" if control == "random_skip" else control
+    if control == "full_finetune":
+        return AlwaysFalsePolicy()
+    if control == "exact_random":
+        return RandomSkipPolicy(
+            target_skip_rate=target_skip_rate,
+            min_step=POLICY_MIN_STEP,
+            seed=controller_cfg["policy_seed"],
+            total_steps=total_steps,
+        )
+    if control == "grad_norm":
+        return GradNormSkipPolicy(
+            target_skip_rate=target_skip_rate,
+            min_step=POLICY_MIN_STEP,
+            calibration_steps=60,
+            recalibrate_every=200,
+            max_consecutive_skips=controller_cfg["max_consecutive_skips"],
+        )
+    if control == "rvd":
+        return LERNARandomVetoDeferralPolicy(
+            ler_tracker=ler_tracker,
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            min_step=POLICY_MIN_STEP,
+            seed=controller_cfg["policy_seed"],
+            use_loss_spike_veto=controller_cfg["use_loss_spike_veto"],
+            spike_factor=controller_cfg["spike_factor"],
+            spike_ema_window=controller_cfg["spike_ema_window"],
+            use_rho_vg_veto=False,
+            use_grad_norm_veto=False,
+            use_margin_veto=controller_cfg["use_margin_veto"],
+            margin_rank_floor=controller_cfg["margin_rank_floor"],
+            use_novelty_veto=False,
+            use_phase_protection=False,
+            repay_mode=controller_cfg["repay_mode"],
+            repay_protect_dangerous=controller_cfg["repay_protect_dangerous"],
+            rho_veto_threshold=rho_veto_threshold,
+            max_consecutive_skips=controller_cfg["max_consecutive_skips"],
+            probe_interval=probe_interval,
+            use_ler=use_ler,
+            use_rho_vg=use_rho_vg,
+            use_safety_horizon=use_safety_horizon,
+            fallback_threshold=fallback_threshold,
+            calibration_steps=60,
+            recalibrate_every=200,
+            risk_gamma=risk_gamma,
+        )
+    raise ValueError(f"Unsupported explicit control arm: {control!r}")
 
 
 class _GradNormCapture(TrainerCallback):
@@ -319,8 +477,40 @@ def run_ablation_single(
     risk_gamma: float = 0.0,
     guard_mode: str = "on",
     skip_update_mode: str = None,
+    allow_early_stopping_with_skipping: bool = False,
+    rvd_veto_mode: str = "none",
+    rvd_margin_rank_floor: float = 0.20,
+    rvd_spike_factor: float = 1.0,
+    rvd_spike_ema_window: int = 20,
+    rvd_repay_mode: str = "asap",
+    rvd_repay_protect_dangerous: bool = True,
+    rvd_policy_seed=None,
 ):
     """Run a single experiment with a specific ablation config."""
+
+    control = ablation_overrides.get("control")
+    effective_control = "exact_random" if control == "random_skip" else control
+    budget_state = assert_fixed_budget(
+        ablation_name=ablation_name,
+        control=effective_control,
+        no_early_stopping=no_early_stopping,
+        allow_early_stopping_with_skipping=allow_early_stopping_with_skipping,
+    )
+    if not 0.0 <= float(target_skip_rate) <= 1.0:
+        raise ValueError(
+            f"target_skip_rate must be in [0, 1], got {target_skip_rate!r}"
+        )
+    controller_cfg = build_rvd_controller_config(
+        veto_mode=rvd_veto_mode,
+        margin_rank_floor=rvd_margin_rank_floor,
+        spike_factor=rvd_spike_factor,
+        spike_ema_window=rvd_spike_ema_window,
+        repay_mode=rvd_repay_mode,
+        repay_protect_dangerous=rvd_repay_protect_dangerous,
+        policy_seed=rvd_policy_seed,
+        training_seed=seed,
+        max_consecutive_skips=max_consecutive_skips,
+    )
 
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
     lr = task_hp.get("learning_rate", 2e-5)
@@ -433,6 +623,23 @@ def run_ablation_single(
     total_steps = steps_per_epoch * num_epochs
     eval_steps = max(total_steps // 20, 10)
 
+    quota_control = effective_control
+    if quota_control is None and policy == "random_veto_deferral":
+        quota_control = "rvd"
+    requested_quota = None
+    if quota_control in ("exact_random", "rvd"):
+        try:
+            _, requested_quota = build_exact_random_skip_set(
+                total_steps=total_steps,
+                target_skip_rate=target_skip_rate,
+                min_step=POLICY_MIN_STEP,
+                seed=controller_cfg["policy_seed"],
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid exact quota for arm {ablation_name!r}: {exc}"
+            ) from exc
+
     use_rho_vg = ablation_overrides.get("use_rho_vg", True)
     use_ler = ablation_overrides.get("use_ler", True)
     use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
@@ -451,21 +658,20 @@ def run_ablation_single(
     task_cal = ler_tracker.task_calibration.get(task_name, {})
     base_thr = task_cal.get("ler_threshold", 0.01)
 
-    control = ablation_overrides.get("control")
-    if control == "random_skip":
-        skip_policy = RandomSkipPolicy(
+    if effective_control is not None:
+        skip_policy = build_skip_policy(
+            control=effective_control,
+            ler_tracker=ler_tracker,
             target_skip_rate=target_skip_rate,
-            min_step=50,
-            seed=seed,
             total_steps=total_steps,
-        )
-    elif control == "grad_norm":
-        skip_policy = GradNormSkipPolicy(
-            target_skip_rate=target_skip_rate,
-            min_step=50,
-            calibration_steps=60,
-            recalibrate_every=200,
-            max_consecutive_skips=max_consecutive_skips,
+            controller_cfg=controller_cfg,
+            rho_veto_threshold=rho_veto_threshold,
+            probe_interval=probe_interval,
+            use_ler=use_ler,
+            use_rho_vg=use_rho_vg,
+            use_safety_horizon=use_safety_horizon,
+            fallback_threshold=base_thr,
+            risk_gamma=risk_gamma,
         )
     else:
         if policy == "guarded_hybrid":
@@ -514,32 +720,18 @@ def run_ablation_single(
                 risk_gamma=risk_gamma,
             )
         elif policy == "random_veto_deferral":
-            skip_policy = LERNARandomVetoDeferralPolicy(
+            skip_policy = build_skip_policy(
+                control="rvd",
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 total_steps=total_steps,
-                min_step=50,
-                seed=seed,
-
-                use_loss_spike_veto=False,
-                use_rho_vg_veto=False,
-                use_grad_norm_veto=False,
-                use_margin_veto=True,
-                use_novelty_veto=False,
-                use_phase_protection=False,
-                spike_factor=1.0,
-                margin_rank_floor=0.20,
-                repay_mode="asap",
-
+                controller_cfg=controller_cfg,
                 rho_veto_threshold=rho_veto_threshold,
-                max_consecutive_skips=max_consecutive_skips,
                 probe_interval=probe_interval,
                 use_ler=use_ler,
                 use_rho_vg=use_rho_vg,
                 use_safety_horizon=use_safety_horizon,
                 fallback_threshold=base_thr,
-                calibration_steps=60,
-                recalibrate_every=200,
                 risk_gamma=risk_gamma,
             )
         else:
@@ -557,6 +749,43 @@ def run_ablation_single(
                 max_consecutive_skips=max_consecutive_skips,
                 probe_interval=probe_interval,
             )
+
+    policy_effective_config = (
+        skip_policy.effective_config()
+        if hasattr(skip_policy, "effective_config")
+        else {}
+    )
+    compute_saving_mechanism = (
+        ComputeSavingMechanism.NONE
+        if effective_control == "full_finetune"
+        else ComputeSavingMechanism.BACKWARD_SKIPPING
+    )
+    controller_config_effective = {
+        "arm": ablation_name,
+        "arm_alias_of": ablation_overrides.get("alias_of"),
+        "control": effective_control or policy,
+        "policy_class": type(skip_policy).__name__,
+        "compute_saving_mechanism": compute_saving_mechanism,
+        "policy_seed": controller_cfg["policy_seed"],
+        "target_skip_rate": target_skip_rate,
+        "min_step": POLICY_MIN_STEP,
+        "configured_total_steps": total_steps,
+        "requested_quota": requested_quota,
+        "matched_budget": budget_state["matched_budget"],
+        "is_skipping_arm": budget_state["is_skipping_arm"],
+        "allow_early_stopping_with_skipping": (
+            allow_early_stopping_with_skipping
+        ),
+        "early_stopping_active": budget_state["early_stopping_active"],
+        "num_epochs": num_epochs,
+        "policy_effective_config": policy_effective_config,
+    }
+    if quota_control == "rvd":
+        controller_config_effective["rvd"] = dict(controller_cfg)
+    print(
+        "  Controller config: "
+        + json.dumps(controller_config_effective, sort_keys=True, default=str)
+    )
 
     ler_feed_callback = LERFeedCallback(
         ler_tracker=ler_tracker,
@@ -634,7 +863,7 @@ def run_ablation_single(
         skip_policy=skip_policy,
         skip_update_mode=effective_skip_update_mode,
         apply_momentum=legacy_momentum_flag,  # None when CLI path; preserves legacy provenance
-        compute_saving_mechanism=ComputeSavingMechanism.BACKWARD_SKIPPING,
+        compute_saving_mechanism=compute_saving_mechanism,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
         capture_logits=True,
         callbacks=[
@@ -666,6 +895,21 @@ def run_ablation_single(
                  if power_callback._power_samples else 0)
 
     instrumentation = trainer.get_instrumentation()
+    policy_diagnostics = (
+        skip_policy.get_diagnostics()
+        if hasattr(skip_policy, "get_diagnostics")
+        else {}
+    )
+    if hasattr(skip_policy, "effective_config"):
+        controller_config_effective["policy_effective_config"] = (
+            skip_policy.effective_config()
+        )
+    runtime_quota = policy_diagnostics.get("quota_size")
+    if runtime_quota is not None:
+        controller_config_effective["requested_quota"] = runtime_quota
+    controller_config_effective["runtime_quota_total_steps"] = (
+        policy_diagnostics.get("quota_total_steps")
+    )
 
     results = {
         "task": task_name,
@@ -682,10 +926,8 @@ def run_ablation_single(
         "power_avg_watts": avg_power,
         "ler_final": ler_tracker.get_diagnostics(),
         "true_skip_instrumentation": instrumentation,
-        "policy_diagnostics": (
-            skip_policy.get_diagnostics()
-            if hasattr(skip_policy, "get_diagnostics") else {}
-        ),
+        "policy_diagnostics": policy_diagnostics,
+        "controller_config": controller_config_effective,
         "timestamp": datetime.now().isoformat(),
         "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
     }
@@ -710,6 +952,7 @@ def run_ablation_single(
     results["code_git_sha"] = git_sha
     results["run_config"] = {
         "policy": policy,
+        "control": effective_control,
         "target_skip_rate": target_skip_rate,
         "max_consecutive_skips": max_consecutive_skips,
         "probe_interval": probe_interval,
@@ -719,6 +962,21 @@ def run_ablation_single(
         "num_epochs": num_epochs,
         "skip_update_mode": effective_skip_update_mode,
         "skip_update_mode_legacy_compat_used": skip_mode_legacy_compat_used,
+        "controller_config": controller_config_effective,
+        "allow_early_stopping_with_skipping": (
+            allow_early_stopping_with_skipping
+        ),
+        "matched_budget": budget_state["matched_budget"],
+        "rvd_veto_mode": rvd_veto_mode,
+        "rvd_margin_rank_floor": rvd_margin_rank_floor,
+        "rvd_spike_factor": rvd_spike_factor,
+        "rvd_spike_ema_window": rvd_spike_ema_window,
+        "rvd_repay_mode": rvd_repay_mode,
+        "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
+        "rvd_policy_seed": controller_cfg["policy_seed"],
+        "rvd_policy_seed_defaulted_to_training_seed": (
+            controller_cfg["policy_seed_defaulted_to_training_seed"]
+        ),
     }
 
     results_path = os.path.join(output_dir, "results.json")
@@ -762,7 +1020,7 @@ def run_ablation_single(
     return results
 
 
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="LERNA Ablation Study")
     parser.add_argument("--mode", choices=["smoke", "full", "custom"], default="smoke")
     parser.add_argument("--tasks", nargs="+", default=None)
@@ -779,6 +1037,11 @@ def main():
     parser.add_argument("--unlimited", action="store_true")
     parser.add_argument("--no-early-stopping", action="store_true",
                         help="Run full fixed epochs so arms are compute-comparable")
+    parser.add_argument(
+        "--allow-early-stopping-with-skipping",
+        action="store_true",
+        help="Allow an unmatched exploratory skipping run with early stopping",
+    )
     parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid", "phase_strat", "random_veto_deferral"], default="hybrid")
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--risk-gamma", type=float, default=0.0)
@@ -787,6 +1050,28 @@ def main():
     parser.add_argument("--target-skip-rate", type=float, default=0.20)
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
+    parser.add_argument(
+        "--rvd-veto-mode",
+        choices=["none", "margin", "loss_spike"],
+        default="none",
+    )
+    parser.add_argument("--rvd-margin-rank-floor", type=float, default=0.20)
+    parser.add_argument("--rvd-spike-factor", type=float, default=1.0)
+    parser.add_argument("--rvd-spike-ema-window", type=int, default=20)
+    parser.add_argument(
+        "--rvd-repay-mode", choices=["asap", "spread"], default="asap"
+    )
+    parser.add_argument(
+        "--rvd-repay-protect-dangerous",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--rvd-policy-seed",
+        type=int,
+        default=None,
+        help="RVD/exact-random policy seed; defaults to the training seed",
+    )
     parser.add_argument(
         "--skip-update-mode",
         choices=["freeze", "momentum"],
@@ -797,7 +1082,11 @@ def main():
              "'momentum': LERNAMomentumTrainer extrapolation from stale "
              "optimizer state. Omitting the flag resolves to 'freeze'.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_arg_parser().parse_args()
 
     profile = detect_device_profile()
 
@@ -808,11 +1097,11 @@ def main():
     elif args.mode == "full":
         tasks = ABLATION_GLUE_TASKS
         seeds = SEEDS
-        ablations_to_run = list(ABLATIONS.keys())
+        ablations_to_run = list(DEFAULT_ABLATIONS)
     else:
         tasks = args.tasks or ["sst2"]
         seeds = args.seeds or [42]
-        ablations_to_run = args.ablations or list(ABLATIONS.keys())
+        ablations_to_run = args.ablations or list(DEFAULT_ABLATIONS)
 
     if args.tasks:
         tasks = args.tasks
@@ -891,6 +1180,18 @@ def main():
                         risk_gamma=args.risk_gamma,
                         guard_mode=args.guard_mode,
                         skip_update_mode=args.skip_update_mode,
+                        allow_early_stopping_with_skipping=(
+                            args.allow_early_stopping_with_skipping
+                        ),
+                        rvd_veto_mode=args.rvd_veto_mode,
+                        rvd_margin_rank_floor=args.rvd_margin_rank_floor,
+                        rvd_spike_factor=args.rvd_spike_factor,
+                        rvd_spike_ema_window=args.rvd_spike_ema_window,
+                        rvd_repay_mode=args.rvd_repay_mode,
+                        rvd_repay_protect_dangerous=(
+                            args.rvd_repay_protect_dangerous
+                        ),
+                        rvd_policy_seed=args.rvd_policy_seed,
                     )
                     all_results.append(result)
                 except Exception as e:

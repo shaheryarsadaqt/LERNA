@@ -21,6 +21,53 @@ import torch
 from lerna.callbacks.lerna_switching import SafetyHorizon
 
 
+def build_exact_random_skip_set(
+    total_steps: int,
+    target_skip_rate: float,
+    min_step: int,
+    seed: int,
+) -> tuple[set[int], int]:
+    """Build the deterministic exact-random candidate set.
+
+    RandomSkipPolicy and RVD share this implementation so identical inputs
+    produce identical candidates. Infeasible post-warmup quotas fail instead
+    of being silently clipped.
+    """
+    if total_steps is None or int(total_steps) <= 0:
+        raise ValueError(
+            f"total_steps must be a positive integer, got {total_steps!r}"
+        )
+    total_steps = int(total_steps)
+    target_skip_rate = float(target_skip_rate)
+    min_step = int(min_step)
+    if not 0.0 <= target_skip_rate <= 1.0:
+        raise ValueError(
+            "target_skip_rate must be in [0, 1], "
+            f"got {target_skip_rate!r}"
+        )
+    if min_step < 0:
+        raise ValueError(f"min_step must be >= 0, got {min_step}")
+
+    requested_quota = int(round(target_skip_rate * total_steps))
+    eligible = list(range(min_step, total_steps))
+    if requested_quota > len(eligible):
+        raise ValueError(
+            f"Infeasible skip quota: requested {requested_quota} skips "
+            f"({target_skip_rate:.3f} of {total_steps} steps), but only "
+            f"{len(eligible)} steps are eligible after min_step={min_step}. "
+            "Reduce target_skip_rate or min_step, or increase total_steps; "
+            "quotas are never silently clipped."
+        )
+
+    rng = random.Random(int(seed))
+    skip_set = (
+        set(rng.sample(eligible, requested_quota))
+        if requested_quota > 0
+        else set()
+    )
+    return skip_set, requested_quota
+
+
 # ---------------------------------------------------------------------------
 # 1) Always false  — uniform instrumentation for non-skipping baselines
 # ---------------------------------------------------------------------------
@@ -183,7 +230,8 @@ class RandomSkipPolicy:
         self.target_skip_rate = float(target_skip_rate)
         self.min_step = int(min_step)
         self.total_steps = total_steps
-        self._rng = random.Random(seed)
+        self.seed = int(seed)
+        self._rng = random.Random(self.seed)
 
         self._skip_set = None
         self._quota_total_steps = None
@@ -194,16 +242,13 @@ class RandomSkipPolicy:
         self._skip_decisions = 0
 
     def _build_skip_set(self, total_steps: int):
-        total_steps = int(total_steps)
-        eligible = list(range(self.min_step, total_steps))
-
-        # Match the reported overall skip ratio, not only post-warmup ratio.
-        k = int(round(self.target_skip_rate * total_steps))
-        k = min(k, len(eligible))
-
-        self._skip_set = set(self._rng.sample(eligible, k)) if k > 0 else set()
-        self._quota_total_steps = total_steps
-        self._quota_size = k
+        self._skip_set, self._quota_size = build_exact_random_skip_set(
+            total_steps=total_steps,
+            target_skip_rate=self.target_skip_rate,
+            min_step=self.min_step,
+            seed=self.seed,
+        )
+        self._quota_total_steps = int(total_steps)
 
     def should_skip(self, trainer, model, inputs) -> bool:
         self._decision_idx += 1
@@ -232,8 +277,10 @@ class RandomSkipPolicy:
         return {
             "target_skip_rate": self.target_skip_rate,
             "min_step": self.min_step,
+            "seed": self.seed,
             "quota_total_steps": self._quota_total_steps,
             "quota_size": self._quota_size,
+            "requested_quota": self._quota_size,
             "decisions_seen": self._decisions_seen,
             "skip_decisions": self._skip_decisions,
             "realized_skip_rate": self._skip_decisions / max(1, self._decisions_seen),
@@ -1647,6 +1694,66 @@ class LERNARandomVetoDeferralPolicy:
         self._forced_max_consecutive_override_count = 0
         self._max_consec_repayment_veto = 0
 
+        enabled_vetoes = {
+            "margin": self.use_margin_veto,
+            "loss_spike": self.use_loss_spike_veto,
+            "rho_vg": self.use_rho_vg_veto,
+            "grad_norm": self.use_grad_norm_veto,
+            "novelty": self.use_novelty_veto,
+            "phase_protection": self.use_phase_protection,
+        }
+        active_vetoes = [name for name, enabled in enabled_vetoes.items() if enabled]
+        if not active_vetoes:
+            self._veto_mode = "none"
+        elif active_vetoes == ["margin"]:
+            self._veto_mode = "margin"
+        elif active_vetoes == ["loss_spike"]:
+            self._veto_mode = "loss_spike"
+        else:
+            self._veto_mode = "custom_multi"
+
+    def effective_config(self) -> dict:
+        """Return the active RVD configuration as JSON-serializable data."""
+        return {
+            "policy": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "configured_total_steps": self.total_steps,
+            "quota_total_steps": self._quota_total_steps,
+            "min_step": self.min_step,
+            "seed": self.seed,
+            "veto_mode": self._veto_mode,
+            "use_margin_veto": self.use_margin_veto,
+            "margin_rank_floor": self.margin_rank_floor,
+            "use_loss_spike_veto": self.use_loss_spike_veto,
+            "spike_factor": self.spike_factor,
+            "spike_ema_window": self.spike_ema_window,
+            "use_rho_vg_veto": self.use_rho_vg_veto,
+            "rho_veto_threshold": self.rho_veto_threshold,
+            "use_grad_norm_veto": self.use_grad_norm_veto,
+            "grad_rank_veto": self.grad_rank_veto,
+            "use_novelty_veto": self.use_novelty_veto,
+            "novelty_rank_veto": self.novelty_rank_veto,
+            "use_phase_protection": self.use_phase_protection,
+            "repay_mode": self.repay_mode,
+            "repay_protect_dangerous": self.repay_protect_dangerous,
+            "use_safety_horizon": self.use_safety_horizon,
+            "max_consecutive_skips": self.max_consecutive_skips,
+            "requested_quota": self._quota_size,
+            "inactive_compat_fields": {
+                "probe_interval": self.probe_interval,
+                "risk_gamma": self.risk_gamma,
+                "target_veto_rate": self.target_veto_rate,
+                "fallback_threshold": self.fallback_threshold,
+                "calibration_steps": self.calibration_steps,
+                "recalibrate_every": self.recalibrate_every,
+                "use_ler": self.use_ler,
+                "use_rho_vg": self.use_rho_vg,
+                "use_grad_norm": self.use_grad_norm,
+                "n_phases": self.n_phases,
+                "early_protect_phases": self.early_protect_phases,
+            },
+        }
+
     def record_grad_norm(self, v) -> None:
         try:
             v = float(v)
@@ -1672,14 +1779,14 @@ class LERNARandomVetoDeferralPolicy:
             )
 
         total = int(total)
-        eligible = list(range(self.min_step, total))
-        k = min(int(round(self.target_skip_rate * total)), len(eligible))
-
-        rng = random.Random(self.seed)
-        self._skip_set = set(rng.sample(eligible, k)) if k > 0 else set()
+        self._skip_set, self._quota_size = build_exact_random_skip_set(
+            total_steps=total,
+            target_skip_rate=self.target_skip_rate,
+            min_step=self.min_step,
+            seed=self.seed,
+        )
 
         self._quota_total_steps = total
-        self._quota_size = k
         self._candidate_set_size = len(self._skip_set)
 
         if self._candidate_set_size != self._quota_size:
@@ -1957,6 +2064,7 @@ class LERNARandomVetoDeferralPolicy:
             )
         return {
             "policy_name": self.name,
+            "effective_config": self.effective_config(),
             "target_skip_rate": self.target_skip_rate,
             "target_veto_rate": self.target_veto_rate,
             "realized_skip_rate": self._skip_decisions / denom,
