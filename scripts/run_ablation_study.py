@@ -27,6 +27,7 @@ import argparse
 import gc
 import math
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import torch
 try:
@@ -65,7 +66,23 @@ from lerna.trainers import (
     normalize_skip_update_mode,
 )
 from lerna.trainers.policies import build_exact_random_skip_set
+from lerna.utils.run_provenance import (
+    CLASSIFICATION_LOCAL_DEVELOPMENT,
+    CLASSIFICATION_MATCHED_CLAIM,
+    finalize_manifest_completed,
+    finalize_manifest_failed,
+    write_manifest_running,
+)
 from transformers import TrainerCallback
+
+try:
+    from scripts.validate_skip_policy_results import (
+        validate_results as validate_skip_results,
+    )
+except ModuleNotFoundError:
+    from validate_skip_policy_results import (
+        validate_results as validate_skip_results,
+    )
 
 try:
     from scripts.run_baseline_glue import (
@@ -485,6 +502,7 @@ def run_ablation_single(
     rvd_repay_mode: str = "asap",
     rvd_repay_protect_dangerous: bool = True,
     rvd_policy_seed=None,
+    provenance_classification: str = CLASSIFICATION_MATCHED_CLAIM,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -883,141 +901,211 @@ def run_ablation_single(
     # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
     # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
 
-    start_time = time.time()
-    print(f"\n  Starting ablation [{ablation_name}]: {total_steps} steps, eval every {eval_steps}")
-    train_result = trainer.train()
-    total_time = time.time() - start_time
-
-    print(f"\n  Evaluating best model...")
-    eval_result = trainer.evaluate()
-
-    avg_power = (float(np.mean([s["power_w"] for s in power_callback._power_samples]))
-                 if power_callback._power_samples else 0)
-
-    instrumentation = trainer.get_instrumentation()
-    policy_diagnostics = (
-        skip_policy.get_diagnostics()
-        if hasattr(skip_policy, "get_diagnostics")
-        else {}
+    write_manifest_running(
+        output_dir,
+        argv=list(sys.argv),
+        task=task_name,
+        model_id=model_name,
+        seed=seed,
+        controller_name=type(skip_policy).__name__,
+        controller_seed=controller_cfg["policy_seed"],
+        target_skip_rate=target_skip_rate,
+        planned_quota=requested_quota,
+        total_steps=total_steps,
+        warmup_steps=training_args.get_warmup_steps(total_steps),
+        skip_update_mode=effective_skip_update_mode,
+        controller_config_effective=controller_config_effective,
+        matched_budget_planned=budget_state["matched_budget"],
+        budget_classification=(
+            "fixed_epoch"
+            if budget_state["matched_budget"]
+            else "early_stopping_exploratory"
+        ),
+        output_paths={
+            "results": "results.json",
+            "instrumentation": "instrumentation.json",
+            "ler_diagnostics": "ler_diagnostics.json",
+            "manifest": "run_manifest.json",
+        },
+        requested_classification=provenance_classification,
+        repo_root=str(Path(__file__).resolve().parents[1]),
     )
-    if hasattr(skip_policy, "effective_config"):
-        controller_config_effective["policy_effective_config"] = (
-            skip_policy.effective_config()
-        )
-    runtime_quota = policy_diagnostics.get("quota_size")
-    if runtime_quota is not None:
-        controller_config_effective["requested_quota"] = runtime_quota
-    controller_config_effective["runtime_quota_total_steps"] = (
-        policy_diagnostics.get("quota_total_steps")
-    )
-
-    results = {
-        "task": task_name,
-        "seed": seed,
-        "ablation": ablation_name,
-        "ablation_overrides": ablation_overrides,
-        "learning_rate": lr,
-        "profile": profile,
-        "model": MODEL_NAME,
-        "train_runtime_s": total_time,
-        "train_loss": train_result.training_loss,
-        "eval_metrics": eval_result,
-        "energy_kwh": power_callback.cumulative_kwh,
-        "power_avg_watts": avg_power,
-        "ler_final": ler_tracker.get_diagnostics(),
-        "true_skip_instrumentation": instrumentation,
-        "policy_diagnostics": policy_diagnostics,
-        "controller_config": controller_config_effective,
-        "timestamp": datetime.now().isoformat(),
-        "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
-    }
-    _instr = instrumentation or {}
-    results["skip_ratio"] = _instr.get("skip_ratio_by_batch")
-    results["backward_calls"] = _instr.get("backward_calls")
-    results["skipped_backward_steps"] = _instr.get("skipped_backward_steps")
-    results["forward_calls"] = _instr.get("forward_calls")
-    results["policy_name"] = _instr.get("policy_name") or getattr(skip_policy, "name", None)
-    results["skip_update_mode"] = effective_skip_update_mode
-    results["skip_update_mode_legacy_compat_used"] = skip_mode_legacy_compat_used
-
-
 
     try:
-        import subprocess
-        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
-                  cwd=os.path.dirname(__file__)).decode().strip()
-    except Exception:
-        git_sha = "unknown"
+        start_time = time.time()
+        print(
+            f"\n  Starting ablation [{ablation_name}]: "
+            f"{total_steps} steps, eval every {eval_steps}"
+        )
+        train_result = trainer.train()
+        total_time = time.time() - start_time
 
-    results["code_git_sha"] = git_sha
-    results["run_config"] = {
-        "policy": policy,
-        "control": effective_control,
-        "target_skip_rate": target_skip_rate,
-        "max_consecutive_skips": max_consecutive_skips,
-        "probe_interval": probe_interval,
-        "guard_mode": guard_mode,
-        "risk_gamma": risk_gamma,
-        "no_early_stopping": no_early_stopping,
-        "num_epochs": num_epochs,
-        "skip_update_mode": effective_skip_update_mode,
-        "skip_update_mode_legacy_compat_used": skip_mode_legacy_compat_used,
-        "controller_config": controller_config_effective,
-        "allow_early_stopping_with_skipping": (
-            allow_early_stopping_with_skipping
-        ),
-        "matched_budget": budget_state["matched_budget"],
-        "rvd_veto_mode": rvd_veto_mode,
-        "rvd_margin_rank_floor": rvd_margin_rank_floor,
-        "rvd_spike_factor": rvd_spike_factor,
-        "rvd_spike_ema_window": rvd_spike_ema_window,
-        "rvd_repay_mode": rvd_repay_mode,
-        "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
-        "rvd_policy_seed": controller_cfg["policy_seed"],
-        "rvd_policy_seed_defaulted_to_training_seed": (
-            controller_cfg["policy_seed_defaulted_to_training_seed"]
-        ),
-    }
+        print(f"\n  Evaluating best model...")
+        eval_result = trainer.evaluate()
 
-    results_path = os.path.join(output_dir, "results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        avg_power = (
+            float(np.mean([s["power_w"] for s in power_callback._power_samples]))
+            if power_callback._power_samples
+            else 0
+        )
 
-    if use_wandb:
+        instrumentation = trainer.get_instrumentation()
+        policy_diagnostics = (
+            skip_policy.get_diagnostics()
+            if hasattr(skip_policy, "get_diagnostics")
+            else {}
+        )
+        if hasattr(skip_policy, "effective_config"):
+            controller_config_effective["policy_effective_config"] = (
+                skip_policy.effective_config()
+            )
+        runtime_quota = policy_diagnostics.get("quota_size")
+        if runtime_quota is not None:
+            controller_config_effective["requested_quota"] = runtime_quota
+        controller_config_effective["runtime_quota_total_steps"] = (
+            policy_diagnostics.get("quota_total_steps")
+        )
+
+        results = {
+            "task": task_name,
+            "seed": seed,
+            "ablation": ablation_name,
+            "ablation_overrides": ablation_overrides,
+            "learning_rate": lr,
+            "profile": profile,
+            "model": MODEL_NAME,
+            "train_runtime_s": total_time,
+            "train_loss": train_result.training_loss,
+            "eval_metrics": eval_result,
+            "energy_kwh": power_callback.cumulative_kwh,
+            "power_avg_watts": avg_power,
+            "ler_final": ler_tracker.get_diagnostics(),
+            "true_skip_instrumentation": instrumentation,
+            "policy_diagnostics": policy_diagnostics,
+            "controller_config": controller_config_effective,
+            "timestamp": datetime.now().isoformat(),
+            "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
+        }
+        _instr = instrumentation or {}
+        results["skip_ratio"] = _instr.get("skip_ratio_by_batch")
+        results["backward_calls"] = _instr.get("backward_calls")
+        results["skipped_backward_steps"] = _instr.get("skipped_backward_steps")
+        results["forward_calls"] = _instr.get("forward_calls")
+        results["policy_name"] = _instr.get("policy_name") or getattr(
+            skip_policy, "name", None
+        )
+        results["skip_update_mode"] = effective_skip_update_mode
+        results["skip_update_mode_legacy_compat_used"] = (
+            skip_mode_legacy_compat_used
+        )
+
         try:
-            import wandb
-            if wandb.run is not None:
-                wandb.summary.update({
-                    "final/eval_accuracy": eval_result.get("eval_accuracy",
-                        eval_result.get("eval_matthews_correlation",
-                        eval_result.get("eval_pearsonr"))),
-                    "final/eval_loss": eval_result.get("eval_loss"),
-                    "final/energy_kwh": power_callback.cumulative_kwh,
-                    "final/runtime_s": total_time,
-                    "final/ler": ler_tracker.get_diagnostics().get("ler"),
-                    "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
-                    "final/steps_skipped": instrumentation["skipped_backward_steps"],
-                    "final/skip_ratio": instrumentation["skip_ratio_by_batch"],
-                    "ablation/overrides": ablation_overrides,
-                })
+            import subprocess
+
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)
+            ).decode().strip()
         except Exception:
-            pass
+            git_sha = "unknown"
 
-    print(f"\n  Ablation [{ablation_name}] Results:")
-    print(f"  Eval metrics: {eval_result}")
-    print(f"  Energy: {power_callback.cumulative_kwh:.6f} kWh")
-    print(f"  Time: {total_time:.1f}s")
-    print(f"  Saved: {results_path}")
+        results["code_git_sha"] = git_sha
+        results["run_config"] = {
+            "policy": policy,
+            "control": effective_control,
+            "target_skip_rate": target_skip_rate,
+            "max_consecutive_skips": max_consecutive_skips,
+            "probe_interval": probe_interval,
+            "guard_mode": guard_mode,
+            "risk_gamma": risk_gamma,
+            "no_early_stopping": no_early_stopping,
+            "num_epochs": num_epochs,
+            "skip_update_mode": effective_skip_update_mode,
+            "skip_update_mode_legacy_compat_used": skip_mode_legacy_compat_used,
+            "controller_config": controller_config_effective,
+            "allow_early_stopping_with_skipping": (
+                allow_early_stopping_with_skipping
+            ),
+            "matched_budget": budget_state["matched_budget"],
+            "rvd_veto_mode": rvd_veto_mode,
+            "rvd_margin_rank_floor": rvd_margin_rank_floor,
+            "rvd_spike_factor": rvd_spike_factor,
+            "rvd_spike_ema_window": rvd_spike_ema_window,
+            "rvd_repay_mode": rvd_repay_mode,
+            "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
+            "rvd_policy_seed": controller_cfg["policy_seed"],
+            "rvd_policy_seed_defaulted_to_training_seed": (
+                controller_cfg["policy_seed_defaulted_to_training_seed"]
+            ),
+        }
 
-    del model, trainer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        results_path = os.path.join(output_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2, default=str)
 
-    if use_wandb:
-        _ensure_wandb_finished()
+        if use_wandb:
+            try:
+                import wandb
 
-    return results
+                if wandb.run is not None:
+                    wandb.summary.update({
+                        "final/eval_accuracy": eval_result.get(
+                            "eval_accuracy",
+                            eval_result.get(
+                                "eval_matthews_correlation",
+                                eval_result.get("eval_pearsonr"),
+                            ),
+                        ),
+                        "final/eval_loss": eval_result.get("eval_loss"),
+                        "final/energy_kwh": power_callback.cumulative_kwh,
+                        "final/runtime_s": total_time,
+                        "final/ler": ler_tracker.get_diagnostics().get("ler"),
+                        "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
+                        "final/steps_skipped": instrumentation[
+                            "skipped_backward_steps"
+                        ],
+                        "final/skip_ratio": instrumentation["skip_ratio_by_batch"],
+                        "ablation/overrides": ablation_overrides,
+                    })
+            except Exception:
+                pass
+
+        print(f"\n  Ablation [{ablation_name}] Results:")
+        print(f"  Eval metrics: {eval_result}")
+        print(f"  Energy: {power_callback.cumulative_kwh:.6f} kWh")
+        print(f"  Time: {total_time:.1f}s")
+        print(f"  Saved: {results_path}")
+
+        del model, trainer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if use_wandb:
+            _ensure_wandb_finished()
+
+        validation_report = validate_skip_results(
+            Path(results_path),
+            required_artifacts=[
+                "instrumentation.json",
+                "ler_diagnostics.json",
+            ],
+        )
+        finalize_manifest_completed(
+            output_dir,
+            realized_skips=instrumentation.get("skipped_backward_steps"),
+            realized_skip_rate=instrumentation.get("skip_ratio_by_batch"),
+            validation_status=validation_report.to_dict(),
+        )
+        return results
+    except BaseException as exc:
+        try:
+            finalize_manifest_failed(output_dir, exc)
+        except Exception as provenance_exc:
+            print(
+                "  [provenance] Failed to write terminal failure manifest: "
+                f"{type(provenance_exc).__name__}"
+            )
+        raise
 
 
 def build_arg_parser():
@@ -1081,6 +1169,19 @@ def build_arg_parser():
              "optimizer-state update on skipped steps. "
              "'momentum': LERNAMomentumTrainer extrapolation from stale "
              "optimizer state. Omitting the flag resolves to 'freeze'.",
+    )
+    parser.add_argument(
+        "--provenance-classification",
+        choices=[
+            CLASSIFICATION_MATCHED_CLAIM,
+            CLASSIFICATION_LOCAL_DEVELOPMENT,
+        ],
+        default=CLASSIFICATION_MATCHED_CLAIM,
+        help=(
+            "matched_claim requires a clean tracked tree, fixed budget, "
+            "freeze mode, and successful Piece 5 validation; use "
+            "local_development explicitly for exploratory runs"
+        ),
     )
     return parser
 
@@ -1192,6 +1293,7 @@ def main():
                             args.rvd_repay_protect_dangerous
                         ),
                         rvd_policy_seed=args.rvd_policy_seed,
+                        provenance_classification=args.provenance_classification,
                     )
                     all_results.append(result)
                 except Exception as e:
