@@ -111,6 +111,26 @@ class SkipPolicy(Protocol):
     ) -> bool: ...
 
 
+class SkipPolicyDecisionError(RuntimeError):
+    """A skip policy failed after forward and invalidated the run."""
+
+    def __init__(
+        self,
+        *,
+        policy_name: str,
+        decision_index: int,
+        original_exception_type: str,
+    ):
+        self.policy_name = policy_name
+        self.decision_index = int(decision_index)
+        self.original_exception_type = original_exception_type
+        super().__init__(
+            f"Skip policy {policy_name!r} failed after forward pass for "
+            f"decision {decision_index} ({original_exception_type}); "
+            "the run is invalid and must terminate"
+        )
+
+
 class SchedulerStepPolicy:
     SKIP_ON_BACKWARD_SKIP = "skip_on_backward_skip"  # research choice A (default)
     ALWAYS_STEP = "always_step"                       # documented alternative
@@ -195,6 +215,9 @@ class SkipInstrumentation:
     parameters_may_change_on_skipped_step: bool = False
     skip_update_mechanism: str = _SKIP_UPDATE_MECHANISM_DESC[SKIP_UPDATE_MODE_FREEZE]
     skip_update_mode_legacy_compat_used: bool = False
+    policy_decision_failures: int = 0
+    last_policy_error_type: Optional[str] = None
+    run_invalidated: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -395,12 +418,32 @@ class TrueBackwardSkippingTrainer(Trainer):
         # [FIX P0-3] Feed current-step diagnostics ONLINE before deciding (R2/R3).
         self._online_ler_update(loss.detach(), self._last_real_logits, model)
 
-        # [FIX P0-3] Decide AFTER the current forward.
+        # [FIX P0-3] Decide AFTER the current forward. Policy failures cannot
+        # silently become ordinary backward steps because that changes the
+        # realized compute budget and invalidates matched-run accounting.
         try:
             should_skip = bool(self.skip_policy.should_skip(self, model, inputs))
         except Exception as exc:
-            logger.warning(f"[TrueSkip] policy.should_skip raised {exc!r}; not skipping")
-            should_skip = False
+            self.instr.policy_decision_failures += 1
+            self.instr.last_policy_error_type = type(exc).__name__
+            self.instr.run_invalidated = True
+            self._skip_optimizer_step = False
+            self._skip_scheduler_step = False
+            try:
+                self._uninstall_wrappers()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "[TrueSkip] wrapper cleanup after policy failure raised %s",
+                    type(cleanup_exc).__name__,
+                )
+            self._dump_instrumentation()
+            raise SkipPolicyDecisionError(
+                policy_name=getattr(
+                    self.skip_policy, "name", type(self.skip_policy).__name__
+                ),
+                decision_index=self.instr.batches_seen,
+                original_exception_type=type(exc).__name__,
+            ) from exc
 
         if should_skip:
             # [CRIT-1] Set BOTH flags independently.

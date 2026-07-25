@@ -8,6 +8,7 @@ Changes from original v1:
 
 """
 import copy
+import json
 import os
 import tempfile
 
@@ -21,7 +22,10 @@ from lerna.trainers import (
     TrueBackwardSkippingTrainer, LERNAMomentumTrainer,
     normalize_skip_update_mode, AlwaysFalsePolicy, RandomSkipPolicy, SkipPolicy,
 )
-from lerna.trainers.true_skip_trainer import _OptimizerStepWrapper
+from lerna.trainers.true_skip_trainer import (
+    SkipPolicyDecisionError,
+    _OptimizerStepWrapper,
+)
 
 
 class _TinyDS(Dataset):
@@ -86,6 +90,35 @@ class _ScriptedSkipPolicy(SkipPolicy):
         return self._calls > self.real_steps
 
 
+class _ExplodingSkipPolicy(SkipPolicy):
+    name = "exploding"
+
+    def __init__(self, fail_on_call=1, error_factory=None):
+        self.fail_on_call = fail_on_call
+        self.error_factory = error_factory or (
+            lambda: ValueError("sensitive policy failure detail")
+        )
+        self.calls = 0
+
+    def should_skip(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise self.error_factory()
+        return False
+
+
+class _BadBoolDecision:
+    def __bool__(self):
+        raise TypeError("sensitive bool conversion detail")
+
+
+class _BadBoolSkipPolicy(SkipPolicy):
+    name = "bad_bool"
+
+    def should_skip(self, *args, **kwargs):
+        return _BadBoolDecision()
+
+
 class _WeightsSnapshotUntilFirstSkip(TrainerCallback):
     """Snapshot of weights at the end of the last step before any skip."""
     def __init__(self):
@@ -145,6 +178,101 @@ def _check_universal_invariants(i):
     assert i["optimizer_step_attempts"] <= i["backward_calls"]
     assert i["scheduler_step_calls"] <= i["optimizer_step_attempts"]
     assert i["grad_scaler_step_calls"] <= i["optimizer_step_attempts"]
+    assert i["policy_decision_failures"] == 0
+    assert i["last_policy_error_type"] is None
+    assert i["run_invalidated"] is False
+
+
+def _build_failure_trainer(policy, td):
+    model = _TinyModel()
+    trainer = TrueBackwardSkippingTrainer(
+        model=model,
+        args=_tiny_args(td, epochs=2),
+        train_dataset=_TinyDS(),
+        data_collator=_collate,
+        skip_policy=policy,
+        instrumentation_path=os.path.join(td, "instrumentation.json"),
+    )
+    return model, trainer
+
+
+def test_policy_exception_terminates_without_backward_or_update():
+    with tempfile.TemporaryDirectory() as td:
+        policy = _ExplodingSkipPolicy()
+        model, trainer = _build_failure_trainer(policy, td)
+        initial = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+
+        with pytest.raises(SkipPolicyDecisionError) as caught:
+            trainer.train()
+
+        error = caught.value
+        assert isinstance(error.__cause__, ValueError)
+        assert error.policy_name == "exploding"
+        assert error.decision_index == 1
+        assert error.original_exception_type == "ValueError"
+        assert "sensitive policy failure detail" not in str(error)
+        assert policy.calls == 1
+
+        instrumentation = trainer.get_instrumentation()
+        assert instrumentation["batches_seen"] == 1
+        assert instrumentation["forward_calls"] == 1
+        assert instrumentation["backward_calls"] == 0
+        assert instrumentation["skipped_backward_steps"] == 0
+        assert instrumentation["optimizer_step_attempts"] == 0
+        assert instrumentation["scheduler_step_calls"] == 0
+        assert instrumentation["policy_decision_failures"] == 1
+        assert instrumentation["last_policy_error_type"] == "ValueError"
+        assert instrumentation["run_invalidated"] is True
+        assert trainer._skip_optimizer_step is False
+        assert trainer._skip_scheduler_step is False
+        assert trainer._wrappers_installed is False
+        assert all(parameter.grad is None for parameter in model.parameters())
+        for name, parameter in model.named_parameters():
+            assert torch.equal(initial[name], parameter.detach())
+
+        artifact = os.path.join(td, "instrumentation.json")
+        assert os.path.exists(artifact)
+        with open(artifact) as handle:
+            persisted = json.load(handle)
+        assert persisted["policy_decision_failures"] == 1
+        assert persisted["last_policy_error_type"] == "ValueError"
+        assert persisted["run_invalidated"] is True
+        assert "sensitive policy failure detail" not in json.dumps(persisted)
+
+
+def test_policy_decision_bool_failure_also_invalidates_run():
+    with tempfile.TemporaryDirectory() as td:
+        _, trainer = _build_failure_trainer(_BadBoolSkipPolicy(), td)
+        with pytest.raises(SkipPolicyDecisionError) as caught:
+            trainer.train()
+        assert isinstance(caught.value.__cause__, TypeError)
+        assert caught.value.policy_name == "bad_bool"
+        instrumentation = trainer.get_instrumentation()
+        assert instrumentation["forward_calls"] == 1
+        assert instrumentation["backward_calls"] == 0
+        assert instrumentation["policy_decision_failures"] == 1
+        assert instrumentation["last_policy_error_type"] == "TypeError"
+        assert instrumentation["run_invalidated"] is True
+
+
+def test_later_policy_failure_does_not_become_extra_real_step():
+    with tempfile.TemporaryDirectory() as td:
+        policy = _ExplodingSkipPolicy(fail_on_call=2)
+        _, trainer = _build_failure_trainer(policy, td)
+        with pytest.raises(SkipPolicyDecisionError):
+            trainer.train()
+        instrumentation = trainer.get_instrumentation()
+        assert policy.calls == 2
+        assert instrumentation["forward_calls"] == 2
+        assert instrumentation["backward_calls"] == 1
+        assert instrumentation["skipped_backward_steps"] == 0
+        assert instrumentation["optimizer_step_attempts"] == 1
+        assert instrumentation["scheduler_step_calls"] == 1
+        assert instrumentation["policy_decision_failures"] == 1
+        assert instrumentation["run_invalidated"] is True
 
 
 def test_always_false():
