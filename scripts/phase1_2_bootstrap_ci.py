@@ -1,6 +1,7 @@
-Per-baseline bootstrap CI helper (called from the runner's result aggregation):
+"""Per-baseline bootstrap CI helper (called from the runner's result aggregation).
 
-"""Bootstrap 95% CIs for Phase 1.2 per-baseline metrics."""
+Bootstrap 95% CIs for Phase 1.2 per-baseline metrics.
+"""
 import numpy as np
 
 def bootstrap_ci(scores, n_boot: int = 1000, alpha: float = 0.05, seed: int = 0):
