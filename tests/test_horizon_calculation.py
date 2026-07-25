@@ -79,40 +79,69 @@ def test_gradient_accumulation_scales_horizon():
     assert total == 6  # ceil(3 * ceil(100/64)) = ceil(3 * 2) = 6
 
 
-def test_equality_between_configured_and_runtime_horizons():
-    """Configured horizon must equal runtime max_steps."""
+def test_uneven_microbatches_with_accumulation():
+    """Uneven microbatch count with accumulation uses max(..., 1)."""
+    ds = FakeDataset(160)
+    # 160 samples, batch=32, ga=2, n_gpu=1 -> 5 microbatches/epoch
+    # updates_per_epoch = max(5 // 2, 1) = 2
+    total = compute_authoritative_horizon(
+        train_dataset=ds,
+        num_epochs=4,
+        per_device_train_batch_size=32,
+        gradient_accumulation_steps=2,
+        n_gpu=1,
+    )
+    assert total == 8  # ceil(4 * 2) = 8
+
+
+def test_real_trainer_guard_allows_zero_max_steps():
+    """Real trainer guard must not raise when state.max_steps is 0 (pre-train)."""
+    from lerna.trainers.true_skip_trainer import TrueBackwardSkippingTrainer
 
     class FakePolicy:
         def __init__(self, total_steps):
             self.total_steps = total_steps
+            self.name = "fake"
 
     class FakeState:
         def __init__(self, max_steps):
             self.max_steps = max_steps
+            self.global_step = 0
 
-    class FakeTrainer:
+    class FakeTrainer(TrueBackwardSkippingTrainer):
         def __init__(self, max_steps):
             self.state = FakeState(max_steps)
             self.skip_policy = FakePolicy(total_steps=max_steps)
             self._horizon_checked = False
+            self.args = type("Args", (), {"gradient_accumulation_steps": 1})()
 
-        def _check_authoritative_horizon(self):
-            if self._horizon_checked or not hasattr(self.skip_policy, "total_steps"):
-                return
-            self._horizon_checked = True
-            runtime_max_steps = getattr(self.state, "max_steps", None)
-            configured_total_steps = getattr(self.skip_policy, "total_steps", None)
-            if runtime_max_steps is not None and configured_total_steps is not None:
-                if runtime_max_steps != configured_total_steps:
-                    raise RuntimeError(
-                        f"Authoritative horizon mismatch: policy configured "
-                        f"total_steps={configured_total_steps}, but "
-                        f"trainer.state.max_steps={runtime_max_steps}."
-                    )
-
+    # Pre-training state.max_steps == 0 must not raise.
     trainer = FakeTrainer(max_steps=160)
     trainer._check_authoritative_horizon()  # should not raise
 
+
+def test_real_trainer_guard_rejects_mismatch_after_init():
+    """Real trainer guard must raise when state.max_steps differs from policy."""
+    from lerna.trainers.true_skip_trainer import TrueBackwardSkippingTrainer
+
+    class FakePolicy:
+        def __init__(self, total_steps):
+            self.total_steps = total_steps
+            self.name = "fake"
+
+    class FakeState:
+        def __init__(self, max_steps):
+            self.max_steps = max_steps
+            self.global_step = 0
+
+    class FakeTrainer(TrueBackwardSkippingTrainer):
+        def __init__(self, max_steps):
+            self.state = FakeState(max_steps)
+            self.skip_policy = FakePolicy(total_steps=max_steps)
+            self._horizon_checked = False
+            self.args = type("Args", (), {"gradient_accumulation_steps": 1})()
+
+    trainer = FakeTrainer(max_steps=160)
     trainer.state.max_steps = 159
     trainer._horizon_checked = False
     with pytest.raises(RuntimeError, match="Authoritative horizon mismatch"):

@@ -192,20 +192,22 @@ def compute_authoritative_horizon(
     gradient_accumulation_steps: int,
     n_gpu: int = 1,
 ) -> int:
-    """Compute the authoritative training horizon matching HF Trainer's max_steps.
+    """Compute the authoritative training horizon matching HF Trainer 4.48.
 
     Must be called AFTER forcing single-GPU if multi-GPU is detected.
-    Uses ceil semantics to match Trainer's max_steps calculation, including
-    partial final batches.
+    Matches Trainer._inner_training_loop step calculation exactly:
+      microbatches = ceil(dataset_size / (batch_size * gpu_count))
+      updates_per_epoch = max(microbatches // gradient_accumulation_steps, 1)
+      max_steps = ceil(num_epochs * updates_per_epoch)
     """
     if n_gpu < 1:
         n_gpu = 1
     if per_device_train_batch_size < 1 or gradient_accumulation_steps < 1:
         raise ValueError("batch_size and gradient_accumulation_steps must be >= 1")
-    steps_per_epoch = math.ceil(
-        len(train_dataset) / (per_device_train_batch_size * gradient_accumulation_steps * n_gpu)
-    )
-    return math.ceil(num_epochs * steps_per_epoch)
+    microbatch_size = per_device_train_batch_size * n_gpu
+    microbatches = math.ceil(len(train_dataset) / microbatch_size)
+    updates_per_epoch = max(microbatches // gradient_accumulation_steps, 1)
+    return math.ceil(num_epochs * updates_per_epoch)
 
 
 def assert_fixed_budget(
@@ -929,16 +931,10 @@ def run_ablation_single(
     ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
 
-    # [Piece 8] Authoritative horizon check: trainer.state.max_steps must match
-    # the configured horizon used for quota generation and manifest.
-    runtime_max_steps = getattr(trainer.state, "max_steps", None)
-    if runtime_max_steps is not None and runtime_max_steps != total_steps:
-        raise RuntimeError(
-            f"Authoritative horizon mismatch for arm {ablation_name!r}: "
-            f"configured total_steps={total_steps}, but trainer.state.max_steps="
-            f"{runtime_max_steps}. The run must use a single authoritative "
-            f"training horizon computed after forced single-GPU execution."
-        )
+    # [Piece 8] Authoritative horizon validation is performed at runtime by
+    # TrueBackwardSkippingTrainer._check_authoritative_horizon() during the
+    # first training_step(), after HF has initialized trainer.state.max_steps.
+    # The pre-train state is 0 in Transformers 4.48 and must not be used here.
 
     # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
     # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
