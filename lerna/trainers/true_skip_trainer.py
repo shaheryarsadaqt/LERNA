@@ -355,6 +355,9 @@ class TrueBackwardSkippingTrainer(Trainer):
         self._scaler_ref = None
         self._wrappers_installed = False
 
+        # [Piece 8] Authoritative horizon validation flag
+        self._horizon_checked: bool = False
+
         self.add_callback(_SkipWrapperInstaller(self))
 
     # ----------------------------------------------------- subclass hook
@@ -374,6 +377,23 @@ class TrueBackwardSkippingTrainer(Trainer):
             trk.update(loss=float(loss_value), logits=logits, accuracy=None, model=model)
         except Exception as exc:
             logger.debug(f"[TrueSkip] online LER update failed: {exc!r}")
+
+    # [Piece 8] Authoritative horizon validation
+    def _check_authoritative_horizon(self) -> None:
+        if self._horizon_checked or not hasattr(self.skip_policy, "total_steps"):
+            return
+        self._horizon_checked = True
+        runtime_max_steps = getattr(self.state, "max_steps", None)
+        configured_total_steps = getattr(self.skip_policy, "total_steps", None)
+        if runtime_max_steps is not None and configured_total_steps is not None:
+            if runtime_max_steps != configured_total_steps:
+                raise RuntimeError(
+                    f"Authoritative horizon mismatch: policy configured "
+                    f"total_steps={configured_total_steps}, but "
+                    f"trainer.state.max_steps={runtime_max_steps}. The run "
+                    f"must use a single authoritative training horizon computed "
+                    f"after forced single-GPU execution."
+                )
 
     # ----------------------------------------------------- core training
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -417,6 +437,9 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # [FIX P0-3] Feed current-step diagnostics ONLINE before deciding (R2/R3).
         self._online_ler_update(loss.detach(), self._last_real_logits, model)
+
+        # [Piece 8] Authoritative horizon validation before the first policy decision.
+        self._check_authoritative_horizon()
 
         # [FIX P0-3] Decide AFTER the current forward. Policy failures cannot
         # silently become ordinary backward steps because that changes the

@@ -185,6 +185,29 @@ def build_rvd_controller_config(
     }
 
 
+def compute_authoritative_horizon(
+    train_dataset,
+    num_epochs: int,
+    per_device_train_batch_size: int,
+    gradient_accumulation_steps: int,
+    n_gpu: int = 1,
+) -> int:
+    """Compute the authoritative training horizon matching HF Trainer's max_steps.
+
+    Must be called AFTER forcing single-GPU if multi-GPU is detected.
+    Uses ceil semantics to match Trainer's max_steps calculation, including
+    partial final batches.
+    """
+    if n_gpu < 1:
+        n_gpu = 1
+    if per_device_train_batch_size < 1 or gradient_accumulation_steps < 1:
+        raise ValueError("batch_size and gradient_accumulation_steps must be >= 1")
+    steps_per_epoch = math.ceil(
+        len(train_dataset) / (per_device_train_batch_size * gradient_accumulation_steps * n_gpu)
+    )
+    return math.ceil(num_epochs * steps_per_epoch)
+
+
 def assert_fixed_budget(
     *,
     ablation_name: str,
@@ -635,10 +658,19 @@ def run_ablation_single(
         task_name, tokenizer, max_length=128, max_samples=hw_cfg["max_samples"])
     print(f"  Train samples: {len(train_ds)}, Eval samples: {len(eval_ds)}")
 
-    n_gpu = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
-    steps_per_epoch = len(train_ds) // (
-        hw_cfg["per_device_train_batch_size"] * hw_cfg["gradient_accumulation_steps"] * n_gpu)
-    total_steps = steps_per_epoch * num_epochs
+    # Detect multi-GPU early so the authoritative horizon uses forced single-GPU.
+    visible_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    effective_n_gpu = 1 if visible_gpus > 1 else max(1, visible_gpus)
+    if visible_gpus > 1:
+        print(f"  [Ablation] Multiple GPUs detected ({visible_gpus}); forcing single-GPU training.")
+
+    total_steps = compute_authoritative_horizon(
+        train_dataset=train_ds,
+        num_epochs=num_epochs,
+        per_device_train_batch_size=hw_cfg["per_device_train_batch_size"],
+        gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
+        n_gpu=effective_n_gpu,
+    )
     eval_steps = max(total_steps // 20, 10)
 
     quota_control = effective_control
@@ -864,7 +896,6 @@ def run_ablation_single(
 
     # Force single-GPU to avoid unstable NCCL/DataParallel on DGX multi-GPU
     if torch.cuda.is_available() and training_args._n_gpu > 1:
-        print(f"  [Ablation] Multiple GPUs detected ({training_args._n_gpu}); forcing single-GPU training.")
         training_args._n_gpu = 1
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
@@ -897,6 +928,17 @@ def run_ablation_single(
     )
     ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
+
+    # [Piece 8] Authoritative horizon check: trainer.state.max_steps must match
+    # the configured horizon used for quota generation and manifest.
+    runtime_max_steps = getattr(trainer.state, "max_steps", None)
+    if runtime_max_steps is not None and runtime_max_steps != total_steps:
+        raise RuntimeError(
+            f"Authoritative horizon mismatch for arm {ablation_name!r}: "
+            f"configured total_steps={total_steps}, but trainer.state.max_steps="
+            f"{runtime_max_steps}. The run must use a single authoritative "
+            f"training horizon computed after forced single-GPU execution."
+        )
 
     # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
     # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
