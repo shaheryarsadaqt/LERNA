@@ -222,6 +222,59 @@ def _artifact_check(run_dir: str, filename: str) -> Dict[str, Any]:
     }
 
 
+def build_scientific_fingerprint(
+    *,
+    task: str,
+    training_seed: int,
+    model_id: str,
+    max_samples: int,
+    num_epochs: int,
+    control: str,
+    target_skip_rate: float,
+    policy_seed: int,
+    skip_update_mode: str,
+    no_early_stopping: bool,
+    rvd_veto_mode: str,
+    rvd_margin_rank_floor: float,
+    rvd_spike_factor: float,
+    rvd_spike_ema_window: int,
+    rvd_repay_mode: str,
+    rvd_repay_protect_dangerous: bool,
+    max_consecutive_skips: int,
+    total_steps: int,
+    git_sha: str,
+) -> str:
+    """Build a deterministic collision-resistant fingerprint for a scientific run.
+
+    The fingerprint covers every configuration dimension that can affect
+    experimental outcomes. Identical configurations produce identical fingerprints;
+    any relevant difference produces a different fingerprint.
+    """
+    identity_inputs = {
+        "task": str(task),
+        "training_seed": int(training_seed),
+        "model_id": str(model_id),
+        "max_samples": int(max_samples),
+        "num_epochs": int(num_epochs),
+        "control": str(control),
+        "target_skip_rate": float(target_skip_rate),
+        "policy_seed": int(policy_seed),
+        "skip_update_mode": str(skip_update_mode),
+        "no_early_stopping": bool(no_early_stopping),
+        "rvd_veto_mode": str(rvd_veto_mode),
+        "rvd_margin_rank_floor": float(rvd_margin_rank_floor),
+        "rvd_spike_factor": float(rvd_spike_factor),
+        "rvd_spike_ema_window": int(rvd_spike_ema_window),
+        "rvd_repay_mode": str(rvd_repay_mode),
+        "rvd_repay_protect_dangerous": bool(rvd_repay_protect_dangerous),
+        "max_consecutive_skips": int(max_consecutive_skips),
+        "total_steps": int(total_steps),
+        "git_sha": str(git_sha),
+    }
+    canonical = json.dumps(identity_inputs, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _validation_summary(status: Dict[str, Any]) -> Dict[str, Any]:
     """Keep validation decisions without copying arbitrary result values."""
     summary = {
@@ -300,6 +353,9 @@ def write_manifest_running(
     repo_root: Optional[str] = None,
     git_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     version_provider: Callable[[], Dict[str, Any]] = collect_environment_versions,
+    identity_inputs: Optional[Dict[str, Any]] = None,
+    fingerprint: Optional[str] = None,
+    attempt: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create the unique initial running manifest atomically."""
     os.makedirs(run_dir, exist_ok=True)
@@ -352,6 +408,12 @@ def write_manifest_running(
         ),
         "output_paths": _sanitize(output_paths),
     }
+    if identity_inputs is not None:
+        manifest["identity_inputs"] = _sanitize(identity_inputs)
+    if fingerprint is not None:
+        manifest["fingerprint"] = fingerprint
+    if attempt is not None:
+        manifest["attempt"] = attempt
     _atomic_write_json(target, manifest)
     return manifest
 

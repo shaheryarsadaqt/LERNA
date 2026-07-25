@@ -69,6 +69,7 @@ from lerna.trainers.policies import build_exact_random_skip_set
 from lerna.utils.run_provenance import (
     CLASSIFICATION_LOCAL_DEVELOPMENT,
     CLASSIFICATION_MATCHED_CLAIM,
+    build_scientific_fingerprint,
     finalize_manifest_completed,
     finalize_manifest_failed,
     write_manifest_running,
@@ -568,9 +569,51 @@ def run_ablation_single(
     if max_samples_override is not None:
         hw_cfg["max_samples"] = max_samples_override
 
-    run_id = f"{task_name}_s{seed}_ab-{ablation_name}"
-    output_dir = os.path.join(base_output_dir, ablation_name, run_id)
-    os.makedirs(output_dir, exist_ok=True)
+    # [Piece 9] Deterministic scientific fingerprint for collision-proof identity.
+    git_sha = "unknown"
+    try:
+        import subprocess
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)
+        ).decode().strip()
+    except Exception:
+        pass
+
+    fingerprint = build_scientific_fingerprint(
+        task=task_name,
+        training_seed=seed,
+        model_id=model_name,
+        max_samples=hw_cfg["max_samples"],
+        num_epochs=num_epochs,
+        control=effective_control or policy,
+        target_skip_rate=target_skip_rate,
+        policy_seed=controller_cfg["policy_seed"],
+        skip_update_mode=effective_skip_update_mode,
+        no_early_stopping=no_early_stopping,
+        rvd_veto_mode=rvd_veto_mode,
+        rvd_margin_rank_floor=rvd_margin_rank_floor,
+        rvd_spike_factor=rvd_spike_factor,
+        rvd_spike_ema_window=rvd_spike_ema_window,
+        rvd_repay_mode=rvd_repay_mode,
+        rvd_repay_protect_dangerous=rvd_repay_protect_dangerous,
+        max_consecutive_skips=max_consecutive_skips,
+        total_steps=total_steps,
+        git_sha=git_sha,
+    )
+
+    # [Piece 9] Retry-safe directory layout:
+    #   <base>/<ablation>/<fingerprint>/attempt-<N>/
+    # Previous attempts are preserved; never deleted or overwritten.
+    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
+    os.makedirs(arm_dir, exist_ok=True)
+    attempt = 1
+    while True:
+        run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
+        if not os.path.exists(os.path.join(run_dir, "run_manifest.json")):
+            break
+        attempt += 1
+    os.makedirs(run_dir, exist_ok=True)
+    output_dir = run_dir
 
     # [Phase 1.3 Piece 1] Explicit skipped-step update mode.
     # Legacy 'use_momentum_extrap' overrides are supported ONLY as a logged
@@ -967,6 +1010,28 @@ def run_ablation_single(
         },
         requested_classification=provenance_classification,
         repo_root=str(Path(__file__).resolve().parents[1]),
+        identity_inputs={
+            "task": task_name,
+            "training_seed": seed,
+            "model_id": model_name,
+            "max_samples": hw_cfg["max_samples"],
+            "num_epochs": num_epochs,
+            "control": effective_control or policy,
+            "target_skip_rate": target_skip_rate,
+            "policy_seed": controller_cfg["policy_seed"],
+            "skip_update_mode": effective_skip_update_mode,
+            "no_early_stopping": no_early_stopping,
+            "rvd_veto_mode": rvd_veto_mode,
+            "rvd_margin_rank_floor": rvd_margin_rank_floor,
+            "rvd_spike_factor": rvd_spike_factor,
+            "rvd_spike_ema_window": rvd_spike_ema_window,
+            "rvd_repay_mode": rvd_repay_mode,
+            "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
+            "max_consecutive_skips": max_consecutive_skips,
+            "total_steps": total_steps,
+        },
+        fingerprint=fingerprint,
+        attempt=attempt,
     )
 
     try:
@@ -1036,6 +1101,28 @@ def run_ablation_single(
         results["skip_update_mode_legacy_compat_used"] = (
             skip_mode_legacy_compat_used
         )
+        results["fingerprint"] = fingerprint
+        results["attempt"] = attempt
+        results["identity_inputs"] = {
+            "task": task_name,
+            "training_seed": seed,
+            "model_id": model_name,
+            "max_samples": hw_cfg["max_samples"],
+            "num_epochs": num_epochs,
+            "control": effective_control or policy,
+            "target_skip_rate": target_skip_rate,
+            "policy_seed": controller_cfg["policy_seed"],
+            "skip_update_mode": effective_skip_update_mode,
+            "no_early_stopping": no_early_stopping,
+            "rvd_veto_mode": rvd_veto_mode,
+            "rvd_margin_rank_floor": rvd_margin_rank_floor,
+            "rvd_spike_factor": rvd_spike_factor,
+            "rvd_spike_ema_window": rvd_spike_ema_window,
+            "rvd_repay_mode": rvd_repay_mode,
+            "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
+            "max_consecutive_skips": max_consecutive_skips,
+            "total_steps": total_steps,
+        }
 
         try:
             import subprocess
