@@ -720,15 +720,18 @@ def run_ablation_single(
     # [Piece 9] Retry-safe directory layout:
     #   <base>/<ablation>/<fingerprint>/attempt-<N>/
     # Previous attempts are preserved; never deleted or overwritten.
+    # Every attempt gets a fresh directory via atomic creation.
     arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
     os.makedirs(arm_dir, exist_ok=True)
     attempt = 1
     while True:
         run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
-        if not os.path.exists(os.path.join(run_dir, "run_manifest.json")):
-            break
-        attempt += 1
-    os.makedirs(run_dir, exist_ok=True)
+        try:
+            os.makedirs(run_dir, exist_ok=False)
+        except FileExistsError:
+            attempt += 1
+            continue
+        break
     output_dir = run_dir
 
     print(f"\n{'='*60}")
