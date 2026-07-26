@@ -222,12 +222,15 @@ def _artifact_check(run_dir: str, filename: str) -> Dict[str, Any]:
     }
 
 
-def build_scientific_fingerprint(
+def build_identity_inputs(
     *,
     task: str,
     training_seed: int,
     model_id: str,
-    max_samples: int,
+    max_samples_requested: Optional[int],
+    train_samples_realized: int,
+    eval_samples_realized: int,
+    train_dataset_fingerprint: Optional[str],
     num_epochs: int,
     control: str,
     target_skip_rate: float,
@@ -243,18 +246,21 @@ def build_scientific_fingerprint(
     max_consecutive_skips: int,
     total_steps: int,
     git_sha: str,
-) -> str:
-    """Build a deterministic collision-resistant fingerprint for a scientific run.
+) -> Dict[str, Any]:
+    """Build the canonical identity dictionary for a scientific run.
 
-    The fingerprint covers every configuration dimension that can affect
-    experimental outcomes. Identical configurations produce identical fingerprints;
-    any relevant difference produces a different fingerprint.
+    None serializes deterministically as JSON null, truthfully representing
+    an unlimited requested cap. Realized dataset size and the Hugging Face
+    dataset fingerprint identify the actual data used.
     """
-    identity_inputs = {
+    return {
         "task": str(task),
         "training_seed": int(training_seed),
         "model_id": str(model_id),
-        "max_samples": int(max_samples),
+        "max_samples_requested": max_samples_requested,
+        "train_samples_realized": int(train_samples_realized),
+        "eval_samples_realized": int(eval_samples_realized),
+        "train_dataset_fingerprint": train_dataset_fingerprint,
         "num_epochs": int(num_epochs),
         "control": str(control),
         "target_skip_rate": float(target_skip_rate),
@@ -271,6 +277,19 @@ def build_scientific_fingerprint(
         "total_steps": int(total_steps),
         "git_sha": str(git_sha),
     }
+
+
+def build_scientific_fingerprint(identity_inputs: Dict[str, Any]) -> str:
+    """Build a deterministic collision-resistant fingerprint for a scientific run.
+
+    The fingerprint covers every configuration dimension that can affect
+    experimental outcomes. Identical configurations produce identical fingerprints;
+    any relevant difference produces a different fingerprint.
+
+    Args:
+        identity_inputs: Canonical identity dictionary produced by
+            ``build_identity_inputs()``.
+    """
     canonical = json.dumps(identity_inputs, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 

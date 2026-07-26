@@ -69,6 +69,7 @@ from lerna.trainers.policies import build_exact_random_skip_set
 from lerna.utils.run_provenance import (
     CLASSIFICATION_LOCAL_DEVELOPMENT,
     CLASSIFICATION_MATCHED_CLAIM,
+    build_identity_inputs,
     build_scientific_fingerprint,
     finalize_manifest_completed,
     finalize_manifest_failed,
@@ -569,52 +570,6 @@ def run_ablation_single(
     if max_samples_override is not None:
         hw_cfg["max_samples"] = max_samples_override
 
-    # [Piece 9] Deterministic scientific fingerprint for collision-proof identity.
-    git_sha = "unknown"
-    try:
-        import subprocess
-        git_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)
-        ).decode().strip()
-    except Exception:
-        pass
-
-    fingerprint = build_scientific_fingerprint(
-        task=task_name,
-        training_seed=seed,
-        model_id=model_name,
-        max_samples=hw_cfg["max_samples"],
-        num_epochs=num_epochs,
-        control=effective_control or policy,
-        target_skip_rate=target_skip_rate,
-        policy_seed=controller_cfg["policy_seed"],
-        skip_update_mode=effective_skip_update_mode,
-        no_early_stopping=no_early_stopping,
-        rvd_veto_mode=rvd_veto_mode,
-        rvd_margin_rank_floor=rvd_margin_rank_floor,
-        rvd_spike_factor=rvd_spike_factor,
-        rvd_spike_ema_window=rvd_spike_ema_window,
-        rvd_repay_mode=rvd_repay_mode,
-        rvd_repay_protect_dangerous=rvd_repay_protect_dangerous,
-        max_consecutive_skips=max_consecutive_skips,
-        total_steps=total_steps,
-        git_sha=git_sha,
-    )
-
-    # [Piece 9] Retry-safe directory layout:
-    #   <base>/<ablation>/<fingerprint>/attempt-<N>/
-    # Previous attempts are preserved; never deleted or overwritten.
-    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
-    os.makedirs(arm_dir, exist_ok=True)
-    attempt = 1
-    while True:
-        run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
-        if not os.path.exists(os.path.join(run_dir, "run_manifest.json")):
-            break
-        attempt += 1
-    os.makedirs(run_dir, exist_ok=True)
-    output_dir = run_dir
-
     # [Phase 1.3 Piece 1] Explicit skipped-step update mode.
     # Legacy 'use_momentum_extrap' overrides are supported ONLY as a logged
     # compatibility path; conflicts with an explicit CLI mode are rejected.
@@ -635,37 +590,11 @@ def run_ablation_single(
     if wandb_group is None:
         wandb_group = f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    if use_wandb:
-        import wandb
-        _ensure_wandb_finished()
-        wandb.init(
-            project=wandb_project,
-            name=run_id,
-            group=wandb_group,
-            job_type=f"ablation-{ablation_name}",
-            tags=[task_name, f"ablation-{ablation_name}", f"seed-{seed}", model_name.split("/")[-1]],
-            reinit=True,
-            settings=wandb.Settings(init_timeout=120),
-            config={
-                "task": task_name,
-                "seed": seed,
-                "ablation": ablation_name,
-                "ablation_overrides": ablation_overrides,
-                "learning_rate": lr,
-                "model": MODEL_NAME,
-                "profile": profile,
-                "max_samples": hw_cfg["max_samples"],
-                "run_index": run_idx,
-                "total_runs": total_runs,
-            },
-        )
-
     print(f"\n{'='*60}")
     print(f"  Ablation [{ablation_name}]: {task_name} | seed={seed} | lr={lr}")
     print(f"  Overrides: {ablation_overrides}")
     print(f"  Skip-update mode: {effective_skip_update_mode}"
           + ("  (legacy use_momentum_extrap compat)" if skip_mode_legacy_compat_used else ""))
-    print(f"  Profile: {profile} | Output: {output_dir}")
     print(f"{'='*60}")
 
     torch.manual_seed(seed)
@@ -717,6 +646,98 @@ def run_ablation_single(
         n_gpu=effective_n_gpu,
     )
     eval_steps = max(total_steps // 20, 10)
+
+    # [Piece 9] Deterministic scientific fingerprint for collision-proof identity.
+    git_sha = "unknown"
+    try:
+        import subprocess
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)
+        ).decode().strip()
+    except Exception:
+        git_sha = "unknown"
+
+    # [Piece 9B] Build canonical identity after dataset loading and horizon
+    # calculation. This single dictionary is reused for fingerprint, manifest,
+    # and results to avoid identity drift.
+    max_samples_requested = (
+        None if max_samples_override is None else int(max_samples_override)
+    )
+    identity_inputs = build_identity_inputs(
+        task=task_name,
+        training_seed=seed,
+        model_id=model_name,
+        max_samples_requested=max_samples_requested,
+        train_samples_realized=len(train_ds),
+        eval_samples_realized=len(eval_ds),
+        train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
+        num_epochs=num_epochs,
+        control=effective_control or policy,
+        target_skip_rate=target_skip_rate,
+        policy_seed=controller_cfg["policy_seed"],
+        skip_update_mode=effective_skip_update_mode,
+        no_early_stopping=no_early_stopping,
+        rvd_veto_mode=rvd_veto_mode,
+        rvd_margin_rank_floor=rvd_margin_rank_floor,
+        rvd_spike_factor=rvd_spike_factor,
+        rvd_spike_ema_window=rvd_spike_ema_window,
+        rvd_repay_mode=rvd_repay_mode,
+        rvd_repay_protect_dangerous=rvd_repay_protect_dangerous,
+        max_consecutive_skips=max_consecutive_skips,
+        total_steps=total_steps,
+        git_sha=git_sha,
+    )
+    fingerprint = build_scientific_fingerprint(identity_inputs)
+
+    # Define run_id from task, seed, arm, and fingerprint.
+    run_id = f"{task_name}_s{seed}_{ablation_name}_{fingerprint}"
+
+    if use_wandb:
+        import wandb
+        _ensure_wandb_finished()
+        wandb.init(
+            project=wandb_project,
+            name=run_id,
+            group=wandb_group,
+            job_type=f"ablation-{ablation_name}",
+            tags=[task_name, f"ablation-{ablation_name}", f"seed-{seed}", model_name.split("/")[-1]],
+            reinit=True,
+            settings=wandb.Settings(init_timeout=120),
+            config={
+                "task": task_name,
+                "seed": seed,
+                "ablation": ablation_name,
+                "ablation_overrides": ablation_overrides,
+                "learning_rate": lr,
+                "model": MODEL_NAME,
+                "profile": profile,
+                "max_samples": hw_cfg["max_samples"],
+                "run_index": run_idx,
+                "total_runs": total_runs,
+            },
+        )
+
+    # [Piece 9] Retry-safe directory layout:
+    #   <base>/<ablation>/<fingerprint>/attempt-<N>/
+    # Previous attempts are preserved; never deleted or overwritten.
+    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
+    os.makedirs(arm_dir, exist_ok=True)
+    attempt = 1
+    while True:
+        run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
+        if not os.path.exists(os.path.join(run_dir, "run_manifest.json")):
+            break
+        attempt += 1
+    os.makedirs(run_dir, exist_ok=True)
+    output_dir = run_dir
+
+    print(f"\n{'='*60}")
+    print(f"  Ablation [{ablation_name}]: {task_name} | seed={seed} | lr={lr}")
+    print(f"  Overrides: {ablation_overrides}")
+    print(f"  Skip-update mode: {effective_skip_update_mode}"
+          + ("  (legacy use_momentum_extrap compat)" if skip_mode_legacy_compat_used else ""))
+    print(f"  Profile: {profile} | Output: {output_dir}")
+    print(f"{'='*60}")
 
     quota_control = effective_control
     if quota_control is None and policy == "random_veto_deferral":
@@ -1010,26 +1031,7 @@ def run_ablation_single(
         },
         requested_classification=provenance_classification,
         repo_root=str(Path(__file__).resolve().parents[1]),
-        identity_inputs={
-            "task": task_name,
-            "training_seed": seed,
-            "model_id": model_name,
-            "max_samples": hw_cfg["max_samples"],
-            "num_epochs": num_epochs,
-            "control": effective_control or policy,
-            "target_skip_rate": target_skip_rate,
-            "policy_seed": controller_cfg["policy_seed"],
-            "skip_update_mode": effective_skip_update_mode,
-            "no_early_stopping": no_early_stopping,
-            "rvd_veto_mode": rvd_veto_mode,
-            "rvd_margin_rank_floor": rvd_margin_rank_floor,
-            "rvd_spike_factor": rvd_spike_factor,
-            "rvd_spike_ema_window": rvd_spike_ema_window,
-            "rvd_repay_mode": rvd_repay_mode,
-            "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
-            "max_consecutive_skips": max_consecutive_skips,
-            "total_steps": total_steps,
-        },
+        identity_inputs=identity_inputs,
         fingerprint=fingerprint,
         attempt=attempt,
     )
@@ -1103,26 +1105,7 @@ def run_ablation_single(
         )
         results["fingerprint"] = fingerprint
         results["attempt"] = attempt
-        results["identity_inputs"] = {
-            "task": task_name,
-            "training_seed": seed,
-            "model_id": model_name,
-            "max_samples": hw_cfg["max_samples"],
-            "num_epochs": num_epochs,
-            "control": effective_control or policy,
-            "target_skip_rate": target_skip_rate,
-            "policy_seed": controller_cfg["policy_seed"],
-            "skip_update_mode": effective_skip_update_mode,
-            "no_early_stopping": no_early_stopping,
-            "rvd_veto_mode": rvd_veto_mode,
-            "rvd_margin_rank_floor": rvd_margin_rank_floor,
-            "rvd_spike_factor": rvd_spike_factor,
-            "rvd_spike_ema_window": rvd_spike_ema_window,
-            "rvd_repay_mode": rvd_repay_mode,
-            "rvd_repay_protect_dangerous": rvd_repay_protect_dangerous,
-            "max_consecutive_skips": max_consecutive_skips,
-            "total_steps": total_steps,
-        }
+        results["identity_inputs"] = identity_inputs
 
         try:
             import subprocess

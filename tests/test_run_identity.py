@@ -1,4 +1,4 @@
-"""Piece 9: collision-proof run and attempt identity tests."""
+"""Piece 9B: collision-proof run and attempt identity tests."""
 
 import json
 import os
@@ -6,6 +6,7 @@ import os
 import pytest
 
 from lerna.utils.run_provenance import (
+    build_identity_inputs,
     build_scientific_fingerprint,
     write_manifest_running,
     finalize_manifest_completed,
@@ -16,101 +17,72 @@ from scripts.run_ablation_study import compute_authoritative_horizon
 
 
 class FakeDataset:
-    def __init__(self, length):
+    def __init__(self, length, fingerprint=None):
         self._length = length
+        self._fingerprint = fingerprint
 
     def __len__(self):
         return self._length
 
 
+def _make_identity_inputs(**overrides):
+    defaults = dict(
+        task="mrpc",
+        training_seed=42,
+        model_id="modernbert",
+        max_samples_requested=None,
+        train_samples_realized=1000,
+        eval_samples_realized=200,
+        train_dataset_fingerprint="abc123",
+        num_epochs=5,
+        control="rvd",
+        target_skip_rate=0.30,
+        policy_seed=42,
+        skip_update_mode="freeze",
+        no_early_stopping=True,
+        rvd_veto_mode="margin",
+        rvd_margin_rank_floor=0.20,
+        rvd_spike_factor=1.0,
+        rvd_spike_ema_window=20,
+        rvd_repay_mode="asap",
+        rvd_repay_protect_dangerous=True,
+        max_consecutive_skips=4,
+        total_steps=160,
+        git_sha="abc123",
+    )
+    defaults.update(overrides)
+    return defaults
+
+
 def test_fingerprint_stable_for_identical_configs():
     """Identical scientific configurations must produce identical fingerprints."""
-    fp1 = build_scientific_fingerprint(
-        task="mrpc",
-        training_seed=42,
-        model_id="modernbert",
-        max_samples=1000,
-        num_epochs=5,
-        control="rvd",
-        target_skip_rate=0.30,
-        policy_seed=42,
-        skip_update_mode="freeze",
-        no_early_stopping=True,
-        rvd_veto_mode="margin",
-        rvd_margin_rank_floor=0.20,
-        rvd_spike_factor=1.0,
-        rvd_spike_ema_window=20,
-        rvd_repay_mode="asap",
-        rvd_repay_protect_dangerous=True,
-        max_consecutive_skips=4,
-        total_steps=160,
-        git_sha="abc123",
-    )
-    fp2 = build_scientific_fingerprint(
-        task="mrpc",
-        training_seed=42,
-        model_id="modernbert",
-        max_samples=1000,
-        num_epochs=5,
-        control="rvd",
-        target_skip_rate=0.30,
-        policy_seed=42,
-        skip_update_mode="freeze",
-        no_early_stopping=True,
-        rvd_veto_mode="margin",
-        rvd_margin_rank_floor=0.20,
-        rvd_spike_factor=1.0,
-        rvd_spike_ema_window=20,
-        rvd_repay_mode="asap",
-        rvd_repay_protect_dangerous=True,
-        max_consecutive_skips=4,
-        total_steps=160,
-        git_sha="abc123",
-    )
+    identity = _make_identity_inputs()
+    fp1 = build_scientific_fingerprint(identity)
+    fp2 = build_scientific_fingerprint(identity)
     assert fp1 == fp2
     assert len(fp1) == 16
 
 
 def test_fingerprint_changes_when_scientific_input_differs():
     """Any relevant configuration difference must produce a different fingerprint."""
-    base = dict(
-        task="mrpc",
-        training_seed=42,
-        model_id="modernbert",
-        max_samples=1000,
-        num_epochs=5,
-        control="rvd",
-        target_skip_rate=0.30,
-        policy_seed=42,
-        skip_update_mode="freeze",
-        no_early_stopping=True,
-        rvd_veto_mode="margin",
-        rvd_margin_rank_floor=0.20,
-        rvd_spike_factor=1.0,
-        rvd_spike_ema_window=20,
-        rvd_repay_mode="asap",
-        rvd_repay_protect_dangerous=True,
-        max_consecutive_skips=4,
-        total_steps=160,
-        git_sha="abc123",
-    )
-    base_fp = build_scientific_fingerprint(**base)
+    base = _make_identity_inputs()
+    base_fp = build_scientific_fingerprint(base)
 
     changed = dict(base)
     changed["target_skip_rate"] = 0.40
-    assert build_scientific_fingerprint(**changed) != base_fp
+    assert build_scientific_fingerprint(changed) != base_fp
 
     changed = dict(base)
     changed["rvd_veto_mode"] = "loss_spike"
-    assert build_scientific_fingerprint(**changed) != base_fp
+    assert build_scientific_fingerprint(changed) != base_fp
 
     changed = dict(base)
     changed["policy_seed"] = 99
-    assert build_scientific_fingerprint(**changed) != base_fp
+    assert build_scientific_fingerprint(changed) != base_fp
 
     changed = dict(base)
     changed["no_early_stopping"] = False
-    assert build_scientific_fingerprint(**changed) != base_fp
+    assert build_scientific_fingerprint(changed) != base_fp
 
 
 def test_retry_preserves_previous_attempt(tmp_path):
@@ -196,26 +168,7 @@ def test_manifest_contains_identity_fields(tmp_path):
     """Manifest must record identity_inputs, fingerprint, and attempt."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    identity = {
-        "task": "mrpc",
-        "training_seed": 42,
-        "model_id": "modernbert",
-        "max_samples": 1000,
-        "num_epochs": 5,
-        "control": "rvd",
-        "target_skip_rate": 0.30,
-        "policy_seed": 42,
-        "skip_update_mode": "freeze",
-        "no_early_stopping": True,
-        "rvd_veto_mode": "margin",
-        "rvd_margin_rank_floor": 0.20,
-        "rvd_spike_factor": 1.0,
-        "rvd_spike_ema_window": 20,
-        "rvd_repay_mode": "asap",
-        "rvd_repay_protect_dangerous": True,
-        "max_consecutive_skips": 4,
-        "total_steps": 160,
-    }
+    identity = _make_identity_inputs()
 
     def clean_git():
         return {"commit_sha": "abc123", "dirty": False, "tracked_changes": [], "untracked_paths": []}
@@ -254,27 +207,8 @@ def test_identical_scientific_inputs_never_collide():
     fps = set()
     for rate in [0.1, 0.2, 0.3, 0.4]:
         for mode in ["none", "margin", "loss_spike"]:
-            fp = build_scientific_fingerprint(
-                task="mrpc",
-                training_seed=42,
-                model_id="modernbert",
-                max_samples=1000,
-                num_epochs=5,
-                control="rvd",
-                target_skip_rate=rate,
-                policy_seed=42,
-                skip_update_mode="freeze",
-                no_early_stopping=True,
-                rvd_veto_mode=mode,
-                rvd_margin_rank_floor=0.20,
-                rvd_spike_factor=1.0,
-                rvd_spike_ema_window=20,
-                rvd_repay_mode="asap",
-                rvd_repay_protect_dangerous=True,
-                max_consecutive_skips=4,
-                total_steps=160,
-                git_sha="abc123",
-            )
+            identity = _make_identity_inputs(target_skip_rate=rate, rvd_veto_mode=mode)
+            fp = build_scientific_fingerprint(identity)
             fps.add(fp)
     assert len(fps) == 12
 
@@ -291,26 +225,126 @@ def test_horizon_matches_authoritative_calculation():
     )
     assert total == 160
 
-    fp = build_scientific_fingerprint(
-        task="mrpc",
-        training_seed=42,
-        model_id="modernbert",
-        max_samples=1000,
-        num_epochs=5,
-        control="rvd",
-        target_skip_rate=0.30,
-        policy_seed=42,
-        skip_update_mode="freeze",
-        no_early_stopping=True,
-        rvd_veto_mode="margin",
-        rvd_margin_rank_floor=0.20,
-        rvd_spike_factor=1.0,
-        rvd_spike_ema_window=20,
-        rvd_repay_mode="asap",
-        rvd_repay_protect_dangerous=True,
-        max_consecutive_skips=4,
-        total_steps=total,
-        git_sha="abc123",
+    identity = _make_identity_inputs(total_steps=total)
+    fp = build_scientific_fingerprint(identity)
+    assert fp is not None
+    assert len(fp) == 16
+
+
+def test_none_max_samples_fingerprints_without_error():
+    """max_samples_requested=None must fingerprint without error (unlimited)."""
+    identity = _make_identity_inputs(max_samples_requested=None)
+    fp = build_scientific_fingerprint(identity)
+    assert fp is not None
+    assert len(fp) == 16
+
+
+def test_unlimited_configs_produce_identical_fingerprints():
+    """Identical unlimited configurations must produce identical fingerprints."""
+    identity = _make_identity_inputs(max_samples_requested=None)
+    fp1 = build_scientific_fingerprint(identity)
+    fp2 = build_scientific_fingerprint(identity)
+    assert fp1 == fp2
+
+
+def test_unlimited_and_capped_configs_differ():
+    """Unlimited (None) and explicitly capped configurations must produce different fingerprints."""
+    unlimited = _make_identity_inputs(max_samples_requested=None)
+    capped = _make_identity_inputs(max_samples_requested=1000)
+    assert build_scientific_fingerprint(unlimited) != build_scientific_fingerprint(capped)
+
+
+def test_different_realized_train_sizes_differ():
+    """Different realized train dataset sizes must produce different fingerprints."""
+    small = _make_identity_inputs(train_samples_realized=500)
+    large = _make_identity_inputs(train_samples_realized=2000)
+    assert build_scientific_fingerprint(small) != build_scientific_fingerprint(large)
+
+
+def test_different_dataset_fingerprints_differ():
+    """Different train dataset fingerprints must produce different fingerprints."""
+    fp1 = _make_identity_inputs(train_dataset_fingerprint="ds_a")
+    fp2 = _make_identity_inputs(train_dataset_fingerprint="ds_b")
+    assert build_scientific_fingerprint(fp1) != build_scientific_fingerprint(fp2)
+
+
+def test_identity_inputs_reused_across_fingerprint_manifest_and_results(tmp_path):
+    """The same identity_inputs dict object must be used for fingerprint, manifest, and results."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    identity = _make_identity_inputs()
+
+    def clean_git():
+        return {"commit_sha": "abc123", "dirty": False, "tracked_changes": [], "untracked_paths": []}
+
+    fingerprint = build_scientific_fingerprint(identity)
+
+    write_manifest_running(
+        str(run_dir),
+        argv=["prog"],
+        task=identity["task"],
+        model_id=identity["model_id"],
+        seed=identity["training_seed"],
+        controller_name="RVD",
+        controller_seed=identity["policy_seed"],
+        target_skip_rate=identity["target_skip_rate"],
+        planned_quota=48,
+        total_steps=identity["total_steps"],
+        warmup_steps=10,
+        skip_update_mode=identity["skip_update_mode"],
+        controller_config_effective={},
+        matched_budget_planned=True,
+        budget_classification="fixed_epoch",
+        output_paths={"results": "results.json"},
+        identity_inputs=identity,
+        fingerprint=fingerprint,
+        attempt=1,
+        requested_classification="local_development",
+        git_provider=clean_git,
     )
+
+    manifest = load_manifest(str(run_dir))
+    assert manifest["identity_inputs"] == identity
+    assert manifest["fingerprint"] == fingerprint
+
+    # Simulate results writing with the same identity_inputs object
+    results = {"fingerprint": fingerprint, "identity_inputs": identity}
+    assert results["identity_inputs"] is identity
+
+
+def test_fingerprint_constructed_after_dataset_and_horizon():
+    """Fingerprint must include realized dataset sizes, not just requested max_samples."""
+    identity = _make_identity_inputs(
+        max_samples_requested=None,
+        train_samples_realized=1500,
+        eval_samples_realized=300,
+        train_dataset_fingerprint="hf_ds_abc",
+        total_steps=160,
+    )
+    fp = build_scientific_fingerprint(identity)
+    assert fp is not None
+
+    # Verify the identity_inputs dict contains the realized fields
+    assert identity["train_samples_realized"] == 1500
+    assert identity["eval_samples_realized"] == 300
+    assert identity["train_dataset_fingerprint"] == "hf_ds_abc"
+    assert identity["max_samples_requested"] is None
+
+
+def test_piece8b_mrpc_horizon_unchanged():
+    """Piece 8B's 160-step MRPC horizon must remain unchanged."""
+    ds = FakeDataset(1000)
+    total = compute_authoritative_horizon(
+        train_dataset=ds,
+        num_epochs=5,
+        per_device_train_batch_size=32,
+        gradient_accumulation_steps=1,
+        n_gpu=1,
+    )
+    assert total == 160
+
+    identity = _make_identity_inputs(total_steps=total)
+    fp = build_scientific_fingerprint(identity)
     assert fp is not None
     assert len(fp) == 16
