@@ -1404,6 +1404,12 @@ class LERNAPhaseStratifiedPolicy:
         self._random_safe_skip = 0
         self._selected: List[float] = []
 
+        self._cum_phase_quota: List[int] = []
+        self._phase_debt_current = 0
+        self._phase_debt_carried_total = 0
+        self._forced_global_tail_skip = 0
+        self._forced_safety_override = 0
+
     def record_grad_norm(self, v) -> None:
         try:
             v = float(v)
@@ -1429,6 +1435,15 @@ class LERNAPhaseStratifiedPolicy:
         total = int(total)
         self._quota_total_steps = total
         self._quota_size = int(round(self.target_skip_rate * total))
+        eligible_count = total - self.min_step
+        if self._quota_size > eligible_count:
+            raise ValueError(
+                f"Infeasible skip quota: requested {self._quota_size} skips "
+                f"({self.target_skip_rate:.3f} of {total} steps), but only "
+                f"{eligible_count} steps are eligible after min_step={self.min_step}. "
+                "Reduce target_skip_rate or min_step, or increase total_steps; "
+                "quotas are never clipped."
+            )
 
         eligible = list(range(self.min_step, total))
         n_elig = len(eligible)
@@ -1451,6 +1466,11 @@ class LERNAPhaseStratifiedPolicy:
             idx += 1
         self._phase_quota = q
         self._phase_skips = [0] * self.n_phases
+        cumulative = 0
+        self._cum_phase_quota = []
+        for phase_quota in q:
+            cumulative += phase_quota
+            self._cum_phase_quota.append(cumulative)
 
     def _phase_of(self, di: int) -> int:
         for i in range(self.n_phases):
@@ -1477,7 +1497,25 @@ class LERNAPhaseStratifiedPolicy:
             return False
 
         ph = self._phase_of(di)
+        if ph != self._cur_phase and self._cur_phase >= 0:
+            carried = max(
+                self._cum_phase_quota[self._cur_phase] - self._skip_decisions,
+                0,
+            )
+            self._phase_debt_carried_total += carried
         self._cur_phase = ph
+        self._phase_debt_current = (
+            max(self._cum_phase_quota[ph - 1] - self._skip_decisions, 0)
+            if ph > 0
+            else 0
+        )
+
+        remaining_skips = self._quota_size - self._skip_decisions
+        remaining_decisions = self._quota_total_steps - di
+        if remaining_skips <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
 
         diag = self.trk.get_diagnostics()
         rho = diag.get("rho_vg_raw", diag.get("rho_vg", 0.0)) or 0.0
@@ -1485,22 +1523,41 @@ class LERNAPhaseStratifiedPolicy:
         lh = getattr(self.trk, "loss_history", None)
         cur_loss = float(lh[-1]) if lh else None
 
-        if self.use_safety_horizon and self._consecutive_skips >= self.max_consecutive_skips:
-            self._max_consec_veto += 1
-            self._consecutive_skips = 0
-            return False
-        if self.use_rho_vg and rho < self.rho_veto_threshold:
-            self._rho_veto += 1
-            self._consecutive_skips = 0
-            return False
-        if lh and len(lh) >= 6 and cur_loss is not None:
+        vetoed = False
+        veto_kind = None
+        if (
+            self.use_safety_horizon
+            and self._consecutive_skips >= self.max_consecutive_skips
+        ):
+            vetoed, veto_kind = True, "max_consec"
+        elif self.use_rho_vg and rho < self.rho_veto_threshold:
+            vetoed, veto_kind = True, "rho"
+        elif lh and len(lh) >= 6 and cur_loss is not None:
             ema = float(np.mean(lh[-6:-1]))
             if cur_loss > ema * (1.0 + self.spike_factor):
-                self._spike_veto += 1
-                self._consecutive_skips = 0
-                return False
+                vetoed, veto_kind = True, "spike"
 
-        q_left = self._phase_quota[ph] - self._phase_skips[ph]
+        # The global tail overrides safety only when every remaining decision
+        # must skip to make the exact quota feasible.
+        if remaining_skips >= remaining_decisions:
+            self._forced_global_tail_skip += 1
+            if vetoed:
+                self._forced_safety_override += 1
+            return self._do_skip(ph)
+
+        if vetoed:
+            if veto_kind == "max_consec":
+                self._max_consec_veto += 1
+            elif veto_kind == "rho":
+                self._rho_veto += 1
+            else:
+                self._spike_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        # The cumulative target automatically includes unpaid earlier-phase
+        # quota, so debt remains available to later phases.
+        q_left = self._cum_phase_quota[ph] - self._skip_decisions
         if q_left <= 0:
             self._quota_exhausted += 1
             self._consecutive_skips = 0
@@ -1546,6 +1603,15 @@ class LERNAPhaseStratifiedPolicy:
             "max_consecutive_veto_count": self._max_consec_veto,
             "quota_exhausted_count": self._quota_exhausted,
             "forced_tail_skip_count": self._forced_tail,
+            "forced_global_tail_skip_count": self._forced_global_tail_skip,
+            "forced_safety_override_count": self._forced_safety_override,
+            "phase_debt_current": self._phase_debt_current,
+            "phase_debt_carried_total": self._phase_debt_carried_total,
+            "quota_exact": (
+                self._quota_total_steps is not None
+                and self._decisions_seen == self._quota_total_steps
+                and self._skip_decisions == self._quota_size
+            ),
             "random_safe_skip_count": self._random_safe_skip,
             "risk_gamma": self.risk_gamma,
             "grad_norm_last": self._grad_norm_last,
