@@ -21,6 +21,7 @@ from transformers import TrainerCallback, TrainingArguments
 from lerna.trainers import (
     TrueBackwardSkippingTrainer, LERNAMomentumTrainer,
     normalize_skip_update_mode, AlwaysFalsePolicy, RandomSkipPolicy, SkipPolicy,
+    SchedulerStepPolicy,
 )
 from lerna.trainers.true_skip_trainer import (
     SkipPolicyDecisionError,
@@ -145,7 +146,11 @@ class _WeightsSnapshotUntilFirstSkip(TrainerCallback):
                             }
 
 
-def _run(policy, td):
+def _run(
+    policy,
+    td,
+    scheduler_step_policy=SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP,
+):
     args = TrainingArguments(
         output_dir=td,
         num_train_epochs=2,
@@ -166,6 +171,7 @@ def _run(policy, td):
         train_dataset=_TinyDS(),
         data_collator=_collate,
         skip_policy=policy,
+        scheduler_step_policy=scheduler_step_policy,
         instrumentation_path=os.path.join(td, "instrumentation.json"),
     )
     t.train()
@@ -177,6 +183,9 @@ def _check_universal_invariants(i):
     assert i["forward_calls"] == i["backward_calls"] + i["skipped_backward_steps"]
     assert i["optimizer_step_attempts"] <= i["backward_calls"]
     assert i["scheduler_step_calls"] <= i["optimizer_step_attempts"]
+    assert i["invariant_sched_le_opt"] is True
+    assert i["invariant_sched_le_opportunities"] is True
+    assert i["invariant_scheduler_policy_consistent"] is True
     assert i["grad_scaler_step_calls"] <= i["optimizer_step_attempts"]
     assert i["policy_decision_failures"] == 0
     assert i["last_policy_error_type"] is None
@@ -349,6 +358,26 @@ def test_scheduler_advances_on_real_steps():
         i = _run(AlwaysFalsePolicy(), td)
         assert i["scheduler_step_calls"] > 0
         assert i["optimizer_step_attempts"] > 0
+
+
+def test_scheduler_always_steps_on_fully_skipped_run():
+    with tempfile.TemporaryDirectory() as td:
+        instrumentation = _run(
+            RandomSkipPolicy(target_skip_rate=1.0, min_step=0, seed=0),
+            td,
+            scheduler_step_policy=SchedulerStepPolicy.ALWAYS_STEP,
+        )
+    assert instrumentation["scheduler_step_calls"] == instrumentation["batches_seen"]
+    assert instrumentation["optimizer_step_attempts"] == 0
+    assert instrumentation["skipped_backward_steps"] == instrumentation["batches_seen"]
+    assert instrumentation["invariant_sched_le_opportunities"] is True
+    assert instrumentation["invariant_scheduler_policy_consistent"] is True
+    assert "invariant_sched_le_opt" not in instrumentation
+
+
+def test_invalid_scheduler_step_policy_rejected_before_trainer_setup():
+    with pytest.raises(ValueError, match="Invalid scheduler_step_policy"):
+        TrueBackwardSkippingTrainer(scheduler_step_policy="not-a-policy")
 
 
 def test_grad_accum_guard():

@@ -246,6 +246,7 @@ def build_identity_inputs(
     max_consecutive_skips: int,
     total_steps: int,
     git_sha: str,
+    scheduler_step_policy: str = "skip_on_backward_skip",
 ) -> Dict[str, Any]:
     """Build the canonical identity dictionary for a scientific run.
 
@@ -266,6 +267,7 @@ def build_identity_inputs(
         "target_skip_rate": float(target_skip_rate),
         "policy_seed": int(policy_seed),
         "skip_update_mode": str(skip_update_mode),
+        "scheduler_step_policy": str(scheduler_step_policy),
         "no_early_stopping": bool(no_early_stopping),
         "rvd_veto_mode": str(rvd_veto_mode),
         "rvd_margin_rank_floor": float(rvd_margin_rank_floor),

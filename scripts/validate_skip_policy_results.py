@@ -20,6 +20,12 @@ SEVERITY_WARNING = "warning"
 SEVERITY_INFO = "info"
 
 VALID_SKIP_UPDATE_MODES = ("freeze", "momentum")
+SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP = "skip_on_backward_skip"
+SCHEDULER_POLICY_ALWAYS_STEP = "always_step"
+VALID_SCHEDULER_STEP_POLICIES = (
+    SCHEDULER_POLICY_ALWAYS_STEP,
+    SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP,
+)
 RVD_POLICY_NAME = "random_veto_deferral"
 LEGACY_QUOTA_INVARIANT_KEY = "invariant_quota_decomposition_ok"
 
@@ -35,12 +41,14 @@ POLICY_INVARIANT_KEYS = (
     "invariant_repayment_single_source_ok",
 )
 
-# Boolean invariants emitted by TrueBackwardSkippingTrainer instrumentation.
-INSTRUMENTATION_INVARIANT_KEYS = (
+# Common invariants emitted by TrueBackwardSkippingTrainer instrumentation.
+INSTRUMENTATION_COMMON_INVARIANT_KEYS = (
     "invariant_forward_eq_backward_plus_skipped",
     "invariant_opt_le_backward",
-    "invariant_sched_le_opt",
 )
+LEGACY_SCHEDULER_INVARIANT_KEY = "invariant_sched_le_opt"
+SCHEDULER_INVARIANT_KEY = "invariant_scheduler_policy_consistent"
+SCHEDULER_OPPORTUNITY_INVARIANT_KEY = "invariant_sched_le_opportunities"
 
 _MISSING = object()
 
@@ -116,10 +124,109 @@ def _as_int(value) -> Optional[int]:
     return int(parsed)
 
 
+def _resolve_scheduler_step_policy(report: ValidationReport, data: dict,
+                                   run_config: dict, instr: dict) -> str:
+    """Resolve explicit policy, defaulting legacy artifacts to trainer behavior."""
+    sources = {
+        "scheduler_step_policy": data.get("scheduler_step_policy", _MISSING),
+        "run_config.scheduler_step_policy": run_config.get(
+            "scheduler_step_policy", _MISSING
+        ),
+        "true_skip_instrumentation.scheduler_step_policy": instr.get(
+            "scheduler_step_policy", _MISSING
+        ),
+    }
+    present = {key: value for key, value in sources.items() if value is not _MISSING}
+    if not present:
+        return SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP
+
+    valid = {}
+    for field_name, value in present.items():
+        if value not in VALID_SCHEDULER_STEP_POLICIES:
+            report.add(
+                SEVERITY_ERROR,
+                field_name,
+                f"one of {VALID_SCHEDULER_STEP_POLICIES}",
+                value,
+                "invalid scheduler_step_policy value",
+            )
+        else:
+            valid[field_name] = value
+    if len(set(valid.values())) > 1:
+        report.add(
+            SEVERITY_ERROR,
+            "scheduler_step_policy_consistency",
+            "one consistent scheduler policy",
+            valid,
+            "scheduler_step_policy disagrees across result artifacts",
+        )
+    return next(iter(valid.values()), SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP)
+
+
+def _check_scheduler_step_counts(report: ValidationReport, instr: dict,
+                                 scheduler_policy: str) -> None:
+    scheduler_steps = _as_int(instr.get("scheduler_step_calls"))
+    optimizer_attempts = _as_int(instr.get("optimizer_step_attempts"))
+    if scheduler_steps is None or optimizer_attempts is None:
+        return
+
+    if scheduler_policy == SCHEDULER_POLICY_ALWAYS_STEP:
+        skipped = _as_int(instr.get("skipped_backward_steps"))
+        if skipped is None:
+            report.add(
+                SEVERITY_ERROR,
+                "true_skip_instrumentation.skipped_backward_steps",
+                "integer",
+                instr.get("skipped_backward_steps"),
+                "always_step validation requires skipped backward count",
+            )
+            return
+        bound = optimizer_attempts + skipped
+        bound_description = "optimizer attempts plus skipped backward steps"
+    else:
+        bound = optimizer_attempts
+        bound_description = "optimizer step attempts"
+
+    if scheduler_steps > bound:
+        report.add(
+            SEVERITY_ERROR,
+            "true_skip_instrumentation.scheduler_step_calls",
+            f"<= {bound}",
+            scheduler_steps,
+            f"scheduler calls exceed {bound_description}",
+        )
+
+
+def _require_scheduler_invariant(report: ValidationReport, instr: dict,
+                                 scheduler_policy: str) -> None:
+    if SCHEDULER_INVARIANT_KEY in instr:
+        if instr[SCHEDULER_INVARIANT_KEY] is not True:
+            report.add(
+                SEVERITY_ERROR,
+                f"true_skip_instrumentation.{SCHEDULER_INVARIANT_KEY}",
+                True,
+                instr[SCHEDULER_INVARIANT_KEY],
+                "policy-aware scheduler invariant is false",
+            )
+        return
+    if (
+        scheduler_policy == SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP
+        and instr.get(LEGACY_SCHEDULER_INVARIANT_KEY) is True
+    ):
+        return
+    report.add(
+        SEVERITY_ERROR,
+        f"true_skip_instrumentation.{SCHEDULER_INVARIANT_KEY}",
+        True,
+        None,
+        "required policy-aware scheduler invariant is missing",
+    )
+
+
 def _check_existing_boolean_invariants(report: ValidationReport, diag: dict,
-                                       instr: dict) -> None:
+                                       instr: dict,
+                                       scheduler_policy: str) -> None:
     """Check only invariant keys that actually exist in the emitted output."""
-    # Legacy key: checked ONLY if that exact key exists.
     if LEGACY_QUOTA_INVARIANT_KEY in diag:
         if diag[LEGACY_QUOTA_INVARIANT_KEY] is not True:
             report.add(SEVERITY_ERROR, f"policy_diagnostics.{LEGACY_QUOTA_INVARIANT_KEY}",
@@ -131,10 +238,27 @@ def _check_existing_boolean_invariants(report: ValidationReport, diag: dict,
             report.add(SEVERITY_ERROR, f"policy_diagnostics.{key}", True, diag[key],
                        f"policy invariant {key} is false")
 
-    for key in INSTRUMENTATION_INVARIANT_KEYS:
+    scheduler_keys = (
+        SCHEDULER_INVARIANT_KEY,
+        SCHEDULER_OPPORTUNITY_INVARIANT_KEY,
+    )
+    for key in (*INSTRUMENTATION_COMMON_INVARIANT_KEYS, *scheduler_keys):
         if key in instr and instr[key] is not True:
             report.add(SEVERITY_ERROR, f"true_skip_instrumentation.{key}", True,
                        instr[key], f"instrumentation invariant {key} is false")
+
+    if (
+        scheduler_policy == SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP
+        and LEGACY_SCHEDULER_INVARIANT_KEY in instr
+        and instr[LEGACY_SCHEDULER_INVARIANT_KEY] is not True
+    ):
+        report.add(
+            SEVERITY_ERROR,
+            f"true_skip_instrumentation.{LEGACY_SCHEDULER_INVARIANT_KEY}",
+            True,
+            instr[LEGACY_SCHEDULER_INVARIANT_KEY],
+            "legacy scheduler invariant is false",
+        )
 
 
 def _require_true_invariants(report: ValidationReport, payload: dict,
@@ -443,7 +567,7 @@ def _check_matched_budget(report: ValidationReport, data: dict, run_config: dict
 
     _require_true_invariants(
         report, instr, "true_skip_instrumentation",
-        INSTRUMENTATION_INVARIANT_KEYS,
+        INSTRUMENTATION_COMMON_INVARIANT_KEYS,
     )
 
 
@@ -560,7 +684,13 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
             "exact-quota protocol did not complete its planned horizon",
         )
 
-    _check_existing_boolean_invariants(report, diag, instr)
+    scheduler_policy = _resolve_scheduler_step_policy(
+        report, data, run_config, instr
+    )
+    _check_existing_boolean_invariants(
+        report, diag, instr, scheduler_policy
+    )
+    _check_scheduler_step_counts(report, instr, scheduler_policy)
     _check_agreement(report, diag, instr)
     _check_veto_rate_descriptive(report, diag)
     _check_skip_update_mode(report, data, run_config, instr, matched,
@@ -573,6 +703,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
         _check_rvd_exact_quota(report, diag, instr)
 
     if matched:
+        _require_scheduler_invariant(report, instr, scheduler_policy)
         _check_matched_budget(
             report, data, run_config, diag, instr, completed, interrupted,
             rate_tolerance, count_tolerance,

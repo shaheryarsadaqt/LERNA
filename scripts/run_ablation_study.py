@@ -63,7 +63,7 @@ from lerna.trainers import (
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
     LERNARandomVetoDeferralPolicy,
     AlwaysFalsePolicy, RandomSkipPolicy, GradNormSkipPolicy,
-    normalize_skip_update_mode,
+    SchedulerStepPolicy, normalize_skip_update_mode,
 )
 from lerna.trainers.policies import build_exact_random_skip_set
 from lerna.utils.run_provenance import (
@@ -521,6 +521,7 @@ def run_ablation_single(
     risk_gamma: float = 0.0,
     guard_mode: str = "on",
     skip_update_mode: str = None,
+    scheduler_step_policy: str = SchedulerStepPolicy.ALWAYS_STEP,
     allow_early_stopping_with_skipping: bool = False,
     rvd_veto_mode: str = "none",
     rvd_margin_rank_floor: float = 0.20,
@@ -545,6 +546,9 @@ def run_ablation_single(
         raise ValueError(
             f"target_skip_rate must be in [0, 1], got {target_skip_rate!r}"
         )
+    scheduler_step_policy = SchedulerStepPolicy.validate(
+        scheduler_step_policy
+    )
     controller_cfg = build_rvd_controller_config(
         veto_mode=rvd_veto_mode,
         margin_rank_floor=rvd_margin_rank_floor,
@@ -676,6 +680,7 @@ def run_ablation_single(
         target_skip_rate=target_skip_rate,
         policy_seed=controller_cfg["policy_seed"],
         skip_update_mode=effective_skip_update_mode,
+        scheduler_step_policy=scheduler_step_policy,
         no_early_stopping=no_early_stopping,
         rvd_veto_mode=rvd_veto_mode,
         rvd_margin_rank_floor=rvd_margin_rank_floor,
@@ -709,6 +714,7 @@ def run_ablation_single(
                 "ablation": ablation_name,
                 "ablation_overrides": ablation_overrides,
                 "learning_rate": lr,
+                "scheduler_step_policy": scheduler_step_policy,
                 "model": MODEL_NAME,
                 "profile": profile,
                 "max_samples": hw_cfg["max_samples"],
@@ -980,6 +986,7 @@ def run_ablation_single(
         ler_tracker=ler_tracker,
         skip_policy=skip_policy,
         skip_update_mode=effective_skip_update_mode,
+        scheduler_step_policy=scheduler_step_policy,
         apply_momentum=legacy_momentum_flag,  # None when CLI path; preserves legacy provenance
         compute_saving_mechanism=compute_saving_mechanism,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
@@ -1106,6 +1113,7 @@ def run_ablation_single(
         results["skip_update_mode_legacy_compat_used"] = (
             skip_mode_legacy_compat_used
         )
+        results["scheduler_step_policy"] = scheduler_step_policy
         results["fingerprint"] = fingerprint
         results["attempt"] = attempt
         results["identity_inputs"] = identity_inputs
@@ -1131,6 +1139,7 @@ def run_ablation_single(
             "no_early_stopping": no_early_stopping,
             "num_epochs": num_epochs,
             "skip_update_mode": effective_skip_update_mode,
+            "scheduler_step_policy": scheduler_step_policy,
             "skip_update_mode_legacy_compat_used": skip_mode_legacy_compat_used,
             "controller_config": controller_config_effective,
             "allow_early_stopping_with_skipping": (
@@ -1282,6 +1291,15 @@ def build_arg_parser():
              "optimizer state. Omitting the flag resolves to 'freeze'.",
     )
     parser.add_argument(
+        "--scheduler-step-policy",
+        choices=SchedulerStepPolicy.VALID,
+        default=SchedulerStepPolicy.ALWAYS_STEP,
+        help=(
+            "Learning-rate scheduler behavior on skipped-backward steps. "
+            "The matched Phase 1.3 default advances over every training batch."
+        ),
+    )
+    parser.add_argument(
         "--provenance-classification",
         choices=[
             CLASSIFICATION_MATCHED_CLAIM,
@@ -1392,6 +1410,7 @@ def main():
                         risk_gamma=args.risk_gamma,
                         guard_mode=args.guard_mode,
                         skip_update_mode=args.skip_update_mode,
+                        scheduler_step_policy=args.scheduler_step_policy,
                         allow_early_stopping_with_skipping=(
                             args.allow_early_stopping_with_skipping
                         ),

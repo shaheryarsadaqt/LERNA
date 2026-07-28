@@ -124,6 +124,7 @@ def test_parser_flags_normalization():
             "--rvd-repay-mode", "spread",
             "--no-rvd-repay-protect-dangerous",
             "--rvd-policy-seed", "77",
+            "--scheduler-step-policy", "skip_on_backward_skip",
             "--allow-early-stopping-with-skipping",
         ]
     )
@@ -134,7 +135,13 @@ def test_parser_flags_normalization():
     assert args.rvd_repay_mode == "spread"
     assert args.rvd_repay_protect_dangerous is False
     assert args.rvd_policy_seed == 77
+    assert args.scheduler_step_policy == "skip_on_backward_skip"
     assert args.allow_early_stopping_with_skipping is True
+
+
+def test_scheduler_step_policy_defaults_to_always_step():
+    args = build_arg_parser().parse_args([])
+    assert args.scheduler_step_policy == "always_step"
 
 
 def test_explicit_arms_and_legacy_alias_construct_expected_classes():

@@ -24,25 +24,41 @@ QUOTA = 30
 RATE = QUOTA / TOTAL  # 0.15
 
 
-def _instrumentation(skipped=QUOTA, batches=TOTAL, mode="freeze"):
+def _instrumentation(
+    skipped=QUOTA,
+    batches=TOTAL,
+    mode="freeze",
+    scheduler_policy="skip_on_backward_skip",
+):
     backward = batches - skipped
-    return {
+    scheduler_calls = batches if scheduler_policy == "always_step" else backward
+    instrumentation = {
         "forward_calls": batches,
         "backward_calls": backward,
         "optimizer_step_attempts": backward,
-        "scheduler_step_calls": backward,
+        "scheduler_step_calls": scheduler_calls,
         "skipped_backward_steps": skipped,
         "batches_seen": batches,
         "skipped_batches": skipped,
         "skip_ratio_by_batch": skipped / max(batches, 1),
         "skip_update_mode": mode,
+        "scheduler_step_policy": scheduler_policy,
+        "scheduler_step_opportunities": batches,
         "invariant_forward_eq_backward_plus_skipped": True,
         "invariant_opt_le_backward": True,
-        "invariant_sched_le_opt": True,
+        "invariant_sched_le_opportunities": True,
+        "invariant_scheduler_policy_consistent": True,
     }
+    if scheduler_policy == "skip_on_backward_skip":
+        instrumentation["invariant_sched_le_opt"] = True
+    return instrumentation
 
 
-def _run_config(mode="freeze", matched=True):
+def _run_config(
+    mode="freeze",
+    matched=True,
+    scheduler_policy="skip_on_backward_skip",
+):
     return {
         "policy": "random_veto_deferral",
         "target_skip_rate": RATE,
@@ -50,6 +66,7 @@ def _run_config(mode="freeze", matched=True):
         "allow_early_stopping_with_skipping": False,
         "matched_budget": matched,
         "skip_update_mode": mode,
+        "scheduler_step_policy": scheduler_policy,
     }
 
 
@@ -58,6 +75,7 @@ def random_results():
     return {
         "eval_metrics": {"eval_accuracy": 0.9},
         "skip_update_mode": "freeze",
+        "scheduler_step_policy": "skip_on_backward_skip",
         "true_skip_instrumentation": _instrumentation(),
         "policy_diagnostics": {
             "policy_name": "random_skip",
@@ -146,6 +164,53 @@ def test_valid_exact_random_passes(tmp_path):
     assert report.ok, [f.to_dict() for f in report.errors]
     assert report.protocol_complete is True
     assert report.valid_for_matched_budget is True
+
+
+def test_valid_always_step_artifact_passes(tmp_path):
+    data = random_results()
+    data["scheduler_step_policy"] = "always_step"
+    data["run_config"]["scheduler_step_policy"] = "always_step"
+    data["true_skip_instrumentation"] = _instrumentation(
+        scheduler_policy="always_step"
+    )
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert report.ok, [finding.to_dict() for finding in report.errors]
+
+
+def test_scheduler_policy_mismatch_fails(tmp_path):
+    data = random_results()
+    data["scheduler_step_policy"] = "always_step"
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    assert "scheduler_step_policy_consistency" in fields(report, "error")
+
+
+def test_always_step_count_above_opportunities_fails(tmp_path):
+    data = random_results()
+    data["scheduler_step_policy"] = "always_step"
+    data["run_config"]["scheduler_step_policy"] = "always_step"
+    data["true_skip_instrumentation"] = _instrumentation(
+        scheduler_policy="always_step"
+    )
+    data["true_skip_instrumentation"]["scheduler_step_calls"] = TOTAL + 1
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    assert (
+        "true_skip_instrumentation.scheduler_step_calls"
+        in fields(report, "error")
+    )
+
+
+def test_legacy_scheduler_artifact_defaults_to_skip_policy(tmp_path):
+    data = random_results()
+    del data["scheduler_step_policy"]
+    del data["run_config"]["scheduler_step_policy"]
+    instrumentation = data["true_skip_instrumentation"]
+    del instrumentation["scheduler_step_policy"]
+    del instrumentation["invariant_scheduler_policy_consistent"]
+    del instrumentation["invariant_sched_le_opportunities"]
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert report.ok, [finding.to_dict() for finding in report.errors]
 
 
 def test_valid_rvd_passes(tmp_path):
@@ -331,11 +396,15 @@ def test_completed_rvd_requires_every_emitted_invariant(tmp_path):
 
 def test_matched_run_requires_trainer_invariants(tmp_path):
     data = random_results()
-    del data["true_skip_instrumentation"]["invariant_sched_le_opt"]
+    instrumentation = data["true_skip_instrumentation"]
+    del instrumentation["invariant_scheduler_policy_consistent"]
+    del instrumentation["invariant_sched_le_opt"]
     report = vspr.validate_results(write_results(tmp_path, data))
     assert not report.ok
-    assert ("true_skip_instrumentation.invariant_sched_le_opt"
-            in fields(report, "error"))
+    assert (
+        "true_skip_instrumentation.invariant_scheduler_policy_consistent"
+        in fields(report, "error")
+    )
 
 
 def test_malformed_source_count_is_structured_error(tmp_path):

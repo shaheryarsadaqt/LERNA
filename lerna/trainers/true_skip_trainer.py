@@ -134,6 +134,16 @@ class SkipPolicyDecisionError(RuntimeError):
 class SchedulerStepPolicy:
     SKIP_ON_BACKWARD_SKIP = "skip_on_backward_skip"  # research choice A (default)
     ALWAYS_STEP = "always_step"                       # documented alternative
+    VALID = (ALWAYS_STEP, SKIP_ON_BACKWARD_SKIP)
+
+    @classmethod
+    def validate(cls, value: str) -> str:
+        if value not in cls.VALID:
+            raise ValueError(
+                f"Invalid scheduler_step_policy={value!r}; "
+                f"expected one of {cls.VALID}."
+            )
+        return value
 
 
 # Standard label set used in results.json (per Verdict Issue #9)
@@ -235,9 +245,24 @@ class SkipInstrumentation:
         d["invariant_opt_le_backward"] = (
             self.optimizer_step_attempts <= self.backward_calls
         )
-        d["invariant_sched_le_opt"] = (
-            self.scheduler_step_calls <= self.optimizer_step_attempts
+        scheduler_opportunities = (
+            self.optimizer_step_attempts + self.skipped_backward_steps
         )
+        d["scheduler_step_opportunities"] = scheduler_opportunities
+        d["invariant_sched_le_opportunities"] = (
+            self.scheduler_step_calls <= scheduler_opportunities
+        )
+        if self.scheduler_step_policy == SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP:
+            d["invariant_sched_le_opt"] = (
+                self.scheduler_step_calls <= self.optimizer_step_attempts
+            )
+            d["invariant_scheduler_policy_consistent"] = d[
+                "invariant_sched_le_opt"
+            ]
+        else:
+            d["invariant_scheduler_policy_consistent"] = d[
+                "invariant_sched_le_opportunities"
+            ]
         # [IMP-4] Clarify semantics in output
         d["_note_optimizer_step_attempts"] = (
             "Counts non-skipped calls into optimizer.step(). Under AMP/fp16, "
@@ -310,6 +335,9 @@ class TrueBackwardSkippingTrainer(Trainer):
         allow_grad_accumulation_with_skipping: bool = False,
         **kwargs,
     ):
+        scheduler_step_policy = SchedulerStepPolicy.validate(
+            scheduler_step_policy
+        )
         super().__init__(*args, **kwargs)
         from .policies import AlwaysFalsePolicy  # lazy
         self.skip_policy: SkipPolicy = skip_policy or AlwaysFalsePolicy()

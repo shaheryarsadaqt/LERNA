@@ -39,6 +39,7 @@ def _make_identity_inputs(**overrides):
         target_skip_rate=0.30,
         policy_seed=42,
         skip_update_mode="freeze",
+        scheduler_step_policy="always_step",
         no_early_stopping=True,
         rvd_veto_mode="margin",
         rvd_margin_rank_floor=0.20,
@@ -82,6 +83,10 @@ def test_fingerprint_changes_when_scientific_input_differs():
 
     changed = dict(base)
     changed["no_early_stopping"] = False
+    assert build_scientific_fingerprint(changed) != base_fp
+
+    changed = dict(base)
+    changed["scheduler_step_policy"] = "skip_on_backward_skip"
     assert build_scientific_fingerprint(changed) != base_fp
 
 
