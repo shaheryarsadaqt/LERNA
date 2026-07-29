@@ -61,6 +61,7 @@ from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
+    PhaseStratifiedGuardedRandomPolicy, FixedPhaseStratifiedRandomPolicy,
     LERNARandomVetoDeferralPolicy,
     AlwaysFalsePolicy, RandomSkipPolicy, GradNormSkipPolicy,
     SchedulerStepPolicy, normalize_skip_update_mode,
@@ -844,6 +845,28 @@ def run_ablation_single(
                 use_safety_horizon=use_safety_horizon,
                 risk_gamma=risk_gamma,
             )
+        elif policy == "phase_strat_guarded":
+            # Explicit name for the guarded controller; identical behavior.
+            skip_policy = PhaseStratifiedGuardedRandomPolicy(
+                ler_tracker=ler_tracker,
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                min_step=50,
+                seed=seed,
+                max_consecutive_skips=max_consecutive_skips,
+                rho_veto_threshold=rho_veto_threshold,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                risk_gamma=risk_gamma,
+            )
+        elif policy == "fixed_phase_strat":
+            # Pure temporal baseline: no tracker, vetoes, or LERNA signals.
+            skip_policy = FixedPhaseStratifiedRandomPolicy(
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                min_step=50,
+                seed=seed,
+            )
         elif policy == "random_veto_deferral":
             skip_policy = build_skip_policy(
                 control="rvd",
@@ -1250,7 +1273,20 @@ def build_arg_parser():
         action="store_true",
         help="Allow an unmatched exploratory skipping run with early stopping",
     )
-    parser.add_argument("--policy", choices=["calibrated", "hybrid", "quota_hybrid", "guarded_hybrid", "phase_strat", "random_veto_deferral"], default="hybrid")
+    parser.add_argument(
+        "--policy",
+        choices=[
+            "calibrated",
+            "hybrid",
+            "quota_hybrid",
+            "guarded_hybrid",
+            "phase_strat",
+            "phase_strat_guarded",
+            "fixed_phase_strat",
+            "random_veto_deferral",
+        ],
+        default="hybrid",
+    )
     parser.add_argument("--rho-veto-threshold", type=float, default=-0.2)
     parser.add_argument("--risk-gamma", type=float, default=0.0)
     parser.add_argument("--guard-mode", choices=["on", "off"], default="on",

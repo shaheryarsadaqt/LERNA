@@ -1619,6 +1619,233 @@ class LERNAPhaseStratifiedPolicy:
         }
 
 
+class PhaseStratifiedGuardedRandomPolicy(LERNAPhaseStratifiedPolicy):
+    """Descriptive subclass preserving the exact guarded phase-stratified behavior."""
+
+    name = "phase_strat_guarded"
+
+
+class FixedPhaseStratifiedRandomPolicy:
+    """Pure fixed temporal baseline: fixed equal-length phases, weighted quotas,
+    and random selection within each phase. No tracker, no rho/loss-spike vetoes,
+    and no LER/rho/grad-norm signals."""
+
+    name = "fixed_phase_strat"
+
+    def __init__(
+        self,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        n_phases: int = 4,
+        phase_weights: Optional[List[float]] = None,
+        max_consecutive_skips: int = 1,
+    ):
+        self.target_skip_rate = float(target_skip_rate)
+        self.total_steps = total_steps
+        self.min_step = int(min_step)
+        self.n_phases = int(n_phases)
+        if phase_weights is None:
+            phase_weights = [0.22, 0.24, 0.26, 0.28][:self.n_phases]
+        s = sum(phase_weights) or 1.0
+        self.phase_weights = [w / s for w in phase_weights]
+        self.max_consecutive_skips = int(max_consecutive_skips)
+        self.risk_gamma = 0.0
+
+        self._rng = random.Random(seed)
+        self._quota_total_steps: Optional[int] = None
+        self._quota_size: Optional[int] = None
+        self._phase_bounds: List[int] = []
+        self._phase_quota: List[int] = []
+        self._phase_skips: List[int] = []
+        self._phase_eligible: List[int] = []
+
+        self._cum_phase_quota: List[int] = []
+        self._consecutive_skips = 0
+        self._decisions_seen = 0
+        self._skip_decisions = 0
+        self._cur_phase = -1
+
+        self._phase_debt_current = 0
+        self._phase_debt_carried_total = 0
+
+        self._warmup_veto = 0
+        self._quota_exhausted = 0
+        self._forced_tail = 0
+        self._forced_global_tail_skip = 0
+        self._max_consec_veto = 0
+        self._random_safe_skip = 0
+        self._grad_norm_last = None
+
+    def _lazy_init(self, trainer):
+        if self._quota_size is not None:
+            return
+        rt = getattr(getattr(trainer, "state", None), "max_steps", None)
+        total = rt or self.total_steps
+        if not total:
+            total = getattr(getattr(trainer, "args", None), "max_steps", None)
+        if not total or int(total) <= self.min_step:
+            raise RuntimeError(
+                "FixedPhaseStratifiedRandomPolicy could not resolve total_steps"
+            )
+        total = int(total)
+        self._quota_total_steps = total
+        self._quota_size = int(round(self.target_skip_rate * total))
+        eligible_count = total - self.min_step
+        if self._quota_size > eligible_count:
+            raise ValueError(
+                f"Infeasible skip quota: requested {self._quota_size} skips "
+                f"({self.target_skip_rate:.3f} of {total} steps), but only "
+                f"{eligible_count} steps are eligible after min_step={self.min_step}. "
+                "Reduce target_skip_rate or min_step, or increase total_steps; "
+                "quotas are never silently clipped."
+            )
+
+        eligible = list(range(self.min_step, total))
+        n_elig = len(eligible)
+        edges = [
+            self.min_step + int(round(n_elig * i / self.n_phases))
+            for i in range(self.n_phases + 1)
+        ]
+        self._phase_bounds = edges
+        self._phase_eligible = [
+            edges[i + 1] - edges[i] for i in range(self.n_phases)
+        ]
+
+        raw = [self._quota_size * w for w in self.phase_weights]
+        q = [int(math.floor(x)) for x in raw]
+        q = [min(q[i], self._phase_eligible[i]) for i in range(self.n_phases)]
+        rem = self._quota_size - sum(q)
+        order = sorted(
+            range(self.n_phases), key=lambda i: raw[i] - q[i], reverse=True
+        )
+        idx = 0
+        while rem > 0 and idx < 10 * self.n_phases:
+            i = order[idx % self.n_phases]
+            if q[i] < self._phase_eligible[i]:
+                q[i] += 1
+                rem -= 1
+            idx += 1
+        self._phase_quota = q
+        self._phase_skips = [0] * self.n_phases
+        cumulative = 0
+        self._cum_phase_quota = []
+        for phase_quota in q:
+            cumulative += phase_quota
+            self._cum_phase_quota.append(cumulative)
+
+    def _phase_of(self, di: int) -> int:
+        for i in range(self.n_phases):
+            if self._phase_bounds[i] <= di < self._phase_bounds[i + 1]:
+                return i
+        return self.n_phases - 1
+
+    def _do_skip(self, ph: int) -> bool:
+        self._skip_decisions += 1
+        self._phase_skips[ph] += 1
+        self._consecutive_skips += 1
+        return True
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        di = self._decisions_seen
+        self._decisions_seen += 1
+        self._lazy_init(trainer)
+
+        if di < self.min_step or self._quota_size is None:
+            self._warmup_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        ph = self._phase_of(di)
+        if ph != self._cur_phase and self._cur_phase >= 0:
+            carried = max(
+                self._cum_phase_quota[self._cur_phase] - self._skip_decisions,
+                0,
+            )
+            self._phase_debt_carried_total += carried
+        self._cur_phase = ph
+        self._phase_debt_current = (
+            max(self._cum_phase_quota[ph - 1] - self._skip_decisions, 0)
+            if ph > 0
+            else 0
+        )
+
+        remaining_skips = self._quota_size - self._skip_decisions
+        remaining_decisions = self._quota_total_steps - di
+        if remaining_skips <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+
+        if self._consecutive_skips >= self.max_consecutive_skips:
+            self._max_consec_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        if remaining_skips >= remaining_decisions:
+            self._forced_global_tail_skip += 1
+            return self._do_skip(ph)
+
+        q_left = self._cum_phase_quota[ph] - self._skip_decisions
+        if q_left <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+        decisions_left_in_phase = max(self._phase_bounds[ph + 1] - di, 1)
+
+        if q_left >= decisions_left_in_phase:
+            self._forced_tail += 1
+            return self._do_skip(ph)
+
+        pressure = q_left / decisions_left_in_phase
+        p = min(max(pressure, 0.0), 1.0)
+
+        if self._rng.random() < p:
+            self._random_safe_skip += 1
+            return self._do_skip(ph)
+        self._consecutive_skips = 0
+        return False
+
+    def get_diagnostics(self) -> dict:
+        denom = max(self._decisions_seen, 1)
+        return {
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "quota_total_steps": self._quota_total_steps,
+            "quota_size": self._quota_size,
+            "n_phases": self.n_phases,
+            "phase_weights": self.phase_weights,
+            "phase_bounds": self._phase_bounds,
+            "phase_quota": self._phase_quota,
+            "phase_skips": self._phase_skips,
+            "phase_eligible": self._phase_eligible,
+            "decisions_seen": self._decisions_seen,
+            "skip_decisions": self._skip_decisions,
+            "realized_skip_rate": self._skip_decisions / denom,
+            "current_phase": self._cur_phase,
+            "warmup_veto_count": self._warmup_veto,
+            "rho_veto_count": 0,
+            "spike_veto_count": 0,
+            "max_consecutive_veto_count": self._max_consec_veto,
+            "quota_exhausted_count": self._quota_exhausted,
+            "forced_tail_skip_count": self._forced_tail,
+            "forced_global_tail_skip_count": self._forced_global_tail_skip,
+            "forced_safety_override_count": 0,
+            "phase_debt_current": self._phase_debt_current,
+            "phase_debt_carried_total": self._phase_debt_carried_total,
+            "quota_exact": (
+                self._quota_total_steps is not None
+                and self._decisions_seen == self._quota_total_steps
+                and self._skip_decisions == self._quota_size
+            ),
+            "random_safe_skip_count": self._random_safe_skip,
+            "risk_gamma": self.risk_gamma,
+            "grad_norm_last": self._grad_norm_last,
+            "skipped_grad_mean": None,
+        }
+
+
 class LERNARandomVetoDeferralPolicy:
     """Sparse random skip with vetoes and deferred danger protection.
 
