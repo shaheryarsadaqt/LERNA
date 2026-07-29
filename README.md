@@ -78,23 +78,9 @@ This controller will isolate whether temporal quota allocation alone adds value 
 
 ### Phase-Stratified Guarded Random Skip
 
-This is the accurate name for the controller currently implemented as:
-
-```text
-LERNAPhaseStratifiedPolicy
-```
+Phase-Stratified Guarded Random Skip divides training into fixed temporal phases and allocates a weighted skip budget across them. Unused quota from an earlier phase is carried into later phases through cumulative quota accounting. Rho and loss-spike signals act as best-effort safety vetoes while sufficient budget flexibility remains. Near the end of the training horizon, forced-tail enforcement may override these vetoes to guarantee the exact global skip quota. LER does not currently determine phase boundaries, quota allocation, vetoes, or skip decisions.
 
 The current code identifier is retained temporarily for historical compatibility and will be renamed only after characterization tests lock its existing behavior.
-
-The controller:
-
-- divides training into four predetermined equal-length phases;
-- uses fixed phase-quota weights;
-- selects steps randomly within each phase;
-- optionally prevents consecutive skip bursts;
-- uses rho-based and loss-spike safety vetoes.
-
-It is a **fixed-schedule temporal controller with safety vetoes**. It does not use LER to determine phase boundaries, phase quotas, or skip decisions and is not currently classified as a genuinely LER-driven controller.
 
 ### Random-Veto Deferral
 
@@ -222,13 +208,11 @@ Momentum extrapolation remains historical or exploratory functionality. It is no
 - GradNorm does not respect the requested budget.
 - Online diagnostics currently add model-scale overhead.
 - A complete seed-level Phase 1.3 evidence package is not yet included.
-- Dedicated tests for the existing Phase-Stratified policy are still required.
 
 ## Immediate Research Plan
 
-1. Add characterization tests for the existing Phase-Stratified Guarded Random Skip controller.
-2. Implement a pure Fixed Phase-Stratified Random baseline without safety signals.
-3. Make diagnostics optional and measure their overhead.
+1. Implement a pure Fixed Phase-Stratified Random baseline without safety signals.
+2. Make diagnostics optional and measure their overhead.
 4. Reduce the cost of LER and rho computation.
 5. Repair the experiment runner, ablations, and scientific fingerprints.
 6. Implement LER-Guided Stratified control as a separate Phase 1.3b policy.
