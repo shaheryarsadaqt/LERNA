@@ -228,6 +228,12 @@ class SkipInstrumentation:
     policy_decision_failures: int = 0
     last_policy_error_type: Optional[str] = None
     run_invalidated: bool = False
+    online_ler_enabled: bool = True
+    online_ler_update_interval: int = 1
+    online_ler_update_attempts: int = 0
+    online_ler_update_successes: int = 0
+    capture_logits_enabled: bool = True
+    grad_norm_capture_enabled: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -331,6 +337,8 @@ class TrueBackwardSkippingTrainer(Trainer):
         scheduler_step_policy: str = SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP,
         instrumentation_path: Optional[str] = None,
         capture_logits: bool = True,
+        online_ler_enabled: bool = True,
+        online_ler_update_interval: int = 1,
         compute_saving_mechanism: str = ComputeSavingMechanism.BACKWARD_SKIPPING,
         allow_grad_accumulation_with_skipping: bool = False,
         **kwargs,
@@ -343,7 +351,14 @@ class TrueBackwardSkippingTrainer(Trainer):
         self.skip_policy: SkipPolicy = skip_policy or AlwaysFalsePolicy()
         self.scheduler_step_policy = scheduler_step_policy
         self.instrumentation_path = instrumentation_path
-        self.capture_logits = capture_logits
+        self.online_ler_enabled = bool(online_ler_enabled)
+        interval = int(online_ler_update_interval)
+        if self.online_ler_enabled and interval < 1:
+            raise ValueError(
+                "online_ler_update_interval must be >= 1 when online LER is enabled"
+            )
+        self.online_ler_update_interval = interval if self.online_ler_enabled else 0
+        self.capture_logits = bool(capture_logits) and self.online_ler_enabled
 
         # [FIX #3] enforce grad_accum == 1 for true-skipping experiments
         ga = int(getattr(self.args, "gradient_accumulation_steps", 1))
@@ -362,6 +377,10 @@ class TrueBackwardSkippingTrainer(Trainer):
             policy_name=getattr(self.skip_policy, "name", type(self.skip_policy).__name__),
             compute_saving_mechanism=compute_saving_mechanism,
             grad_accumulation_steps=ga,
+            online_ler_enabled=self.online_ler_enabled,
+            online_ler_update_interval=self.online_ler_update_interval,
+            capture_logits_enabled=self.capture_logits,
+            grad_norm_capture_enabled=hasattr(self.skip_policy, "record_grad_norm"),
         )
 
         # [CRIT-1] Two independent flags for optimizer and scheduler wrappers.
@@ -393,18 +412,24 @@ class TrueBackwardSkippingTrainer(Trainer):
         return None
 
     # ----------------------------------------------------- online LER update (FIX P0-3)
-    def _online_ler_update(self, loss_value, logits, model, every: int = 1):
-        """Dense, per-step LER feed using the TRAIN batch already computed.
-        Cheap: reuses logits/loss; param-velocity uses tracker's own snapshot."""
+    def _online_ler_update(self, loss_value, logits, model) -> bool:
+        """Update legacy online diagnostics at the configured batch cadence."""
+        if not self.online_ler_enabled or logits is None:
+            return False
         trk = getattr(self, "ler_tracker", None) or getattr(self, "_ler_tracker", None)
-        if trk is None or logits is None:
-            return
-        if self.state.global_step % every != 0:
-            return
+        if trk is None:
+            return False
+        decision_index = max(self.instr.batches_seen - 1, 0)
+        if decision_index % self.online_ler_update_interval != 0:
+            return False
+        self.instr.online_ler_update_attempts += 1
         try:
             trk.update(loss=float(loss_value), logits=logits, accuracy=None, model=model)
         except Exception as exc:
             logger.debug(f"[TrueSkip] online LER update failed: {exc!r}")
+            return False
+        self.instr.online_ler_update_successes += 1
+        return True
 
     # [Piece 8] Authoritative horizon validation
     def _check_authoritative_horizon(self) -> None:
@@ -435,6 +460,10 @@ class TrueBackwardSkippingTrainer(Trainer):
             self._last_real_logits = logits
             self._last_logits = logits
             self.last_logits = logits
+        else:
+            self._last_real_logits = None
+            self._last_logits = None
+            self.last_logits = None
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
@@ -451,19 +480,11 @@ class TrueBackwardSkippingTrainer(Trainer):
         with self.compute_loss_context_manager():
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
 
-        logits = getattr(outputs, "logits", None)
-        if logits is None and isinstance(outputs, dict):
-            logits = outputs.get("logits")
-        logits = logits.detach() if logits is not None else None
-        self._last_real_logits = logits
-        self._last_logits = logits
-        self.last_logits = logits
-
         self.instr.forward_calls += 1
         if self.args.n_gpu > 1:
             loss = loss.mean()
 
-        # [FIX P0-3] Feed current-step diagnostics ONLINE before deciding (R2/R3).
+        # Legacy dense diagnostics remain available only when explicitly enabled.
         self._online_ler_update(loss.detach(), self._last_real_logits, model)
 
         # [Piece 8] Authoritative horizon validation before the first policy decision.
@@ -526,31 +547,33 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.accelerator.backward(loss)
         self.instr.backward_calls += 1
 
-        # --- SINGLE SOURCE OF TRUTH: pre-clip grad norm (before HF clips) ---
-        with torch.no_grad():
-            squared_norm = 0.0
-            for p in model.parameters():
-                if p.requires_grad and p.grad is not None:
-                    pn = float(p.grad.detach().float().norm().item())
-                    squared_norm += pn ** 2
-            grad_norm = squared_norm ** 0.5
-
-        scaler = getattr(
-            getattr(self, "accelerator", None),
-            "scaler",
-            None,
-        )
-        grad_scale = 1.0
-        if scaler is not None:
-            candidate_scale = float(scaler.get_scale())
-            if math.isfinite(candidate_scale) and candidate_scale > 0:
-                grad_scale = candidate_scale
-
-        self._pre_clip_grad_norm = grad_norm / grad_scale
-        self._last_grad_scale = grad_scale
+        # Compute the full pre-clip norm only for policies that consume it.
         pol = self.skip_policy
         if hasattr(pol, "record_grad_norm"):
+            with torch.no_grad():
+                squared_norm = 0.0
+                for p in model.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        pn = float(p.grad.detach().float().norm().item())
+                        squared_norm += pn ** 2
+                grad_norm = squared_norm ** 0.5
+
+            scaler = getattr(
+                getattr(self, "accelerator", None),
+                "scaler",
+                None,
+            )
+            grad_scale = 1.0
+            if scaler is not None:
+                candidate_scale = float(scaler.get_scale())
+                if math.isfinite(candidate_scale) and candidate_scale > 0:
+                    grad_scale = candidate_scale
+
+            self._pre_clip_grad_norm = grad_norm / grad_scale
+            self._last_grad_scale = grad_scale
             pol.record_grad_norm(self._pre_clip_grad_norm)
+        else:
+            self._pre_clip_grad_norm = None
 
         # Return the un-scaled detached loss for logging consistency.
         return loss.detach()

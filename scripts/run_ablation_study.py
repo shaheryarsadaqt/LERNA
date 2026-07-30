@@ -332,21 +332,11 @@ class _GradNormCapture(TrainerCallback):
 
 
 class AblationTrainer(LERNAMomentumTrainer):
-    """Trainer subclass that captures real logits for LER computation."""
+    """Momentum trainer with an optional online LER tracker."""
 
     def __init__(self, *args, ler_tracker=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._ler_tracker = ler_tracker
-        self._last_real_logits = None
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
-        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
-        if hasattr(outputs, "logits"):
-            self._last_real_logits = outputs.logits.detach()
-        elif isinstance(outputs, dict) and "logits" in outputs:
-            self._last_real_logits = outputs["logits"].detach()
-        return (loss, outputs) if return_outputs else loss
 
 
 class AblationDiagnosticsCallback:
@@ -771,7 +761,28 @@ def run_ablation_single(
     use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
     use_hysteresis = ablation_overrides.get("use_hysteresis", True)
 
-    ler_tracker = LERTracker(task=task_name, window_size=5, use_hysteresis=use_hysteresis)
+    signal_free_control = effective_control in {"full_finetune", "exact_random"}
+    signal_free_policy = effective_control is None and policy == "fixed_phase_strat"
+    online_ler_enabled = not (signal_free_control or signal_free_policy)
+    online_ler_update_interval = 1 if online_ler_enabled else 0
+    if signal_free_control:
+        diagnostics_reason = f"signal_free_control:{effective_control}"
+    elif signal_free_policy:
+        diagnostics_reason = "signal_free_policy:fixed_phase_strat"
+    else:
+        diagnostics_reason = "legacy_policy_requires_online_signals"
+    online_diagnostics = {
+        "enabled": online_ler_enabled,
+        "mode": "legacy_dense" if online_ler_enabled else "off",
+        "update_interval": online_ler_update_interval,
+        "reason": diagnostics_reason,
+    }
+
+    ler_tracker = (
+        LERTracker(task=task_name, window_size=5, use_hysteresis=use_hysteresis)
+        if online_ler_enabled
+        else None
+    )
 
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
@@ -780,8 +791,13 @@ def run_ablation_single(
         log_frequency=50,
     )
 
-    # [FIX P0-2] Pull the task-calibrated LER threshold instead of hardcoded 1e-5 (R1)
-    task_cal = ler_tracker.task_calibration.get(task_name, {})
+    # Signal-consuming policies use their task calibration; signal-free arms
+    # never read this compatibility fallback.
+    task_cal = (
+        ler_tracker.task_calibration.get(task_name, {})
+        if ler_tracker is not None
+        else {}
+    )
     base_thr = task_cal.get("ler_threshold", 0.01)
 
     if effective_control is not None:
@@ -927,6 +943,7 @@ def run_ablation_single(
         "early_stopping_active": budget_state["early_stopping_active"],
         "num_epochs": num_epochs,
         "policy_effective_config": policy_effective_config,
+        "online_diagnostics": online_diagnostics,
     }
     if quota_control == "rvd":
         controller_config_effective["rvd"] = dict(controller_cfg)
@@ -935,32 +952,33 @@ def run_ablation_single(
         + json.dumps(controller_config_effective, sort_keys=True, default=str)
     )
 
-    ler_feed_callback = LERFeedCallback(
-        ler_tracker=ler_tracker,
-        policy_ref=skip_policy,
-    )
-
     trainer_holder = [None]
-
-    diag_callback = AblationDiagnosticsCallback(
-        ler_trk=ler_tracker,
-        model_ref=model,
-        trainer_ref_holder=trainer_holder,
-        greater_is_better=greater_is_better,
-        use_rho_vg=use_rho_vg,
-        use_ler=use_ler,
-        use_hysteresis=use_hysteresis,
-        use_safety_horizon=use_safety_horizon,
-        skip_update_mode=effective_skip_update_mode,
-        skip_update_mode_legacy_compat_used=skip_mode_legacy_compat_used,
-        ablation_name=ablation_name,
-        ablation_overrides=ablation_overrides,
-        output_dir=output_dir,
-        use_wandb=use_wandb,
-        task_cfg=task_cfg,
-        eval_ds=eval_ds,
-        tokenizer=tokenizer,
-    )
+    ler_feed_callback = None
+    diag_callback = None
+    if online_ler_enabled:
+        ler_feed_callback = LERFeedCallback(
+            ler_tracker=ler_tracker,
+            policy_ref=skip_policy,
+        )
+        diag_callback = AblationDiagnosticsCallback(
+            ler_trk=ler_tracker,
+            model_ref=model,
+            trainer_ref_holder=trainer_holder,
+            greater_is_better=greater_is_better,
+            use_rho_vg=use_rho_vg,
+            use_ler=use_ler,
+            use_hysteresis=use_hysteresis,
+            use_safety_horizon=use_safety_horizon,
+            skip_update_mode=effective_skip_update_mode,
+            skip_update_mode_legacy_compat_used=skip_mode_legacy_compat_used,
+            ablation_name=ablation_name,
+            ablation_overrides=ablation_overrides,
+            output_dir=output_dir,
+            use_wandb=use_wandb,
+            task_cfg=task_cfg,
+            eval_ds=eval_ds,
+            tokenizer=tokenizer,
+        )
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -999,6 +1017,15 @@ def run_ablation_single(
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     compute_metrics = build_compute_metrics(task_name)
 
+    callbacks = [power_callback]
+    if online_ler_enabled:
+        callbacks.extend([ler_feed_callback, diag_callback])
+    if not no_early_stopping:
+        callbacks.insert(
+            0,
+            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
+        )
+
     trainer = AblationTrainer(
         model=model,
         args=training_args,
@@ -1013,19 +1040,13 @@ def run_ablation_single(
         apply_momentum=legacy_momentum_flag,  # None when CLI path; preserves legacy provenance
         compute_saving_mechanism=compute_saving_mechanism,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
-        capture_logits=True,
-        callbacks=[
-            power_callback,
-            ler_feed_callback,
-            diag_callback,
-        ] if no_early_stopping else [
-            EarlyStoppingCallback(early_stopping_patience=early_stopping_patience),
-            power_callback,
-            ler_feed_callback,
-            diag_callback,
-        ],
+        capture_logits=online_ler_enabled,
+        online_ler_enabled=online_ler_enabled,
+        online_ler_update_interval=(online_ler_update_interval or 1),
+        callbacks=callbacks,
     )
-    ler_feed_callback.attach(trainer=trainer)
+    if ler_feed_callback is not None:
+        ler_feed_callback.attach(trainer=trainer)
     trainer_holder[0] = trainer
 
     # [Piece 8] Authoritative horizon validation is performed at runtime by
@@ -1035,6 +1056,14 @@ def run_ablation_single(
 
     # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
     # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
+
+    output_paths = {
+        "results": "results.json",
+        "instrumentation": "instrumentation.json",
+        "manifest": "run_manifest.json",
+    }
+    if online_ler_enabled:
+        output_paths["ler_diagnostics"] = "ler_diagnostics.json"
 
     write_manifest_running(
         output_dir,
@@ -1056,12 +1085,7 @@ def run_ablation_single(
             if budget_state["matched_budget"]
             else "early_stopping_exploratory"
         ),
-        output_paths={
-            "results": "results.json",
-            "instrumentation": "instrumentation.json",
-            "ler_diagnostics": "ler_diagnostics.json",
-            "manifest": "run_manifest.json",
-        },
+        output_paths=output_paths,
         requested_classification=provenance_classification,
         repo_root=str(Path(__file__).resolve().parents[1]),
         identity_inputs=identity_inputs,
@@ -1104,6 +1128,12 @@ def run_ablation_single(
             policy_diagnostics.get("quota_total_steps")
         )
 
+        ler_final = (
+            ler_tracker.get_diagnostics()
+            if ler_tracker is not None
+            else {"enabled": False, "mode": "off", "n_updates": 0}
+        )
+
         results = {
             "task": task_name,
             "seed": seed,
@@ -1117,7 +1147,7 @@ def run_ablation_single(
             "eval_metrics": eval_result,
             "energy_kwh": power_callback.cumulative_kwh,
             "power_avg_watts": avg_power,
-            "ler_final": ler_tracker.get_diagnostics(),
+            "ler_final": ler_final,
             "true_skip_instrumentation": instrumentation,
             "policy_diagnostics": policy_diagnostics,
             "controller_config": controller_config_effective,
@@ -1201,8 +1231,8 @@ def run_ablation_single(
                         "final/eval_loss": eval_result.get("eval_loss"),
                         "final/energy_kwh": power_callback.cumulative_kwh,
                         "final/runtime_s": total_time,
-                        "final/ler": ler_tracker.get_diagnostics().get("ler"),
-                        "final/rho_vg": ler_tracker.get_diagnostics().get("rho_vg"),
+                        "final/ler": ler_final.get("ler"),
+                        "final/rho_vg": ler_final.get("rho_vg"),
                         "final/steps_skipped": instrumentation[
                             "skipped_backward_steps"
                         ],
@@ -1226,12 +1256,12 @@ def run_ablation_single(
         if use_wandb:
             _ensure_wandb_finished()
 
+        required_artifacts = ["instrumentation.json"]
+        if online_ler_enabled:
+            required_artifacts.append("ler_diagnostics.json")
         validation_report = validate_skip_results(
             Path(results_path),
-            required_artifacts=[
-                "instrumentation.json",
-                "ler_diagnostics.json",
-            ],
+            required_artifacts=required_artifacts,
         )
         finalize_manifest_completed(
             output_dir,
