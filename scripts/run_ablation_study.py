@@ -67,6 +67,15 @@ from lerna.trainers import (
     SchedulerStepPolicy, normalize_skip_update_mode,
 )
 from lerna.trainers.policies import build_exact_random_skip_set
+from lerna.trainers.true_skip_trainer import (
+    ONLINE_LER_MODE_OFF,
+    ONLINE_LER_MODE_LEGACY_DENSE,
+    ONLINE_LER_MODE_SAMPLED_LAGGED,
+    VALID_ONLINE_LER_MODES,
+    ONLINE_LER_TIMING_NONE,
+    ONLINE_LER_TIMING_PRE_DECISION,
+    ONLINE_LER_TIMING_POST_DECISION,
+)
 from lerna.utils.run_provenance import (
     CLASSIFICATION_LOCAL_DEVELOPMENT,
     CLASSIFICATION_MATCHED_CLAIM,
@@ -133,6 +142,9 @@ ABLATIONS = {
 
 POLICY_MIN_STEP = 50
 SKIPPING_CONTROLS = {"exact_random", "random_skip", "rvd", "grad_norm"}
+ONLINE_LER_MODE_AUTO = "auto"
+ONLINE_LER_SIGNAL_FREE_CONTROLS = ("full_finetune", "exact_random")
+ONLINE_LER_SIGNAL_FREE_POLICY = "fixed_phase_strat"
 DEFAULT_ABLATIONS = [
     name for name, config in ABLATIONS.items() if "alias_of" not in config
 ]
@@ -185,6 +197,73 @@ def build_rvd_controller_config(
         "policy_seed": int(training_seed if policy_seed is None else policy_seed),
         "policy_seed_defaulted_to_training_seed": policy_seed is None,
         "max_consecutive_skips": max_consecutive_skips,
+    }
+
+
+def resolve_online_ler_config(
+    requested_mode,
+    *,
+    effective_control,
+    policy,
+    parameter_sample_size,
+    update_interval,
+):
+    """Resolve the canonical online LER diagnostics configuration for one arm."""
+    if requested_mode == ONLINE_LER_MODE_AUTO:
+        if effective_control in ONLINE_LER_SIGNAL_FREE_CONTROLS:
+            mode = ONLINE_LER_MODE_OFF
+            reason = f"auto_signal_free_control:{effective_control}"
+        elif effective_control is None and policy == ONLINE_LER_SIGNAL_FREE_POLICY:
+            mode = ONLINE_LER_MODE_OFF
+            reason = f"auto_signal_free_policy:{ONLINE_LER_SIGNAL_FREE_POLICY}"
+        else:
+            mode = ONLINE_LER_MODE_SAMPLED_LAGGED
+            reason = "auto_signal_consuming_arm"
+    elif requested_mode in VALID_ONLINE_LER_MODES:
+        mode = requested_mode
+        reason = f"explicit:{requested_mode}"
+    else:
+        raise ValueError(
+            f"Invalid requested_mode={requested_mode!r} for online_ler_mode; "
+            f"expected {ONLINE_LER_MODE_AUTO!r} or one of {VALID_ONLINE_LER_MODES}."
+        )
+
+    enabled = mode != ONLINE_LER_MODE_OFF
+    if enabled:
+        resolved_interval = int(update_interval)
+        if resolved_interval < 1:
+            raise ValueError(
+                "update_interval must be >= 1 when online LER diagnostics "
+                f"are enabled; got {update_interval!r}"
+            )
+    else:
+        resolved_interval = 0
+
+    if mode == ONLINE_LER_MODE_SAMPLED_LAGGED:
+        resolved_sample_size = int(parameter_sample_size)
+        if resolved_sample_size < 1:
+            raise ValueError(
+                "parameter_sample_size must be >= 1 for "
+                f"{ONLINE_LER_MODE_SAMPLED_LAGGED!r} mode; "
+                f"got {parameter_sample_size!r}"
+            )
+    else:
+        resolved_sample_size = 0
+
+    timing = {
+        ONLINE_LER_MODE_OFF: ONLINE_LER_TIMING_NONE,
+        ONLINE_LER_MODE_LEGACY_DENSE: ONLINE_LER_TIMING_PRE_DECISION,
+        ONLINE_LER_MODE_SAMPLED_LAGGED: ONLINE_LER_TIMING_POST_DECISION,
+    }[mode]
+
+    return {
+        "requested_mode": requested_mode,
+        "mode": mode,
+        "enabled": enabled,
+        "timing": timing,
+        "parameter_sample_size": resolved_sample_size,
+        "update_interval": resolved_interval,
+        "reason": reason,
     }
 
 
