@@ -23,6 +23,20 @@ from transformers import Trainer, TrainerCallback
 
 logger = logging.getLogger(__name__)
 
+# --- Online LER diagnostic mode constants ---
+ONLINE_LER_MODE_OFF = "off"
+ONLINE_LER_MODE_LEGACY_DENSE = "legacy_dense"
+ONLINE_LER_MODE_SAMPLED_LAGGED = "sampled_lagged"
+VALID_ONLINE_LER_MODES = frozenset({
+    ONLINE_LER_MODE_OFF,
+    ONLINE_LER_MODE_LEGACY_DENSE,
+    ONLINE_LER_MODE_SAMPLED_LAGGED,
+})
+
+ONLINE_LER_TIMING_NONE = "none"
+ONLINE_LER_TIMING_PRE_DECISION = "pre_decision"
+ONLINE_LER_TIMING_POST_DECISION = "post_decision"
+
 
 class _OptimizerStepWrapper:
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
