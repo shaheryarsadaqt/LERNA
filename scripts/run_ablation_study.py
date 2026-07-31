@@ -319,6 +319,94 @@ def build_online_ler_tracker(
     raise ValueError(f"Unknown online LER mode: {mode!r}")
 
 
+def build_online_ler_runtime_metadata(
+    online_diagnostics,
+    instrumentation,
+    tracker_diagnostics=None,
+):
+    """Combine configured online LER metadata with realized runtime counters."""
+    config = online_diagnostics or {}
+    instr = instrumentation or {}
+    tracker = tracker_diagnostics or {}
+    metadata = {
+        "requested_mode": config.get("requested_mode"),
+        "mode": config.get("mode"),
+        "enabled": config.get("enabled"),
+        "timing": config.get("timing"),
+        "parameter_sample_size": config.get("parameter_sample_size"),
+        "update_interval": config.get("update_interval"),
+        "reason": config.get("reason"),
+        "sample_seed": config.get("sample_seed"),
+    }
+
+    if not config.get("enabled"):
+        metadata.update(
+            {
+                "parameter_sample_size_realized": 0,
+                "update_attempts": 0,
+                "update_successes": 0,
+                "last_update_decision": None,
+                "observation_age_decisions": None,
+                "n_updates": 0,
+                "n_decisions": 0,
+            }
+        )
+        return metadata
+
+    update_attempts = instr.get("online_ler_update_attempts", 0)
+    update_successes = instr.get("online_ler_update_successes", 0)
+    last_update_decision = instr.get("online_ler_last_update_decision")
+    realized_sample_size = tracker.get("parameter_sample_size_realized")
+    if realized_sample_size is None:
+        realized_sample_size = 0
+
+    observation_age = tracker.get("observation_age_decisions")
+    if observation_age is None and last_update_decision is not None:
+        batches_seen = instr.get("batches_seen", 0)
+        observation_age = max((batches_seen - 1) - last_update_decision, 0)
+
+    n_updates = tracker.get("n_updates")
+    if n_updates is None:
+        n_updates = update_successes
+    n_decisions = tracker.get("n_decisions")
+    if n_decisions is None:
+        n_decisions = (
+            instr.get("batches_seen", 0)
+            if config.get("mode") == ONLINE_LER_MODE_LEGACY_DENSE
+            else 0
+        )
+
+    metadata.update(
+        {
+            "parameter_sample_size_realized": realized_sample_size,
+            "update_attempts": update_attempts,
+            "update_successes": update_successes,
+            "last_update_decision": last_update_decision,
+            "observation_age_decisions": observation_age,
+            "n_updates": n_updates,
+            "n_decisions": n_decisions,
+        }
+    )
+    return metadata
+
+
+def build_online_ler_artifact_contract(online_diagnostics):
+    """Build the truthful artifact contract for one resolved online LER config."""
+    output_paths = {
+        "results": "results.json",
+        "instrumentation": "instrumentation.json",
+        "manifest": "run_manifest.json",
+    }
+    required_artifacts = ["instrumentation.json"]
+    if online_diagnostics["enabled"]:
+        output_paths["ler_diagnostics"] = "ler_diagnostics.json"
+        required_artifacts.append("ler_diagnostics.json")
+    return {
+        "output_paths": output_paths,
+        "required_artifacts": required_artifacts,
+    }
+
+
 def compute_authoritative_horizon(
     train_dataset,
     num_epochs: int,
@@ -490,6 +578,7 @@ class AblationDiagnosticsCallback:
         task_cfg,
         eval_ds,
         tokenizer,
+        online_diagnostics,
     ):
         self.ler_tracker = ler_trk
         self._model = model_ref
@@ -508,6 +597,7 @@ class AblationDiagnosticsCallback:
         self._task_cfg = task_cfg
         self._eval_ds = eval_ds
         self._tokenizer = tokenizer
+        self.online_diagnostics = dict(online_diagnostics)
         self._last_loss = None
         self._step_count = 0
 
@@ -601,7 +691,12 @@ class AblationDiagnosticsCallback:
 
     def _save_diagnostics(self):
         diag_path = os.path.join(self.output_dir, "ler_diagnostics.json")
-        final = self.ler_tracker.get_diagnostics()
+        tracker_diagnostics = dict(self.ler_tracker.get_diagnostics())
+        trainer = self._trainer_holder[0]
+        instrumentation = (
+            trainer.get_instrumentation() if trainer is not None else None
+        ) or {}
+        final = dict(tracker_diagnostics)
         final["ler_history"] = self.ler_tracker.ler_history
         final["rho_vg_history"] = self.ler_tracker.rho_vg_history
         final["velocity_history"] = self.ler_tracker.velocity_history
@@ -609,6 +704,11 @@ class AblationDiagnosticsCallback:
         final["ablation_overrides"] = self.ablation_overrides
         final["skip_update_mode"] = self.skip_update_mode
         final["skip_update_mode_legacy_compat_used"] = self.skip_update_mode_legacy_compat_used
+        final["online_diagnostics_runtime"] = build_online_ler_runtime_metadata(
+            self.online_diagnostics,
+            instrumentation,
+            tracker_diagnostics=tracker_diagnostics,
+        )
         with open(diag_path, "w") as f:
             json.dump(final, f, indent=2, default=str)
         print(f"  LER diagnostics saved: {diag_path}")
@@ -1114,6 +1214,7 @@ def run_ablation_single(
             task_cfg=task_cfg,
             eval_ds=eval_ds,
             tokenizer=tokenizer,
+            online_diagnostics=online_diagnostics,
         )
 
     training_args = TrainingArguments(
@@ -1194,13 +1295,8 @@ def run_ablation_single(
     # Pre-clip grad norm is now fed from inside TrueBackwardSkippingTrainer.training_step
     # (single, correct source). The old _GradNormCapture read POST-clip grads (~1.0) and is removed.
 
-    output_paths = {
-        "results": "results.json",
-        "instrumentation": "instrumentation.json",
-        "manifest": "run_manifest.json",
-    }
-    if online_ler_enabled:
-        output_paths["ler_diagnostics"] = "ler_diagnostics.json"
+    artifact_contract = build_online_ler_artifact_contract(online_diagnostics)
+    output_paths = artifact_contract["output_paths"]
 
     write_manifest_running(
         output_dir,
@@ -1265,10 +1361,18 @@ def run_ablation_single(
             policy_diagnostics.get("quota_total_steps")
         )
 
+        tracker_diagnostics = (
+            ler_tracker.get_diagnostics() if ler_tracker is not None else None
+        )
         ler_final = (
-            ler_tracker.get_diagnostics()
-            if ler_tracker is not None
+            tracker_diagnostics
+            if tracker_diagnostics is not None
             else {"enabled": False, "mode": "off", "n_updates": 0}
+        )
+        online_diagnostics_runtime = build_online_ler_runtime_metadata(
+            online_diagnostics,
+            instrumentation,
+            tracker_diagnostics=tracker_diagnostics,
         )
 
         results = {
@@ -1285,6 +1389,7 @@ def run_ablation_single(
             "energy_kwh": power_callback.cumulative_kwh,
             "power_avg_watts": avg_power,
             "ler_final": ler_final,
+            "online_diagnostics": online_diagnostics_runtime,
             "true_skip_instrumentation": instrumentation,
             "policy_diagnostics": policy_diagnostics,
             "controller_config": controller_config_effective,
@@ -1346,6 +1451,7 @@ def run_ablation_single(
             "rvd_policy_seed_defaulted_to_training_seed": (
                 controller_cfg["policy_seed_defaulted_to_training_seed"]
             ),
+            "online_diagnostics": dict(online_diagnostics),
         }
 
         results_path = os.path.join(output_dir, "results.json")
@@ -1393,12 +1499,9 @@ def run_ablation_single(
         if use_wandb:
             _ensure_wandb_finished()
 
-        required_artifacts = ["instrumentation.json"]
-        if online_ler_enabled:
-            required_artifacts.append("ler_diagnostics.json")
         validation_report = validate_skip_results(
             Path(results_path),
-            required_artifacts=required_artifacts,
+            required_artifacts=artifact_contract["required_artifacts"],
         )
         finalize_manifest_completed(
             output_dir,
