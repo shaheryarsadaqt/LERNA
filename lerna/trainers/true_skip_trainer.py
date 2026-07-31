@@ -35,7 +35,13 @@ VALID_ONLINE_LER_MODES = frozenset({
 
 ONLINE_LER_TIMING_NONE = "none"
 ONLINE_LER_TIMING_PRE_DECISION = "pre_decision"
-ONLINE_LER_TIMING_POST_DECISION = "post_decision"
+ONLINE_LER_TIMING_POST_DECISION = "post_decision_after_backward"
+
+ONLINE_LER_MODE_TO_TIMING = {
+    ONLINE_LER_MODE_OFF: ONLINE_LER_TIMING_NONE,
+    ONLINE_LER_MODE_LEGACY_DENSE: ONLINE_LER_TIMING_PRE_DECISION,
+    ONLINE_LER_MODE_SAMPLED_LAGGED: ONLINE_LER_TIMING_POST_DECISION,
+}
 
 
 class _OptimizerStepWrapper:
@@ -243,9 +249,12 @@ class SkipInstrumentation:
     last_policy_error_type: Optional[str] = None
     run_invalidated: bool = False
     online_ler_enabled: bool = True
+    online_ler_mode: str = ONLINE_LER_MODE_LEGACY_DENSE
+    online_ler_update_timing: str = ONLINE_LER_TIMING_PRE_DECISION
     online_ler_update_interval: int = 1
     online_ler_update_attempts: int = 0
     online_ler_update_successes: int = 0
+    online_ler_last_update_decision: Optional[int] = None
     capture_logits_enabled: bool = True
     grad_norm_capture_enabled: bool = False
 
@@ -352,6 +361,7 @@ class TrueBackwardSkippingTrainer(Trainer):
         instrumentation_path: Optional[str] = None,
         capture_logits: bool = True,
         online_ler_enabled: bool = True,
+        online_ler_mode: Optional[str] = None,
         online_ler_update_interval: int = 1,
         compute_saving_mechanism: str = ComputeSavingMechanism.BACKWARD_SKIPPING,
         allow_grad_accumulation_with_skipping: bool = False,
@@ -365,7 +375,22 @@ class TrueBackwardSkippingTrainer(Trainer):
         self.skip_policy: SkipPolicy = skip_policy or AlwaysFalsePolicy()
         self.scheduler_step_policy = scheduler_step_policy
         self.instrumentation_path = instrumentation_path
-        self.online_ler_enabled = bool(online_ler_enabled)
+        if online_ler_mode is None:
+            resolved_mode = (
+                ONLINE_LER_MODE_LEGACY_DENSE
+                if bool(online_ler_enabled)
+                else ONLINE_LER_MODE_OFF
+            )
+        elif online_ler_mode not in VALID_ONLINE_LER_MODES:
+            raise ValueError(
+                f"Invalid online_ler_mode={online_ler_mode!r}; "
+                f"expected one of {sorted(VALID_ONLINE_LER_MODES)}."
+            )
+        else:
+            resolved_mode = online_ler_mode
+        self.online_ler_mode = resolved_mode
+        self.online_ler_update_timing = ONLINE_LER_MODE_TO_TIMING[resolved_mode]
+        self.online_ler_enabled = resolved_mode != ONLINE_LER_MODE_OFF
         interval = int(online_ler_update_interval)
         if self.online_ler_enabled and interval < 1:
             raise ValueError(
@@ -392,6 +417,8 @@ class TrueBackwardSkippingTrainer(Trainer):
             compute_saving_mechanism=compute_saving_mechanism,
             grad_accumulation_steps=ga,
             online_ler_enabled=self.online_ler_enabled,
+            online_ler_mode=self.online_ler_mode,
+            online_ler_update_timing=self.online_ler_update_timing,
             online_ler_update_interval=self.online_ler_update_interval,
             capture_logits_enabled=self.capture_logits,
             grad_norm_capture_enabled=hasattr(self.skip_policy, "record_grad_norm"),
@@ -427,8 +454,8 @@ class TrueBackwardSkippingTrainer(Trainer):
 
     # ----------------------------------------------------- online LER update (FIX P0-3)
     def _online_ler_update(self, loss_value, logits, model) -> bool:
-        """Update legacy online diagnostics at the configured batch cadence."""
-        if not self.online_ler_enabled or logits is None:
+        """Update legacy dense diagnostics before the current decision."""
+        if self.online_ler_mode != ONLINE_LER_MODE_LEGACY_DENSE or logits is None:
             return False
         trk = getattr(self, "ler_tracker", None) or getattr(self, "_ler_tracker", None)
         if trk is None:
@@ -443,6 +470,50 @@ class TrueBackwardSkippingTrainer(Trainer):
             logger.debug(f"[TrueSkip] online LER update failed: {exc!r}")
             return False
         self.instr.online_ler_update_successes += 1
+        self.instr.online_ler_last_update_decision = decision_index
+        return True
+
+    def _note_sampled_lagged_decision(self, decision_index: int) -> None:
+        if self.online_ler_mode != ONLINE_LER_MODE_SAMPLED_LAGGED:
+            return
+        tracker = getattr(self, "ler_tracker", None) or getattr(
+            self, "_ler_tracker", None
+        )
+        if tracker is None or not hasattr(tracker, "note_decision"):
+            return
+        try:
+            tracker.note_decision(decision_index)
+        except Exception as exc:
+            logger.debug("[TrueSkip] sampled LER decision note failed: %r", exc)
+
+    def _sampled_lagged_update(self, loss_value, logits, model) -> bool:
+        """Commit sampled diagnostics after a real backward pass."""
+        if self.online_ler_mode != ONLINE_LER_MODE_SAMPLED_LAGGED or logits is None:
+            return False
+        tracker = getattr(self, "ler_tracker", None) or getattr(
+            self, "_ler_tracker", None
+        )
+        if tracker is None:
+            return False
+        real_step_index = max(self.instr.backward_calls - 1, 0)
+        if real_step_index % self.online_ler_update_interval != 0:
+            return False
+        decision_index = max(self.instr.batches_seen - 1, 0)
+        self.instr.online_ler_update_attempts += 1
+        try:
+            tracker.update(
+                loss=float(loss_value),
+                logits=logits,
+                accuracy=None,
+                model=model,
+                optimizer=self.optimizer,
+                decision_index=decision_index,
+            )
+        except Exception as exc:
+            logger.debug("[TrueSkip] sampled LER update failed: %r", exc)
+            return False
+        self.instr.online_ler_update_successes += 1
+        self.instr.online_ler_last_update_decision = decision_index
         return True
 
     # [Piece 8] Authoritative horizon validation
@@ -504,6 +575,9 @@ class TrueBackwardSkippingTrainer(Trainer):
         # [Piece 8] Authoritative horizon validation before the first policy decision.
         self._check_authoritative_horizon()
 
+        decision_index = max(self.instr.batches_seen - 1, 0)
+        self._note_sampled_lagged_decision(decision_index)
+
         # [FIX P0-3] Decide AFTER the current forward. Policy failures cannot
         # silently become ordinary backward steps because that changes the
         # realized compute budget and invalidates matched-run accounting.
@@ -560,6 +634,9 @@ class TrueBackwardSkippingTrainer(Trainer):
         else:
             self.accelerator.backward(loss)
         self.instr.backward_calls += 1
+
+        # Sampled diagnostics commit only after this decision performed backward.
+        self._sampled_lagged_update(loss.detach(), self._last_real_logits, model)
 
         # Compute the full pre-clip norm only for policies that consume it.
         pol = self.skip_policy

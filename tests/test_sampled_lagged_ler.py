@@ -1,10 +1,16 @@
 """Focused tests for deterministic sampled lagged LER diagnostics."""
 
 import inspect
+import os
+import tempfile
 
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset
+from transformers import TrainingArguments
+
+from lerna.trainers import AlwaysFalsePolicy, TrueBackwardSkippingTrainer
 
 from lerna.utils.lagged_ler import (
     SAMPLED_LAGGED_MODE,
@@ -228,3 +234,223 @@ def test_invalid_tracker_configuration_raises():
         SampledLaggedLERTracker(parameter_sample_size=0)
     with pytest.raises(ValueError, match="window_size"):
         SampledLaggedLERTracker(window_size=1)
+
+
+class TrainerTinyDataset(Dataset):
+    def __init__(self, size=8, width=4):
+        generator = torch.Generator().manual_seed(13)
+        self.inputs = torch.randn(size, width, generator=generator)
+        self.labels = torch.randint(0, 2, (size,), generator=generator)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        return {"input_ids": self.inputs[index], "labels": self.labels[index]}
+
+
+class TrainerTinyModel(nn.Module):
+    def __init__(self, width=4):
+        super().__init__()
+        self.classifier = nn.Linear(width, 2)
+
+    def forward(self, input_ids=None, labels=None, **kwargs):
+        logits = self.classifier(input_ids)
+        loss = nn.functional.cross_entropy(logits, labels)
+        return {"loss": loss, "logits": logits}
+
+
+def _trainer_collate(batch):
+    return {
+        "input_ids": torch.stack([row["input_ids"] for row in batch]),
+        "labels": torch.stack([row["labels"] for row in batch]),
+    }
+
+
+class CountingTracker:
+    def __init__(self):
+        self.calls = 0
+
+    def update(self, **kwargs):
+        self.calls += 1
+
+
+class ObservingSkipPolicy:
+    name = "observing_skip"
+
+    def __init__(self, tracker, skip_decisions=()):
+        self.tracker = tracker
+        self.skip_decisions = set(skip_decisions)
+        self.decisions = 0
+        self.seen_update_counts = []
+        self.seen_observation_ages = []
+        self.seen_histories = []
+
+    def _histories(self):
+        return (
+            list(self.tracker.loss_history),
+            list(self.tracker.entropy_history),
+            list(self.tracker.velocity_history),
+            list(self.tracker.rho_vg_history),
+            list(self.tracker.ler_history),
+        )
+
+    def should_skip(self, trainer, model, inputs):
+        self.seen_update_counts.append(self.tracker.n_updates)
+        self.seen_observation_ages.append(
+            self.tracker.get_diagnostics()["observation_age_decisions"]
+        )
+        self.seen_histories.append(self._histories())
+        should_skip = self.decisions in self.skip_decisions
+        self.decisions += 1
+        return should_skip
+
+
+class LegacyObservingPolicy:
+    name = "legacy_observing"
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.seen_call_counts = []
+
+    def should_skip(self, trainer, model, inputs):
+        self.seen_call_counts.append(self.tracker.calls)
+        return False
+
+
+def _build_trainer(tmpdir, *, policy, tracker, **kwargs):
+    args = TrainingArguments(
+        output_dir=tmpdir,
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-3,
+        save_strategy="no",
+        report_to="none",
+        remove_unused_columns=False,
+        use_cpu=True,
+        fp16=False,
+        bf16=False,
+        seed=19,
+    )
+    trainer = TrueBackwardSkippingTrainer(
+        model=TrainerTinyModel(),
+        args=args,
+        train_dataset=TrainerTinyDataset(),
+        data_collator=_trainer_collate,
+        skip_policy=policy,
+        instrumentation_path=os.path.join(tmpdir, "instrumentation.json"),
+        **kwargs,
+    )
+    trainer._ler_tracker = tracker
+    return trainer
+
+
+def test_sampled_mode_policy_sees_lagged_observations_and_skips_do_not_update():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = SampledLaggedLERTracker(parameter_sample_size=8, sample_seed=1)
+        policy = ObservingSkipPolicy(tracker, skip_decisions={1})
+        trainer = _build_trainer(
+            tmpdir,
+            policy=policy,
+            tracker=tracker,
+            online_ler_mode="sampled_lagged",
+            online_ler_update_interval=1,
+        )
+        trainer.train()
+
+        assert policy.seen_update_counts == [0, 1, 1, 2]
+        assert policy.seen_observation_ages == [1, 1, 2, 1]
+        assert policy.seen_histories[2] == policy.seen_histories[1]
+
+        diagnostics = trainer.get_instrumentation()
+        assert tracker.n_updates == diagnostics["backward_calls"] == 3
+        assert len(tracker.loss_history) == 3
+        assert len(tracker.entropy_history) == 3
+        assert diagnostics["online_ler_mode"] == "sampled_lagged"
+        assert diagnostics["online_ler_update_timing"] == (
+            "post_decision_after_backward"
+        )
+        assert diagnostics["online_ler_update_attempts"] == 3
+        assert diagnostics["online_ler_update_successes"] == 3
+        assert diagnostics["online_ler_last_update_decision"] == 3
+        assert diagnostics["skipped_backward_steps"] == 1
+        assert diagnostics["invariant_forward_eq_backward_plus_skipped"] is True
+
+
+def test_sampled_interval_uses_zero_based_completed_backward_cadence():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = SampledLaggedLERTracker(parameter_sample_size=8, sample_seed=3)
+        policy = ObservingSkipPolicy(tracker)
+        trainer = _build_trainer(
+            tmpdir,
+            policy=policy,
+            tracker=tracker,
+            online_ler_mode="sampled_lagged",
+            online_ler_update_interval=2,
+        )
+        trainer.train()
+
+        diagnostics = trainer.get_instrumentation()
+        assert policy.seen_update_counts == [0, 1, 1, 2]
+        assert diagnostics["backward_calls"] == 4
+        assert tracker.n_updates == 2
+        assert diagnostics["online_ler_update_attempts"] == 2
+        assert diagnostics["online_ler_update_successes"] == 2
+        assert diagnostics["online_ler_last_update_decision"] == 2
+
+
+def test_legacy_dense_still_updates_before_each_decision():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = CountingTracker()
+        policy = LegacyObservingPolicy(tracker)
+        trainer = _build_trainer(
+            tmpdir,
+            policy=policy,
+            tracker=tracker,
+            online_ler_mode="legacy_dense",
+            online_ler_update_interval=1,
+        )
+        trainer.train()
+
+        assert policy.seen_call_counts == [1, 2, 3, 4]
+        diagnostics = trainer.get_instrumentation()
+        assert diagnostics["online_ler_mode"] == "legacy_dense"
+        assert diagnostics["online_ler_update_timing"] == "pre_decision"
+        assert diagnostics["online_ler_update_attempts"] == 4
+        assert diagnostics["online_ler_update_successes"] == 4
+        assert diagnostics["online_ler_last_update_decision"] == 3
+        assert diagnostics["invariant_forward_eq_backward_plus_skipped"] is True
+
+
+def test_off_mode_and_invalid_mode_contract():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = CountingTracker()
+        trainer = _build_trainer(
+            tmpdir,
+            policy=AlwaysFalsePolicy(),
+            tracker=tracker,
+            online_ler_mode="off",
+            online_ler_enabled=True,
+        )
+        trainer.train()
+
+        diagnostics = trainer.get_instrumentation()
+        assert tracker.calls == 0
+        assert diagnostics["online_ler_mode"] == "off"
+        assert diagnostics["online_ler_update_timing"] == "none"
+        assert diagnostics["online_ler_enabled"] is False
+        assert diagnostics["online_ler_update_interval"] == 0
+        assert diagnostics["online_ler_update_attempts"] == 0
+        assert diagnostics["online_ler_update_successes"] == 0
+        assert diagnostics["online_ler_last_update_decision"] is None
+        assert diagnostics["capture_logits_enabled"] is False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ValueError, match="online_ler_mode"):
+            _build_trainer(
+                tmpdir,
+                policy=AlwaysFalsePolicy(),
+                tracker=None,
+                online_ler_mode="bogus",
+            )
