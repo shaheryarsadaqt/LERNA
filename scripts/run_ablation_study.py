@@ -56,6 +56,7 @@ import numpy as np
 
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
 from lerna.callbacks.ler_feed import LERFeedCallback
+from lerna.utils.lagged_ler import SampledLaggedLERTracker
 from lerna.utils.metrics import LERTracker
 from lerna.trainers import (
     LERNAMomentumTrainer, ComputeSavingMechanism, LERNAPolicy,
@@ -265,6 +266,33 @@ def resolve_online_ler_config(
         "update_interval": resolved_interval,
         "reason": reason,
     }
+
+
+def build_online_ler_tracker(
+    online_diagnostics,
+    *,
+    task_name,
+    use_hysteresis,
+    sample_seed,
+):
+    """Construct the runtime tracker for one resolved online LER config."""
+    mode = online_diagnostics["mode"]
+    if mode == ONLINE_LER_MODE_OFF:
+        return None
+    if mode == ONLINE_LER_MODE_LEGACY_DENSE:
+        return LERTracker(
+            task=task_name,
+            window_size=5,
+            use_hysteresis=use_hysteresis,
+        )
+    if mode == ONLINE_LER_MODE_SAMPLED_LAGGED:
+        return SampledLaggedLERTracker(
+            task=task_name,
+            window_size=5,
+            parameter_sample_size=online_diagnostics["parameter_sample_size"],
+            sample_seed=sample_seed,
+        )
+    raise ValueError(f"Unknown online LER mode: {mode!r}")
 
 
 def compute_authoritative_horizon(
@@ -601,6 +629,9 @@ def run_ablation_single(
     rvd_repay_protect_dangerous: bool = True,
     rvd_policy_seed=None,
     provenance_classification: str = CLASSIFICATION_MATCHED_CLAIM,
+    online_ler_mode=ONLINE_LER_MODE_AUTO,
+    online_ler_parameter_sample_size=4096,
+    online_ler_update_interval=1,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -840,27 +871,20 @@ def run_ablation_single(
     use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
     use_hysteresis = ablation_overrides.get("use_hysteresis", True)
 
-    signal_free_control = effective_control in {"full_finetune", "exact_random"}
-    signal_free_policy = effective_control is None and policy == "fixed_phase_strat"
-    online_ler_enabled = not (signal_free_control or signal_free_policy)
-    online_ler_update_interval = 1 if online_ler_enabled else 0
-    if signal_free_control:
-        diagnostics_reason = f"signal_free_control:{effective_control}"
-    elif signal_free_policy:
-        diagnostics_reason = "signal_free_policy:fixed_phase_strat"
-    else:
-        diagnostics_reason = "legacy_policy_requires_online_signals"
-    online_diagnostics = {
-        "enabled": online_ler_enabled,
-        "mode": "legacy_dense" if online_ler_enabled else "off",
-        "update_interval": online_ler_update_interval,
-        "reason": diagnostics_reason,
-    }
+    online_diagnostics = resolve_online_ler_config(
+        online_ler_mode,
+        effective_control=effective_control,
+        policy=policy,
+        parameter_sample_size=online_ler_parameter_sample_size,
+        update_interval=online_ler_update_interval,
+    )
+    online_ler_enabled = online_diagnostics["enabled"]
 
-    ler_tracker = (
-        LERTracker(task=task_name, window_size=5, use_hysteresis=use_hysteresis)
-        if online_ler_enabled
-        else None
+    ler_tracker = build_online_ler_tracker(
+        online_diagnostics,
+        task_name=task_name,
+        use_hysteresis=use_hysteresis,
+        sample_seed=seed,
     )
 
     power_callback = PowerTelemetryCallback(
@@ -873,7 +897,7 @@ def run_ablation_single(
     # Signal-consuming policies use their task calibration; signal-free arms
     # never read this compatibility fallback.
     task_cal = (
-        ler_tracker.task_calibration.get(task_name, {})
+        getattr(ler_tracker, "task_calibration", {}).get(task_name, {})
         if ler_tracker is not None
         else {}
     )
@@ -1119,9 +1143,10 @@ def run_ablation_single(
         apply_momentum=legacy_momentum_flag,  # None when CLI path; preserves legacy provenance
         compute_saving_mechanism=compute_saving_mechanism,
         instrumentation_path=os.path.join(output_dir, "instrumentation.json"),
-        capture_logits=online_ler_enabled,
-        online_ler_enabled=online_ler_enabled,
-        online_ler_update_interval=(online_ler_update_interval or 1),
+        capture_logits=online_diagnostics["enabled"],
+        online_ler_mode=online_diagnostics["mode"],
+        online_ler_enabled=online_diagnostics["enabled"],
+        online_ler_update_interval=online_diagnostics["update_interval"],
         callbacks=callbacks,
     )
     if ler_feed_callback is not None:
@@ -1441,8 +1466,35 @@ def build_arg_parser():
         default=SchedulerStepPolicy.ALWAYS_STEP,
         help=(
             "Learning-rate scheduler behavior on skipped-backward steps. "
-            "The matched Phase 1.3 default advances over every training batch."
+             "The matched Phase 1.3 default advances over every training batch."
         ),
+    )
+    parser.add_argument(
+        "--online-ler-mode",
+        choices=[
+            ONLINE_LER_MODE_AUTO,
+            ONLINE_LER_MODE_OFF,
+            ONLINE_LER_MODE_LEGACY_DENSE,
+            ONLINE_LER_MODE_SAMPLED_LAGGED,
+        ],
+        default=ONLINE_LER_MODE_AUTO,
+        help=(
+            "Online LER diagnostics tracker mode. 'auto' resolves per arm: "
+            "signal-free arms get 'off'; signal-consuming arms get "
+            "'sampled_lagged'."
+        ),
+    )
+    parser.add_argument(
+        "--online-ler-sample-size",
+        type=int,
+        default=4096,
+        help="Parameter sample size for sampled_lagged online LER tracking",
+    )
+    parser.add_argument(
+        "--online-ler-update-interval",
+        type=int,
+        default=1,
+        help="Update interval in real backward steps for online LER tracking",
     )
     parser.add_argument(
         "--provenance-classification",
@@ -1569,6 +1621,13 @@ def main():
                         ),
                         rvd_policy_seed=args.rvd_policy_seed,
                         provenance_classification=args.provenance_classification,
+                        online_ler_mode=args.online_ler_mode,
+                        online_ler_parameter_sample_size=(
+                            args.online_ler_sample_size
+                        ),
+                        online_ler_update_interval=(
+                            args.online_ler_update_interval
+                        ),
                     )
                     all_results.append(result)
                 except Exception as e:

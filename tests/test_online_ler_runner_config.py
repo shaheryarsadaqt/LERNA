@@ -10,7 +10,13 @@ from lerna.trainers.true_skip_trainer import (
     ONLINE_LER_TIMING_PRE_DECISION,
     ONLINE_LER_TIMING_POST_DECISION,
 )
-from scripts.run_ablation_study import resolve_online_ler_config
+from lerna.utils.lagged_ler import SampledLaggedLERTracker
+from lerna.utils.metrics import LERTracker
+from scripts.run_ablation_study import (
+    build_arg_parser,
+    build_online_ler_tracker,
+    resolve_online_ler_config,
+)
 
 
 CANONICAL_KEYS = {
@@ -176,3 +182,75 @@ def test_helper_does_not_reuse_mutated_results():
     cfg["mode"] = "mutated"
     cfg2 = resolve_online_ler_config("sampled_lagged", **kwargs)
     assert cfg2["mode"] == ONLINE_LER_MODE_SAMPLED_LAGGED
+
+
+def test_parser_online_ler_defaults():
+    args = build_arg_parser().parse_args([])
+    assert args.online_ler_mode == "auto"
+    assert args.online_ler_sample_size == 4096
+    assert args.online_ler_update_interval == 1
+
+
+def test_parser_online_ler_explicit_values():
+    args = build_arg_parser().parse_args(
+        [
+            "--online-ler-mode",
+            "sampled_lagged",
+            "--online-ler-sample-size",
+            "128",
+            "--online-ler-update-interval",
+            "5",
+        ]
+    )
+    assert args.online_ler_mode == ONLINE_LER_MODE_SAMPLED_LAGGED
+    assert args.online_ler_sample_size == 128
+    assert args.online_ler_update_interval == 5
+
+
+def test_factory_off_mode_returns_none():
+    cfg = _resolve("off")
+    tracker = build_online_ler_tracker(
+        cfg,
+        task_name="sst2",
+        use_hysteresis=True,
+        sample_seed=42,
+    )
+    assert tracker is None
+
+
+def test_factory_legacy_dense_returns_ler_tracker():
+    cfg = _resolve("legacy_dense")
+    tracker = build_online_ler_tracker(
+        cfg,
+        task_name="sst2",
+        use_hysteresis=False,
+        sample_seed=42,
+    )
+    assert type(tracker) is LERTracker
+
+
+def test_factory_sampled_lagged_returns_sampled_tracker():
+    cfg = _resolve("sampled_lagged", parameter_sample_size=128)
+    tracker = build_online_ler_tracker(
+        cfg,
+        task_name="qnli",
+        use_hysteresis=True,
+        sample_seed=1234,
+    )
+    assert type(tracker) is SampledLaggedLERTracker
+    assert tracker.task == "qnli"
+    assert tracker.window_size == 5
+    assert tracker.parameter_sample_size == 128
+    assert tracker.sample_seed == 1234
+
+
+def test_factory_rejects_unknown_concrete_mode():
+    cfg = _resolve("legacy_dense")
+    cfg["mode"] = "dense"
+    with pytest.raises(ValueError, match="online LER mode"):
+        build_online_ler_tracker(
+            cfg,
+            task_name="sst2",
+            use_hysteresis=True,
+            sample_seed=42,
+        )
