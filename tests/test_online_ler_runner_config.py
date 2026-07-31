@@ -12,8 +12,11 @@ from lerna.trainers.true_skip_trainer import (
 )
 from lerna.utils.lagged_ler import SampledLaggedLERTracker
 from lerna.utils.metrics import LERTracker
+from lerna.utils.run_provenance import build_scientific_fingerprint
 from scripts.run_ablation_study import (
+    add_online_ler_to_identity,
     build_arg_parser,
+    build_online_ler_provenance_config,
     build_online_ler_tracker,
     resolve_online_ler_config,
 )
@@ -254,3 +257,159 @@ def test_factory_rejects_unknown_concrete_mode():
             use_hysteresis=True,
             sample_seed=42,
         )
+
+
+PROVENANCE_KEYS = CANONICAL_KEYS | {"sample_seed"}
+
+
+def _provenance(requested_mode, *, sample_seed=1234, **overrides):
+    return build_online_ler_provenance_config(
+        _resolve(requested_mode, **overrides),
+        sample_seed=sample_seed,
+    )
+
+
+def test_provenance_sampled_lagged_adds_integer_sample_seed():
+    cfg = _provenance("sampled_lagged", sample_seed=777)
+    assert set(cfg) == PROVENANCE_KEYS
+    assert cfg["sample_seed"] == 777
+    assert isinstance(cfg["sample_seed"], int)
+
+
+@pytest.mark.parametrize("mode", ["off", "legacy_dense"])
+def test_provenance_off_and_legacy_dense_canonicalize_sample_seed_none(mode):
+    cfg = _provenance(mode, sample_seed=777)
+    assert set(cfg) == PROVENANCE_KEYS
+    assert cfg["sample_seed"] is None
+
+
+def test_provenance_preserves_every_canonical_field():
+    resolved = _resolve(
+        "sampled_lagged",
+        parameter_sample_size=128,
+        update_interval=5,
+    )
+    cfg = build_online_ler_provenance_config(resolved, sample_seed=9)
+    for key in CANONICAL_KEYS:
+        assert cfg[key] == resolved[key]
+
+
+def test_provenance_does_not_mutate_resolved_config():
+    resolved = _resolve("sampled_lagged")
+    snapshot = dict(resolved)
+    cfg = build_online_ler_provenance_config(resolved, sample_seed=5)
+    assert resolved == snapshot
+    assert "sample_seed" not in resolved
+    cfg["mode"] = "mutated"
+    assert resolved == snapshot
+
+
+def test_add_online_ler_to_identity_does_not_mutate_inputs():
+    identity = {"task": "sst2", "training_seed": 42}
+    identity_snapshot = dict(identity)
+    diagnostics = _provenance("sampled_lagged", sample_seed=1)
+    diagnostics_snapshot = dict(diagnostics)
+    extended = add_online_ler_to_identity(identity, diagnostics)
+    assert identity == identity_snapshot
+    assert diagnostics == diagnostics_snapshot
+    assert extended is not identity
+    assert set(extended) == set(identity) | {"online_diagnostics"}
+
+
+def test_add_online_ler_to_identity_stores_defensive_copy():
+    identity = {"task": "sst2"}
+    diagnostics = _provenance("sampled_lagged", sample_seed=1)
+    extended = add_online_ler_to_identity(identity, diagnostics)
+    assert extended["online_diagnostics"] == diagnostics
+    assert extended["online_diagnostics"] is not diagnostics
+    diagnostics["mode"] = "mutated"
+    assert extended["online_diagnostics"]["mode"] == (
+        ONLINE_LER_MODE_SAMPLED_LAGGED
+    )
+
+
+def _fingerprint(identity, diagnostics):
+    return build_scientific_fingerprint(
+        add_online_ler_to_identity(identity, diagnostics)
+    )
+
+
+BASE_IDENTITY = {"task": "sst2", "training_seed": 42, "model_id": "tiny"}
+
+
+def test_fingerprints_differ_across_modes():
+    fingerprints = {
+        mode: _fingerprint(BASE_IDENTITY, _provenance(mode, sample_seed=42))
+        for mode in ("off", "legacy_dense", "sampled_lagged")
+    }
+    assert len(set(fingerprints.values())) == 3
+
+
+def test_sampled_fingerprints_differ_on_parameter_sample_size():
+    a = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", parameter_sample_size=128),
+    )
+    b = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", parameter_sample_size=256),
+    )
+    assert a != b
+
+
+def test_sampled_fingerprints_differ_on_update_interval():
+    a = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", update_interval=1),
+    )
+    b = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", update_interval=5),
+    )
+    assert a != b
+
+
+def test_sampled_fingerprints_differ_on_sample_seed():
+    a = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", sample_seed=1),
+    )
+    b = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", sample_seed=2),
+    )
+    assert a != b
+
+
+def test_identical_inputs_produce_identical_fingerprints():
+    a = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", sample_seed=7, parameter_sample_size=128),
+    )
+    b = _fingerprint(
+        BASE_IDENTITY,
+        _provenance("sampled_lagged", sample_seed=7, parameter_sample_size=128),
+    )
+    assert a == b
+
+
+def test_off_fingerprint_stable_under_irrelevant_sample_inputs():
+    a = _fingerprint(
+        BASE_IDENTITY,
+        _provenance(
+            "off",
+            sample_seed=1,
+            parameter_sample_size=128,
+            update_interval=1,
+        ),
+    )
+    b = _fingerprint(
+        BASE_IDENTITY,
+        _provenance(
+            "off",
+            sample_seed=2,
+            parameter_sample_size=4096,
+            update_interval=9,
+        ),
+    )
+    assert a == b

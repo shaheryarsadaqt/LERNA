@@ -268,6 +268,30 @@ def resolve_online_ler_config(
     }
 
 
+def build_online_ler_provenance_config(
+    resolved_config,
+    *,
+    sample_seed,
+):
+    """Extend a resolved online LER config with its provenance sample seed."""
+    provenance = dict(resolved_config)
+    if provenance["mode"] == ONLINE_LER_MODE_SAMPLED_LAGGED:
+        provenance["sample_seed"] = int(sample_seed)
+    else:
+        provenance["sample_seed"] = None
+    return provenance
+
+
+def add_online_ler_to_identity(
+    identity_inputs,
+    online_diagnostics,
+):
+    """Return new identity inputs extended with the online diagnostics config."""
+    extended = dict(identity_inputs)
+    extended["online_diagnostics"] = dict(online_diagnostics)
+    return extended
+
+
 def build_online_ler_tracker(
     online_diagnostics,
     *,
@@ -662,6 +686,18 @@ def run_ablation_single(
         max_consecutive_skips=max_consecutive_skips,
     )
 
+    resolved_online_ler = resolve_online_ler_config(
+        online_ler_mode,
+        effective_control=effective_control,
+        policy=policy,
+        parameter_sample_size=online_ler_parameter_sample_size,
+        update_interval=online_ler_update_interval,
+    )
+    online_diagnostics = build_online_ler_provenance_config(
+        resolved_online_ler,
+        sample_seed=seed,
+    )
+
     task_hp = TASK_HP_OVERRIDES.get(task_name, {})
     lr = task_hp.get("learning_rate", 2e-5)
     num_epochs = task_hp.get("num_epochs", num_epochs)
@@ -793,6 +829,10 @@ def run_ablation_single(
         total_steps=total_steps,
         git_sha=git_sha,
     )
+    identity_inputs = add_online_ler_to_identity(
+        identity_inputs,
+        online_diagnostics,
+    )
     fingerprint = build_scientific_fingerprint(identity_inputs)
 
     # Define run_id from task, seed, arm, and fingerprint.
@@ -871,20 +911,13 @@ def run_ablation_single(
     use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
     use_hysteresis = ablation_overrides.get("use_hysteresis", True)
 
-    online_diagnostics = resolve_online_ler_config(
-        online_ler_mode,
-        effective_control=effective_control,
-        policy=policy,
-        parameter_sample_size=online_ler_parameter_sample_size,
-        update_interval=online_ler_update_interval,
-    )
     online_ler_enabled = online_diagnostics["enabled"]
 
     ler_tracker = build_online_ler_tracker(
         online_diagnostics,
         task_name=task_name,
         use_hysteresis=use_hysteresis,
-        sample_seed=seed,
+        sample_seed=online_diagnostics["sample_seed"],
     )
 
     power_callback = PowerTelemetryCallback(
