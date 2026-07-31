@@ -1846,6 +1846,274 @@ class FixedPhaseStratifiedRandomPolicy:
         }
 
 
+class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
+    """LER-guided phase-stratified skipping without safety vetoes.
+
+    Reuses the fixed baseline's phase construction, largest-remainder quotas,
+    cumulative debt, and exact-quota tail forcing, but modulates the ordinary
+    random selection with a lagged sampled-LER percentile rank. Reads only
+    previously committed tracker diagnostics; never mutates the tracker.
+    """
+
+    name = "ler_guided_stratified"
+
+    REQUIRED_TRACKER_MODE = "sampled_lagged"
+    REQUIRED_TRACKER_TIMING = "post_decision_after_backward"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        n_phases: int = 4,
+        phase_weights: Optional[List[float]] = None,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
+        min_ler_observations: int = 3,
+        ler_guidance_strength: float = 1.0,
+    ):
+        self._validate_tracker(ler_tracker)
+        super().__init__(
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            min_step=min_step,
+            seed=seed,
+            n_phases=n_phases,
+            phase_weights=phase_weights,
+            max_consecutive_skips=max_consecutive_skips,
+        )
+        self.ler_tracker = ler_tracker
+        self.seed = int(seed)
+        self.probe_interval = int(probe_interval)
+        self.min_ler_observations = int(min_ler_observations)
+        self.ler_guidance_strength = float(ler_guidance_strength)
+        if self.probe_interval < 1:
+            raise ValueError("probe_interval must be >= 1")
+        if self.min_ler_observations < 1:
+            raise ValueError("min_ler_observations must be >= 1")
+        if not math.isfinite(self.ler_guidance_strength):
+            raise ValueError("ler_guidance_strength must be finite")
+        if self.ler_guidance_strength < 0.0:
+            raise ValueError("ler_guidance_strength must be >= 0")
+        self.safety_enabled = False
+
+        self._ler_observations: List[float] = []
+        self._last_signal_update_decision: Optional[int] = None
+        self._current_signal_age: Optional[int] = None
+        self._max_signal_age_observed = 0
+        self._current_ler: Optional[float] = None
+        self._current_ler_rank: Optional[float] = None
+
+        self._probe_decision_count = 0
+        self._missing_signal_probe_count = 0
+        self._stale_signal_probe_count = 0
+        self._ler_guided_decision_count = 0
+        self._ler_selected_skip_count = 0
+        self._fallback_random_decision_count = 0
+        self._fallback_random_skip_count = 0
+        self._forced_quota_decision_count = 0
+
+    @classmethod
+    def _validate_tracker(cls, ler_tracker) -> None:
+        if ler_tracker is None:
+            raise ValueError(
+                "LERGuidedStratifiedPolicy requires a sampled lagged LER tracker; "
+                "got None"
+            )
+        if not hasattr(ler_tracker, "get_diagnostics"):
+            raise ValueError(
+                "LERGuidedStratifiedPolicy tracker must expose get_diagnostics()"
+            )
+        diag = ler_tracker.get_diagnostics()
+        if not isinstance(diag, dict):
+            raise RuntimeError(
+                "LERGuidedStratifiedPolicy tracker get_diagnostics() must return a dict"
+            )
+        mode = diag.get("mode")
+        if mode != cls.REQUIRED_TRACKER_MODE:
+            raise ValueError(
+                f"LERGuidedStratifiedPolicy requires tracker mode "
+                f"'{cls.REQUIRED_TRACKER_MODE}', got {mode!r}"
+            )
+        timing = diag.get("timing")
+        if timing != cls.REQUIRED_TRACKER_TIMING:
+            raise ValueError(
+                f"LERGuidedStratifiedPolicy requires tracker timing "
+                f"'{cls.REQUIRED_TRACKER_TIMING}', got {timing!r}"
+            )
+
+    def _percentile_rank(self, value: float) -> float:
+        obs = self._ler_observations
+        if not obs:
+            return 0.5
+        less = sum(1 for v in obs if v < value)
+        equal = sum(1 for v in obs if v == value)
+        return (less + 0.5 * equal) / len(obs)
+
+    def _observe_signal(self) -> None:
+        diag = self.ler_tracker.get_diagnostics()
+        ler = diag.get("ler_raw")
+        if ler is None:
+            ler = diag.get("ler")
+        age = diag.get("observation_age_decisions")
+        self._current_signal_age = age
+        if age is not None:
+            self._max_signal_age_observed = max(
+                self._max_signal_age_observed, int(age)
+            )
+        lud = diag.get("last_update_decision")
+        if (
+            ler is not None
+            and lud is not None
+            and lud != self._last_signal_update_decision
+        ):
+            self._ler_observations.append(float(ler))
+            self._last_signal_update_decision = int(lud)
+            self._current_ler = float(ler)
+            self._current_ler_rank = self._percentile_rank(float(ler))
+
+    def should_skip(self, trainer, model, inputs) -> bool:
+        di = self._decisions_seen
+        self._decisions_seen += 1
+        self._lazy_init(trainer)
+        self._observe_signal()
+
+        if di < self.min_step or self._quota_size is None:
+            self._warmup_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        ph = self._phase_of(di)
+        if ph != self._cur_phase and self._cur_phase >= 0:
+            carried = max(
+                self._cum_phase_quota[self._cur_phase] - self._skip_decisions,
+                0,
+            )
+            self._phase_debt_carried_total += carried
+        self._cur_phase = ph
+        self._phase_debt_current = (
+            max(self._cum_phase_quota[ph - 1] - self._skip_decisions, 0)
+            if ph > 0
+            else 0
+        )
+
+        remaining_skips = self._quota_size - self._skip_decisions
+        remaining_decisions = self._quota_total_steps - di
+        if remaining_skips <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+
+        if remaining_skips >= remaining_decisions:
+            self._forced_global_tail_skip += 1
+            self._forced_quota_decision_count += 1
+            return self._do_skip(ph)
+
+        q_left = self._cum_phase_quota[ph] - self._skip_decisions
+        decisions_left_in_phase = max(self._phase_bounds[ph + 1] - di, 1)
+        if q_left <= 0:
+            self._quota_exhausted += 1
+            self._consecutive_skips = 0
+            return False
+
+        if q_left >= decisions_left_in_phase:
+            self._forced_tail += 1
+            self._forced_quota_decision_count += 1
+            return self._do_skip(ph)
+
+        if self._consecutive_skips >= self.max_consecutive_skips:
+            self._max_consec_veto += 1
+            self._consecutive_skips = 0
+            return False
+
+        if self._current_ler is None or self._last_signal_update_decision is None:
+            self._probe_decision_count += 1
+            self._missing_signal_probe_count += 1
+            self._consecutive_skips = 0
+            return False
+
+        if (
+            self._current_signal_age is not None
+            and self._current_signal_age >= self.probe_interval
+        ):
+            self._probe_decision_count += 1
+            self._stale_signal_probe_count += 1
+            self._consecutive_skips = 0
+            return False
+
+        base_pressure = q_left / decisions_left_in_phase
+
+        if len(self._ler_observations) < self.min_ler_observations:
+            self._fallback_random_decision_count += 1
+            p = min(max(base_pressure, 0.0), 1.0)
+            if self._rng.random() < p:
+                self._fallback_random_skip_count += 1
+                self._random_safe_skip += 1
+                return self._do_skip(ph)
+            self._consecutive_skips = 0
+            return False
+
+        ler_rank = self._percentile_rank(self._current_ler)
+        self._current_ler_rank = ler_rank
+        guided_pressure = base_pressure * (
+            1.0 + self.ler_guidance_strength * (0.5 - ler_rank)
+        )
+        p = min(max(guided_pressure, 0.0), 1.0)
+        self._ler_guided_decision_count += 1
+        if self._rng.random() < p:
+            self._ler_selected_skip_count += 1
+            return self._do_skip(ph)
+        self._consecutive_skips = 0
+        return False
+
+    def get_diagnostics(self) -> dict:
+        d = super().get_diagnostics()
+        d.update(
+            {
+                "safety_enabled": False,
+                "probe_interval": self.probe_interval,
+                "min_ler_observations": self.min_ler_observations,
+                "ler_guidance_strength": self.ler_guidance_strength,
+                "signal_observation_count": len(self._ler_observations),
+                "last_signal_update_decision": self._last_signal_update_decision,
+                "current_signal_age": self._current_signal_age,
+                "max_signal_age_observed": self._max_signal_age_observed,
+                "current_ler": self._current_ler,
+                "current_ler_rank": self._current_ler_rank,
+                "probe_decision_count": self._probe_decision_count,
+                "missing_signal_probe_count": self._missing_signal_probe_count,
+                "stale_signal_probe_count": self._stale_signal_probe_count,
+                "ler_guided_decision_count": self._ler_guided_decision_count,
+                "ler_selected_skip_count": self._ler_selected_skip_count,
+                "fallback_random_decision_count": self._fallback_random_decision_count,
+                "fallback_random_skip_count": self._fallback_random_skip_count,
+                "forced_quota_decision_count": self._forced_quota_decision_count,
+            }
+        )
+        return d
+
+    def effective_config(self) -> dict:
+        return {
+            "policy_class": type(self).__name__,
+            "policy_name": self.name,
+            "target_skip_rate": self.target_skip_rate,
+            "total_steps": self.total_steps,
+            "min_step": self.min_step,
+            "n_phases": self.n_phases,
+            "phase_weights": list(self.phase_weights),
+            "seed": self.seed,
+            "max_consecutive_skips": self.max_consecutive_skips,
+            "probe_interval": self.probe_interval,
+            "min_ler_observations": self.min_ler_observations,
+            "ler_guidance_strength": self.ler_guidance_strength,
+            "required_tracker_mode": self.REQUIRED_TRACKER_MODE,
+            "required_tracker_timing": self.REQUIRED_TRACKER_TIMING,
+            "safety_enabled": False,
+        }
+
+
 class LERNARandomVetoDeferralPolicy:
     """Sparse random skip with vetoes and deferred danger protection.
 
