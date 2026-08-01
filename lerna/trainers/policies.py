@@ -1974,6 +1974,19 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             self._current_ler = float(ler)
             self._current_ler_rank = self._percentile_rank(float(ler))
 
+    def _safety_veto_kind(self) -> Optional[str]:
+        """Return 'rho', 'spike', or None without mutating counters."""
+        return None
+
+    def _record_safety_veto(
+        self,
+        veto_kind: str,
+        *,
+        overridden: bool,
+    ) -> None:
+        """No-op in the LER-only policy."""
+        return None
+
     def should_skip(self, trainer, model, inputs) -> bool:
         di = self._decisions_seen
         self._decisions_seen += 1
@@ -2007,6 +2020,9 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             return False
 
         if remaining_skips >= remaining_decisions:
+            veto_kind = self._safety_veto_kind()
+            if veto_kind is not None:
+                self._record_safety_veto(veto_kind, overridden=True)
             self._forced_global_tail_skip += 1
             self._forced_quota_decision_count += 1
             return self._do_skip(ph)
@@ -2017,6 +2033,13 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             self._quota_exhausted += 1
             self._consecutive_skips = 0
             return False
+
+        if self._consecutive_skips < self.max_consecutive_skips:
+            veto_kind = self._safety_veto_kind()
+            if veto_kind is not None:
+                self._record_safety_veto(veto_kind, overridden=False)
+                self._consecutive_skips = 0
+                return False
 
         if q_left >= decisions_left_in_phase:
             self._forced_tail += 1
@@ -2112,6 +2135,182 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             "required_tracker_timing": self.REQUIRED_TRACKER_TIMING,
             "safety_enabled": False,
         }
+
+
+class LERGuidedStratifiedSafetyPolicy(LERGuidedStratifiedPolicy):
+    """Step 3B.2: LER-guided stratified skipping with safety vetoes.
+
+    Overrides the parent's protected no-op safety hooks with a rho-thrashing
+    veto and a loss-spike veto. Ordinary vetoes block the skip without
+    consuming RNG draws or skip-category counters; the global exact-quota
+    tail overrides safety and is accounted separately.
+    """
+
+    name = "ler_guided_stratified_safe"
+
+    def __init__(
+        self,
+        ler_tracker,
+        target_skip_rate: float = 0.20,
+        total_steps: Optional[int] = None,
+        min_step: int = 50,
+        seed: int = 42,
+        n_phases: int = 4,
+        phase_weights: Optional[List[float]] = None,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
+        min_ler_observations: int = 3,
+        ler_guidance_strength: float = 1.0,
+        use_rho_vg_safety: bool = True,
+        rho_veto_threshold: float = -0.2,
+        use_loss_spike_safety: bool = True,
+        loss_spike_factor: float = 1.0,
+        loss_spike_window: int = 5,
+    ):
+        super().__init__(
+            ler_tracker,
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            min_step=min_step,
+            seed=seed,
+            n_phases=n_phases,
+            phase_weights=phase_weights,
+            max_consecutive_skips=max_consecutive_skips,
+            probe_interval=probe_interval,
+            min_ler_observations=min_ler_observations,
+            ler_guidance_strength=ler_guidance_strength,
+        )
+        self.use_rho_vg_safety = bool(use_rho_vg_safety)
+        self.rho_veto_threshold = float(rho_veto_threshold)
+        self.use_loss_spike_safety = bool(use_loss_spike_safety)
+        self.loss_spike_factor = float(loss_spike_factor)
+        self.loss_spike_window = int(loss_spike_window)
+        if not math.isfinite(self.rho_veto_threshold):
+            raise ValueError("rho_veto_threshold must be finite")
+        if not math.isfinite(self.loss_spike_factor):
+            raise ValueError("loss_spike_factor must be finite")
+        if self.loss_spike_factor < 0.0:
+            raise ValueError("loss_spike_factor must be >= 0")
+        if self.loss_spike_window < 1:
+            raise ValueError("loss_spike_window must be >= 1")
+        self.safety_enabled = True
+
+        self._rho_safety_veto_count = 0
+        self._spike_safety_veto_count = 0
+        self._forced_safety_override_count = 0
+        self._rho_last: Optional[float] = None
+        self._loss_last: Optional[float] = None
+
+    def _safety_veto_kind(self) -> Optional[str]:
+        """Return 'rho', 'spike', or None without mutating counters."""
+        diag = self.ler_tracker.get_diagnostics()
+        rho = diag.get("rho_vg_raw")
+        if rho is None:
+            rho = diag.get("rho_vg")
+        if rho is not None:
+            try:
+                rho = float(rho)
+            except (TypeError, ValueError):
+                rho = None
+            else:
+                if not math.isfinite(rho):
+                    rho = None
+        self._rho_last = rho
+
+        lh = getattr(self.ler_tracker, "loss_history", None)
+        cur_loss = None
+        if lh:
+            try:
+                cur_loss = float(lh[-1])
+            except (TypeError, ValueError):
+                cur_loss = None
+            else:
+                if not math.isfinite(cur_loss):
+                    cur_loss = None
+        self._loss_last = cur_loss
+
+        if (
+            self.use_rho_vg_safety
+            and rho is not None
+            and rho < self.rho_veto_threshold
+        ):
+            return "rho"
+
+        if (
+            self.use_loss_spike_safety
+            and lh is not None
+            and len(lh) >= self.loss_spike_window + 1
+            and cur_loss is not None
+        ):
+            try:
+                window_vals = [
+                    float(v) for v in lh[-self.loss_spike_window - 1:-1]
+                ]
+            except (TypeError, ValueError):
+                window_vals = None
+            if window_vals is not None and all(
+                math.isfinite(v) for v in window_vals
+            ):
+                baseline = sum(window_vals) / len(window_vals)
+                if cur_loss > baseline * (1.0 + self.loss_spike_factor):
+                    return "spike"
+
+        return None
+
+    def _record_safety_veto(
+        self,
+        veto_kind: str,
+        *,
+        overridden: bool,
+    ) -> None:
+        if overridden:
+            self._forced_safety_override_count += 1
+            return
+        if veto_kind == "rho":
+            self._rho_safety_veto_count += 1
+        elif veto_kind == "spike":
+            self._spike_safety_veto_count += 1
+
+    def get_diagnostics(self) -> dict:
+        d = super().get_diagnostics()
+        d.update(
+            {
+                "safety_enabled": True,
+                "rho_veto_count": self._rho_safety_veto_count,
+                "spike_veto_count": self._spike_safety_veto_count,
+                "safety_veto_count": (
+                    self._rho_safety_veto_count
+                    + self._spike_safety_veto_count
+                ),
+                "forced_safety_override_count": (
+                    self._forced_safety_override_count
+                ),
+                "rho_last": self._rho_last,
+                "loss_last": self._loss_last,
+                "use_rho_vg_safety": self.use_rho_vg_safety,
+                "rho_veto_threshold": self.rho_veto_threshold,
+                "use_loss_spike_safety": self.use_loss_spike_safety,
+                "loss_spike_factor": self.loss_spike_factor,
+                "loss_spike_window": self.loss_spike_window,
+            }
+        )
+        return d
+
+    def effective_config(self) -> dict:
+        cfg = super().effective_config()
+        cfg.update(
+            {
+                "policy_class": type(self).__name__,
+                "policy_name": self.name,
+                "safety_enabled": True,
+                "use_rho_vg_safety": self.use_rho_vg_safety,
+                "rho_veto_threshold": self.rho_veto_threshold,
+                "use_loss_spike_safety": self.use_loss_spike_safety,
+                "loss_spike_factor": self.loss_spike_factor,
+                "loss_spike_window": self.loss_spike_window,
+            }
+        )
+        return cfg
 
 
 class LERNARandomVetoDeferralPolicy:
