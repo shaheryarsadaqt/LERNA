@@ -63,6 +63,7 @@ from lerna.trainers import (
     LERNACalibratedPolicy, LERNAHybridPolicy, LERNAQuotaHybridPolicy,
     LERNAGuardedStochasticPolicy, LERNAPhaseStratifiedPolicy,
     PhaseStratifiedGuardedRandomPolicy, FixedPhaseStratifiedRandomPolicy,
+    LERGuidedStratifiedPolicy, LERGuidedStratifiedSafetyPolicy,
     LERNARandomVetoDeferralPolicy,
     AlwaysFalsePolicy, RandomSkipPolicy, GradNormSkipPolicy,
     SchedulerStepPolicy, normalize_skip_update_mode,
@@ -137,12 +138,20 @@ ABLATIONS = {
     "exact_random":     {"control": "exact_random"},
     "rvd":              {"control": "rvd"},
     "grad_norm":        {"control": "grad_norm"},
+    "ler_guided_stratified": {"control": "ler_guided_stratified"},
+    "ler_guided_stratified_safe": {"control": "ler_guided_stratified_safe"},
     # Compatibility alias for old invocations; excluded from default matrices.
     "random_skip":      {"control": "exact_random", "alias_of": "exact_random"},
 }
 
 POLICY_MIN_STEP = 50
-SKIPPING_CONTROLS = {"exact_random", "random_skip", "rvd", "grad_norm"}
+LER_GUIDED_CONTROL = "ler_guided_stratified"
+LER_GUIDED_SAFE_CONTROL = "ler_guided_stratified_safe"
+LER_GUIDED_CONTROLS = {LER_GUIDED_CONTROL, LER_GUIDED_SAFE_CONTROL}
+SKIPPING_CONTROLS = (
+    {"exact_random", "random_skip", "rvd", "grad_norm"}
+    | LER_GUIDED_CONTROLS
+)
 ONLINE_LER_MODE_AUTO = "auto"
 ONLINE_LER_SIGNAL_FREE_CONTROLS = ("full_finetune", "exact_random")
 ONLINE_LER_SIGNAL_FREE_POLICY = "fixed_phase_strat"
@@ -199,6 +208,98 @@ def build_rvd_controller_config(
         "policy_seed_defaulted_to_training_seed": policy_seed is None,
         "max_consecutive_skips": max_consecutive_skips,
     }
+
+
+def build_ler_guided_controller_config(
+    *,
+    control: str,
+    target_skip_rate: float,
+    total_steps: int,
+    policy_seed: int,
+    max_consecutive_skips: int,
+    probe_interval: int,
+    rho_veto_threshold: float,
+) -> dict:
+    """Build canonical scientific configuration for a LER-guided arm."""
+    if control not in LER_GUIDED_CONTROLS:
+        raise ValueError(
+            f"Unknown LER-guided control: {control!r}; "
+            f"expected one of {sorted(LER_GUIDED_CONTROLS)}"
+        )
+
+    target_skip_rate = float(target_skip_rate)
+    if not math.isfinite(target_skip_rate) or not 0.0 <= target_skip_rate <= 1.0:
+        raise ValueError("target_skip_rate must be finite and in [0, 1]")
+
+    total_steps_int = int(total_steps)
+    if total_steps_int <= POLICY_MIN_STEP or total_steps_int != total_steps:
+        raise ValueError(
+            f"total_steps must be an integer greater than POLICY_MIN_STEP="
+            f"{POLICY_MIN_STEP}; got {total_steps!r}"
+        )
+
+    max_consecutive_skips = int(max_consecutive_skips)
+    if max_consecutive_skips < 1:
+        raise ValueError("max_consecutive_skips must be >= 1")
+    probe_interval = int(probe_interval)
+    if probe_interval < 1:
+        raise ValueError("probe_interval must be >= 1")
+    rho_veto_threshold = float(rho_veto_threshold)
+    if not math.isfinite(rho_veto_threshold):
+        raise ValueError("rho_veto_threshold must be finite")
+
+    requested_quota = int(round(target_skip_rate * total_steps_int))
+    eligible_count = total_steps_int - POLICY_MIN_STEP
+    if requested_quota > eligible_count:
+        raise ValueError(
+            f"Infeasible skip quota: requested {requested_quota} skips after "
+            f"min_step={POLICY_MIN_STEP}, but only {eligible_count} decisions "
+            "are eligible; quotas are never clipped"
+        )
+
+    safety_enabled = control == LER_GUIDED_SAFE_CONTROL
+    config = {
+        "control": control,
+        "policy_class": (
+            "LERGuidedStratifiedSafetyPolicy"
+            if safety_enabled
+            else "LERGuidedStratifiedPolicy"
+        ),
+        "policy_name": control,
+        "target_skip_rate": target_skip_rate,
+        "total_steps": total_steps_int,
+        "min_step": POLICY_MIN_STEP,
+        "policy_seed": int(policy_seed),
+        "n_phases": 4,
+        "phase_weights": [0.22, 0.24, 0.26, 0.28],
+        "max_consecutive_skips": max_consecutive_skips,
+        "probe_interval": probe_interval,
+        "min_ler_observations": 3,
+        "ler_guidance_strength": 1.0,
+        "required_tracker_mode": "sampled_lagged",
+        "required_tracker_timing": "post_decision_after_backward",
+        "safety_enabled": safety_enabled,
+    }
+    if safety_enabled:
+        config.update(
+            {
+                "use_rho_vg_safety": True,
+                "rho_veto_threshold": rho_veto_threshold,
+                "use_loss_spike_safety": True,
+                "loss_spike_factor": 1.0,
+                "loss_spike_window": 5,
+            }
+        )
+    return config
+
+
+def add_ler_guided_to_identity(identity_inputs, controller_config) -> dict:
+    """Return identity inputs with a defensive LER-guided config copy."""
+    extended = dict(identity_inputs)
+    copied_config = dict(controller_config)
+    copied_config["phase_weights"] = list(controller_config["phase_weights"])
+    extended["ler_guided_controller"] = copied_config
+    return extended
 
 
 def resolve_online_ler_config(
