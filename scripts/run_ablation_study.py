@@ -302,6 +302,17 @@ def add_ler_guided_to_identity(identity_inputs, controller_config) -> dict:
     return extended
 
 
+def copy_ler_guided_config(controller_config) -> dict:
+    """Return a defensively copied LER-guided controller config.
+
+    Fresh dict and a fresh phase_weights list so later mutation of either
+    cannot leak into shared provenance/results structures.
+    """
+    copied = dict(controller_config)
+    copied["phase_weights"] = list(controller_config["phase_weights"])
+    return copied
+
+
 def build_ler_guided_skip_policy(
     *,
     ler_tracker,
@@ -632,11 +643,22 @@ def build_skip_policy(
     use_safety_horizon: bool,
     fallback_threshold: float,
     risk_gamma: float,
+    ler_guided_controller_config=None,
 ):
-    """Construct one explicit baseline/RVD control arm."""
+    """Construct one explicit baseline/RVD/LER-guided control arm."""
     control = "exact_random" if control == "random_skip" else control
     if control == "full_finetune":
         return AlwaysFalsePolicy()
+    if control in LER_GUIDED_CONTROLS:
+        if ler_guided_controller_config is None:
+            raise ValueError(
+                f"LER-guided control {control!r} requires "
+                "ler_guided_controller_config"
+            )
+        return build_ler_guided_skip_policy(
+            ler_tracker=ler_tracker,
+            ler_guided_controller=ler_guided_controller_config,
+        )
     if control == "exact_random":
         return RandomSkipPolicy(
             target_skip_rate=target_skip_rate,
@@ -1085,6 +1107,22 @@ def run_ablation_single(
         identity_inputs,
         online_diagnostics,
     )
+    if effective_control in LER_GUIDED_CONTROLS:
+        ler_guided_controller_config = build_ler_guided_controller_config(
+            control=effective_control,
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            policy_seed=controller_cfg["policy_seed"],
+            max_consecutive_skips=max_consecutive_skips,
+            probe_interval=probe_interval,
+            rho_veto_threshold=rho_veto_threshold,
+        )
+        identity_inputs = add_ler_guided_to_identity(
+            identity_inputs,
+            ler_guided_controller_config,
+        )
+    else:
+        ler_guided_controller_config = None
     fingerprint = build_scientific_fingerprint(identity_inputs)
 
     # Define run_id from task, seed, arm, and fingerprint.
@@ -1145,7 +1183,9 @@ def run_ablation_single(
     if quota_control is None and policy == "random_veto_deferral":
         quota_control = "rvd"
     requested_quota = None
-    if quota_control in ("exact_random", "rvd"):
+    if quota_control in ("exact_random", "rvd") or (
+        quota_control in LER_GUIDED_CONTROLS
+    ):
         try:
             _, requested_quota = build_exact_random_skip_set(
                 total_steps=total_steps,
@@ -1202,6 +1242,7 @@ def run_ablation_single(
             use_safety_horizon=use_safety_horizon,
             fallback_threshold=base_thr,
             risk_gamma=risk_gamma,
+            ler_guided_controller_config=ler_guided_controller_config,
         )
     else:
         if policy == "guarded_hybrid":
@@ -1335,6 +1376,10 @@ def run_ablation_single(
     }
     if quota_control == "rvd":
         controller_config_effective["rvd"] = dict(controller_cfg)
+    if effective_control in LER_GUIDED_CONTROLS:
+        controller_config_effective["ler_guided"] = copy_ler_guided_config(
+            ler_guided_controller_config
+        )
     print(
         "  Controller config: "
         + json.dumps(controller_config_effective, sort_keys=True, default=str)
@@ -1605,6 +1650,10 @@ def run_ablation_single(
             ),
             "online_diagnostics": dict(online_diagnostics),
         }
+        if effective_control in LER_GUIDED_CONTROLS:
+            results["run_config"]["ler_guided"] = copy_ler_guided_config(
+                ler_guided_controller_config
+            )
 
         results_path = os.path.join(output_dir, "results.json")
         with open(results_path, "w") as f:
