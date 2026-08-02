@@ -302,6 +302,57 @@ def add_ler_guided_to_identity(identity_inputs, controller_config) -> dict:
     return extended
 
 
+def build_ler_guided_skip_policy(
+    *,
+    ler_tracker,
+    ler_guided_controller: dict,
+):
+    """Construct the LER-guided policy from its canonical controller config.
+
+    The control field is the authoritative arm identity; safety_enabled is
+    derived from it so a malformed config cannot claim the wrong arm. The
+    policy constructor validates the tracker and parameters itself (single
+    guard); this factory only maps the canonical config onto the classes.
+    """
+    control = ler_guided_controller["control"]
+    if control not in LER_GUIDED_CONTROLS:
+        raise ValueError(
+            f"Unknown LER-guided control: {control!r}; "
+            f"expected one of {sorted(LER_GUIDED_CONTROLS)}"
+        )
+    safety_enabled = control == LER_GUIDED_SAFE_CONTROL
+    PolicyCls = (
+        LERGuidedStratifiedSafetyPolicy
+        if safety_enabled
+        else LERGuidedStratifiedPolicy
+    )
+    kwargs = {
+        "target_skip_rate": ler_guided_controller["target_skip_rate"],
+        "total_steps": ler_guided_controller["total_steps"],
+        "min_step": ler_guided_controller["min_step"],
+        "seed": ler_guided_controller["policy_seed"],
+        "n_phases": ler_guided_controller["n_phases"],
+        "phase_weights": ler_guided_controller["phase_weights"],
+        "max_consecutive_skips": ler_guided_controller["max_consecutive_skips"],
+        "probe_interval": ler_guided_controller["probe_interval"],
+        "min_ler_observations": ler_guided_controller["min_ler_observations"],
+        "ler_guidance_strength": ler_guided_controller["ler_guidance_strength"],
+    }
+    if safety_enabled:
+        kwargs.update(
+            {
+                "use_rho_vg_safety": ler_guided_controller["use_rho_vg_safety"],
+                "rho_veto_threshold": ler_guided_controller["rho_veto_threshold"],
+                "use_loss_spike_safety": ler_guided_controller[
+                    "use_loss_spike_safety"
+                ],
+                "loss_spike_factor": ler_guided_controller["loss_spike_factor"],
+                "loss_spike_window": ler_guided_controller["loss_spike_window"],
+            }
+        )
+    return PolicyCls(ler_tracker=ler_tracker, **kwargs)
+
+
 def resolve_online_ler_config(
     requested_mode,
     *,
