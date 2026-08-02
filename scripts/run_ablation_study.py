@@ -28,6 +28,7 @@ import gc
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import List, Optional
 
 import torch
 try:
@@ -140,24 +141,36 @@ ABLATIONS = {
     "grad_norm":        {"control": "grad_norm"},
     "ler_guided_stratified": {"control": "ler_guided_stratified"},
     "ler_guided_stratified_safe": {"control": "ler_guided_stratified_safe"},
+    "fixed_phase_strat": {"control": "fixed_phase_strat"},
+    "phase_strat_guarded": {"control": "phase_strat_guarded"},
     # Compatibility alias for old invocations; excluded from default matrices.
     "random_skip":      {"control": "exact_random", "alias_of": "exact_random"},
 }
+
+PHASE1_3_MATRIX = [
+    "full_finetune",
+    "exact_random",
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+]
 
 POLICY_MIN_STEP = 50
 LER_GUIDED_CONTROL = "ler_guided_stratified"
 LER_GUIDED_SAFE_CONTROL = "ler_guided_stratified_safe"
 LER_GUIDED_CONTROLS = {LER_GUIDED_CONTROL, LER_GUIDED_SAFE_CONTROL}
 SKIPPING_CONTROLS = (
-    {"exact_random", "random_skip", "rvd", "grad_norm"}
+    {"exact_random", "fixed_phase_strat", "phase_strat_guarded",
+     "rvd", "grad_norm"}
     | LER_GUIDED_CONTROLS
 )
 ONLINE_LER_MODE_AUTO = "auto"
-ONLINE_LER_SIGNAL_FREE_CONTROLS = ("full_finetune", "exact_random")
+ONLINE_LER_SIGNAL_FREE_CONTROLS = (
+    "full_finetune", "exact_random", "fixed_phase_strat"
+)
 ONLINE_LER_SIGNAL_FREE_POLICY = "fixed_phase_strat"
-DEFAULT_ABLATIONS = [
-    name for name, config in ABLATIONS.items() if "alias_of" not in config
-]
+DEFAULT_ABLATIONS = list(PHASE1_3_MATRIX)
 ABLATION_GLUE_TASKS = [t for t in GLUE_TASKS if t != "rte_modernbert_2e5"]
 
 
@@ -288,6 +301,118 @@ def build_ler_guided_controller_config(
                 "use_loss_spike_safety": True,
                 "loss_spike_factor": 1.0,
                 "loss_spike_window": 5,
+            }
+        )
+    return config
+
+
+def build_phase_strat_controller_config(
+    *,
+    control: str,
+    target_skip_rate: float,
+    total_steps: int,
+    policy_seed: int,
+    max_consecutive_skips: int,
+    n_phases: int = 4,
+    phase_weights: Optional[List[float]] = None,
+    rho_veto_threshold: float = -0.2,
+    spike_factor: float = 1.0,
+    use_rho_vg: bool = True,
+    use_safety_horizon: bool = True,
+    risk_gamma: float = 0.0,
+    guarded: bool = False,
+) -> dict:
+    """Build canonical provenance configuration for a phase-stratified arm."""
+    if control not in ("fixed_phase_strat", "phase_strat_guarded"):
+        raise ValueError(
+            f"Unknown phase-stratified control: {control!r}; "
+            "expected 'fixed_phase_strat' or 'phase_strat_guarded'"
+        )
+
+    target_skip_rate = float(target_skip_rate)
+    if not math.isfinite(target_skip_rate) or not 0.0 <= target_skip_rate <= 1.0:
+        raise ValueError("target_skip_rate must be finite and in [0, 1]")
+
+    total_steps_int = int(total_steps)
+    if total_steps_int <= POLICY_MIN_STEP or total_steps_int != total_steps:
+        raise ValueError(
+            f"total_steps must be an integer greater than POLICY_MIN_STEP="
+            f"{POLICY_MIN_STEP}; got {total_steps!r}"
+        )
+
+    max_consecutive_skips = int(max_consecutive_skips)
+    if max_consecutive_skips < 1:
+        raise ValueError("max_consecutive_skips must be >= 1")
+
+    if phase_weights is None:
+        phase_weights = [0.22, 0.24, 0.26, 0.28][:n_phases]
+    s = sum(phase_weights) or 1.0
+    normalized_weights = [w / s for w in phase_weights]
+
+    requested_quota = int(round(target_skip_rate * total_steps_int))
+    eligible_count = total_steps_int - POLICY_MIN_STEP
+    if requested_quota > eligible_count:
+        raise ValueError(
+            f"Infeasible skip quota: requested {requested_quota} skips after "
+            f"min_step={POLICY_MIN_STEP}, but only {eligible_count} decisions "
+            "are eligible; quotas are never clipped"
+        )
+
+    eligible = list(range(POLICY_MIN_STEP, total_steps_int))
+    n_elig = len(eligible)
+    edges = [
+        POLICY_MIN_STEP + int(round(n_elig * i / n_phases))
+        for i in range(n_phases + 1)
+    ]
+    phase_bounds = edges
+    phase_eligible = [edges[i + 1] - edges[i] for i in range(n_phases)]
+
+    raw = [requested_quota * w for w in normalized_weights]
+    q = [int(math.floor(x)) for x in raw]
+    q = [min(q[i], phase_eligible[i]) for i in range(n_phases)]
+    rem = requested_quota - sum(q)
+    order = sorted(
+        range(n_phases), key=lambda i: raw[i] - q[i], reverse=True
+    )
+    idx = 0
+    while rem > 0 and idx < 10 * n_phases:
+        i = order[idx % n_phases]
+        if q[i] < phase_eligible[i]:
+            q[i] += 1
+            rem -= 1
+        idx += 1
+    phase_quota = q
+
+    config = {
+        "control": control,
+        "controller_class": (
+            "PhaseStratifiedGuardedRandomPolicy"
+            if guarded
+            else "FixedPhaseStratifiedRandomPolicy"
+        ),
+        "policy_name": control,
+        "target_skip_rate": target_skip_rate,
+        "total_steps": total_steps_int,
+        "min_step": POLICY_MIN_STEP,
+        "policy_seed": int(policy_seed),
+        "n_phases": n_phases,
+        "phase_weights": normalized_weights,
+        "phase_bounds": phase_bounds,
+        "phase_quota": phase_quota,
+        "phase_eligible": phase_eligible,
+        "max_consecutive_skips": max_consecutive_skips,
+        "requested_quota": requested_quota,
+        "risk_gamma": float(risk_gamma),
+    }
+    if guarded:
+        config.update(
+            {
+                "guarded_safety": {
+                    "use_rho_vg": bool(use_rho_vg),
+                    "rho_veto_threshold": float(rho_veto_threshold),
+                    "use_safety_horizon": bool(use_safety_horizon),
+                    "spike_factor": float(spike_factor),
+                }
             }
         )
     return config
@@ -670,6 +795,26 @@ def build_skip_policy(
             min_step=POLICY_MIN_STEP,
             seed=controller_cfg["policy_seed"],
             total_steps=total_steps,
+        )
+    if control == "fixed_phase_strat":
+        return FixedPhaseStratifiedRandomPolicy(
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            min_step=POLICY_MIN_STEP,
+            seed=controller_cfg["policy_seed"],
+        )
+    if control == "phase_strat_guarded":
+        return PhaseStratifiedGuardedRandomPolicy(
+            ler_tracker=ler_tracker,
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            min_step=POLICY_MIN_STEP,
+            seed=controller_cfg["policy_seed"],
+            max_consecutive_skips=controller_cfg["max_consecutive_skips"],
+            rho_veto_threshold=rho_veto_threshold,
+            use_rho_vg=use_rho_vg,
+            use_safety_horizon=use_safety_horizon,
+            risk_gamma=risk_gamma,
         )
     if control == "grad_norm":
         return GradNormSkipPolicy(
@@ -1128,6 +1273,40 @@ def run_ablation_single(
         )
     else:
         ler_guided_controller_config = None
+    if effective_control == "fixed_phase_strat":
+        phase_strat_controller_config = (
+            build_phase_strat_controller_config(
+                control="fixed_phase_strat",
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                policy_seed=controller_cfg["policy_seed"],
+                max_consecutive_skips=max_consecutive_skips,
+            )
+        )
+        identity_inputs["phase_strat_controller"] = (
+            phase_strat_controller_config
+        )
+    elif effective_control == "phase_strat_guarded":
+        phase_strat_controller_config = (
+            build_phase_strat_controller_config(
+                control="phase_strat_guarded",
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                policy_seed=controller_cfg["policy_seed"],
+                max_consecutive_skips=max_consecutive_skips,
+                guarded=True,
+                rho_veto_threshold=rho_veto_threshold,
+                spike_factor=1.0,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                risk_gamma=risk_gamma,
+            )
+        )
+        identity_inputs["phase_strat_controller"] = (
+            phase_strat_controller_config
+        )
+    else:
+        phase_strat_controller_config = None
     fingerprint = build_scientific_fingerprint(identity_inputs)
 
     # Define run_id from task, seed, arm, and fingerprint.
@@ -1188,7 +1367,9 @@ def run_ablation_single(
     if quota_control is None and policy == "random_veto_deferral":
         quota_control = "rvd"
     requested_quota = None
-    if quota_control in ("exact_random", "rvd") or (
+    if quota_control in (
+        "exact_random", "rvd", "fixed_phase_strat", "phase_strat_guarded"
+    ) or (
         quota_control in LER_GUIDED_CONTROLS
     ):
         try:
@@ -1384,6 +1565,32 @@ def run_ablation_single(
     if effective_control in LER_GUIDED_CONTROLS:
         controller_config_effective["ler_guided_controller"] = (
             copy_ler_guided_config(ler_guided_controller_config)
+        )
+    if effective_control == "fixed_phase_strat":
+        controller_config_effective["phase_strat_controller"] = (
+            build_phase_strat_controller_config(
+                control="fixed_phase_strat",
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                policy_seed=controller_cfg["policy_seed"],
+                max_consecutive_skips=max_consecutive_skips,
+            )
+        )
+    if effective_control == "phase_strat_guarded":
+        controller_config_effective["phase_strat_controller"] = (
+            build_phase_strat_controller_config(
+                control="phase_strat_guarded",
+                target_skip_rate=target_skip_rate,
+                total_steps=total_steps,
+                policy_seed=controller_cfg["policy_seed"],
+                max_consecutive_skips=max_consecutive_skips,
+                guarded=True,
+                rho_veto_threshold=rho_veto_threshold,
+                spike_factor=1.0,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                risk_gamma=risk_gamma,
+            )
         )
     print(
         "  Controller config: "
@@ -1659,6 +1866,32 @@ def run_ablation_single(
             results["run_config"]["ler_guided_controller"] = (
                 copy_ler_guided_config(ler_guided_controller_config)
             )
+        if effective_control == "fixed_phase_strat":
+            results["run_config"]["phase_strat_controller"] = (
+                build_phase_strat_controller_config(
+                    control="fixed_phase_strat",
+                    target_skip_rate=target_skip_rate,
+                    total_steps=total_steps,
+                    policy_seed=controller_cfg["policy_seed"],
+                    max_consecutive_skips=max_consecutive_skips,
+                )
+            )
+        if effective_control == "phase_strat_guarded":
+            results["run_config"]["phase_strat_controller"] = (
+                build_phase_strat_controller_config(
+                    control="phase_strat_guarded",
+                    target_skip_rate=target_skip_rate,
+                    total_steps=total_steps,
+                    policy_seed=controller_cfg["policy_seed"],
+                    max_consecutive_skips=max_consecutive_skips,
+                    guarded=True,
+                    rho_veto_threshold=rho_veto_threshold,
+                    spike_factor=1.0,
+                    use_rho_vg=use_rho_vg,
+                    use_safety_horizon=use_safety_horizon,
+                    risk_gamma=risk_gamma,
+                )
+            )
 
         results_path = os.path.join(output_dir, "results.json")
         with open(results_path, "w") as f:
@@ -1862,7 +2095,7 @@ def main():
     if args.mode == "smoke":
         tasks = ["sst2"]
         seeds = [42]
-        ablations_to_run = ["full_lerna", "no_ler", "no_safety"]
+        ablations_to_run = list(PHASE1_3_MATRIX)
     elif args.mode == "full":
         tasks = ABLATION_GLUE_TASKS
         seeds = SEEDS

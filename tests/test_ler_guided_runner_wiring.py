@@ -6,6 +6,7 @@ import pytest
 
 import lerna.trainers as trainers
 from lerna.trainers.true_skip_trainer import (
+    ONLINE_LER_MODE_OFF,
     ONLINE_LER_MODE_SAMPLED_LAGGED,
     ONLINE_LER_TIMING_POST_DECISION,
 )
@@ -16,12 +17,56 @@ from scripts.run_ablation_study import (
     LER_GUIDED_CONTROL,
     LER_GUIDED_CONTROLS,
     LER_GUIDED_SAFE_CONTROL,
+    PHASE1_3_MATRIX,
     POLICY_MIN_STEP,
     SKIPPING_CONTROLS,
     add_ler_guided_to_identity,
     build_ler_guided_controller_config,
+    build_phase_strat_controller_config,
+    build_skip_policy,
     resolve_online_ler_config,
 )
+
+
+class FakeLagTracker:
+    """Fake SampledLaggedLERTracker satisfying the required diagnostics."""
+
+    def __init__(self, mode="sampled_lagged", timing="post_decision_after_backward"):
+        self.mode = mode
+        self.timing = timing
+        self.ler_raw = None
+        self.last_update_decision = None
+        self.observation_age_decisions = 0
+        self.rho_vg_raw = None
+        self.loss_history = []
+        self.update_calls = 0
+        self.note_calls = 0
+
+    def commit(self, ler, decision_index):
+        self.ler_raw = ler
+        self.last_update_decision = decision_index
+        self.observation_age_decisions = 0
+
+    def tick(self):
+        self.observation_age_decisions += 1
+
+    def update(self, *a, **k):
+        self.update_calls += 1
+
+    def note_decision(self, *a, **k):
+        self.note_calls += 1
+
+    def get_diagnostics(self):
+        return {
+            "mode": self.mode,
+            "timing": self.timing,
+            "ler_raw": self.ler_raw,
+            "ler": self.ler_raw,
+            "last_update_decision": self.last_update_decision,
+            "observation_age_decisions": self.observation_age_decisions,
+            "rho_vg_raw": self.rho_vg_raw,
+            "rho_vg": self.rho_vg_raw,
+        }
 
 
 COMMON_KEYS = {
@@ -250,3 +295,363 @@ def test_active_rho_threshold_changes_only_safety_fingerprint():
         LER_GUIDED_CONTROL,
         rho_veto_threshold=-0.4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Matrix Contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_phase1_3_matrix_has_exactly_six_arms():
+    assert len(PHASE1_3_MATRIX) == 6
+
+
+def test_phase1_3_matrix_contains_exactly_canonical_arms():
+    assert set(PHASE1_3_MATRIX) == {
+        "full_finetune",
+        "exact_random",
+        "fixed_phase_strat",
+        "phase_strat_guarded",
+        "ler_guided_stratified",
+        "ler_guided_stratified_safe",
+    }
+
+
+def test_phase1_3_matrix_ordering_is_canonical():
+    assert PHASE1_3_MATRIX == [
+        "full_finetune",
+        "exact_random",
+        "fixed_phase_strat",
+        "phase_strat_guarded",
+        "ler_guided_stratified",
+        "ler_guided_stratified_safe",
+    ]
+
+
+def test_fixed_phase_strat_is_explicit_ablation():
+    assert "fixed_phase_strat" in ABLATIONS
+    assert ABLATIONS["fixed_phase_strat"] == {"control": "fixed_phase_strat"}
+    assert "alias_of" not in ABLATIONS["fixed_phase_strat"]
+
+
+def test_phase_strat_guarded_is_explicit_ablation():
+    assert "phase_strat_guarded" in ABLATIONS
+    assert ABLATIONS["phase_strat_guarded"] == {
+        "control": "phase_strat_guarded"
+    }
+    assert "alias_of" not in ABLATIONS["phase_strat_guarded"]
+
+
+def test_build_skip_policy_routes_fixed_phase_strat():
+    from lerna.trainers.policies import FixedPhaseStratifiedRandomPolicy
+
+    policy = build_skip_policy(
+        control="fixed_phase_strat",
+        ler_tracker=None,
+        target_skip_rate=0.20,
+        total_steps=100,
+        controller_cfg={"policy_seed": 42},
+        rho_veto_threshold=-0.2,
+        probe_interval=8,
+        use_ler=True,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        fallback_threshold=0.01,
+        risk_gamma=0.0,
+    )
+    assert type(policy) is FixedPhaseStratifiedRandomPolicy
+    assert policy.target_skip_rate == 0.20
+    assert policy.min_step == POLICY_MIN_STEP
+
+
+def test_build_skip_policy_routes_phase_strat_guarded():
+    from lerna.trainers.policies import PhaseStratifiedGuardedRandomPolicy
+
+    policy = build_skip_policy(
+        control="phase_strat_guarded",
+        ler_tracker=FakeLagTracker(),
+        target_skip_rate=0.20,
+        total_steps=100,
+        controller_cfg={"policy_seed": 42, "max_consecutive_skips": 4},
+        rho_veto_threshold=-0.2,
+        probe_interval=8,
+        use_ler=True,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        fallback_threshold=0.01,
+        risk_gamma=0.0,
+    )
+    assert type(policy) is PhaseStratifiedGuardedRandomPolicy
+    assert policy.target_skip_rate == 0.20
+    assert policy.min_step == POLICY_MIN_STEP
+
+
+def test_resolve_online_ler_fixed_phase_strat_is_off():
+    resolved = resolve_online_ler_config(
+        "auto",
+        effective_control="fixed_phase_strat",
+        policy=None,
+        parameter_sample_size=4096,
+        update_interval=1,
+    )
+    assert resolved["mode"] == ONLINE_LER_MODE_OFF
+    assert resolved["enabled"] is False
+    assert "fixed_phase_strat" in resolved["reason"]
+
+
+def test_resolve_online_ler_phase_strat_guarded_is_sampled_lagged():
+    resolved = resolve_online_ler_config(
+        "auto",
+        effective_control="phase_strat_guarded",
+        policy=None,
+        parameter_sample_size=4096,
+        update_interval=2,
+    )
+    assert resolved["mode"] == ONLINE_LER_MODE_SAMPLED_LAGGED
+    assert resolved["enabled"] is True
+    assert resolved["reason"] == "auto_signal_consuming_arm"
+
+
+def test_fixed_phase_strat_in_skipping_controls():
+    assert "fixed_phase_strat" in SKIPPING_CONTROLS
+
+
+def test_phase_strat_guarded_in_skipping_controls():
+    assert "phase_strat_guarded" in SKIPPING_CONTROLS
+
+
+def test_phase_strat_controller_config_has_required_keys():
+    config = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    assert config["control"] == "fixed_phase_strat"
+    assert config["controller_class"] == "FixedPhaseStratifiedRandomPolicy"
+    assert config["policy_seed"] == 42
+    assert config["total_steps"] == 100
+    assert config["requested_quota"] == 20
+    assert config["n_phases"] == 4
+    assert "phase_weights" in config
+    assert "phase_bounds" in config
+    assert "phase_quota" in config
+    assert "phase_eligible" in config
+    assert "max_consecutive_skips" in config
+    assert "risk_gamma" in config
+
+
+def test_phase_strat_controller_config_guarded_has_safety():
+    config = build_phase_strat_controller_config(
+        control="phase_strat_guarded",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+        guarded=True,
+        rho_veto_threshold=-0.2,
+        spike_factor=1.0,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        risk_gamma=0.0,
+    )
+    assert config["control"] == "phase_strat_guarded"
+    assert config["controller_class"] == "PhaseStratifiedGuardedRandomPolicy"
+    assert "guarded_safety" in config
+    assert config["guarded_safety"]["use_rho_vg"] is True
+    assert config["guarded_safety"]["rho_veto_threshold"] == -0.2
+    assert config["guarded_safety"]["use_safety_horizon"] is True
+    assert config["guarded_safety"]["spike_factor"] == 1.0
+
+
+def test_phase_strat_controller_config_not_guarded_has_no_safety():
+    config = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    assert "guarded_safety" not in config
+
+
+def test_phase_strat_controller_config_quota_matches_build_exact_random_skip_set():
+    from lerna.trainers.policies import build_exact_random_skip_set
+
+    config = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    _, expected_quota = build_exact_random_skip_set(
+        total_steps=100,
+        target_skip_rate=0.20,
+        min_step=POLICY_MIN_STEP,
+        seed=42,
+    )
+    assert config["requested_quota"] == expected_quota
+
+
+def test_legacy_arms_excluded_from_phase1_3_matrix():
+    for legacy in ["full_lerna", "no_rho_vg", "no_ler", "no_safety",
+                   "no_hysteresis", "no_momentum", "rvd", "grad_norm",
+                   "random_skip", "phase_strat"]:
+        assert legacy not in PHASE1_3_MATRIX
+
+
+def test_random_skip_is_alias_not_in_matrix():
+    assert "random_skip" in ABLATIONS
+    assert ABLATIONS["random_skip"].get("alias_of") == "exact_random"
+    assert "random_skip" not in PHASE1_3_MATRIX
+
+
+def test_phase_strat_ambiguous_legacy_not_in_matrix():
+    assert "phase_strat" not in PHASE1_3_MATRIX
+
+
+def test_exact_random_still_in_matrix():
+    assert "exact_random" in PHASE1_3_MATRIX
+
+
+def test_full_finetune_still_in_matrix():
+    assert "full_finetune" in PHASE1_3_MATRIX
+
+
+def test_phase_strat_controller_config_is_defensive_copy():
+    config1 = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    config2 = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    assert config1 == config2
+    assert config1 is not config2
+    assert config1["phase_weights"] is not config2["phase_weights"]
+    config1["phase_weights"][0] = 99.0
+    assert config2["phase_weights"] == [0.22, 0.24, 0.26, 0.28]
+
+
+def test_phase_strat_controller_config_fingerprint_consistency():
+    config = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    id1 = {"task": "mrpc", "training_seed": 42, "control": "fixed_phase_strat"}
+    id1["phase_strat_controller"] = config
+    id2 = dict(id1)
+    id2["phase_strat_controller"] = dict(config)
+    id2["phase_strat_controller"]["phase_weights"] = list(
+        config["phase_weights"]
+    )
+    fp1 = build_scientific_fingerprint(id1)
+    fp2 = build_scientific_fingerprint(id2)
+    assert fp1 == fp2
+
+
+def test_phase_strat_controller_config_fingerprint_differs_by_seed():
+    config_a = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    config_b = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=43,
+        max_consecutive_skips=4,
+    )
+    assert config_a != config_b
+
+
+def test_phase_strat_controller_config_fingerprint_differs_by_control():
+    config_fixed = build_phase_strat_controller_config(
+        control="fixed_phase_strat",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+    )
+    config_guarded = build_phase_strat_controller_config(
+        control="phase_strat_guarded",
+        target_skip_rate=0.20,
+        total_steps=100,
+        policy_seed=42,
+        max_consecutive_skips=4,
+        guarded=True,
+        rho_veto_threshold=-0.2,
+        spike_factor=1.0,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        risk_gamma=0.0,
+    )
+    assert config_fixed != config_guarded
+
+
+def test_legacy_policy_fixed_phase_strat_still_works():
+    from lerna.trainers.policies import FixedPhaseStratifiedRandomPolicy
+
+    policy = FixedPhaseStratifiedRandomPolicy(
+        target_skip_rate=0.20,
+        total_steps=100,
+        min_step=POLICY_MIN_STEP,
+        seed=42,
+    )
+    assert policy.name == "fixed_phase_strat"
+    assert policy.target_skip_rate == 0.20
+
+
+def test_legacy_policy_phase_strat_guarded_still_works():
+    from lerna.trainers.policies import PhaseStratifiedGuardedRandomPolicy
+
+    policy = PhaseStratifiedGuardedRandomPolicy(
+        ler_tracker=FakeLagTracker(),
+        target_skip_rate=0.20,
+        total_steps=100,
+        min_step=POLICY_MIN_STEP,
+        seed=42,
+        max_consecutive_skips=4,
+        rho_veto_threshold=-0.2,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        risk_gamma=0.0,
+    )
+    assert policy.name == "phase_strat_guarded"
+    assert policy.target_skip_rate == 0.20
+
+
+def test_exact_random_still_routes_through_build_skip_policy():
+    from lerna.trainers.policies import RandomSkipPolicy
+
+    policy = build_skip_policy(
+        control="exact_random",
+        ler_tracker=None,
+        target_skip_rate=0.20,
+        total_steps=100,
+        controller_cfg={"policy_seed": 42},
+        rho_veto_threshold=-0.2,
+        probe_interval=8,
+        use_ler=True,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        fallback_threshold=0.01,
+        risk_gamma=0.0,
+    )
+    assert type(policy) is RandomSkipPolicy
+    assert policy.seed == 42
