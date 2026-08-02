@@ -152,6 +152,23 @@ def test_build_skip_policy_requires_config_for_ler_guided():
         call_build_skip_policy(LER_GUIDED_CONTROL)
 
 
+@pytest.mark.parametrize(
+    ("control", "config_control"),
+    [
+        # Safe control with a no-safety config.
+        (LER_GUIDED_SAFE_CONTROL, LER_GUIDED_CONTROL),
+        # No-safety control with a safe config.
+        (LER_GUIDED_CONTROL, LER_GUIDED_SAFE_CONTROL),
+    ],
+)
+def test_build_skip_policy_rejects_control_mismatch(control, config_control):
+    with pytest.raises(ValueError, match="does not match controller"):
+        call_build_skip_policy(
+            control,
+            ler_guided_controller_config=make_ler_guided_config(config_control),
+        )
+
+
 def test_build_skip_policy_existing_arms_unchanged():
     # full_finetune
     assert type(call_build_skip_policy("full_finetune")) is AlwaysFalsePolicy

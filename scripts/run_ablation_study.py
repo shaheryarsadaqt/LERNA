@@ -655,6 +655,11 @@ def build_skip_policy(
                 f"LER-guided control {control!r} requires "
                 "ler_guided_controller_config"
             )
+        if ler_guided_controller_config.get("control") != control:
+            raise ValueError(
+                f"LER-guided control {control!r} does not match controller "
+                f"config control {ler_guided_controller_config.get('control')!r}"
+            )
         return build_ler_guided_skip_policy(
             ler_tracker=ler_tracker,
             ler_guided_controller=ler_guided_controller_config,
@@ -1377,8 +1382,8 @@ def run_ablation_single(
     if quota_control == "rvd":
         controller_config_effective["rvd"] = dict(controller_cfg)
     if effective_control in LER_GUIDED_CONTROLS:
-        controller_config_effective["ler_guided"] = copy_ler_guided_config(
-            ler_guided_controller_config
+        controller_config_effective["ler_guided_controller"] = (
+            copy_ler_guided_config(ler_guided_controller_config)
         )
     print(
         "  Controller config: "
@@ -1651,8 +1656,8 @@ def run_ablation_single(
             "online_diagnostics": dict(online_diagnostics),
         }
         if effective_control in LER_GUIDED_CONTROLS:
-            results["run_config"]["ler_guided"] = copy_ler_guided_config(
-                ler_guided_controller_config
+            results["run_config"]["ler_guided_controller"] = (
+                copy_ler_guided_config(ler_guided_controller_config)
             )
 
         results_path = os.path.join(output_dir, "results.json")
