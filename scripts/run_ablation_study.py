@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
-LERNA Ablation Study: Disabling individual LERNA components to quantify their contribution.
+LERNA Phase 1.3 ablation runner.
 
-Ablation configs:
-    full_lerna       — control (all components enabled)
-    no_rho_vg        — disable rho_VG velocity-gradient correlation
-    no_ler           — disable LER tracking (plateau detection falls back)
-    no_safety        — disable safety horizon (unbounded momentum extrapolation)
-    no_hysteresis   — disable phase-detection hysteresis
-    no_momentum     — disable momentum extrapolation (full backprop always)
+PHASE1_3_MATRIX is the authoritative six-arm matched-budget matrix. The six
+canonical arm names are:
+
+    full_finetune
+    exact_random
+    fixed_phase_strat
+    phase_strat_guarded
+    ler_guided_stratified
+    ler_guided_stratified_safe
+
+random_skip is a compatibility alias for exact_random and is excluded from
+the default matrices.
+
+full_lerna, the no_* arms (no_rho_vg, no_ler, no_safety, no_hysteresis,
+no_momentum), rvd, and grad_norm are legacy/exploratory arms; they are not
+aliases and are not matrix defaults. phase_strat is an ambiguous legacy
+policy name; prefer the explicit matrix arm names above.
 
 Usage:
-    python scripts/run_ablation_study.py --mode smoke
-    python scripts/run_ablation_study.py --mode full --tasks sst2 qnli --seeds 42 43 44
+    python scripts/run_ablation_study.py --mode smoke --no-early-stopping --skip-update-mode freeze
+    python scripts/run_ablation_study.py --mode full --tasks sst2 qnli --seeds 42 43 44 --no-early-stopping --skip-update-mode freeze
 """
 
 import os
@@ -1236,6 +1246,7 @@ def run_ablation_single(
         train_samples_realized=len(train_ds),
         eval_samples_realized=len(eval_ds),
         train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
+        eval_dataset_fingerprint=getattr(eval_ds, "_fingerprint", None),
         num_epochs=num_epochs,
         control=effective_control or policy,
         target_skip_rate=target_skip_rate,
@@ -1454,7 +1465,7 @@ def run_ablation_single(
                 fallback_threshold=base_thr,
                 min_step=50,
                 calibration_steps=60,
-                recalibr_every=200,
+                recalibrate_every=200,
                 use_ler=use_ler,
                 use_rho_vg=use_rho_vg,
                 use_safety_horizon=use_safety_horizon,

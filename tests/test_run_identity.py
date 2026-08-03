@@ -34,6 +34,7 @@ def _make_identity_inputs(**overrides):
         train_samples_realized=1000,
         eval_samples_realized=200,
         train_dataset_fingerprint="abc123",
+        eval_dataset_fingerprint="eval_fp_abc",
         num_epochs=5,
         control="rvd",
         target_skip_rate=0.30,
