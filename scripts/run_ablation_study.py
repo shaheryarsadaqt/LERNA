@@ -233,6 +233,21 @@ def build_rvd_controller_config(
     }
 
 
+def canonicalize_rvd_identity(rvd_config: dict, training_seed: int) -> dict:
+    """Return an RVD identity containing only behaviorally active fields."""
+    veto_mode = rvd_config.get("veto_mode", "none")
+    canonical = dict(rvd_config)
+    if veto_mode != "margin":
+        canonical.pop("margin_rank_floor", None)
+    if veto_mode != "loss_spike":
+        canonical.pop("spike_factor", None)
+        canonical.pop("spike_ema_window", None)
+    policy_seed = canonical.get("policy_seed")
+    if policy_seed is not None and policy_seed == training_seed:
+        canonical.pop("policy_seed_defaulted_to_training_seed", None)
+    return canonical
+
+
 def build_ler_guided_controller_config(
     *,
     control: str,
@@ -1268,7 +1283,7 @@ def run_ablation_single(
     if effective_control == "rvd" or (
         effective_control is None and policy == "random_veto_deferral"
     ):
-        identity_inputs["rvd"] = dict(controller_cfg)
+        identity_inputs["rvd"] = canonicalize_rvd_identity(controller_cfg, seed)
     # max_consecutive_skips is represented only in controller configurations
     # where it changes behavior. grad_norm consumes it but has no dedicated
     # controller config, so it is recorded here.

@@ -314,38 +314,73 @@ _MAX_CONSECUTIVE_SKIPS_APPLICABLE = frozenset(
     }
 )
 
+_RVD_ACTIVE_MARGIN_FIELDS = frozenset({"margin_rank_floor"})
+_RVD_ACTIVE_LOSS_SPIKE_FIELDS = frozenset({"spike_factor", "spike_ema_window"})
+_LER_GUIDED_CONTROLS = frozenset(
+    {"ler_guided_stratified", "ler_guided_stratified_safe"}
+)
+
+
+def _canonicalize_rvd_config(
+    rvd_config: Dict[str, Any],
+    training_seed: int,
+) -> Dict[str, Any]:
+    """Strip behaviorally inactive fields from an RVD controller config."""
+    veto_mode = rvd_config.get("veto_mode", "none")
+    canonical = dict(rvd_config)
+    if veto_mode != "margin":
+        for key in _RVD_ACTIVE_MARGIN_FIELDS:
+            canonical.pop(key, None)
+    if veto_mode != "loss_spike":
+        for key in _RVD_ACTIVE_LOSS_SPIKE_FIELDS:
+            canonical.pop(key, None)
+    policy_seed = canonical.get("policy_seed")
+    if policy_seed is not None and policy_seed == training_seed:
+        canonical.pop("policy_seed_defaulted_to_training_seed", None)
+    return canonical
+
 
 def _canonicalize_identity_inputs(identity_inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip controller-specific keys that do not apply to the effective control.
+    """Canonicalize identity inputs for fingerprinting.
 
-    The canonical identity contains only the universal base fields plus
-    controller configuration sub-dictionaries.  Stray top-level controller
-    keys (for example, ``rvd_veto_mode`` on a non-RVD run) are dropped so
-    they cannot corrupt fingerprints.
+    Preserves unknown fields by default, strips only known inactive fields,
+    and normalizes controller-specific configuration.
     """
     control = identity_inputs.get("control")
     if control == "random_skip":
         control = "exact_random"
 
-    canonical: Dict[str, Any] = {}
-    has_phase_strat_controller = "phase_strat_controller" in identity_inputs
+    canonical = dict(identity_inputs)
+    canonical["control"] = control
 
-    for key, value in identity_inputs.items():
-        if key in _BASE_IDENTITY_KEYS:
-            if key == "control":
-                canonical[key] = control
+    if control != "rvd":
+        for key in list(canonical.keys()):
+            if key.startswith("rvd_") and key not in _BASE_IDENTITY_KEYS:
+                del canonical[key]
+
+    if "max_consecutive_skips" in canonical:
+        applicable = control in {"grad_norm"} | _MAX_CONSECUTIVE_SKIPS_APPLICABLE
+        if not applicable:
+            del canonical["max_consecutive_skips"]
+        elif control == "phase_strat_guarded" and "phase_strat_controller" in canonical:
+            del canonical["max_consecutive_skips"]
+
+    for key in list(canonical.keys()):
+        if key not in _CONTROLLER_CONFIG_SUBDICTS:
+            continue
+        if key == "rvd":
+            if control != "rvd":
+                del canonical[key]
             else:
-                canonical[key] = value
-        elif key in _CONTROLLER_CONFIG_SUBDICTS:
-            canonical[key] = value
-        elif key == "max_consecutive_skips":
-            if control == "grad_norm":
-                canonical[key] = value
-            elif control in _MAX_CONSECUTIVE_SKIPS_APPLICABLE:
-                if control == "phase_strat_guarded" and has_phase_strat_controller:
-                    continue
-                canonical[key] = value
-        elif key.startswith("rvd_") and control != "rvd":
+                training_seed = canonical.get("training_seed")
+                canonical[key] = _canonicalize_rvd_config(canonical[key], training_seed)
+        elif key == "phase_strat_controller":
+            if control not in {"fixed_phase_strat", "phase_strat_guarded"}:
+                del canonical[key]
+        elif key == "ler_guided_controller":
+            if control not in _LER_GUIDED_CONTROLS:
+                del canonical[key]
+        elif key == "online_diagnostics":
             continue
 
     return canonical

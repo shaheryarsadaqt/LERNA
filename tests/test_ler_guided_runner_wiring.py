@@ -1,5 +1,8 @@
 """Step 3B.3A: canonical LER-guided runner arm and identity helpers."""
 
+import ast
+from pathlib import Path
+
 import math
 
 import pytest
@@ -657,3 +660,56 @@ def test_exact_random_still_routes_through_build_skip_policy():
     )
     assert type(policy) is RandomSkipPolicy
     assert policy.seed == 42
+
+
+def test_quota_hybrid_runner_passes_recalibrate_every():
+    """The runner quota_hybrid branch must pass recalibrate_every=200."""
+    runner_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_ablation_study.py"
+    )
+    source = runner_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare):
+            continue
+        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+            continue
+        if len(test.comparators) != 1:
+            continue
+        left = test.left
+        right = test.comparators[0]
+        is_quota_hybrid = (
+            (isinstance(left, ast.Name) and left.id == "policy"
+             and isinstance(right, ast.Constant) and right.value == "quota_hybrid")
+            or (isinstance(left, ast.Constant) and left.value == "quota_hybrid"
+                and isinstance(right, ast.Name) and right.id == "policy")
+        )
+        if not is_quota_hybrid:
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            for target in stmt.targets:
+                if not (isinstance(target, ast.Name) and target.id == "skip_policy"):
+                    continue
+                call = stmt.value
+                if not isinstance(call, ast.Call):
+                    continue
+                if not (isinstance(call.func, ast.Name) and call.func.id == "LERNAQuotaHybridPolicy"):
+                    continue
+                for keyword in call.keywords:
+                    if keyword.arg == "recalibrate_every":
+                        if isinstance(keyword.value, ast.Constant) and keyword.value.value == 200:
+                            found = True
+                            break
+            if found:
+                break
+        if found:
+            break
+
+    assert found, "quota_hybrid branch must pass recalibrate_every=200 to LERNAQuotaHybridPolicy"

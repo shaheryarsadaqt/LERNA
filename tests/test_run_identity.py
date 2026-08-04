@@ -461,3 +461,129 @@ def test_quota_hybrid_constructs_with_recalibrate_every():
     assert policy.name == "lerna_quota_hybrid"
     assert policy.target_skip_rate == 0.20
     assert policy.max_consecutive_skips == 4
+
+
+# ---------------------------------------------------------------------------
+# #5B.1: canonicalization must preserve unknown fields, strip only known
+# inactive fields, and canonicalize RVD configs.
+# ---------------------------------------------------------------------------
+
+def test_unknown_active_fields_change_fingerprint():
+    """Unknown behaviorally active fields must change fingerprints."""
+    base = _make_identity_inputs()
+    base_fp = build_scientific_fingerprint(base)
+
+    changed_a = dict(base)
+    changed_a["new_active_setting"] = "a"
+    assert build_scientific_fingerprint(changed_a) != base_fp
+
+    changed_b = dict(base)
+    changed_b["new_active_setting"] = "b"
+    assert build_scientific_fingerprint(changed_b) != base_fp
+    assert build_scientific_fingerprint(changed_a) != build_scientific_fingerprint(changed_b)
+
+
+def test_stray_rvd_config_does_not_affect_non_rvd_fingerprints():
+    """An accidental rvd sub-dict must not affect non-RVD fingerprints."""
+    base = _make_identity_inputs(control="exact_random")
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["rvd"] = {"veto_mode": "margin", "margin_rank_floor": 0.5}
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_inactive_rvd_mode_settings_do_not_change_rvd_fingerprint():
+    """Inactive RVD mode settings must not change RVD fingerprints."""
+    base = _make_identity_inputs(control="rvd")
+    base["rvd"] = {
+        "veto_mode": "none",
+        "use_margin_veto": False,
+        "use_loss_spike_veto": False,
+        "margin_rank_floor": 0.5,
+        "spike_factor": 2.0,
+        "spike_ema_window": 50,
+        "repay_mode": "asap",
+        "repay_protect_dangerous": True,
+        "policy_seed": 42,
+        "policy_seed_defaulted_to_training_seed": True,
+        "max_consecutive_skips": 4,
+    }
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["rvd"] = dict(base["rvd"])
+    changed["rvd"]["margin_rank_floor"] = 0.8
+    changed["rvd"]["spike_factor"] = 3.0
+    changed["rvd"]["spike_ema_window"] = 100
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_active_rvd_margin_settings_change_fingerprint():
+    """Active RVD margin settings must change RVD fingerprints."""
+    base = _make_identity_inputs(control="rvd")
+    base["rvd"] = {
+        "veto_mode": "margin",
+        "use_margin_veto": True,
+        "use_loss_spike_veto": False,
+        "margin_rank_floor": 0.5,
+        "repay_mode": "asap",
+        "repay_protect_dangerous": True,
+        "policy_seed": 42,
+        "max_consecutive_skips": 4,
+    }
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["rvd"] = dict(base["rvd"])
+    changed["rvd"]["margin_rank_floor"] = 0.8
+    assert build_scientific_fingerprint(changed) != base_fp
+
+
+def test_active_rvd_loss_spike_settings_change_fingerprint():
+    """Active RVD loss-spike settings must change RVD fingerprints."""
+    base = _make_identity_inputs(control="rvd")
+    base["rvd"] = {
+        "veto_mode": "loss_spike",
+        "use_margin_veto": False,
+        "use_loss_spike_veto": True,
+        "spike_factor": 1.0,
+        "spike_ema_window": 20,
+        "repay_mode": "asap",
+        "repay_protect_dangerous": True,
+        "policy_seed": 42,
+        "max_consecutive_skips": 4,
+    }
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["rvd"] = dict(base["rvd"])
+    changed["rvd"]["spike_factor"] = 2.0
+    assert build_scientific_fingerprint(changed) != base_fp
+
+    changed = dict(base)
+    changed["rvd"] = dict(base["rvd"])
+    changed["rvd"]["spike_ema_window"] = 50
+    assert build_scientific_fingerprint(changed) != base_fp
+
+
+def test_explicit_and_defaulted_seed_fingerprint_equally():
+    """Explicit and defaulted identical resolved seeds must fingerprint equally."""
+    base = _make_identity_inputs(control="rvd")
+    base["rvd"] = {
+        "veto_mode": "margin",
+        "use_margin_veto": True,
+        "margin_rank_floor": 0.5,
+        "repay_mode": "asap",
+        "repay_protect_dangerous": True,
+        "policy_seed": 42,
+        "policy_seed_defaulted_to_training_seed": True,
+        "max_consecutive_skips": 4,
+    }
+    defaulted_fp = build_scientific_fingerprint(base)
+
+    explicit = dict(base)
+    explicit["rvd"] = dict(base["rvd"])
+    explicit["rvd"]["policy_seed_defaulted_to_training_seed"] = False
+    explicit_fp = build_scientific_fingerprint(explicit)
+    assert defaulted_fp == explicit_fp
