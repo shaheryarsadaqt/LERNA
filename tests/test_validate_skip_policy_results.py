@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
     "validate_skip_policy_results",
@@ -554,3 +556,146 @@ def test_unmatched_incomplete_run_is_explicitly_not_matched_valid(tmp_path):
     assert report.protocol_complete is False
     assert report.valid_for_matched_budget is False
     assert "quota_protocol_complete" in fields(report, "warning")
+
+
+def _phase1_3_base_inputs(control="full_finetune"):
+    identity = _phase1_3_identity(control)
+    controller_config = _phase1_3_controller_config(
+        control,
+        vspr.PHASE1_3_POLICY_CLASSES[control],
+        control != "full_finetune",
+    )
+    data = {
+        "ablation": control,
+        "identity_inputs": identity,
+        "controller_config": controller_config,
+        "fingerprint": vspr.build_scientific_fingerprint(identity),
+    }
+    run_config = _run_config(
+        control=control,
+        controller_config=json.loads(json.dumps(controller_config)),
+    )
+    report = vspr.ValidationReport(path="synthetic")
+    return report, data, run_config
+
+
+@pytest.mark.parametrize("control", sorted(vspr.PHASE1_3_CONTROLS))
+def test_phase1_3_valid_base_identity_has_no_errors(control):
+    report, data, run_config = _phase1_3_base_inputs(control)
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+def test_phase1_3_noncanonical_control_returns_without_findings():
+    report, data, run_config = _phase1_3_base_inputs()
+    for key in ("control", "arm"):
+        data["controller_config"][key] = "not_a_phase1_3_control"
+        run_config["controller_config"][key] = "not_a_phase1_3_control"
+    data["ablation"] = "not_a_phase1_3_control"
+    run_config["control"] = "not_a_phase1_3_control"
+    data["identity_inputs"]["control"] = "not_a_phase1_3_control"
+    data["fingerprint"] = vspr.build_scientific_fingerprint(
+        data["identity_inputs"]
+    )
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert not report.findings
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (lambda d, rc: d.pop("identity_inputs"), "identity_inputs"),
+        (lambda d, rc: d.__setitem__("identity_inputs", 7), "identity_inputs"),
+        (lambda d, rc: d.pop("controller_config"), "controller_config"),
+        (
+            lambda d, rc: d.__setitem__("controller_config", "bad"),
+            "controller_config",
+        ),
+        (
+            lambda d, rc: rc.pop("controller_config"),
+            "run_config.controller_config",
+        ),
+        (
+            lambda d, rc: rc.__setitem__("controller_config", []),
+            "run_config.controller_config",
+        ),
+    ],
+)
+def test_phase1_3_missing_or_malformed_sections(mutate, field):
+    report, data, run_config = _phase1_3_base_inputs()
+    mutate(data, run_config)
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["ablation", "identity_control", "controller_control", "controller_arm"],
+)
+def test_phase1_3_control_disagreement(location):
+    report, data, run_config = _phase1_3_base_inputs("full_finetune")
+    other = next(
+        c for c in sorted(vspr.PHASE1_3_CONTROLS) if c != "full_finetune"
+    )
+    if location == "ablation":
+        data["ablation"] = other
+    elif location == "identity_control":
+        data["identity_inputs"]["control"] = other
+        data["fingerprint"] = vspr.build_scientific_fingerprint(
+            data["identity_inputs"]
+        )
+    elif location == "controller_control":
+        data["controller_config"]["control"] = other
+        run_config["controller_config"]["control"] = other
+    else:
+        data["controller_config"]["arm"] = other
+        run_config["controller_config"]["arm"] = other
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert "phase1_3_control_identity" in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "key, value, field",
+    [
+        ("arm_alias_of", "full_finetune", "controller_config.arm_alias_of"),
+        ("policy_class", "WrongPolicy", "controller_config.policy_class"),
+        ("is_skipping_arm", True, "controller_config.is_skipping_arm"),
+    ],
+)
+def test_phase1_3_controller_field_errors(key, value, field):
+    report, data, run_config = _phase1_3_base_inputs("full_finetune")
+    data["controller_config"][key] = value
+    run_config["controller_config"][key] = value
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert field in fields(report, "error")
+
+
+def test_phase1_3_controller_copies_must_match():
+    report, data, run_config = _phase1_3_base_inputs()
+    run_config["controller_config"]["min_step"] = 51
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert "controller_config_equality" in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda d: d.pop("fingerprint"),
+        lambda d: d.__setitem__("fingerprint", 7),
+        lambda d: d.__setitem__("fingerprint", "0" * 64),
+        lambda d: d["identity_inputs"].__setitem__("training_seed", 43),
+    ],
+)
+def test_phase1_3_fingerprint_errors(corrupt):
+    report, data, run_config = _phase1_3_base_inputs()
+    corrupt(data)
+    vspr._check_phase1_3_base_identity(report, data, run_config)
+    assert "fingerprint" in fields(report, "error")
+
+
+def test_phase1_3_tampered_fingerprint_fails_validate_results(tmp_path):
+    data = full_finetune_results()
+    data["fingerprint"] = "0" * len(data["fingerprint"])
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    assert "fingerprint" in fields(report, "error")
