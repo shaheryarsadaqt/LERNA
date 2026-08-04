@@ -9,11 +9,22 @@ correctness failures. Observed veto rate is reported descriptively only.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
+
+_PROVENANCE_SPEC = importlib.util.spec_from_file_location(
+    "lerna_run_provenance",
+    Path(__file__).resolve().parents[1] / "lerna" / "utils" / "run_provenance.py",
+)
+if _PROVENANCE_SPEC is None or _PROVENANCE_SPEC.loader is None:
+    raise ImportError("could not load lerna.utils.run_provenance")
+_PROVENANCE_MODULE = importlib.util.module_from_spec(_PROVENANCE_SPEC)
+_PROVENANCE_SPEC.loader.exec_module(_PROVENANCE_MODULE)
+build_scientific_fingerprint = _PROVENANCE_MODULE.build_scientific_fingerprint
 
 SEVERITY_ERROR = "error"
 SEVERITY_WARNING = "warning"
@@ -27,6 +38,24 @@ VALID_SCHEDULER_STEP_POLICIES = (
     SCHEDULER_POLICY_SKIP_ON_BACKWARD_SKIP,
 )
 RVD_POLICY_NAME = "random_veto_deferral"
+
+PHASE1_3_CONTROLS = (
+    "full_finetune",
+    "exact_random",
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+)
+
+PHASE1_3_POLICY_CLASSES = {
+    "full_finetune": "AlwaysFalsePolicy",
+    "exact_random": "RandomSkipPolicy",
+    "fixed_phase_strat": "FixedPhaseStratifiedRandomPolicy",
+    "phase_strat_guarded": "PhaseStratifiedGuardedRandomPolicy",
+    "ler_guided_stratified": "LERGuidedStratifiedPolicy",
+    "ler_guided_stratified_safe": "LERGuidedStratifiedSafetyPolicy",
+}
 LEGACY_QUOTA_INVARIANT_KEY = "invariant_quota_decomposition_ok"
 
 # Boolean invariants emitted by the policies after Pieces 2 and 3.
@@ -588,7 +617,99 @@ def _check_full_finetune(report: ValidationReport, instr: dict) -> None:
     if forward is not None and backward is not None and forward != backward:
         report.add(SEVERITY_ERROR, "full_finetune_forward_vs_backward", forward,
                    backward,
-                   "full_finetune must execute backward for every forward pass")
+                    "full_finetune must execute backward for every forward pass")
+
+
+def _check_phase1_3_base_identity(report: ValidationReport, data: dict,
+                                  run_config: dict) -> None:
+    control = run_config.get("control")
+    if control not in PHASE1_3_CONTROLS:
+        return
+
+    raw_identity = data.get("identity_inputs")
+    identity_inputs = raw_identity if isinstance(raw_identity, dict) else None
+    if identity_inputs is None:
+        report.add(SEVERITY_ERROR, "identity_inputs", "JSON object",
+                   raw_identity,
+                   "identity_inputs missing or malformed for canonical "
+                   "Phase 1.3 control")
+
+    raw_top_cc = data.get("controller_config")
+    top_cc = raw_top_cc if isinstance(raw_top_cc, dict) else None
+    if top_cc is None:
+        report.add(SEVERITY_ERROR, "controller_config", "JSON object",
+                   raw_top_cc,
+                   "top-level controller_config missing or malformed for "
+                   "canonical Phase 1.3 control")
+
+    raw_rc_cc = run_config.get("controller_config")
+    rc_cc = raw_rc_cc if isinstance(raw_rc_cc, dict) else None
+    if rc_cc is None:
+        report.add(SEVERITY_ERROR, "run_config.controller_config",
+                   "JSON object", raw_rc_cc,
+                   "run_config.controller_config missing or malformed for "
+                   "canonical Phase 1.3 control")
+
+    control_sources = {
+        "ablation": data.get("ablation"),
+        "run_config.control": control,
+    }
+    if identity_inputs is not None:
+        control_sources["identity_inputs.control"] = identity_inputs.get(
+            "control"
+        )
+    if top_cc is not None:
+        control_sources["controller_config.control"] = top_cc.get("control")
+        control_sources["controller_config.arm"] = top_cc.get("arm")
+    if any(value != control for value in control_sources.values()):
+        report.add(SEVERITY_ERROR, "phase1_3_control_identity", control,
+                   control_sources,
+                   "control identity disagrees across ablation, run_config, "
+                   "identity_inputs and controller_config")
+
+    if top_cc is not None:
+        alias = top_cc.get("arm_alias_of")
+        if alias is not None:
+            report.add(SEVERITY_ERROR, "controller_config.arm_alias_of", None,
+                       alias,
+                       "canonical Phase 1.3 arm must not alias another arm")
+        expected_policy_class = PHASE1_3_POLICY_CLASSES[control]
+        if top_cc.get("policy_class") != expected_policy_class:
+            report.add(SEVERITY_ERROR, "controller_config.policy_class",
+                       expected_policy_class, top_cc.get("policy_class"),
+                       f"unexpected policy_class for control '{control}'")
+        expected_skipping = control != "full_finetune"
+        if top_cc.get("is_skipping_arm") is not expected_skipping:
+            report.add(SEVERITY_ERROR, "controller_config.is_skipping_arm",
+                       expected_skipping, top_cc.get("is_skipping_arm"),
+                       "is_skipping_arm must be false only for full_finetune "
+                       "and true for every other canonical control")
+
+    if top_cc is not None and rc_cc is not None and top_cc != rc_cc:
+        report.add(SEVERITY_ERROR, "controller_config_equality",
+                   "controller_config == run_config.controller_config",
+                   {"controller_config": top_cc,
+                    "run_config.controller_config": rc_cc},
+                   "top-level controller_config is not deeply equal to "
+                   "run_config.controller_config")
+
+    fingerprint = data.get("fingerprint")
+    if not isinstance(fingerprint, str):
+        report.add(SEVERITY_ERROR, "fingerprint", "string", fingerprint,
+                   "top-level fingerprint missing or not a string")
+    if identity_inputs is not None:
+        try:
+            recomputed = build_scientific_fingerprint(identity_inputs)
+        except Exception as exc:  # noqa: BLE001
+            report.add(SEVERITY_ERROR, "fingerprint_recompute",
+                       "recomputable scientific fingerprint", repr(exc),
+                       "identity_inputs could not be fingerprinted")
+        else:
+            if isinstance(fingerprint, str) and recomputed != fingerprint:
+                report.add(SEVERITY_ERROR, "fingerprint", recomputed,
+                           fingerprint,
+                           "top-level fingerprint does not match the "
+                           "fingerprint recomputed from identity_inputs")
 
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
@@ -644,6 +765,8 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
         if raw_value is not None and not isinstance(raw_value, dict):
             report.add(SEVERITY_ERROR, field_name, "JSON object", raw_value,
                        f"{field_name} must be an object")
+
+    _check_phase1_3_base_identity(report, data, run_config)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")

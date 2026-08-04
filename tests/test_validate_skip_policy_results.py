@@ -58,8 +58,10 @@ def _run_config(
     mode="freeze",
     matched=True,
     scheduler_policy="skip_on_backward_skip",
+    control=None,
+    controller_config=None,
 ):
-    return {
+    config = {
         "policy": "random_veto_deferral",
         "target_skip_rate": RATE,
         "no_early_stopping": True,
@@ -68,6 +70,56 @@ def _run_config(
         "skip_update_mode": mode,
         "scheduler_step_policy": scheduler_policy,
     }
+    if control is not None:
+        config["control"] = control
+    if controller_config is not None:
+        config["controller_config"] = controller_config
+    return config
+
+
+def _phase1_3_identity(control, training_seed=42):
+    return {
+        "task": "mrpc",
+        "training_seed": training_seed,
+        "model_id": "modernbert",
+        "max_samples_requested": None,
+        "train_samples_realized": TOTAL,
+        "eval_samples_realized": TOTAL // 2,
+        "train_dataset_fingerprint": "abc123",
+        "eval_dataset_fingerprint": "eval_fp_abc",
+        "num_epochs": 3,
+        "control": control,
+        "target_skip_rate": RATE,
+        "policy_seed": training_seed,
+        "skip_update_mode": "freeze",
+        "scheduler_step_policy": "skip_on_backward_skip",
+        "no_early_stopping": True,
+        "total_steps": TOTAL,
+        "git_sha": "abc123",
+    }
+
+
+def _phase1_3_controller_config(control, policy_class, is_skipping_arm):
+    config = {
+        "control": control,
+        "policy_class": policy_class,
+        "is_skipping_arm": is_skipping_arm,
+        "arm": control,
+        "target_skip_rate": RATE,
+        "policy_seed": 42,
+        "min_step": 50,
+        "configured_total_steps": TOTAL,
+        "matched_budget": True,
+        "is_skipping_arm": is_skipping_arm,
+        "allow_early_stopping_with_skipping": False,
+        "early_stopping_active": False,
+        "num_epochs": 3,
+    }
+    if control == "full_finetune":
+        config["compute_saving_mechanism"] = "none"
+    else:
+        config["compute_saving_mechanism"] = "backward_skipping"
+    return config
 
 
 def random_results():
@@ -132,15 +184,25 @@ def rvd_results():
 
 def full_finetune_results():
     """Valid fixed-epoch full fine-tuning baseline with no policy diagnostics."""
+    identity = _phase1_3_identity("full_finetune")
+    controller_config = _phase1_3_controller_config(
+        "full_finetune", "AlwaysFalsePolicy", False
+    )
     return {
         "eval_metrics": {"eval_accuracy": 0.9},
         "policy_name": "always_false",
         "skip_update_mode": "freeze",
         "true_skip_instrumentation": _instrumentation(skipped=0),
         "policy_diagnostics": {},
+        "ablation": "full_finetune",
+        "identity_inputs": identity,
+        "controller_config": controller_config,
+        "fingerprint": vspr.build_scientific_fingerprint(identity),
         "run_config": {
-            **_run_config(),
-            "control": "full_finetune",
+            **_run_config(
+                control="full_finetune",
+                controller_config=controller_config,
+            ),
             "target_skip_rate": RATE,
         },
     }
