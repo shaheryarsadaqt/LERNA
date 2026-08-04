@@ -709,7 +709,239 @@ def _check_phase1_3_base_identity(report: ValidationReport, data: dict,
                 report.add(SEVERITY_ERROR, "fingerprint", recomputed,
                            fingerprint,
                            "top-level fingerprint does not match the "
-                           "fingerprint recomputed from identity_inputs")
+                            "fingerprint recomputed from identity_inputs")
+
+
+_PHASE_STRAT_CONTROLS = ("fixed_phase_strat", "phase_strat_guarded")
+
+_PHASE_STRAT_CONTROLLER_CLASSES = {
+    "fixed_phase_strat": "FixedPhaseStratifiedRandomPolicy",
+    "phase_strat_guarded": "PhaseStratifiedGuardedRandomPolicy",
+}
+
+_PHASE_STRAT_REQUIRED_FIELDS = (
+    "control",
+    "controller_class",
+    "policy_name",
+    "target_skip_rate",
+    "total_steps",
+    "min_step",
+    "policy_seed",
+    "n_phases",
+    "phase_weights",
+    "phase_bounds",
+    "phase_quota",
+    "phase_eligible",
+    "requested_quota",
+)
+
+_PHASE_STRAT_INT_FIELDS = ("total_steps", "min_step", "policy_seed",
+                           "n_phases", "requested_quota")
+
+_PHASE_STRAT_LIST_FIELDS = {
+    "phase_weights": 0,
+    "phase_bounds": 1,
+    "phase_quota": 0,
+    "phase_eligible": 0,
+}
+
+
+def _check_phase1_3_phase_controller(report: ValidationReport, data: dict,
+                                     run_config: dict) -> None:
+    """Validate phase-controller provenance for canonical Phase 1.3 arms."""
+    control = run_config.get("control")
+    if control not in PHASE1_3_CONTROLS:
+        return
+
+    raw_identity = data.get("identity_inputs")
+    identity_inputs = raw_identity if isinstance(raw_identity, dict) else None
+    raw_top_cc = data.get("controller_config")
+    top_cc = raw_top_cc if isinstance(raw_top_cc, dict) else None
+
+    sources = {
+        "identity_inputs.phase_strat_controller": (
+            identity_inputs.get("phase_strat_controller", _MISSING)
+            if identity_inputs is not None else _MISSING
+        ),
+        "controller_config.phase_strat_controller": (
+            top_cc.get("phase_strat_controller", _MISSING)
+            if top_cc is not None else _MISSING
+        ),
+        "run_config.phase_strat_controller": run_config.get(
+            "phase_strat_controller", _MISSING
+        ),
+    }
+
+    if control not in _PHASE_STRAT_CONTROLS:
+        for field_name, value in sources.items():
+            if value is not _MISSING:
+                report.add(SEVERITY_ERROR, field_name, "absent", value,
+                           "stray phase_strat_controller config on "
+                           f"non-phase control '{control}'")
+        return
+
+    configs = {}
+    missing_config = False
+    for field_name, value in sources.items():
+        if value is _MISSING or not isinstance(value, dict):
+            report.add(SEVERITY_ERROR, field_name, "JSON object",
+                       None if value is _MISSING else value,
+                       "phase_strat_controller config missing or malformed "
+                       f"for phase control '{control}'")
+            missing_config = True
+        else:
+            configs[field_name] = value
+    if missing_config:
+        return
+
+    values = list(configs.values())
+    if any(cfg != values[0] for cfg in values[1:]):
+        report.add(SEVERITY_ERROR, "phase_strat_controller_equality",
+                   "deeply equal phase_strat_controller configs",
+                   configs,
+                   "phase_strat_controller disagrees across "
+                   "identity_inputs, controller_config and run_config")
+
+    prefix = "identity_inputs.phase_strat_controller"
+    cfg = configs[prefix]
+
+    for key in _PHASE_STRAT_REQUIRED_FIELDS:
+        if key not in cfg:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}", "present", None,
+                       f"required phase controller field {key} is missing")
+
+    if "control" in cfg and cfg["control"] != control:
+        report.add(SEVERITY_ERROR, f"{prefix}.control", control,
+                   cfg["control"],
+                   "phase controller control disagrees with the "
+                   "effective control")
+    if "policy_name" in cfg and cfg["policy_name"] != control:
+        report.add(SEVERITY_ERROR, f"{prefix}.policy_name", control,
+                   cfg["policy_name"],
+                   "phase controller policy_name disagrees with the "
+                   "effective control")
+
+    expected_class = _PHASE_STRAT_CONTROLLER_CLASSES[control]
+    if ("controller_class" in cfg
+            and cfg["controller_class"] != expected_class):
+        report.add(SEVERITY_ERROR, f"{prefix}.controller_class",
+                   expected_class, cfg["controller_class"],
+                   f"unexpected phase controller class for '{control}'")
+
+    if "target_skip_rate" in cfg:
+        target_rate = _as_float(cfg["target_skip_rate"])
+        if target_rate is None:
+            report.add(SEVERITY_ERROR, f"{prefix}.target_skip_rate",
+                       "finite number", cfg["target_skip_rate"],
+                       "phase controller target_skip_rate is malformed")
+        else:
+            identity_rate = _as_float(identity_inputs.get("target_skip_rate"))
+            if identity_rate != target_rate:
+                report.add(SEVERITY_ERROR, f"{prefix}.target_skip_rate",
+                           identity_inputs.get("target_skip_rate"),
+                           target_rate,
+                           "phase controller target_skip_rate disagrees "
+                           "with identity_inputs.target_skip_rate")
+
+    parsed_ints = {}
+    for key in _PHASE_STRAT_INT_FIELDS:
+        if key not in cfg:
+            continue
+        parsed = _as_int(cfg[key])
+        if parsed is None:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       "integer (not boolean)", cfg[key],
+                       f"phase controller {key} is malformed")
+        else:
+            parsed_ints[key] = parsed
+
+    for key in ("total_steps", "policy_seed"):
+        if key not in parsed_ints:
+            continue
+        if _as_int(identity_inputs.get(key)) != parsed_ints[key]:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       identity_inputs.get(key), parsed_ints[key],
+                       f"phase controller {key} disagrees with "
+                       f"identity_inputs.{key}")
+
+    n_phases = parsed_ints.get("n_phases")
+    if n_phases is not None and n_phases < 1:
+        report.add(SEVERITY_ERROR, f"{prefix}.n_phases", ">= 1", n_phases,
+                   "phase controller must declare at least one phase")
+
+    for key, extra in _PHASE_STRAT_LIST_FIELDS.items():
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if not isinstance(value, list):
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}", "list", value,
+                       f"phase controller {key} must be a list")
+            continue
+        if (n_phases is not None and n_phases >= 1
+                and len(value) != n_phases + extra):
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       f"length {n_phases + extra}", len(value),
+                       f"phase controller {key} has the wrong length")
+        if key in ("phase_quota", "phase_eligible"):
+            for index, entry in enumerate(value):
+                parsed = _as_int(entry)
+                if parsed is None or parsed < 0:
+                    report.add(SEVERITY_ERROR, f"{prefix}.{key}[{index}]",
+                               "nonnegative integer", entry,
+                               f"phase controller {key} entry is malformed")
+        elif key == "phase_weights":
+            for index, entry in enumerate(value):
+                parsed = _as_float(entry)
+                if parsed is None or parsed < 0:
+                    report.add(SEVERITY_ERROR, f"{prefix}.{key}[{index}]",
+                               "finite nonnegative number", entry,
+                               f"phase controller {key} entry is malformed")
+
+    if control == "fixed_phase_strat":
+        for key in ("guarded_safety", "risk_gamma", "max_consecutive_skips"):
+            if key in cfg:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}", "absent",
+                           cfg[key],
+                           f"fixed_phase_strat must not carry {key}")
+        return
+
+    risk_gamma = _as_float(cfg.get("risk_gamma"))
+    if risk_gamma is None or risk_gamma < 0:
+        report.add(SEVERITY_ERROR, f"{prefix}.risk_gamma",
+                   "finite nonnegative number", cfg.get("risk_gamma"),
+                   "guarded phase controller risk_gamma is malformed")
+
+    max_skips = _as_int(cfg.get("max_consecutive_skips"))
+    if max_skips is None or max_skips < 1:
+        report.add(SEVERITY_ERROR, f"{prefix}.max_consecutive_skips",
+                   "integer >= 1", cfg.get("max_consecutive_skips"),
+                   "guarded phase controller max_consecutive_skips is "
+                   "malformed")
+
+    raw_safety = cfg.get("guarded_safety")
+    if not isinstance(raw_safety, dict):
+        report.add(SEVERITY_ERROR, f"{prefix}.guarded_safety",
+                   "JSON object", raw_safety,
+                   "guarded phase controller guarded_safety missing or "
+                   "malformed")
+        return
+
+    safety_prefix = f"{prefix}.guarded_safety"
+    for key in ("use_rho_vg", "use_safety_horizon"):
+        if not isinstance(raw_safety.get(key), bool):
+            report.add(SEVERITY_ERROR, f"{safety_prefix}.{key}", "boolean",
+                       raw_safety.get(key),
+                       f"guarded_safety {key} must be a boolean")
+    if _as_float(raw_safety.get("rho_veto_threshold")) is None:
+        report.add(SEVERITY_ERROR, f"{safety_prefix}.rho_veto_threshold",
+                   "finite number", raw_safety.get("rho_veto_threshold"),
+                   "guarded_safety rho_veto_threshold is malformed")
+    spike_factor = _as_float(raw_safety.get("spike_factor"))
+    if spike_factor is None or spike_factor < 0:
+        report.add(SEVERITY_ERROR, f"{safety_prefix}.spike_factor",
+                   "finite nonnegative number",
+                   raw_safety.get("spike_factor"),
+                   "guarded_safety spike_factor is malformed")
 
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
@@ -767,6 +999,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
                        f"{field_name} must be an object")
 
     _check_phase1_3_base_identity(report, data, run_config)
+    _check_phase1_3_phase_controller(report, data, run_config)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
