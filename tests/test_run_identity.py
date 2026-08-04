@@ -42,13 +42,6 @@ def _make_identity_inputs(**overrides):
         skip_update_mode="freeze",
         scheduler_step_policy="always_step",
         no_early_stopping=True,
-        rvd_veto_mode="margin",
-        rvd_margin_rank_floor=0.20,
-        rvd_spike_factor=1.0,
-        rvd_spike_ema_window=20,
-        rvd_repay_mode="asap",
-        rvd_repay_protect_dangerous=True,
-        max_consecutive_skips=4,
         total_steps=160,
         git_sha="abc123",
     )
@@ -72,10 +65,6 @@ def test_fingerprint_changes_when_scientific_input_differs():
 
     changed = dict(base)
     changed["target_skip_rate"] = 0.40
-    assert build_scientific_fingerprint(changed) != base_fp
-
-    changed = dict(base)
-    changed["rvd_veto_mode"] = "loss_spike"
     assert build_scientific_fingerprint(changed) != base_fp
 
     changed = dict(base)
@@ -212,11 +201,10 @@ def test_identical_scientific_inputs_never_collide():
     """Fingerprint must be collision-resistant across input combinations."""
     fps = set()
     for rate in [0.1, 0.2, 0.3, 0.4]:
-        for mode in ["none", "margin", "loss_spike"]:
-            identity = _make_identity_inputs(target_skip_rate=rate, rvd_veto_mode=mode)
-            fp = build_scientific_fingerprint(identity)
-            fps.add(fp)
-    assert len(fps) == 12
+        identity = _make_identity_inputs(target_skip_rate=rate)
+        fp = build_scientific_fingerprint(identity)
+        fps.add(fp)
+    assert len(fps) == 4
 
 
 def test_horizon_matches_authoritative_calculation():
@@ -354,3 +342,122 @@ def test_piece8b_mrpc_horizon_unchanged():
     fp = build_scientific_fingerprint(identity)
     assert fp is not None
     assert len(fp) == 16
+
+
+# ---------------------------------------------------------------------------
+# #5B: RVD settings and max_consecutive_skips must not affect non-consuming
+# fingerprints. Controller-specific settings live in controller configs.
+# ---------------------------------------------------------------------------
+
+def test_rvd_settings_do_not_affect_non_rvd_fingerprints():
+    """Changing RVD settings must not affect non-RVD fingerprints."""
+    base = _make_identity_inputs(control="exact_random")
+    base_fp = build_scientific_fingerprint(base)
+
+    # RVD settings are not part of the universal schema; adding them to a
+    # non-RVD identity must not change the fingerprint.
+    changed = dict(base)
+    changed["rvd_veto_mode"] = "loss_spike"
+    changed["rvd_margin_rank_floor"] = 0.5
+    changed["rvd_spike_factor"] = 2.0
+    changed["rvd_spike_ema_window"] = 50
+    changed["rvd_repay_mode"] = "spread"
+    changed["rvd_repay_protect_dangerous"] = False
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_max_consecutive_skips_does_not_affect_full_finetune():
+    """Changing max_consecutive_skips must not affect full_finetune fingerprints."""
+    base = _make_identity_inputs(control="full_finetune")
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["max_consecutive_skips"] = 8
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_max_consecutive_skips_does_not_affect_exact_random():
+    """Changing max_consecutive_skips must not affect exact_random fingerprints."""
+    base = _make_identity_inputs(control="exact_random")
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["max_consecutive_skips"] = 8
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_max_consecutive_skips_does_not_affect_fixed_phase_strat():
+    """Changing max_consecutive_skips must not affect fixed_phase_strat fingerprints."""
+    base = _make_identity_inputs(control="fixed_phase_strat")
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["max_consecutive_skips"] = 8
+    assert build_scientific_fingerprint(changed) == base_fp
+
+
+def test_active_controller_changes_affect_fingerprint():
+    """Active controller changes must affect the applicable controller's fingerprint."""
+    base = _make_identity_inputs(control="phase_strat_guarded")
+    base["phase_strat_controller"] = {
+        "control": "phase_strat_guarded",
+        "max_consecutive_skips": 4,
+        "risk_gamma": 0.0,
+    }
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["phase_strat_controller"] = dict(base["phase_strat_controller"])
+    changed["phase_strat_controller"]["max_consecutive_skips"] = 8
+    assert build_scientific_fingerprint(changed) != base_fp
+
+
+def test_eval_dataset_changes_affect_fingerprint():
+    """Evaluation-dataset changes must affect fingerprints."""
+    base = _make_identity_inputs()
+    base_fp = build_scientific_fingerprint(base)
+
+    changed = dict(base)
+    changed["eval_dataset_fingerprint"] = "different_eval_fp"
+    assert build_scientific_fingerprint(changed) != base_fp
+
+    changed = dict(base)
+    changed["eval_samples_realized"] = 500
+    assert build_scientific_fingerprint(changed) != base_fp
+
+
+def test_alias_equivalent_configs_produce_identical_fingerprints():
+    """Alias-equivalent effective configurations must produce identical fingerprints."""
+    exact = _make_identity_inputs(control="exact_random")
+    alias = _make_identity_inputs(control="random_skip")
+    assert build_scientific_fingerprint(exact) == build_scientific_fingerprint(alias)
+
+class _FakeTracker:
+    """Minimal tracker satisfying LERNAQuotaHybridPolicy.get_diagnostics()."""
+
+    def get_diagnostics(self):
+        return {"ler_raw": None, "ler": None, "rho_vg_raw": 1.0, "rho_vg": 1.0}
+
+
+def test_quota_hybrid_constructs_with_recalibrate_every():
+    """quota_hybrid must construct successfully with recalibrate_every=200."""
+    from lerna.trainers.policies import LERNAQuotaHybridPolicy
+
+    policy = LERNAQuotaHybridPolicy(
+        ler_tracker=_FakeTracker(),
+        target_skip_rate=0.20,
+        fallback_threshold=0.01,
+        min_step=50,
+        calibration_steps=60,
+        recalibrate_every=200,
+        use_ler=True,
+        use_rho_vg=True,
+        use_safety_horizon=True,
+        max_consecutive_skips=4,
+        probe_interval=8,
+        total_steps=160,
+        rho_veto_threshold=-0.2,
+    )
+    assert policy.name == "lerna_quota_hybrid"
+    assert policy.target_skip_rate == 0.20
+    assert policy.max_consecutive_skips == 4

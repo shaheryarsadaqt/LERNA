@@ -238,13 +238,6 @@ def build_identity_inputs(
     policy_seed: int,
     skip_update_mode: str,
     no_early_stopping: bool,
-    rvd_veto_mode: str,
-    rvd_margin_rank_floor: float,
-    rvd_spike_factor: float,
-    rvd_spike_ema_window: int,
-    rvd_repay_mode: str,
-    rvd_repay_protect_dangerous: bool,
-    max_consecutive_skips: int,
     total_steps: int,
     git_sha: str,
     scheduler_step_policy: str = "skip_on_backward_skip",
@@ -254,6 +247,10 @@ def build_identity_inputs(
     None serializes deterministically as JSON null, truthfully representing
     an unlimited requested cap. Realized dataset size and the Hugging Face
     dataset fingerprint identify the actual data used.
+
+    Controller-specific settings (RVD configuration, max_consecutive_skips,
+    etc.) are represented only in their controller configuration
+    sub-dictionaries, which callers attach after this function returns.
     """
     return {
         "task": str(task),
@@ -271,16 +268,87 @@ def build_identity_inputs(
         "skip_update_mode": str(skip_update_mode),
         "scheduler_step_policy": str(scheduler_step_policy),
         "no_early_stopping": bool(no_early_stopping),
-        "rvd_veto_mode": str(rvd_veto_mode),
-        "rvd_margin_rank_floor": float(rvd_margin_rank_floor),
-        "rvd_spike_factor": float(rvd_spike_factor),
-        "rvd_spike_ema_window": int(rvd_spike_ema_window),
-        "rvd_repay_mode": str(rvd_repay_mode),
-        "rvd_repay_protect_dangerous": bool(rvd_repay_protect_dangerous),
-        "max_consecutive_skips": int(max_consecutive_skips),
         "total_steps": int(total_steps),
         "git_sha": str(git_sha),
     }
+
+
+_BASE_IDENTITY_KEYS = frozenset(
+    {
+        "task",
+        "training_seed",
+        "model_id",
+        "max_samples_requested",
+        "train_samples_realized",
+        "eval_samples_realized",
+        "train_dataset_fingerprint",
+        "eval_dataset_fingerprint",
+        "num_epochs",
+        "control",
+        "target_skip_rate",
+        "policy_seed",
+        "skip_update_mode",
+        "scheduler_step_policy",
+        "no_early_stopping",
+        "total_steps",
+        "git_sha",
+    }
+)
+
+_CONTROLLER_CONFIG_SUBDICTS = frozenset(
+    {
+        "online_diagnostics",
+        "rvd",
+        "ler_guided_controller",
+        "phase_strat_controller",
+    }
+)
+
+_MAX_CONSECUTIVE_SKIPS_APPLICABLE = frozenset(
+    {
+        "grad_norm",
+        "quota_hybrid",
+        "guarded_hybrid",
+        "phase_strat",
+        "phase_strat_guarded",
+    }
+)
+
+
+def _canonicalize_identity_inputs(identity_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip controller-specific keys that do not apply to the effective control.
+
+    The canonical identity contains only the universal base fields plus
+    controller configuration sub-dictionaries.  Stray top-level controller
+    keys (for example, ``rvd_veto_mode`` on a non-RVD run) are dropped so
+    they cannot corrupt fingerprints.
+    """
+    control = identity_inputs.get("control")
+    if control == "random_skip":
+        control = "exact_random"
+
+    canonical: Dict[str, Any] = {}
+    has_phase_strat_controller = "phase_strat_controller" in identity_inputs
+
+    for key, value in identity_inputs.items():
+        if key in _BASE_IDENTITY_KEYS:
+            if key == "control":
+                canonical[key] = control
+            else:
+                canonical[key] = value
+        elif key in _CONTROLLER_CONFIG_SUBDICTS:
+            canonical[key] = value
+        elif key == "max_consecutive_skips":
+            if control == "grad_norm":
+                canonical[key] = value
+            elif control in _MAX_CONSECUTIVE_SKIPS_APPLICABLE:
+                if control == "phase_strat_guarded" and has_phase_strat_controller:
+                    continue
+                canonical[key] = value
+        elif key.startswith("rvd_") and control != "rvd":
+            continue
+
+    return canonical
 
 
 def build_scientific_fingerprint(identity_inputs: Dict[str, Any]) -> str:
@@ -292,10 +360,12 @@ def build_scientific_fingerprint(identity_inputs: Dict[str, Any]) -> str:
 
     Args:
         identity_inputs: Canonical identity dictionary produced by
-            ``build_identity_inputs()``.
+            ``build_identity_inputs()``, optionally extended with controller
+            configuration sub-dictionaries.
     """
-    canonical = json.dumps(identity_inputs, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    canonical = _canonicalize_identity_inputs(identity_inputs)
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 def _validation_summary(status: Dict[str, Any]) -> Dict[str, Any]:

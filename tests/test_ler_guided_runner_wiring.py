@@ -438,8 +438,10 @@ def test_phase_strat_controller_config_has_required_keys():
     assert "phase_bounds" in config
     assert "phase_quota" in config
     assert "phase_eligible" in config
-    assert "max_consecutive_skips" in config
-    assert "risk_gamma" in config
+    # fixed_phase_strat does not consume max_consecutive_skips or risk_gamma;
+    # they must not appear in its provenance config.
+    assert "max_consecutive_skips" not in config
+    assert "risk_gamma" not in config
 
 
 def test_phase_strat_controller_config_guarded_has_safety():

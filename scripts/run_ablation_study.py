@@ -410,11 +410,13 @@ def build_phase_strat_controller_config(
         "phase_bounds": phase_bounds,
         "phase_quota": phase_quota,
         "phase_eligible": phase_eligible,
-        "max_consecutive_skips": max_consecutive_skips,
         "requested_quota": requested_quota,
-        "risk_gamma": float(risk_gamma),
     }
     if guarded:
+        # phase_strat_guarded consumes max_consecutive_skips and risk_gamma;
+        # fixed_phase_strat does not (its policy uses hardcoded defaults).
+        config["max_consecutive_skips"] = max_consecutive_skips
+        config["risk_gamma"] = float(risk_gamma)
         config.update(
             {
                 "guarded_safety": {
@@ -1254,13 +1256,6 @@ def run_ablation_single(
         skip_update_mode=effective_skip_update_mode,
         scheduler_step_policy=scheduler_step_policy,
         no_early_stopping=no_early_stopping,
-        rvd_veto_mode=rvd_veto_mode,
-        rvd_margin_rank_floor=rvd_margin_rank_floor,
-        rvd_spike_factor=rvd_spike_factor,
-        rvd_spike_ema_window=rvd_spike_ema_window,
-        rvd_repay_mode=rvd_repay_mode,
-        rvd_repay_protect_dangerous=rvd_repay_protect_dangerous,
-        max_consecutive_skips=max_consecutive_skips,
         total_steps=total_steps,
         git_sha=git_sha,
     )
@@ -1268,6 +1263,22 @@ def run_ablation_single(
         identity_inputs,
         online_diagnostics,
     )
+    # RVD configuration is included only when the effective control is rvd
+    # or the legacy policy is random_veto_deferral (which resolves to rvd).
+    if effective_control == "rvd" or (
+        effective_control is None and policy == "random_veto_deferral"
+    ):
+        identity_inputs["rvd"] = dict(controller_cfg)
+    # max_consecutive_skips is represented only in controller configurations
+    # where it changes behavior. grad_norm consumes it but has no dedicated
+    # controller config, so it is recorded here.
+    if effective_control == "grad_norm":
+        identity_inputs["max_consecutive_skips"] = int(max_consecutive_skips)
+    # Legacy policies that consume max_consecutive_skips.
+    if effective_control is None and policy in (
+        "quota_hybrid", "guarded_hybrid", "phase_strat", "phase_strat_guarded"
+    ):
+        identity_inputs["max_consecutive_skips"] = int(max_consecutive_skips)
     if effective_control in LER_GUIDED_CONTROLS:
         ler_guided_controller_config = build_ler_guided_controller_config(
             control=effective_control,
