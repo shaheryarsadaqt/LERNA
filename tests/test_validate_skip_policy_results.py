@@ -124,6 +124,37 @@ def _phase1_3_controller_config(control, policy_class, is_skipping_arm):
     return config
 
 
+def _phase1_3_online_diagnostics(control):
+    config = {
+        "requested_mode": "off",
+        "mode": "off",
+        "enabled": False,
+        "timing": "none",
+        "parameter_sample_size": 0,
+        "update_interval": 0,
+        "reason": "control does not use online LER",
+        "sample_seed": None,
+    }
+    runtime = {
+        "requested_mode": "off",
+        "mode": "off",
+        "enabled": False,
+        "timing": "none",
+        "parameter_sample_size": 0,
+        "update_interval": 0,
+        "reason": "control does not use online LER",
+        "sample_seed": None,
+        "parameter_sample_size_realized": 0,
+        "update_attempts": 0,
+        "update_successes": 0,
+        "n_updates": 0,
+        "n_decisions": 0,
+        "last_update_decision": None,
+        "observation_age_decisions": None,
+    }
+    return config, runtime
+
+
 def random_results():
     """Valid completed exact-random run."""
     return {
@@ -190,6 +221,8 @@ def full_finetune_results():
     controller_config = _phase1_3_controller_config(
         "full_finetune", "AlwaysFalsePolicy", False
     )
+    online_cfg, online_rt = _phase1_3_online_diagnostics("full_finetune")
+    identity_inputs = {**identity, "online_diagnostics": online_cfg}
     return {
         "eval_metrics": {"eval_accuracy": 0.9},
         "policy_name": "always_false",
@@ -197,15 +230,23 @@ def full_finetune_results():
         "true_skip_instrumentation": _instrumentation(skipped=0),
         "policy_diagnostics": {},
         "ablation": "full_finetune",
-        "identity_inputs": identity,
-        "controller_config": controller_config,
-        "fingerprint": vspr.build_scientific_fingerprint(identity),
+        "identity_inputs": identity_inputs,
+        "controller_config": {
+            **controller_config,
+            "online_diagnostics": online_cfg,
+        },
+        "online_diagnostics": online_rt,
+        "fingerprint": vspr.build_scientific_fingerprint(identity_inputs),
         "run_config": {
             **_run_config(
                 control="full_finetune",
-                controller_config=controller_config,
+                controller_config={
+                    **controller_config,
+                    "online_diagnostics": online_cfg,
+                },
             ),
             "target_skip_rate": RATE,
+            "online_diagnostics": online_cfg,
         },
     }
 
