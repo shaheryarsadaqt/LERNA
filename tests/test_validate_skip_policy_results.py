@@ -1487,3 +1487,445 @@ def test_stray_ler_config_fails_validate_results(tmp_path):
     assert any(
         "ler_guided_controller" in field for field in error_fields
     ), error_fields
+
+
+OD_CONTROLS = (
+    "full_finetune",
+    "exact_random",
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+)
+OD_OFF_CONTROLS = OD_CONTROLS[:3]
+OD_SAMPLED_CONTROLS = OD_CONTROLS[3:]
+OD_CONFIG_FIELDS = (
+    "requested_mode",
+    "mode",
+    "enabled",
+    "timing",
+    "parameter_sample_size",
+    "update_interval",
+    "reason",
+    "sample_seed",
+)
+OD_RUNTIME_ONLY_FIELDS = (
+    "parameter_sample_size_realized",
+    "update_attempts",
+    "update_successes",
+    "n_updates",
+    "n_decisions",
+    "last_update_decision",
+    "observation_age_decisions",
+)
+OD_RUNTIME_FIELDS = OD_CONFIG_FIELDS + OD_RUNTIME_ONLY_FIELDS
+OD_COUNTER_FIELDS = (
+    "parameter_sample_size_realized",
+    "update_attempts",
+    "update_successes",
+    "n_updates",
+    "n_decisions",
+)
+OD_OPTIONAL_RUNTIME_FIELDS = (
+    "last_update_decision",
+    "observation_age_decisions",
+)
+
+
+def _online_diagnostics_payload(control):
+    """Valid online-diagnostics config and runtime payloads for any arm."""
+    if control in OD_OFF_CONTROLS:
+        config = {
+            "requested_mode": "auto",
+            "mode": "off",
+            "enabled": False,
+            "timing": "none",
+            "parameter_sample_size": 0,
+            "update_interval": 0,
+            "reason": "arm does not use online LER diagnostics",
+            "sample_seed": None,
+        }
+        runtime = {
+            **config,
+            "parameter_sample_size_realized": 0,
+            "update_attempts": 0,
+            "update_successes": 0,
+            "n_updates": 0,
+            "n_decisions": 0,
+            "last_update_decision": None,
+            "observation_age_decisions": None,
+        }
+    else:
+        config = {
+            "requested_mode": "auto",
+            "mode": "sampled_lagged",
+            "enabled": True,
+            "timing": "post_decision_after_backward",
+            "parameter_sample_size": 4096,
+            "update_interval": 1,
+            "reason": "arm uses online LER diagnostics",
+            "sample_seed": 42,
+        }
+        runtime = {
+            **config,
+            "parameter_sample_size_realized": 4096,
+            "update_attempts": 150,
+            "update_successes": 150,
+            "n_updates": 150,
+            "n_decisions": 150,
+            "last_update_decision": 149,
+            "observation_age_decisions": 1,
+        }
+    return config, runtime
+
+
+def _online_diag_inputs(control="full_finetune"):
+    report, data, run_config = _phase1_3_base_inputs(control)
+    config, runtime = _online_diagnostics_payload(control)
+    data["identity_inputs"]["online_diagnostics"] = json.loads(
+        json.dumps(config)
+    )
+    data["fingerprint"] = vspr.build_scientific_fingerprint(
+        data["identity_inputs"]
+    )
+    data["controller_config"]["online_diagnostics"] = json.loads(
+        json.dumps(config)
+    )
+    run_config["controller_config"]["online_diagnostics"] = json.loads(
+        json.dumps(config)
+    )
+    run_config["online_diagnostics"] = json.loads(json.dumps(config))
+    data["online_diagnostics"] = json.loads(json.dumps(runtime))
+    return report, data, run_config
+
+
+def _online_diag_copies(data, run_config):
+    return [
+        data["identity_inputs"]["online_diagnostics"],
+        data["controller_config"]["online_diagnostics"],
+        run_config["controller_config"]["online_diagnostics"],
+        run_config["online_diagnostics"],
+    ]
+
+
+def _set_online_diag_everywhere(data, run_config, key, value):
+    for entry in _online_diag_copies(data, run_config):
+        entry[key] = value
+    data["online_diagnostics"][key] = value
+
+
+@pytest.mark.parametrize("control", OD_CONTROLS)
+def test_online_diagnostics_valid_payloads_have_no_errors(control):
+    report, data, run_config = _online_diag_inputs(control)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+def test_online_diagnostics_sampled_zero_activity_is_valid():
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    runtime = data["online_diagnostics"]
+    runtime["update_attempts"] = 0
+    runtime["update_successes"] = 0
+    runtime["n_updates"] = 0
+    runtime["n_decisions"] = 0
+    runtime["last_update_decision"] = None
+    runtime["observation_age_decisions"] = None
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (
+            lambda d, rc: d["identity_inputs"].pop("online_diagnostics"),
+            "identity_inputs.online_diagnostics",
+        ),
+        (
+            lambda d, rc: d["identity_inputs"].__setitem__(
+                "online_diagnostics", 7
+            ),
+            "identity_inputs.online_diagnostics",
+        ),
+        (
+            lambda d, rc: d["controller_config"].pop("online_diagnostics"),
+            "controller_config.online_diagnostics",
+        ),
+        (
+            lambda d, rc: d["controller_config"].__setitem__(
+                "online_diagnostics", "bad"
+            ),
+            "controller_config.online_diagnostics",
+        ),
+        (
+            lambda d, rc: rc.pop("online_diagnostics"),
+            "run_config.online_diagnostics",
+        ),
+        (
+            lambda d, rc: rc.__setitem__("online_diagnostics", []),
+            "run_config.online_diagnostics",
+        ),
+    ],
+)
+def test_online_diagnostics_missing_or_malformed_sources(mutate, field):
+    report, data, run_config = _online_diag_inputs()
+    mutate(data, run_config)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.pop("online_diagnostics"),
+        lambda d: d.__setitem__("online_diagnostics", 7),
+    ],
+)
+def test_online_diagnostics_missing_or_malformed_runtime(mutate):
+    report, data, run_config = _online_diag_inputs()
+    mutate(data)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics" in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("reason", "a different reason"),
+        ("update_interval", 0.0),
+        ("enabled", 0),
+    ],
+)
+def test_online_diagnostics_copies_must_match(key, value):
+    report, data, run_config = _online_diag_inputs()
+    run_config["online_diagnostics"][key] = value
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics_config_equality" in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_CONFIG_FIELDS)
+def test_online_diagnostics_missing_config_field_is_rejected(key):
+    report, data, run_config = _online_diag_inputs()
+    for entry in _online_diag_copies(data, run_config):
+        entry.pop(key)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics." + key
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("key", ("requested_mode", "reason"))
+@pytest.mark.parametrize("value", ("", 7))
+def test_online_diagnostics_string_config_fields_are_validated(key, value):
+    report, data, run_config = _online_diag_inputs()
+    _set_online_diag_everywhere(data, run_config, key, value)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics." + key
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("control", OD_CONTROLS)
+@pytest.mark.parametrize(
+    "key, off_value, sampled_value",
+    [
+        ("mode", "sampled_lagged", "off"),
+        ("enabled", True, False),
+        ("enabled", "yes", 1),
+        ("timing", "post_decision_after_backward", "none"),
+    ],
+)
+def test_online_diagnostics_arm_config_values_are_validated(
+    control, key, off_value, sampled_value
+):
+    report, data, run_config = _online_diag_inputs(control)
+    value = off_value if control in OD_OFF_CONTROLS else sampled_value
+    _set_online_diag_everywhere(data, run_config, key, value)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics." + key
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("key", ("parameter_sample_size", "update_interval"))
+@pytest.mark.parametrize(
+    "control, value",
+    [
+        ("full_finetune", "0"),
+        ("full_finetune", True),
+        ("full_finetune", 0.0),
+        ("full_finetune", 0.5),
+        ("full_finetune", 1),
+        ("full_finetune", -1),
+        ("ler_guided_stratified", "1"),
+        ("ler_guided_stratified", True),
+        ("ler_guided_stratified", 1.0),
+        ("ler_guided_stratified", 1.5),
+        ("ler_guided_stratified", 0),
+        ("ler_guided_stratified", -1),
+    ],
+)
+def test_online_diagnostics_integer_config_fields_are_validated(
+    key, control, value
+):
+    report, data, run_config = _online_diag_inputs(control)
+    _set_online_diag_everywhere(data, run_config, key, value)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics." + key
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("value", (0, 42, "42", True, False, 42.0, 42.5))
+def test_online_diagnostics_off_sample_seed_must_be_none(value):
+    report, data, run_config = _online_diag_inputs("full_finetune")
+    _set_online_diag_everywhere(data, run_config, "sample_seed", value)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics.sample_seed"
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("value", (None, "42", True, False, 42.0, 42.5))
+def test_online_diagnostics_sampled_sample_seed_is_validated(value):
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    _set_online_diag_everywhere(data, run_config, "sample_seed", value)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert (
+        "identity_inputs.online_diagnostics.sample_seed"
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("key", OD_RUNTIME_FIELDS)
+def test_online_diagnostics_missing_runtime_field_is_rejected(key):
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    data["online_diagnostics"].pop(key)
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize(
+    "control, key, value",
+    [
+        ("full_finetune", "requested_mode", "manual"),
+        ("full_finetune", "mode", "sampled_lagged"),
+        ("full_finetune", "enabled", 0),
+        ("full_finetune", "timing", "post_decision_after_backward"),
+        ("full_finetune", "parameter_sample_size", 0.0),
+        ("full_finetune", "update_interval", 0.0),
+        ("full_finetune", "reason", "a different reason"),
+        ("ler_guided_stratified", "enabled", 1),
+        ("ler_guided_stratified", "parameter_sample_size", 4096.0),
+        ("ler_guided_stratified", "update_interval", True),
+        ("ler_guided_stratified", "sample_seed", 42.0),
+        ("ler_guided_stratified", "sample_seed", 43),
+    ],
+)
+def test_online_diagnostics_runtime_must_copy_config(control, key, value):
+    report, data, run_config = _online_diag_inputs(control)
+    data["online_diagnostics"][key] = value
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_COUNTER_FIELDS)
+@pytest.mark.parametrize("value", (-1, "1", True, 1.0, 1.5))
+def test_online_diagnostics_runtime_counters_are_validated(key, value):
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    data["online_diagnostics"][key] = value
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_OPTIONAL_RUNTIME_FIELDS)
+@pytest.mark.parametrize("value", (None, 0, 7))
+def test_online_diagnostics_optional_fields_accept_valid_values(key, value):
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    data["online_diagnostics"][key] = value
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key not in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_OPTIONAL_RUNTIME_FIELDS)
+@pytest.mark.parametrize("value", (-1, "0", True, 1.0, 1.5))
+def test_online_diagnostics_optional_fields_reject_invalid_values(key, value):
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    data["online_diagnostics"][key] = value
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_COUNTER_FIELDS)
+def test_online_diagnostics_off_counters_must_be_zero(key):
+    report, data, run_config = _online_diag_inputs("full_finetune")
+    data["online_diagnostics"][key] = 1
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", OD_OPTIONAL_RUNTIME_FIELDS)
+def test_online_diagnostics_off_optional_fields_must_be_none(key):
+    report, data, run_config = _online_diag_inputs("full_finetune")
+    data["online_diagnostics"][key] = 0
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics." + key in fields(report, "error")
+
+
+def test_online_diagnostics_successes_cannot_exceed_attempts():
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    runtime = data["online_diagnostics"]
+    runtime["update_attempts"] = 10
+    runtime["update_successes"] = 11
+    runtime["n_updates"] = 11
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics.update_successes" in fields(report, "error")
+
+
+def test_online_diagnostics_n_updates_must_equal_successes():
+    report, data, run_config = _online_diag_inputs("ler_guided_stratified")
+    runtime = data["online_diagnostics"]
+    runtime["update_attempts"] = 150
+    runtime["update_successes"] = 150
+    runtime["n_updates"] = 149
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert "online_diagnostics.n_updates" in fields(report, "error")
+
+
+def test_online_diagnostics_noncanonical_control_returns_without_findings():
+    report, data, run_config = _online_diag_inputs("full_finetune")
+    for key in ("control", "arm"):
+        data["controller_config"][key] = "random_veto_deferral"
+        run_config["controller_config"][key] = "random_veto_deferral"
+    data["ablation"] = "random_veto_deferral"
+    run_config["control"] = "random_veto_deferral"
+    data["identity_inputs"]["control"] = "random_veto_deferral"
+    data["fingerprint"] = vspr.build_scientific_fingerprint(
+        data["identity_inputs"]
+    )
+    data["online_diagnostics"]["update_attempts"] = 1
+    vspr._check_phase1_3_online_diagnostics(report, data, run_config)
+    assert not report.findings
+
+
+def test_online_diagnostics_valid_full_finetune_passes_validate_results(
+    tmp_path,
+):
+    report = vspr.validate_results(
+        write_results(tmp_path, full_finetune_results())
+    )
+    assert report.ok, [f.to_dict() for f in report.errors]
+
+
+def test_online_diagnostics_nonzero_attempts_fails_validate_results(tmp_path):
+    data = full_finetune_results()
+    assert data["online_diagnostics"]["update_attempts"] == 0
+    data["online_diagnostics"]["update_attempts"] = 1
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    assert "online_diagnostics.update_attempts" in fields(report, "error")
