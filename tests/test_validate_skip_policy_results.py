@@ -1056,3 +1056,393 @@ def test_phase1_3_tampered_fingerprint_fails_validate_results(tmp_path):
     report = vspr.validate_results(write_results(tmp_path, data))
     assert not report.ok
     assert "fingerprint" in fields(report, "error")
+
+
+LER_CONTROLS = ("ler_guided_stratified", "ler_guided_stratified_safe")
+LER_SAFE_CONTROL = "ler_guided_stratified_safe"
+NON_LER_CONTROLS = (
+    "full_finetune",
+    "exact_random",
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+)
+LER_COMMON_FIELDS = (
+    "control",
+    "policy_class",
+    "policy_name",
+    "target_skip_rate",
+    "total_steps",
+    "min_step",
+    "policy_seed",
+    "n_phases",
+    "phase_weights",
+    "max_consecutive_skips",
+    "probe_interval",
+    "min_ler_observations",
+    "ler_guidance_strength",
+    "required_tracker_mode",
+    "required_tracker_timing",
+    "safety_enabled",
+)
+LER_SAFE_ONLY_FIELDS = (
+    "use_rho_vg_safety",
+    "rho_veto_threshold",
+    "use_loss_spike_safety",
+    "loss_spike_factor",
+    "loss_spike_window",
+)
+
+
+def _ler_guided_controller(control):
+    """Valid synthetic ler_guided_controller payload for a LER arm."""
+    config = {
+        "control": control,
+        "policy_class": vspr.PHASE1_3_POLICY_CLASSES[control],
+        "policy_name": control,
+        "target_skip_rate": RATE,
+        "total_steps": TOTAL,
+        "min_step": 50,
+        "policy_seed": 42,
+        "n_phases": N_PHASES,
+        "phase_weights": list(PHASE_WEIGHTS),
+        "max_consecutive_skips": 3,
+        "probe_interval": 10,
+        "min_ler_observations": 5,
+        "ler_guidance_strength": 0.5,
+        "required_tracker_mode": "sampled_lagged",
+        "required_tracker_timing": "post_decision_after_backward",
+        "safety_enabled": control == LER_SAFE_CONTROL,
+    }
+    if control == LER_SAFE_CONTROL:
+        config["use_rho_vg_safety"] = True
+        config["rho_veto_threshold"] = -0.2
+        config["use_loss_spike_safety"] = True
+        config["loss_spike_factor"] = 3.0
+        config["loss_spike_window"] = 10
+    return config
+
+
+def _ler_controller_inputs(control="ler_guided_stratified"):
+    identity = _phase1_3_identity(control)
+    identity["ler_guided_controller"] = _ler_guided_controller(control)
+    controller_config = _phase1_3_controller_config(
+        control,
+        vspr.PHASE1_3_POLICY_CLASSES[control],
+        True,
+    )
+    controller_config["ler_guided_controller"] = _ler_guided_controller(
+        control
+    )
+    data = {
+        "ablation": control,
+        "identity_inputs": identity,
+        "controller_config": controller_config,
+        "fingerprint": vspr.build_scientific_fingerprint(identity),
+    }
+    run_config = _run_config(
+        control=control,
+        controller_config=json.loads(json.dumps(controller_config)),
+    )
+    run_config["ler_guided_controller"] = _ler_guided_controller(control)
+    report = vspr.ValidationReport(path="synthetic")
+    return report, data, run_config
+
+
+def _ler_copies(data, run_config):
+    return [
+        data["identity_inputs"]["ler_guided_controller"],
+        data["controller_config"]["ler_guided_controller"],
+        run_config["controller_config"]["ler_guided_controller"],
+        run_config["ler_guided_controller"],
+    ]
+
+
+def _attach_stray_ler_config(data, run_config):
+    stray = _ler_guided_controller("ler_guided_stratified")
+    data["identity_inputs"]["ler_guided_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    data["fingerprint"] = vspr.build_scientific_fingerprint(
+        data["identity_inputs"]
+    )
+    data["controller_config"]["ler_guided_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    run_config["controller_config"]["ler_guided_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    run_config["ler_guided_controller"] = json.loads(json.dumps(stray))
+
+
+def _assert_ler_field_error(report, key):
+    target = "ler_guided_controller." + key
+    error_fields = fields(report, "error")
+    assert any(target in f for f in error_fields), (target, error_fields)
+
+
+@pytest.mark.parametrize("control", LER_CONTROLS)
+def test_ler_controller_valid_configs_have_no_errors(control):
+    report, data, run_config = _ler_controller_inputs(control)
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (
+            lambda d, rc: d["identity_inputs"].pop("ler_guided_controller"),
+            "identity_inputs.ler_guided_controller",
+        ),
+        (
+            lambda d, rc: d["identity_inputs"].__setitem__(
+                "ler_guided_controller", 7
+            ),
+            "identity_inputs.ler_guided_controller",
+        ),
+        (
+            lambda d, rc: d["controller_config"].pop(
+                "ler_guided_controller"
+            ),
+            "controller_config.ler_guided_controller",
+        ),
+        (
+            lambda d, rc: d["controller_config"].__setitem__(
+                "ler_guided_controller", "bad"
+            ),
+            "controller_config.ler_guided_controller",
+        ),
+        (
+            lambda d, rc: rc.pop("ler_guided_controller"),
+            "run_config.ler_guided_controller",
+        ),
+        (
+            lambda d, rc: rc.__setitem__("ler_guided_controller", []),
+            "run_config.ler_guided_controller",
+        ),
+    ],
+)
+def test_ler_controller_missing_or_malformed_sources(mutate, field):
+    report, data, run_config = _ler_controller_inputs()
+    mutate(data, run_config)
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    assert field in fields(report, "error")
+
+
+def test_ler_controller_copies_must_match():
+    report, data, run_config = _ler_controller_inputs()
+    run_config["ler_guided_controller"]["probe_interval"] = 11
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    assert "ler_guided_controller_equality" in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", LER_COMMON_FIELDS)
+def test_ler_controller_missing_common_field_is_rejected(key):
+    report, data, run_config = _ler_controller_inputs()
+    for entry in _ler_copies(data, run_config):
+        entry.pop(key)
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("control", "full_finetune"),
+        ("policy_name", "wrong_policy"),
+        ("policy_class", "WrongPolicy"),
+    ],
+)
+def test_ler_controller_wrong_identity_strings(key, value):
+    report, data, run_config = _ler_controller_inputs()
+    for entry in _ler_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("target_skip_rate", RATE + 0.05),
+        ("total_steps", TOTAL + 1),
+        ("policy_seed", 43),
+    ],
+)
+def test_ler_controller_identity_disagreement(key, value):
+    report, data, run_config = _ler_controller_inputs()
+    for entry in _ler_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("total_steps", "100"),
+        ("total_steps", True),
+        ("total_steps", 100.5),
+        ("total_steps", 0),
+        ("min_step", "50"),
+        ("min_step", True),
+        ("min_step", 50.5),
+        ("min_step", -1),
+        ("policy_seed", "42"),
+        ("policy_seed", True),
+        ("policy_seed", 42.5),
+        ("n_phases", "4"),
+        ("n_phases", True),
+        ("n_phases", 4.5),
+        ("n_phases", 0),
+        ("max_consecutive_skips", "3"),
+        ("max_consecutive_skips", True),
+        ("max_consecutive_skips", 2.5),
+        ("max_consecutive_skips", 0),
+        ("probe_interval", "10"),
+        ("probe_interval", True),
+        ("probe_interval", 10.5),
+        ("probe_interval", 0),
+        ("min_ler_observations", "5"),
+        ("min_ler_observations", True),
+        ("min_ler_observations", 5.5),
+        ("min_ler_observations", 0),
+    ],
+)
+def test_ler_controller_integer_fields_are_validated(key, value):
+    report, data, run_config = _ler_controller_inputs()
+    if key in {"total_steps", "policy_seed"}:
+        data["identity_inputs"][key] = value
+    for entry in _ler_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        7,
+        [0.5, 0.5],
+        [0.25, 0.25, 0.25, -0.25],
+        [0.25, 0.25, 0.25, float("nan")],
+        [0.25, 0.25, 0.25, float("inf")],
+    ],
+)
+def test_ler_controller_phase_weights_are_validated(value):
+    report, data, run_config = _ler_controller_inputs()
+    for entry in _ler_copies(data, run_config):
+        entry["phase_weights"] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, "phase_weights")
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("ler_guidance_strength", "high"),
+        ("ler_guidance_strength", -0.5),
+        ("ler_guidance_strength", float("nan")),
+        ("ler_guidance_strength", float("inf")),
+        ("required_tracker_mode", "dense_immediate"),
+        ("required_tracker_mode", 7),
+        ("required_tracker_timing", "pre_decision_before_backward"),
+        ("required_tracker_timing", None),
+    ],
+)
+def test_ler_controller_guidance_and_tracker_are_validated(key, value):
+    report, data, run_config = _ler_controller_inputs()
+    for entry in _ler_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "control, value",
+    [
+        ("ler_guided_stratified", "no"),
+        ("ler_guided_stratified", 1),
+        ("ler_guided_stratified", True),
+        ("ler_guided_stratified_safe", 0),
+        ("ler_guided_stratified_safe", False),
+    ],
+)
+def test_ler_controller_safety_enabled_is_validated(control, value):
+    report, data, run_config = _ler_controller_inputs(control)
+    for entry in _ler_copies(data, run_config):
+        entry["safety_enabled"] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, "safety_enabled")
+
+
+@pytest.mark.parametrize("key", LER_SAFE_ONLY_FIELDS)
+def test_non_safe_ler_arm_rejects_safety_only_fields(key):
+    report, data, run_config = _ler_controller_inputs("ler_guided_stratified")
+    value = _ler_guided_controller(LER_SAFE_CONTROL)[key]
+    for entry in _ler_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("use_rho_vg_safety", _REMOVE),
+        ("use_rho_vg_safety", False),
+        ("use_rho_vg_safety", "yes"),
+        ("use_rho_vg_safety", 1),
+        ("use_loss_spike_safety", _REMOVE),
+        ("use_loss_spike_safety", False),
+        ("use_loss_spike_safety", "yes"),
+        ("use_loss_spike_safety", 1),
+        ("rho_veto_threshold", _REMOVE),
+        ("rho_veto_threshold", "low"),
+        ("rho_veto_threshold", True),
+        ("rho_veto_threshold", float("nan")),
+        ("rho_veto_threshold", float("inf")),
+        ("loss_spike_factor", _REMOVE),
+        ("loss_spike_factor", "high"),
+        ("loss_spike_factor", True),
+        ("loss_spike_factor", -1.0),
+        ("loss_spike_factor", float("nan")),
+        ("loss_spike_factor", float("inf")),
+        ("loss_spike_window", _REMOVE),
+        ("loss_spike_window", "10"),
+        ("loss_spike_window", True),
+        ("loss_spike_window", 2.5),
+        ("loss_spike_window", 0),
+    ],
+)
+def test_safe_ler_arm_safety_field_errors(key, value):
+    report, data, run_config = _ler_controller_inputs(LER_SAFE_CONTROL)
+    for entry in _ler_copies(data, run_config):
+        if value is _REMOVE:
+            entry.pop(key)
+        else:
+            entry[key] = value
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    _assert_ler_field_error(report, key)
+
+
+@pytest.mark.parametrize("control", NON_LER_CONTROLS)
+def test_non_ler_controls_reject_stray_ler_config(control):
+    report, data, run_config = _phase1_3_base_inputs(control)
+    _attach_stray_ler_config(data, run_config)
+    vspr._check_phase1_3_ler_controller(report, data, run_config)
+    error_fields = fields(report, "error")
+    assert any(
+        "ler_guided_controller" in field for field in error_fields
+    ), error_fields
+
+
+def test_stray_ler_config_fails_validate_results(tmp_path):
+    data = full_finetune_results()
+    _attach_stray_ler_config(data, data["run_config"])
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    error_fields = fields(report, "error")
+    assert any(
+        "ler_guided_controller" in field for field in error_fields
+    ), error_fields
