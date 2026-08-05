@@ -847,10 +847,16 @@ def _check_phase1_3_phase_controller(report: ValidationReport, data: dict,
     for key in _PHASE_STRAT_INT_FIELDS:
         if key not in cfg:
             continue
-        parsed = _as_int(cfg[key])
+        value = cfg[key]
+        if isinstance(value, str) or isinstance(value, bool):
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       "integer (not boolean)", value,
+                       f"phase controller {key} is malformed")
+            continue
+        parsed = _as_int(value)
         if parsed is None:
             report.add(SEVERITY_ERROR, f"{prefix}.{key}",
-                       "integer (not boolean)", cfg[key],
+                       "integer (not boolean)", value,
                        f"phase controller {key} is malformed")
         else:
             parsed_ints[key] = parsed

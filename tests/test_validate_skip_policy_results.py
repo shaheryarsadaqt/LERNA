@@ -558,6 +558,363 @@ def test_unmatched_incomplete_run_is_explicitly_not_matched_valid(tmp_path):
     assert "quota_protocol_complete" in fields(report, "warning")
 
 
+PHASE_STRAT_CONTROLS = ("fixed_phase_strat", "phase_strat_guarded")
+N_PHASES = 4
+PHASE_QUOTA = [8, 8, 7, 7]  # sums to QUOTA
+PHASE_ELIGIBLE = [38, 37, 37, 38]  # sums to TOTAL - min_step
+PHASE_BOUNDS = [50, 88, 125, 162, 200]
+PHASE_WEIGHTS = [0.25, 0.25, 0.25, 0.25]
+_REMOVE = object()
+COMMON_PHASE_FIELDS = (
+    "control",
+    "controller_class",
+    "policy_name",
+    "target_skip_rate",
+    "total_steps",
+    "min_step",
+    "policy_seed",
+    "n_phases",
+    "phase_weights",
+    "phase_bounds",
+    "phase_quota",
+    "phase_eligible",
+    "requested_quota",
+)
+
+
+def _phase_strat_controller(control):
+    """Valid synthetic phase_strat_controller payload for a phase arm."""
+    config = {
+        "control": control,
+        "controller_class": vspr.PHASE1_3_POLICY_CLASSES[control],
+        "policy_name": control,
+        "target_skip_rate": RATE,
+        "total_steps": TOTAL,
+        "min_step": 50,
+        "policy_seed": 42,
+        "n_phases": N_PHASES,
+        "phase_weights": list(PHASE_WEIGHTS),
+        "phase_bounds": list(PHASE_BOUNDS),
+        "phase_quota": list(PHASE_QUOTA),
+        "phase_eligible": list(PHASE_ELIGIBLE),
+        "requested_quota": QUOTA,
+    }
+    if control == "phase_strat_guarded":
+        config["risk_gamma"] = 0.5
+        config["max_consecutive_skips"] = 3
+        config["guarded_safety"] = {
+            "use_rho_vg": True,
+            "rho_veto_threshold": -0.2,
+            "use_safety_horizon": True,
+            "spike_factor": 3.0,
+        }
+    return config
+
+
+def _phase_controller_inputs(control="fixed_phase_strat"):
+    identity = _phase1_3_identity(control)
+    identity["phase_strat_controller"] = _phase_strat_controller(control)
+    controller_config = _phase1_3_controller_config(
+        control,
+        vspr.PHASE1_3_POLICY_CLASSES[control],
+        True,
+    )
+    controller_config["phase_strat_controller"] = _phase_strat_controller(
+        control
+    )
+    data = {
+        "ablation": control,
+        "identity_inputs": identity,
+        "controller_config": controller_config,
+        "fingerprint": vspr.build_scientific_fingerprint(identity),
+    }
+    run_config = _run_config(
+        control=control,
+        controller_config=json.loads(json.dumps(controller_config)),
+    )
+    run_config["phase_strat_controller"] = _phase_strat_controller(control)
+    report = vspr.ValidationReport(path="synthetic")
+    return report, data, run_config
+
+
+def _phase_copies(data, run_config):
+    return [
+        data["identity_inputs"]["phase_strat_controller"],
+        data["controller_config"]["phase_strat_controller"],
+        run_config["controller_config"]["phase_strat_controller"],
+        run_config["phase_strat_controller"],
+    ]
+
+
+def _attach_stray_phase_config(data, run_config):
+    stray = _phase_strat_controller("fixed_phase_strat")
+    data["identity_inputs"]["phase_strat_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    data["fingerprint"] = vspr.build_scientific_fingerprint(
+        data["identity_inputs"]
+    )
+    data["controller_config"]["phase_strat_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    run_config["controller_config"]["phase_strat_controller"] = json.loads(
+        json.dumps(stray)
+    )
+    run_config["phase_strat_controller"] = json.loads(json.dumps(stray))
+
+
+def _assert_phase_field_error(report, key):
+    target = "phase_strat_controller." + key
+    error_fields = fields(report, "error")
+    assert any(target in f for f in error_fields), (target, error_fields)
+
+
+@pytest.mark.parametrize("control", PHASE_STRAT_CONTROLS)
+def test_phase_controller_valid_configs_have_no_errors(control):
+    report, data, run_config = _phase_controller_inputs(control)
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+@pytest.mark.parametrize(
+    "mutate, field",
+    [
+        (
+            lambda d, rc: d["identity_inputs"].pop("phase_strat_controller"),
+            "identity_inputs.phase_strat_controller",
+        ),
+        (
+            lambda d, rc: d["identity_inputs"].__setitem__(
+                "phase_strat_controller", 7
+            ),
+            "identity_inputs.phase_strat_controller",
+        ),
+        (
+            lambda d, rc: d["controller_config"].pop(
+                "phase_strat_controller"
+            ),
+            "controller_config.phase_strat_controller",
+        ),
+        (
+            lambda d, rc: d["controller_config"].__setitem__(
+                "phase_strat_controller", "bad"
+            ),
+            "controller_config.phase_strat_controller",
+        ),
+        (
+            lambda d, rc: rc.pop("phase_strat_controller"),
+            "run_config.phase_strat_controller",
+        ),
+        (
+            lambda d, rc: rc.__setitem__("phase_strat_controller", []),
+            "run_config.phase_strat_controller",
+        ),
+    ],
+)
+def test_phase_controller_missing_or_malformed_sources(mutate, field):
+    report, data, run_config = _phase_controller_inputs()
+    mutate(data, run_config)
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    assert field in fields(report, "error")
+
+
+def test_phase_controller_copies_must_match():
+    report, data, run_config = _phase_controller_inputs()
+    run_config["phase_strat_controller"]["phase_weights"] = [
+        0.4,
+        0.2,
+        0.2,
+        0.2,
+    ]
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    assert "phase_strat_controller_equality" in fields(report, "error")
+
+
+@pytest.mark.parametrize("key", COMMON_PHASE_FIELDS)
+def test_phase_controller_missing_common_field_is_rejected(key):
+    report, data, run_config = _phase_controller_inputs()
+    for entry in _phase_copies(data, run_config):
+        entry.pop(key)
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("control", "full_finetune"),
+        ("policy_name", "wrong_policy"),
+        ("controller_class", "WrongController"),
+    ],
+)
+def test_phase_controller_wrong_identity_strings(key, value):
+    report, data, run_config = _phase_controller_inputs()
+    for entry in _phase_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("target_skip_rate", RATE + 0.05),
+        ("total_steps", TOTAL + 1),
+        ("policy_seed", 43),
+    ],
+)
+def test_phase_controller_identity_disagreement(key, value):
+    report, data, run_config = _phase_controller_inputs()
+    for entry in _phase_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("n_phases", "4"),
+        ("n_phases", True),
+        ("n_phases", 4.5),
+        ("n_phases", 0),
+        ("total_steps", True),
+        ("min_step", 1.5),
+        ("policy_seed", 1.5),
+        ("requested_quota", True),
+    ],
+)
+def test_phase_controller_integer_fields_are_validated(key, value):
+    report, data, run_config = _phase_controller_inputs()
+    for entry in _phase_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("phase_quota", "not-a-list"),
+        ("phase_quota", [8, 8, 14]),
+        ("phase_quota", [8, 8, 7, -7]),
+        ("phase_quota", [8, 8, 7, 6.5]),
+        ("phase_eligible", {"phase": 200}),
+        ("phase_eligible", [75, 75]),
+        ("phase_eligible", [38, 37, 37, -38]),
+        ("phase_eligible", [38, 37, 37, 37.5]),
+        ("phase_bounds", "not-a-list"),
+        ("phase_bounds", [50, 100, 150, 200]),
+        ("phase_weights", 7),
+        ("phase_weights", [0.5, 0.5]),
+        ("phase_weights", [0.25, 0.25, 0.25, -0.25]),
+        ("phase_weights", [0.25, 0.25, 0.25, float("nan")]),
+        ("phase_weights", [0.25, 0.25, 0.25, float("inf")]),
+    ],
+)
+def test_phase_controller_list_fields_are_validated(key, value):
+    report, data, run_config = _phase_controller_inputs()
+    for entry in _phase_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("guarded_safety", {"use_rho_vg": True}),
+        ("risk_gamma", 0.5),
+        ("max_consecutive_skips", 3),
+    ],
+)
+def test_fixed_phase_rejects_guarded_only_fields(key, value):
+    report, data, run_config = _phase_controller_inputs("fixed_phase_strat")
+    for entry in _phase_copies(data, run_config):
+        entry[key] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "path, value, key",
+    [
+        (("risk_gamma",), _REMOVE, "risk_gamma"),
+        (("risk_gamma",), "high", "risk_gamma"),
+        (("risk_gamma",), -0.5, "risk_gamma"),
+        (("risk_gamma",), float("nan"), "risk_gamma"),
+        (("max_consecutive_skips",), _REMOVE, "max_consecutive_skips"),
+        (("max_consecutive_skips",), 0, "max_consecutive_skips"),
+        (("max_consecutive_skips",), True, "max_consecutive_skips"),
+        (("max_consecutive_skips",), 2.5, "max_consecutive_skips"),
+        (("guarded_safety",), _REMOVE, "guarded_safety"),
+        (("guarded_safety",), 7, "guarded_safety"),
+        (
+            ("guarded_safety", "use_rho_vg"),
+            "yes",
+            "guarded_safety.use_rho_vg",
+        ),
+        (
+            ("guarded_safety", "use_safety_horizon"),
+            1,
+            "guarded_safety.use_safety_horizon",
+        ),
+        (
+            ("guarded_safety", "rho_veto_threshold"),
+            float("nan"),
+            "guarded_safety.rho_veto_threshold",
+        ),
+        (
+            ("guarded_safety", "spike_factor"),
+            -1.0,
+            "guarded_safety.spike_factor",
+        ),
+        (
+            ("guarded_safety", "spike_factor"),
+            float("inf"),
+            "guarded_safety.spike_factor",
+        ),
+    ],
+)
+def test_guarded_phase_controller_field_errors(path, value, key):
+    report, data, run_config = _phase_controller_inputs("phase_strat_guarded")
+    for entry in _phase_copies(data, run_config):
+        target = entry
+        for part in path[:-1]:
+            target = target[part]
+        if value is _REMOVE:
+            target.pop(path[-1])
+        else:
+            target[path[-1]] = value
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    _assert_phase_field_error(report, key)
+
+
+@pytest.mark.parametrize(
+    "control",
+    sorted(set(vspr.PHASE1_3_CONTROLS) - set(PHASE_STRAT_CONTROLS)),
+)
+def test_non_phase_controls_reject_stray_phase_config(control):
+    report, data, run_config = _phase1_3_base_inputs(control)
+    _attach_stray_phase_config(data, run_config)
+    vspr._check_phase1_3_phase_controller(report, data, run_config)
+    error_fields = fields(report, "error")
+    assert any(
+        "phase_strat_controller" in field for field in error_fields
+    ), error_fields
+
+
+def test_stray_phase_config_fails_validate_results(tmp_path):
+    data = full_finetune_results()
+    _attach_stray_phase_config(data, data["run_config"])
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    error_fields = fields(report, "error")
+    assert any(
+        "phase_strat_controller" in field for field in error_fields
+    ), error_fields
+
+
 def _phase1_3_base_inputs(control="full_finetune"):
     identity = _phase1_3_identity(control)
     controller_config = _phase1_3_controller_config(
