@@ -947,7 +947,282 @@ def _check_phase1_3_phase_controller(report: ValidationReport, data: dict,
         report.add(SEVERITY_ERROR, f"{safety_prefix}.spike_factor",
                    "finite nonnegative number",
                    raw_safety.get("spike_factor"),
-                   "guarded_safety spike_factor is malformed")
+                    "guarded_safety spike_factor is malformed")
+
+
+_LER_GUIDED_CONTROLS = ("ler_guided_stratified", "ler_guided_stratified_safe")
+
+_LER_GUIDED_CONTROLLER_CLASSES = {
+    "ler_guided_stratified": "LERGuidedStratifiedPolicy",
+    "ler_guided_stratified_safe": "LERGuidedStratifiedSafetyPolicy",
+}
+
+_LER_GUIDED_REQUIRED_FIELDS = (
+    "control",
+    "policy_class",
+    "policy_name",
+    "target_skip_rate",
+    "total_steps",
+    "min_step",
+    "policy_seed",
+    "n_phases",
+    "phase_weights",
+    "max_consecutive_skips",
+    "probe_interval",
+    "min_ler_observations",
+    "ler_guidance_strength",
+    "required_tracker_mode",
+    "required_tracker_timing",
+    "safety_enabled",
+)
+
+_LER_GUIDED_INT_FIELDS = ("total_steps", "min_step", "policy_seed", "n_phases",
+                          "max_consecutive_skips", "probe_interval",
+                          "min_ler_observations")
+
+_LER_GUIDED_INT_MINIMUMS = {
+    "total_steps": 1,
+    "min_step": 0,
+    "n_phases": 1,
+    "max_consecutive_skips": 1,
+    "probe_interval": 1,
+    "min_ler_observations": 1,
+}
+
+_LER_GUIDED_SAFETY_ONLY_FIELDS = (
+    "use_rho_vg_safety",
+    "rho_veto_threshold",
+    "use_loss_spike_safety",
+    "loss_spike_factor",
+    "loss_spike_window",
+)
+
+_LER_REQUIRED_TRACKER_MODE = "sampled_lagged"
+_LER_REQUIRED_TRACKER_TIMING = "post_decision_after_backward"
+
+
+def _check_phase1_3_ler_controller(report: ValidationReport, data: dict,
+                                   run_config: dict) -> None:
+    """Validate LER-guided controller provenance for canonical Phase 1.3 arms."""
+    control = run_config.get("control")
+    if control not in PHASE1_3_CONTROLS:
+        return
+
+    raw_identity = data.get("identity_inputs")
+    identity_inputs = raw_identity if isinstance(raw_identity, dict) else None
+    raw_top_cc = data.get("controller_config")
+    top_cc = raw_top_cc if isinstance(raw_top_cc, dict) else None
+
+    sources = {
+        "identity_inputs.ler_guided_controller": (
+            identity_inputs.get("ler_guided_controller", _MISSING)
+            if identity_inputs is not None else _MISSING
+        ),
+        "controller_config.ler_guided_controller": (
+            top_cc.get("ler_guided_controller", _MISSING)
+            if top_cc is not None else _MISSING
+        ),
+        "run_config.ler_guided_controller": run_config.get(
+            "ler_guided_controller", _MISSING
+        ),
+    }
+
+    if control not in _LER_GUIDED_CONTROLS:
+        for field_name, value in sources.items():
+            if value is not _MISSING:
+                report.add(SEVERITY_ERROR, field_name, "absent", value,
+                           "stray ler_guided_controller config on "
+                           f"non-LER control '{control}'")
+        return
+
+    configs = {}
+    missing_config = False
+    for field_name, value in sources.items():
+        if value is _MISSING or not isinstance(value, dict):
+            report.add(SEVERITY_ERROR, field_name, "JSON object",
+                       None if value is _MISSING else value,
+                       "ler_guided_controller config missing or malformed "
+                       f"for LER control '{control}'")
+            missing_config = True
+        else:
+            configs[field_name] = value
+    if missing_config:
+        return
+
+    values = list(configs.values())
+    if any(cfg != values[0] for cfg in values[1:]):
+        report.add(SEVERITY_ERROR, "ler_guided_controller_equality",
+                   "deeply equal ler_guided_controller configs",
+                   configs,
+                   "ler_guided_controller disagrees across "
+                   "identity_inputs, controller_config and run_config")
+
+    prefix = "identity_inputs.ler_guided_controller"
+    cfg = configs[prefix]
+
+    for key in _LER_GUIDED_REQUIRED_FIELDS:
+        if key not in cfg:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}", "present", None,
+                       f"required LER controller field {key} is missing")
+
+    if "control" in cfg and cfg["control"] != control:
+        report.add(SEVERITY_ERROR, f"{prefix}.control", control,
+                   cfg["control"],
+                   "LER controller control disagrees with the "
+                   "effective control")
+    if "policy_name" in cfg and cfg["policy_name"] != control:
+        report.add(SEVERITY_ERROR, f"{prefix}.policy_name", control,
+                   cfg["policy_name"],
+                   "LER controller policy_name disagrees with the "
+                   "effective control")
+
+    expected_class = _LER_GUIDED_CONTROLLER_CLASSES[control]
+    if "policy_class" in cfg and cfg["policy_class"] != expected_class:
+        report.add(SEVERITY_ERROR, f"{prefix}.policy_class",
+                   expected_class, cfg["policy_class"],
+                   f"unexpected LER controller class for '{control}'")
+
+    if "target_skip_rate" in cfg:
+        target_rate = _as_float(cfg["target_skip_rate"])
+        if target_rate is None or not 0.0 <= target_rate <= 1.0:
+            report.add(SEVERITY_ERROR, f"{prefix}.target_skip_rate",
+                       "finite number in [0, 1]", cfg["target_skip_rate"],
+                       "LER controller target_skip_rate is malformed")
+        else:
+            identity_rate = _as_float(identity_inputs.get("target_skip_rate"))
+            if identity_rate != target_rate:
+                report.add(SEVERITY_ERROR, f"{prefix}.target_skip_rate",
+                           identity_inputs.get("target_skip_rate"),
+                           target_rate,
+                           "LER controller target_skip_rate disagrees "
+                           "with identity_inputs.target_skip_rate")
+
+    parsed_ints = {}
+    for key in _LER_GUIDED_INT_FIELDS:
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if isinstance(value, str) or isinstance(value, bool):
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       "integer (not boolean)", value,
+                       f"LER controller {key} is malformed")
+            continue
+        parsed = _as_int(value)
+        if parsed is None:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       "integer (not boolean)", value,
+                       f"LER controller {key} is malformed")
+        else:
+            parsed_ints[key] = parsed
+
+    for key in ("total_steps", "policy_seed"):
+        if key not in parsed_ints:
+            continue
+        if _as_int(identity_inputs.get(key)) != parsed_ints[key]:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       identity_inputs.get(key), parsed_ints[key],
+                       f"LER controller {key} disagrees with "
+                       f"identity_inputs.{key}")
+
+    for key, minimum in _LER_GUIDED_INT_MINIMUMS.items():
+        if key in parsed_ints and parsed_ints[key] < minimum:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                       f">= {minimum}", parsed_ints[key],
+                       f"LER controller {key} is out of range")
+
+    n_phases = parsed_ints.get("n_phases")
+    if "phase_weights" in cfg:
+        weights = cfg["phase_weights"]
+        if not isinstance(weights, list):
+            report.add(SEVERITY_ERROR, f"{prefix}.phase_weights", "list",
+                       weights, "LER controller phase_weights must be a list")
+        else:
+            if (n_phases is not None and n_phases >= 1
+                    and len(weights) != n_phases):
+                report.add(SEVERITY_ERROR, f"{prefix}.phase_weights",
+                           f"length {n_phases}", len(weights),
+                           "LER controller phase_weights has the wrong "
+                           "length")
+            for index, entry in enumerate(weights):
+                parsed = _as_float(entry)
+                if parsed is None or parsed < 0:
+                    report.add(SEVERITY_ERROR,
+                               f"{prefix}.phase_weights[{index}]",
+                               "finite nonnegative number", entry,
+                               "LER controller phase_weights entry is "
+                               "malformed")
+
+    if "ler_guidance_strength" in cfg:
+        strength = _as_float(cfg["ler_guidance_strength"])
+        if strength is None or strength < 0:
+            report.add(SEVERITY_ERROR, f"{prefix}.ler_guidance_strength",
+                       "finite nonnegative number",
+                       cfg["ler_guidance_strength"],
+                       "LER controller ler_guidance_strength is malformed")
+
+    if ("required_tracker_mode" in cfg
+            and cfg["required_tracker_mode"] != _LER_REQUIRED_TRACKER_MODE):
+        report.add(SEVERITY_ERROR, f"{prefix}.required_tracker_mode",
+                   _LER_REQUIRED_TRACKER_MODE, cfg["required_tracker_mode"],
+                   "LER controller required_tracker_mode is not the "
+                   "canonical tracker mode")
+    if ("required_tracker_timing" in cfg
+            and cfg["required_tracker_timing"] != _LER_REQUIRED_TRACKER_TIMING):
+        report.add(SEVERITY_ERROR, f"{prefix}.required_tracker_timing",
+                   _LER_REQUIRED_TRACKER_TIMING,
+                   cfg["required_tracker_timing"],
+                   "LER controller required_tracker_timing is not the "
+                   "canonical tracker timing")
+
+    expected_safety = control == "ler_guided_stratified_safe"
+    if "safety_enabled" in cfg:
+        safety_enabled = cfg["safety_enabled"]
+        if not isinstance(safety_enabled, bool):
+            report.add(SEVERITY_ERROR, f"{prefix}.safety_enabled", "boolean",
+                       safety_enabled,
+                       "LER controller safety_enabled must be a boolean")
+        elif safety_enabled is not expected_safety:
+            report.add(SEVERITY_ERROR, f"{prefix}.safety_enabled",
+                       expected_safety, safety_enabled,
+                       "LER controller safety_enabled disagrees with the "
+                       f"effective control '{control}'")
+
+    if not expected_safety:
+        for key in _LER_GUIDED_SAFETY_ONLY_FIELDS:
+            if key in cfg:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}", "absent",
+                           cfg[key],
+                           f"ler_guided_stratified must not carry {key}")
+        return
+
+    for key in ("use_rho_vg_safety", "use_loss_spike_safety"):
+        if cfg.get(key) is not True:
+            report.add(SEVERITY_ERROR, f"{prefix}.{key}", True,
+                       cfg.get(key),
+                       f"safe LER controller {key} must be boolean true")
+
+    if _as_float(cfg.get("rho_veto_threshold")) is None:
+        report.add(SEVERITY_ERROR, f"{prefix}.rho_veto_threshold",
+                   "finite number", cfg.get("rho_veto_threshold"),
+                   "safe LER controller rho_veto_threshold is malformed")
+
+    spike_factor = _as_float(cfg.get("loss_spike_factor"))
+    if spike_factor is None or spike_factor < 0:
+        report.add(SEVERITY_ERROR, f"{prefix}.loss_spike_factor",
+                   "finite nonnegative number", cfg.get("loss_spike_factor"),
+                   "safe LER controller loss_spike_factor is malformed")
+
+    spike_window = cfg.get("loss_spike_window")
+    if isinstance(spike_window, str) or isinstance(spike_window, bool):
+        report.add(SEVERITY_ERROR, f"{prefix}.loss_spike_window",
+                   "integer >= 1 (not boolean)", spike_window,
+                   "safe LER controller loss_spike_window is malformed")
+    else:
+        parsed_window = _as_int(spike_window)
+        if parsed_window is None or parsed_window < 1:
+            report.add(SEVERITY_ERROR, f"{prefix}.loss_spike_window",
+                       "integer >= 1 (not boolean)", spike_window,
+                       "safe LER controller loss_spike_window is malformed")
 
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
@@ -1006,6 +1281,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
 
     _check_phase1_3_base_identity(report, data, run_config)
     _check_phase1_3_phase_controller(report, data, run_config)
+    _check_phase1_3_ler_controller(report, data, run_config)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
