@@ -1225,6 +1225,293 @@ def _check_phase1_3_ler_controller(report: ValidationReport, data: dict,
                        "safe LER controller loss_spike_window is malformed")
 
 
+_PHASE1_3_ONLINE_MODE_OFF = "off"
+_PHASE1_3_ONLINE_MODE_SAMPLED_LAGGED = "sampled_lagged"
+_PHASE1_3_ONLINE_TIMING_NONE = "none"
+_PHASE1_3_ONLINE_TIMING_POST_DECISION = "post_decision_after_backward"
+
+_PHASE1_3_ONLINE_EXPECTED = {
+    "full_finetune": (_PHASE1_3_ONLINE_MODE_OFF, False,
+                      _PHASE1_3_ONLINE_TIMING_NONE),
+    "exact_random": (_PHASE1_3_ONLINE_MODE_OFF, False,
+                     _PHASE1_3_ONLINE_TIMING_NONE),
+    "fixed_phase_strat": (_PHASE1_3_ONLINE_MODE_OFF, False,
+                          _PHASE1_3_ONLINE_TIMING_NONE),
+    "phase_strat_guarded": (_PHASE1_3_ONLINE_MODE_SAMPLED_LAGGED, True,
+                            _PHASE1_3_ONLINE_TIMING_POST_DECISION),
+    "ler_guided_stratified": (_PHASE1_3_ONLINE_MODE_SAMPLED_LAGGED, True,
+                              _PHASE1_3_ONLINE_TIMING_POST_DECISION),
+    "ler_guided_stratified_safe": (_PHASE1_3_ONLINE_MODE_SAMPLED_LAGGED,
+                                   True,
+                                   _PHASE1_3_ONLINE_TIMING_POST_DECISION),
+}
+
+_PHASE1_3_ONLINE_CONFIG_FIELDS = (
+    "requested_mode",
+    "mode",
+    "enabled",
+    "timing",
+    "parameter_sample_size",
+    "update_interval",
+    "reason",
+    "sample_seed",
+)
+
+_PHASE1_3_ONLINE_RUNTIME_COUNTER_FIELDS = (
+    "parameter_sample_size_realized",
+    "update_attempts",
+    "update_successes",
+    "n_updates",
+    "n_decisions",
+)
+
+_PHASE1_3_ONLINE_RUNTIME_OPTIONAL_FIELDS = (
+    "last_update_decision",
+    "observation_age_decisions",
+)
+
+_PHASE1_3_ONLINE_RUNTIME_FIELDS = (
+    _PHASE1_3_ONLINE_CONFIG_FIELDS
+    + _PHASE1_3_ONLINE_RUNTIME_COUNTER_FIELDS
+    + _PHASE1_3_ONLINE_RUNTIME_OPTIONAL_FIELDS
+)
+
+
+def _check_phase1_3_online_diagnostics(report: ValidationReport, data: dict,
+                                       run_config: dict) -> None:
+    """Validate online-diagnostics provenance and runtime state."""
+    control = run_config.get("control")
+    if control not in PHASE1_3_CONTROLS:
+        return
+
+    expected_mode, expected_enabled, expected_timing = (
+        _PHASE1_3_ONLINE_EXPECTED[control]
+    )
+    is_off = expected_mode == _PHASE1_3_ONLINE_MODE_OFF
+
+    def _strict_int(value) -> Optional[int]:
+        return value if type(value) is int else None
+
+    def _same_json_value(left, right) -> bool:
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return (
+                left.keys() == right.keys()
+                and all(
+                    _same_json_value(left[key], right[key]) for key in left
+                )
+            )
+        if isinstance(left, list):
+            return (
+                len(left) == len(right)
+                and all(
+                    _same_json_value(left[i], right[i])
+                    for i in range(len(left))
+                )
+            )
+        return left == right
+
+    raw_identity = data.get("identity_inputs")
+    identity_inputs = raw_identity if isinstance(raw_identity, dict) else None
+    raw_top_cc = data.get("controller_config")
+    top_cc = raw_top_cc if isinstance(raw_top_cc, dict) else None
+
+    sources = {
+        "identity_inputs.online_diagnostics": (
+            identity_inputs.get("online_diagnostics", _MISSING)
+            if identity_inputs is not None else _MISSING
+        ),
+        "controller_config.online_diagnostics": (
+            top_cc.get("online_diagnostics", _MISSING)
+            if top_cc is not None else _MISSING
+        ),
+        "run_config.online_diagnostics": run_config.get(
+            "online_diagnostics", _MISSING
+        ),
+    }
+
+    configs = {}
+    for field_name, value in sources.items():
+        if value is _MISSING or not isinstance(value, dict):
+            report.add(SEVERITY_ERROR, field_name, "JSON object",
+                       None if value is _MISSING else value,
+                       "online_diagnostics config missing or malformed for "
+                       f"canonical Phase 1.3 control '{control}'")
+        else:
+            configs[field_name] = value
+
+    values = list(configs.values())
+    if len(values) > 1 and any(
+        not _same_json_value(cfg, values[0]) for cfg in values[1:]
+    ):
+        report.add(SEVERITY_ERROR, "online_diagnostics_config_equality",
+                   "deeply equal online_diagnostics configs", configs,
+                   "online_diagnostics disagrees across identity_inputs, "
+                   "controller_config and run_config")
+
+    prefix = "identity_inputs.online_diagnostics"
+    cfg = configs.get(prefix)
+
+    if cfg is not None:
+        for key in _PHASE1_3_ONLINE_CONFIG_FIELDS:
+            if key not in cfg:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}", "present",
+                           None,
+                           f"required online diagnostics field {key} is "
+                           "missing")
+
+        for key in ("requested_mode", "reason"):
+            if key in cfg:
+                value = cfg[key]
+                if not isinstance(value, str) or not value:
+                    report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                               "nonempty string", value,
+                               f"online diagnostics {key} must be a "
+                               "nonempty string")
+
+        if "enabled" in cfg:
+            enabled = cfg["enabled"]
+            if not isinstance(enabled, bool):
+                report.add(SEVERITY_ERROR, f"{prefix}.enabled", "boolean",
+                           enabled,
+                           "online diagnostics enabled must be a boolean")
+            elif enabled is not expected_enabled:
+                report.add(SEVERITY_ERROR, f"{prefix}.enabled",
+                           expected_enabled, enabled,
+                           "online diagnostics enabled disagrees with the "
+                           f"effective control '{control}'")
+
+        if "mode" in cfg and cfg["mode"] != expected_mode:
+            report.add(SEVERITY_ERROR, f"{prefix}.mode", expected_mode,
+                       cfg["mode"],
+                       "online diagnostics mode is not the canonical mode "
+                       f"for control '{control}'")
+        if "timing" in cfg and cfg["timing"] != expected_timing:
+            report.add(SEVERITY_ERROR, f"{prefix}.timing", expected_timing,
+                       cfg["timing"],
+                       "online diagnostics timing is not the canonical "
+                       f"timing for control '{control}'")
+
+        for key in ("parameter_sample_size", "update_interval"):
+            if key not in cfg:
+                continue
+            parsed = _strict_int(cfg[key])
+            if parsed is None:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}",
+                           "integer (not boolean or string)", cfg[key],
+                           f"online diagnostics {key} is malformed")
+            elif is_off and parsed != 0:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}", 0, parsed,
+                           f"off-mode online diagnostics {key} must be "
+                           "zero")
+            elif not is_off and parsed < 1:
+                report.add(SEVERITY_ERROR, f"{prefix}.{key}", ">= 1",
+                           parsed,
+                           f"sampled-lagged online diagnostics {key} must "
+                           "be at least 1")
+
+        if "sample_seed" in cfg:
+            seed = cfg["sample_seed"]
+            if is_off:
+                if seed is not None:
+                    report.add(SEVERITY_ERROR, f"{prefix}.sample_seed",
+                               None, seed,
+                               "off-mode online diagnostics sample_seed "
+                               "must be None")
+            elif _strict_int(seed) is None:
+                report.add(SEVERITY_ERROR, f"{prefix}.sample_seed",
+                           "integer (not boolean or string)", seed,
+                           "sampled-lagged online diagnostics sample_seed "
+                           "must be an integer")
+
+    rt_prefix = "online_diagnostics"
+    raw_runtime = data.get("online_diagnostics", _MISSING)
+    if raw_runtime is _MISSING or not isinstance(raw_runtime, dict):
+        report.add(SEVERITY_ERROR, rt_prefix, "JSON object",
+                   None if raw_runtime is _MISSING else raw_runtime,
+                   "top-level online_diagnostics missing or malformed for "
+                   f"canonical Phase 1.3 control '{control}'")
+        return
+    runtime = raw_runtime
+
+    for key in _PHASE1_3_ONLINE_RUNTIME_FIELDS:
+        if key not in runtime:
+            report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}", "present",
+                       None,
+                       f"required runtime online diagnostics field {key} "
+                       "is missing")
+
+    if cfg is not None:
+        for key in _PHASE1_3_ONLINE_CONFIG_FIELDS:
+            if (key in runtime and key in cfg
+                    and not _same_json_value(runtime[key], cfg[key])):
+                report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}", cfg[key],
+                           runtime[key],
+                           f"runtime online diagnostics {key} disagrees "
+                           "with the provenance config")
+
+    counters = {}
+    for key in _PHASE1_3_ONLINE_RUNTIME_COUNTER_FIELDS:
+        if key not in runtime:
+            continue
+        parsed = _strict_int(runtime[key])
+        if parsed is None or parsed < 0:
+            report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}",
+                       "nonnegative integer (not boolean or string)",
+                       runtime[key],
+                       f"runtime online diagnostics {key} is malformed")
+        else:
+            counters[key] = parsed
+
+    optionals = {}
+    for key in _PHASE1_3_ONLINE_RUNTIME_OPTIONAL_FIELDS:
+        if key not in runtime:
+            continue
+        value = runtime[key]
+        if value is None:
+            optionals[key] = None
+            continue
+        parsed = _strict_int(value)
+        if parsed is None or parsed < 0:
+            report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}",
+                       "None or nonnegative integer", value,
+                       f"runtime online diagnostics {key} is malformed")
+        else:
+            optionals[key] = parsed
+
+    if is_off:
+        for key in _PHASE1_3_ONLINE_RUNTIME_COUNTER_FIELDS:
+            if key in counters and counters[key] != 0:
+                report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}", 0,
+                           counters[key],
+                           f"off-mode online diagnostics {key} must be "
+                           "zero")
+        for key in _PHASE1_3_ONLINE_RUNTIME_OPTIONAL_FIELDS:
+            if optionals.get(key) is not None:
+                report.add(SEVERITY_ERROR, f"{rt_prefix}.{key}", None,
+                           optionals[key],
+                           f"off-mode online diagnostics {key} must be "
+                           "None")
+        return
+
+    attempts = counters.get("update_attempts")
+    successes = counters.get("update_successes")
+    if (attempts is not None and successes is not None
+            and successes > attempts):
+        report.add(SEVERITY_ERROR, f"{rt_prefix}.update_successes",
+                   f"<= {attempts}", successes,
+                   "online diagnostics update_successes exceeds "
+                   "update_attempts")
+    n_updates = counters.get("n_updates")
+    if (successes is not None and n_updates is not None
+            and n_updates != successes):
+        report.add(SEVERITY_ERROR, f"{rt_prefix}.n_updates", successes,
+                   n_updates,
+                   "online diagnostics n_updates must equal "
+                   "update_successes")
+
+
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
                      count_tolerance: int = 0,
                      allow_historical_momentum: bool = False,
@@ -1282,6 +1569,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
     _check_phase1_3_base_identity(report, data, run_config)
     _check_phase1_3_phase_controller(report, data, run_config)
     _check_phase1_3_ler_controller(report, data, run_config)
+    _check_phase1_3_online_diagnostics(report, data, run_config)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
