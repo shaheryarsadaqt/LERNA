@@ -2000,3 +2000,121 @@ def test_phase1_3_fixed_budget_noncanonical_control_returns_without_findings():
     diag["quota_size"] = QUOTA + 5
     vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
     assert not report.findings
+
+
+FIXED_BUDGET_FLAGS = (
+    ("identity_inputs", "no_early_stopping", True),
+    ("run_config", "no_early_stopping", True),
+    ("controller_config", "early_stopping_active", False),
+    ("controller_config", "allow_early_stopping_with_skipping", False),
+    ("run_config", "allow_early_stopping_with_skipping", False),
+    ("controller_config", "matched_budget", True),
+    ("run_config", "matched_budget", True),
+)
+FIXED_BUDGET_FLAG_CASES = ("missing", "contradictory", "integer")
+FREEZE_MODE_SOURCES = (
+    "identity_inputs.skip_update_mode",
+    "skip_update_mode",
+    "run_config.skip_update_mode",
+    "true_skip_instrumentation.skip_update_mode",
+)
+
+
+def _budget_flag_targets(data, run_config, source):
+    if source == "identity_inputs":
+        return [data["identity_inputs"]]
+    if source == "run_config":
+        return [run_config]
+    return [data["controller_config"], run_config["controller_config"]]
+
+
+def _apply_budget_flag(data, run_config, source, key, value):
+    for entry in _budget_flag_targets(data, run_config, source):
+        if value is _REMOVE:
+            entry.pop(key)
+        else:
+            entry[key] = value
+
+
+def _freeze_mode_target(data, run_config, instr, field):
+    return {
+        "identity_inputs.skip_update_mode": data["identity_inputs"],
+        "skip_update_mode": data,
+        "run_config.skip_update_mode": run_config,
+        "true_skip_instrumentation.skip_update_mode": instr,
+    }[field]
+
+
+@pytest.mark.parametrize("case", FIXED_BUDGET_FLAG_CASES)
+@pytest.mark.parametrize("source, key, expected", FIXED_BUDGET_FLAGS)
+def test_phase1_3_fixed_budget_flag_errors(source, key, expected, case):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    value = {
+        "missing": _REMOVE,
+        "contradictory": not expected,
+        "integer": int(expected),
+    }[case]
+    _apply_budget_flag(data, run_config, source, key, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert source + "." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", (_REMOVE, False))
+def test_phase1_3_fixed_budget_early_stopped_valid_values(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    if value is _REMOVE:
+        data.pop("early_stopped", None)
+    else:
+        data["early_stopped"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "early_stopped" not in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", (True, 0, None))
+def test_phase1_3_fixed_budget_early_stopped_invalid_values(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data["early_stopped"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "early_stopped" in fields(report, "error")
+
+
+@pytest.mark.parametrize("case", FIXED_BUDGET_FLAG_CASES)
+@pytest.mark.parametrize(
+    "control, expected",
+    [("full_finetune", False), ("exact_random", True)],
+)
+def test_phase1_3_fixed_budget_is_skipping_arm_errors(
+    control, expected, case
+):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(control)
+    value = {
+        "missing": _REMOVE,
+        "contradictory": not expected,
+        "integer": int(expected),
+    }[case]
+    _apply_budget_flag(
+        data, run_config, "controller_config", "is_skipping_arm", value
+    )
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "controller_config.is_skipping_arm" in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", (_REMOVE, "momentum", None))
+@pytest.mark.parametrize("field", FREEZE_MODE_SOURCES)
+def test_phase1_3_fixed_budget_freeze_mode_source_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    target = _freeze_mode_target(data, run_config, instr, field)
+    if value is _REMOVE:
+        target.pop("skip_update_mode")
+    else:
+        target["skip_update_mode"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
