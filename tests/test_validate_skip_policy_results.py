@@ -221,6 +221,12 @@ def full_finetune_results():
     controller_config = _phase1_3_controller_config(
         "full_finetune", "AlwaysFalsePolicy", False
     )
+    controller_config.update(
+        {
+            "requested_quota": None,
+            "runtime_quota_total_steps": None,
+        }
+    )
     online_cfg, online_rt = _phase1_3_online_diagnostics("full_finetune")
     identity_inputs = {**identity, "online_diagnostics": online_cfg}
     return {
@@ -246,6 +252,7 @@ def full_finetune_results():
                 },
             ),
             "target_skip_rate": RATE,
+            "rvd_policy_seed": 42,
             "online_diagnostics": online_cfg,
         },
     }

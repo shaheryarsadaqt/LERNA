@@ -1507,9 +1507,453 @@ def _check_phase1_3_online_diagnostics(report: ValidationReport, data: dict,
     if (successes is not None and n_updates is not None
             and n_updates != successes):
         report.add(SEVERITY_ERROR, f"{rt_prefix}.n_updates", successes,
-                   n_updates,
-                   "online diagnostics n_updates must equal "
-                   "update_successes")
+                    n_updates,
+                    "online diagnostics n_updates must equal "
+                    "update_successes")
+
+
+_PHASE1_3_BUDGET_SKIPPING_CONTROLS = tuple(
+    control for control in PHASE1_3_CONTROLS if control != "full_finetune"
+)
+_PHASE1_3_BUDGET_QUOTA_EXACT_CONTROLS = (
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+)
+_PHASE1_3_BUDGET_FREEZE_MODE = "freeze"
+
+
+def _check_phase1_3_fixed_budget(report: ValidationReport, data: dict,
+                                 run_config: dict, diag: dict,
+                                 instr: dict) -> None:
+    """Validate canonical fixed-budget, horizon and exact-quota state."""
+    control = run_config.get("control")
+    if control not in PHASE1_3_CONTROLS:
+        return
+
+    is_skipping_arm = control in _PHASE1_3_BUDGET_SKIPPING_CONTROLS
+
+    def _strict_int(value) -> Optional[int]:
+        return value if type(value) is int else None
+
+    def _strict_rate(value) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
+    raw_identity = data.get("identity_inputs")
+    identity_inputs = raw_identity if isinstance(raw_identity, dict) else {}
+    raw_top_cc = data.get("controller_config")
+    top_cc = raw_top_cc if isinstance(raw_top_cc, dict) else {}
+
+    flag_requirements = (
+        ("identity_inputs.no_early_stopping",
+         identity_inputs.get("no_early_stopping", _MISSING), True),
+        ("run_config.no_early_stopping",
+         run_config.get("no_early_stopping", _MISSING), True),
+        ("controller_config.early_stopping_active",
+         top_cc.get("early_stopping_active", _MISSING), False),
+        ("controller_config.allow_early_stopping_with_skipping",
+         top_cc.get("allow_early_stopping_with_skipping", _MISSING),
+         False),
+        ("run_config.allow_early_stopping_with_skipping",
+         run_config.get("allow_early_stopping_with_skipping", _MISSING),
+         False),
+        ("controller_config.matched_budget",
+         top_cc.get("matched_budget", _MISSING), True),
+        ("run_config.matched_budget",
+         run_config.get("matched_budget", _MISSING), True),
+    )
+    for field_name, value, expected in flag_requirements:
+        if value is not expected:
+            report.add(SEVERITY_ERROR, field_name, expected,
+                       None if value is _MISSING else value,
+                       "fixed-budget flag missing or not exactly "
+                       f"{expected}")
+
+    if "early_stopped" in data and data["early_stopped"] is not False:
+        report.add(SEVERITY_ERROR, "early_stopped", False,
+                   data["early_stopped"],
+                   "fixed-budget run must not report early stopping")
+
+    raw_is_skipping = top_cc.get("is_skipping_arm", _MISSING)
+    if raw_is_skipping is not is_skipping_arm:
+        report.add(SEVERITY_ERROR, "controller_config.is_skipping_arm",
+                   is_skipping_arm,
+                   None if raw_is_skipping is _MISSING else raw_is_skipping,
+                   "is_skipping_arm must be false only for full_finetune "
+                   "and true for every other canonical control")
+
+    freeze_sources = (
+        ("identity_inputs.skip_update_mode",
+         identity_inputs.get("skip_update_mode", _MISSING)),
+        ("skip_update_mode", data.get("skip_update_mode", _MISSING)),
+        ("run_config.skip_update_mode",
+         run_config.get("skip_update_mode", _MISSING)),
+        ("true_skip_instrumentation.skip_update_mode",
+         instr.get("skip_update_mode", _MISSING)),
+    )
+    for field_name, value in freeze_sources:
+        if value is _MISSING:
+            report.add(SEVERITY_ERROR, field_name,
+                       _PHASE1_3_BUDGET_FREEZE_MODE, None,
+                       "authoritative skip_update_mode source is missing")
+        elif value != _PHASE1_3_BUDGET_FREEZE_MODE:
+            report.add(SEVERITY_ERROR, field_name,
+                       _PHASE1_3_BUDGET_FREEZE_MODE, value,
+                       "canonical fixed-budget run must use freeze mode")
+
+    rate_sources = [
+        ("identity_inputs.target_skip_rate",
+         identity_inputs.get("target_skip_rate", _MISSING)),
+        ("controller_config.target_skip_rate",
+         top_cc.get("target_skip_rate", _MISSING)),
+        ("run_config.target_skip_rate",
+         run_config.get("target_skip_rate", _MISSING)),
+    ]
+    if is_skipping_arm:
+        rate_sources.append(
+            ("policy_diagnostics.target_skip_rate",
+             diag.get("target_skip_rate", _MISSING))
+        )
+    parsed_rates = {}
+    for field_name, value in rate_sources:
+        if value is _MISSING:
+            report.add(SEVERITY_ERROR, field_name,
+                       "finite number in [0, 1]", None,
+                       "required target_skip_rate source is missing")
+            continue
+        parsed = _strict_rate(value)
+        if parsed is None or not 0.0 <= parsed <= 1.0:
+            report.add(SEVERITY_ERROR, field_name,
+                       "finite number in [0, 1]", value,
+                       "target_skip_rate is malformed")
+        else:
+            parsed_rates[field_name] = parsed
+    target_rate = parsed_rates.get("identity_inputs.target_skip_rate")
+    if target_rate is not None:
+        for field_name, parsed in parsed_rates.items():
+            if parsed != target_rate:
+                report.add(SEVERITY_ERROR, field_name, target_rate,
+                           parsed,
+                           "target_skip_rate disagrees with "
+                           "identity_inputs.target_skip_rate")
+
+    seed_sources = [
+        ("identity_inputs.policy_seed",
+         identity_inputs.get("policy_seed", _MISSING)),
+        ("controller_config.policy_seed",
+         top_cc.get("policy_seed", _MISSING)),
+        ("run_config.rvd_policy_seed",
+         run_config.get("rvd_policy_seed", _MISSING)),
+    ]
+    if control == "exact_random":
+        seed_sources.append(
+            ("policy_diagnostics.seed", diag.get("seed", _MISSING))
+        )
+    parsed_seeds = {}
+    for field_name, value in seed_sources:
+        if value is _MISSING:
+            report.add(SEVERITY_ERROR, field_name,
+                       "integer (not boolean or string)", None,
+                       "required policy seed source is missing")
+            continue
+        parsed = _strict_int(value)
+        if parsed is None:
+            report.add(SEVERITY_ERROR, field_name,
+                       "integer (not boolean or string)", value,
+                       "policy seed is malformed")
+        else:
+            parsed_seeds[field_name] = parsed
+    policy_seed = parsed_seeds.get("identity_inputs.policy_seed")
+    if policy_seed is not None:
+        for field_name, parsed in parsed_seeds.items():
+            if parsed != policy_seed:
+                report.add(SEVERITY_ERROR, field_name, policy_seed,
+                           parsed,
+                           "policy seed disagrees with "
+                           "identity_inputs.policy_seed")
+
+    raw_total = identity_inputs.get("total_steps", _MISSING)
+    total_steps = None
+    if raw_total is not _MISSING:
+        total_steps = _strict_int(raw_total)
+    if total_steps is None or total_steps < 1:
+        report.add(SEVERITY_ERROR, "identity_inputs.total_steps",
+                   "integer >= 1 (not boolean or string)",
+                   None if raw_total is _MISSING else raw_total,
+                   "authoritative horizon is missing or malformed")
+        total_steps = None
+
+    raw_configured = top_cc.get("configured_total_steps", _MISSING)
+    configured = None
+    if raw_configured is not _MISSING:
+        configured = _strict_int(raw_configured)
+    if configured is None:
+        report.add(SEVERITY_ERROR,
+                   "controller_config.configured_total_steps",
+                   "integer (not boolean or string)",
+                   None if raw_configured is _MISSING else raw_configured,
+                   "configured_total_steps is missing or malformed")
+    elif total_steps is not None and configured != total_steps:
+        report.add(SEVERITY_ERROR,
+                   "controller_config.configured_total_steps",
+                   total_steps, configured,
+                   "configured_total_steps disagrees with "
+                   "identity_inputs.total_steps")
+
+    horizon_counters = {}
+    for key in ("batches_seen", "forward_calls"):
+        raw = instr.get(key, _MISSING)
+        parsed = _strict_int(raw) if raw is not _MISSING else None
+        if parsed is None or parsed < 0:
+            report.add(SEVERITY_ERROR,
+                       f"true_skip_instrumentation.{key}",
+                       "nonnegative integer (not boolean or string)",
+                       None if raw is _MISSING else raw,
+                       f"instrumentation {key} is missing or malformed")
+            continue
+        horizon_counters[key] = parsed
+        if total_steps is not None and parsed != total_steps:
+            report.add(SEVERITY_ERROR,
+                       f"true_skip_instrumentation.{key}",
+                       total_steps, parsed,
+                       f"instrumentation {key} must equal the "
+                       "authoritative horizon")
+
+    if "forward_calls" in data:
+        top_forward = _strict_int(data["forward_calls"])
+        if top_forward is None or top_forward < 0:
+            report.add(SEVERITY_ERROR, "forward_calls",
+                       "nonnegative integer (not boolean or string)",
+                       data["forward_calls"],
+                       "top-level forward_calls is malformed")
+        else:
+            instr_forward = horizon_counters.get("forward_calls")
+            if instr_forward is not None and top_forward != instr_forward:
+                report.add(SEVERITY_ERROR, "forward_calls",
+                           instr_forward, top_forward,
+                           "top-level forward_calls disagrees with "
+                           "instrumentation forward_calls")
+            if total_steps is not None and top_forward != total_steps:
+                report.add(SEVERITY_ERROR, "forward_calls", total_steps,
+                           top_forward,
+                           "top-level forward_calls must equal the "
+                           "authoritative horizon")
+
+    raw_requested = top_cc.get("requested_quota", _MISSING)
+    raw_runtime_total = top_cc.get("runtime_quota_total_steps", _MISSING)
+    if raw_requested is _MISSING:
+        report.add(SEVERITY_ERROR, "controller_config.requested_quota",
+                   "present", None,
+                   "controller_config.requested_quota is missing")
+    if raw_runtime_total is _MISSING:
+        report.add(SEVERITY_ERROR,
+                   "controller_config.runtime_quota_total_steps",
+                   "present", None,
+                   "controller_config.runtime_quota_total_steps is missing")
+
+    requested_quota = None
+    if not is_skipping_arm:
+        if raw_requested is not _MISSING and raw_requested is not None:
+            report.add(SEVERITY_ERROR,
+                       "controller_config.requested_quota", None,
+                       raw_requested,
+                       "full_finetune must not request a skip quota")
+        if (raw_runtime_total is not _MISSING
+                and raw_runtime_total is not None):
+            report.add(SEVERITY_ERROR,
+                       "controller_config.runtime_quota_total_steps",
+                       None, raw_runtime_total,
+                       "full_finetune must not carry a runtime quota "
+                       "horizon")
+    else:
+        raw_min_step = top_cc.get("min_step", _MISSING)
+        min_step = None
+        if raw_min_step is not _MISSING:
+            min_step = _strict_int(raw_min_step)
+        if min_step is None or min_step < 0:
+            report.add(SEVERITY_ERROR, "controller_config.min_step",
+                       "integer >= 0 (not boolean or string)",
+                       None if raw_min_step is _MISSING else raw_min_step,
+                       "controller min_step is missing or malformed")
+            min_step = None
+
+        if raw_requested is not _MISSING:
+            requested_quota = _strict_int(raw_requested)
+            if requested_quota is None or requested_quota < 0:
+                report.add(SEVERITY_ERROR,
+                           "controller_config.requested_quota",
+                           "integer >= 0 (not boolean or string)",
+                           raw_requested,
+                           "requested_quota is malformed")
+                requested_quota = None
+
+        if raw_runtime_total is not _MISSING:
+            runtime_total = _strict_int(raw_runtime_total)
+            if runtime_total is None:
+                report.add(SEVERITY_ERROR,
+                           "controller_config.runtime_quota_total_steps",
+                           "integer (not boolean or string)",
+                           raw_runtime_total,
+                           "runtime_quota_total_steps is malformed")
+            elif total_steps is not None and runtime_total != total_steps:
+                report.add(SEVERITY_ERROR,
+                           "controller_config.runtime_quota_total_steps",
+                           total_steps, runtime_total,
+                           "runtime quota horizon disagrees with the "
+                           "authoritative horizon")
+
+        if (requested_quota is not None and target_rate is not None
+                and total_steps is not None):
+            expected_quota = round(target_rate * total_steps)
+            if requested_quota != expected_quota:
+                report.add(SEVERITY_ERROR,
+                           "controller_config.requested_quota",
+                           expected_quota, requested_quota,
+                           "requested_quota must equal "
+                           "round(target_skip_rate * total_steps); "
+                           "clipping to the eligible count is never "
+                           "accepted")
+        if (requested_quota is not None and total_steps is not None
+                and min_step is not None):
+            eligible_steps = max(total_steps - min_step, 0)
+            if requested_quota > eligible_steps:
+                report.add(SEVERITY_ERROR,
+                           "controller_config.requested_quota",
+                           f"<= {eligible_steps}", requested_quota,
+                           "requested_quota exceeds the eligible step "
+                           "count")
+
+    diag_counts = {}
+    if is_skipping_arm:
+        for key in ("quota_total_steps", "quota_size", "decisions_seen",
+                    "skip_decisions"):
+            raw = diag.get(key, _MISSING)
+            parsed = _strict_int(raw) if raw is not _MISSING else None
+            if parsed is None or parsed < 0:
+                report.add(SEVERITY_ERROR, f"policy_diagnostics.{key}",
+                           "nonnegative integer (not boolean or string)",
+                           None if raw is _MISSING else raw,
+                           f"policy diagnostics {key} is missing or "
+                           "malformed")
+            else:
+                diag_counts[key] = parsed
+
+        if total_steps is not None:
+            for key in ("quota_total_steps", "decisions_seen"):
+                if key in diag_counts and diag_counts[key] != total_steps:
+                    report.add(SEVERITY_ERROR,
+                               f"policy_diagnostics.{key}",
+                               total_steps, diag_counts[key],
+                               f"policy diagnostics {key} must equal "
+                               "the authoritative horizon")
+        if requested_quota is not None:
+            for key in ("quota_size", "skip_decisions"):
+                if (key in diag_counts
+                        and diag_counts[key] != requested_quota):
+                    report.add(SEVERITY_ERROR,
+                               f"policy_diagnostics.{key}",
+                               requested_quota, diag_counts[key],
+                               f"policy diagnostics {key} must equal "
+                               "controller_config.requested_quota")
+
+        if "requested_quota" in diag:
+            diag_requested = _strict_int(diag["requested_quota"])
+            if diag_requested is None:
+                report.add(SEVERITY_ERROR,
+                           "policy_diagnostics.requested_quota",
+                           "integer (not boolean or string)",
+                           diag["requested_quota"],
+                           "policy diagnostics requested_quota is "
+                           "malformed")
+            elif (requested_quota is not None
+                  and diag_requested != requested_quota):
+                report.add(SEVERITY_ERROR,
+                           "policy_diagnostics.requested_quota",
+                           requested_quota, diag_requested,
+                           "policy diagnostics requested_quota disagrees "
+                           "with controller_config.requested_quota")
+
+        if control in _PHASE1_3_BUDGET_QUOTA_EXACT_CONTROLS:
+            raw_exact = diag.get("quota_exact", _MISSING)
+            if raw_exact is not True:
+                report.add(SEVERITY_ERROR,
+                           "policy_diagnostics.quota_exact", True,
+                           None if raw_exact is _MISSING else raw_exact,
+                           "stratified quota policy must report "
+                           "quota_exact True")
+
+    runtime_counts = {}
+    for key in ("skipped_backward_steps", "skipped_batches",
+                "backward_calls"):
+        raw = instr.get(key, _MISSING)
+        parsed = _strict_int(raw) if raw is not _MISSING else None
+        if parsed is None or parsed < 0:
+            report.add(SEVERITY_ERROR,
+                       f"true_skip_instrumentation.{key}",
+                       "nonnegative integer (not boolean or string)",
+                       None if raw is _MISSING else raw,
+                       f"instrumentation {key} is missing or malformed")
+        else:
+            runtime_counts[key] = parsed
+
+    if not is_skipping_arm:
+        for key in ("skipped_backward_steps", "skipped_batches"):
+            if key in runtime_counts and runtime_counts[key] != 0:
+                report.add(SEVERITY_ERROR,
+                           f"true_skip_instrumentation.{key}", 0,
+                           runtime_counts[key],
+                           f"full_finetune must not report nonzero {key}")
+        if (total_steps is not None
+                and "backward_calls" in runtime_counts
+                and runtime_counts["backward_calls"] != total_steps):
+            report.add(SEVERITY_ERROR,
+                       "true_skip_instrumentation.backward_calls",
+                       total_steps, runtime_counts["backward_calls"],
+                       "full_finetune backward_calls must equal the "
+                       "authoritative horizon")
+        for key in ("quota_size", "requested_quota"):
+            if key in diag and diag[key] is not None:
+                report.add(SEVERITY_ERROR, f"policy_diagnostics.{key}",
+                           None, diag[key],
+                           "full_finetune must not report a non-None "
+                           f"{key}")
+    elif requested_quota is not None:
+        for key in ("skipped_backward_steps", "skipped_batches"):
+            if (key in runtime_counts
+                    and runtime_counts[key] != requested_quota):
+                report.add(SEVERITY_ERROR,
+                           f"true_skip_instrumentation.{key}",
+                           requested_quota, runtime_counts[key],
+                           f"instrumentation {key} must equal the "
+                           "requested integer quota")
+        if (total_steps is not None
+                and "backward_calls" in runtime_counts
+                and runtime_counts["backward_calls"]
+                    != total_steps - requested_quota):
+            report.add(SEVERITY_ERROR,
+                       "true_skip_instrumentation.backward_calls",
+                       total_steps - requested_quota,
+                       runtime_counts["backward_calls"],
+                       "instrumentation backward_calls must equal "
+                       "total_steps minus the requested quota")
+
+    for key in ("skipped_backward_steps", "backward_calls"):
+        if key not in data:
+            continue
+        top_value = _strict_int(data[key])
+        if top_value is None:
+            report.add(SEVERITY_ERROR, key,
+                       "integer (not boolean or string)", data[key],
+                       f"top-level {key} is malformed")
+        elif key in runtime_counts and top_value != runtime_counts[key]:
+            report.add(SEVERITY_ERROR, key, runtime_counts[key],
+                       top_value,
+                       f"top-level {key} disagrees with "
+                       "instrumentation")
 
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
@@ -1570,6 +2014,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
     _check_phase1_3_phase_controller(report, data, run_config)
     _check_phase1_3_ler_controller(report, data, run_config)
     _check_phase1_3_online_diagnostics(report, data, run_config)
+    _check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
