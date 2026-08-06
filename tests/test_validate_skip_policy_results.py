@@ -2216,3 +2216,100 @@ def test_phase1_3_fixed_budget_negative_seed_is_valid():
     error_fields = fields(report, "error")
     for field in FIXED_BUDGET_SEED_SOURCES:
         assert field not in error_fields
+
+
+FIXED_BUDGET_IDENTITY_HORIZON_INVALID = (
+    _REMOVE,
+    "200",
+    True,
+    200.0,
+    200.5,
+    0,
+    -1,
+)
+FIXED_BUDGET_HORIZON_INVALID = (
+    _REMOVE,
+    "200",
+    True,
+    200.0,
+    200.5,
+    -1,
+    TOTAL - 1,
+)
+FIXED_BUDGET_HORIZON_COUNTERS = ("batches_seen", "forward_calls")
+FIXED_BUDGET_FORWARD_CALLS_INVALID = (
+    "200",
+    True,
+    200.0,
+    200.5,
+    -1,
+    TOTAL - 1,
+)
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_IDENTITY_HORIZON_INVALID)
+def test_phase1_3_fixed_budget_identity_total_steps_errors(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    if value is _REMOVE:
+        data["identity_inputs"].pop("total_steps")
+    else:
+        data["identity_inputs"]["total_steps"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "identity_inputs.total_steps" in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_HORIZON_INVALID)
+def test_phase1_3_fixed_budget_configured_total_steps_errors(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    for config in (
+        data["controller_config"],
+        run_config["controller_config"],
+    ):
+        if value is _REMOVE:
+            config.pop("configured_total_steps")
+        else:
+            config["configured_total_steps"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert (
+        "controller_config.configured_total_steps"
+        in fields(report, "error")
+    )
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_HORIZON_INVALID)
+@pytest.mark.parametrize("field", FIXED_BUDGET_HORIZON_COUNTERS)
+def test_phase1_3_fixed_budget_instrumentation_horizon_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    if value is _REMOVE:
+        instr.pop(field)
+    else:
+        instr[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert (
+        "true_skip_instrumentation." + field in fields(report, "error")
+    )
+
+
+def test_phase1_3_fixed_budget_top_level_forward_calls_absent_is_valid():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data.pop("forward_calls")
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "forward_calls" not in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_FORWARD_CALLS_INVALID)
+def test_phase1_3_fixed_budget_top_level_forward_calls_errors(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data["forward_calls"] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "forward_calls" in fields(report, "error")
