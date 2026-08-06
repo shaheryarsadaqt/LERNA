@@ -1936,3 +1936,67 @@ def test_online_diagnostics_nonzero_attempts_fails_validate_results(tmp_path):
     report = vspr.validate_results(write_results(tmp_path, data))
     assert not report.ok
     assert "online_diagnostics.update_attempts" in fields(report, "error")
+
+
+FIXED_BUDGET_CONTROLS = (
+    "full_finetune",
+    "exact_random",
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+)
+FIXED_BUDGET_SKIPPING_CONTROLS = FIXED_BUDGET_CONTROLS[1:]
+
+
+def _phase1_3_budget_inputs(control):
+    """Valid A9 fixed-budget inputs for one canonical Phase 1.3 control."""
+    report, data, run_config = _phase1_3_base_inputs(control)
+    controller_config = data["controller_config"]
+    if control == "full_finetune":
+        controller_config["requested_quota"] = None
+        controller_config["runtime_quota_total_steps"] = None
+        diag = {}
+        instr = _instrumentation(skipped=0)
+    else:
+        controller_config["requested_quota"] = QUOTA
+        controller_config["runtime_quota_total_steps"] = TOTAL
+        diag = {
+            "target_skip_rate": RATE,
+            "quota_total_steps": TOTAL,
+            "quota_size": QUOTA,
+            "decisions_seen": TOTAL,
+            "skip_decisions": QUOTA,
+        }
+        if control == "exact_random":
+            diag["seed"] = 42
+            diag["requested_quota"] = QUOTA
+        else:
+            diag["quota_exact"] = True
+        instr = _instrumentation(skipped=QUOTA)
+    run_config["controller_config"] = json.loads(
+        json.dumps(controller_config)
+    )
+    run_config["rvd_policy_seed"] = 42
+    data["skip_update_mode"] = "freeze"
+    data["forward_calls"] = instr["forward_calls"]
+    data["backward_calls"] = instr["backward_calls"]
+    data["skipped_backward_steps"] = instr["skipped_backward_steps"]
+    return report, data, run_config, diag, instr
+
+
+@pytest.mark.parametrize("control", FIXED_BUDGET_CONTROLS)
+def test_phase1_3_fixed_budget_valid_controls_have_no_errors(control):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(control)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert not report.errors, [f.to_dict() for f in report.errors]
+
+
+def test_phase1_3_fixed_budget_noncanonical_control_returns_without_findings():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    run_config["control"] = "random_veto_deferral"
+    diag["quota_size"] = QUOTA + 5
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert not report.findings
