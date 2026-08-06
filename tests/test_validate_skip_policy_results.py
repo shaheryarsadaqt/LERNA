@@ -2118,3 +2118,101 @@ def test_phase1_3_fixed_budget_freeze_mode_source_errors(field, value):
         target["skip_update_mode"] = value
     vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
     assert field in fields(report, "error")
+
+
+FIXED_BUDGET_RATE_SOURCES = (
+    "identity_inputs.target_skip_rate",
+    "controller_config.target_skip_rate",
+    "run_config.target_skip_rate",
+    "policy_diagnostics.target_skip_rate",
+)
+FIXED_BUDGET_RATE_INVALID = (
+    _REMOVE,
+    "0.15",
+    True,
+    float("nan"),
+    float("inf"),
+    -0.1,
+    1.1,
+)
+FIXED_BUDGET_SEED_SOURCES = (
+    "identity_inputs.policy_seed",
+    "controller_config.policy_seed",
+    "run_config.rvd_policy_seed",
+    "policy_diagnostics.seed",
+)
+FIXED_BUDGET_SEED_INVALID = (_REMOVE, "42", True, 42.0, 42.5)
+
+
+def _budget_source_container(data, run_config, diag, field):
+    section, key = field.split(".")
+    container = {
+        "identity_inputs": data["identity_inputs"],
+        "controller_config": data["controller_config"],
+        "run_config": run_config,
+        "policy_diagnostics": diag,
+    }[section]
+    return container, key
+
+
+def _mutate_budget_source(data, run_config, diag, field, value):
+    container, key = _budget_source_container(data, run_config, diag, field)
+    if value is _REMOVE:
+        container.pop(key)
+    else:
+        container[key] = value
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_RATE_INVALID)
+@pytest.mark.parametrize("field", FIXED_BUDGET_RATE_SOURCES)
+def test_phase1_3_fixed_budget_rate_source_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_source(data, run_config, diag, field, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field", FIXED_BUDGET_RATE_SOURCES[1:])
+def test_phase1_3_fixed_budget_rate_disagreement_errors(field):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_source(data, run_config, diag, field, RATE + 0.01)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", FIXED_BUDGET_SEED_INVALID)
+@pytest.mark.parametrize("field", FIXED_BUDGET_SEED_SOURCES)
+def test_phase1_3_fixed_budget_seed_source_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_source(data, run_config, diag, field, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field", FIXED_BUDGET_SEED_SOURCES[1:])
+def test_phase1_3_fixed_budget_seed_disagreement_errors(field):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_source(data, run_config, diag, field, 43)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_negative_seed_is_valid():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    for field in FIXED_BUDGET_SEED_SOURCES:
+        _mutate_budget_source(data, run_config, diag, field, -1)
+    run_config["controller_config"]["policy_seed"] = -1
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    error_fields = fields(report, "error")
+    for field in FIXED_BUDGET_SEED_SOURCES:
+        assert field not in error_fields
