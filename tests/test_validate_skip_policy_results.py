@@ -2522,3 +2522,118 @@ def test_phase1_3_fixed_budget_full_finetune_none_diag_quota_is_valid():
     error_fields = fields(report, "error")
     assert "policy_diagnostics.quota_size" not in error_fields
     assert "policy_diagnostics.requested_quota" not in error_fields
+
+
+REALIZATION_COUNTER_FIELDS = (
+    "skipped_backward_steps",
+    "skipped_batches",
+    "backward_calls",
+)
+REALIZATION_COUNTER_INVALID = (_REMOVE, -1, "1", True, 1.0, 1.5)
+FULL_FINETUNE_REALIZATION_CASES = (
+    ("skipped_backward_steps", 1),
+    ("skipped_batches", 1),
+    ("backward_calls", TOTAL - 1),
+)
+SKIPPING_REALIZATION_CASES = (
+    ("skipped_backward_steps", QUOTA + 1),
+    ("skipped_batches", QUOTA + 1),
+    ("backward_calls", (TOTAL - QUOTA) + 1),
+    ("backward_calls", (TOTAL - QUOTA) - 1),
+)
+TOP_LEVEL_REALIZATION_FIELDS = ("skipped_backward_steps", "backward_calls")
+TOP_LEVEL_REALIZATION_INVALID = ("1", True, 1.0, 1.5, -1)
+TOP_LEVEL_REALIZATION_DISAGREEMENT = (
+    ("skipped_backward_steps", QUOTA + 1),
+    ("backward_calls", (TOTAL - QUOTA) + 1),
+)
+
+
+@pytest.mark.parametrize("value", REALIZATION_COUNTER_INVALID)
+@pytest.mark.parametrize("field", REALIZATION_COUNTER_FIELDS)
+def test_phase1_3_fixed_budget_realization_counter_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    if value is _REMOVE:
+        instr.pop(field)
+    else:
+        instr[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "true_skip_instrumentation." + field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field, value", FULL_FINETUNE_REALIZATION_CASES)
+def test_phase1_3_fixed_budget_full_finetune_realization_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "full_finetune"
+    )
+    instr[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "true_skip_instrumentation." + field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field, value", SKIPPING_REALIZATION_CASES)
+def test_phase1_3_fixed_budget_skipping_realization_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    instr[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "true_skip_instrumentation." + field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field", TOP_LEVEL_REALIZATION_FIELDS)
+def test_phase1_3_fixed_budget_top_level_realization_absent_is_valid(field):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data.pop(field)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field not in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", TOP_LEVEL_REALIZATION_INVALID)
+@pytest.mark.parametrize("field", TOP_LEVEL_REALIZATION_FIELDS)
+def test_phase1_3_fixed_budget_top_level_realization_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field, value", TOP_LEVEL_REALIZATION_DISAGREEMENT)
+def test_phase1_3_fixed_budget_top_level_realization_disagreement_errors(
+    field, value
+):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    data[field] = value
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert field in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_integrated_valid_full_finetune(tmp_path):
+    report = vspr.validate_results(
+        write_results(tmp_path, full_finetune_results())
+    )
+    assert report.ok, [f.to_dict() for f in report.errors]
+    error_fields = fields(report, "error")
+    assert "controller_config.requested_quota" not in error_fields
+    assert (
+        "true_skip_instrumentation.skipped_backward_steps"
+        not in error_fields
+    )
+    assert "true_skip_instrumentation.backward_calls" not in error_fields
+
+
+def test_phase1_3_fixed_budget_integrated_tampered_requested_quota(tmp_path):
+    data = full_finetune_results()
+    data["controller_config"]["requested_quota"] = 1
+    data["run_config"]["controller_config"]["requested_quota"] = 1
+    report = vspr.validate_results(write_results(tmp_path, data))
+    assert not report.ok
+    assert "controller_config.requested_quota" in fields(report, "error")
