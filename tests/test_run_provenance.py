@@ -28,6 +28,7 @@ finalize_manifest_completed = provenance.finalize_manifest_completed
 finalize_manifest_failed = provenance.finalize_manifest_failed
 load_manifest = provenance.load_manifest
 manifest_path = provenance.manifest_path
+verify_completed_manifest = provenance.verify_completed_manifest
 write_manifest_running = provenance.write_manifest_running
 FAKE_GIT_CLEAN = lambda: {
     "commit_sha": "abc123",
@@ -290,6 +291,326 @@ class RunnerWiringTests(unittest.TestCase):
     def test_runner_exposes_explicit_classification_flag(self):
         self.assertIn("--provenance-classification", self.source)
         self.assertIn("provenance_classification=args.provenance_classification", self.source)
+
+
+IDENTITY = {
+    "task": "mrpc",
+    "training_seed": 42,
+    "model_id": "modernbert",
+    "control": "exact_random",
+}
+FINGERPRINT = "a1b2c3d4e5f6a7b8"
+ATTEMPT = 3
+
+
+class CompletedManifestVerificationTests(unittest.TestCase):
+    """6B-2 regression tests for verify_completed_manifest."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="lerna-verify-test-")
+        self.run_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _complete(self, *, on_diagnostics=False, attempt=ATTEMPT,
+                  fingerprint=FINGERPRINT, identity=IDENTITY):
+        output_paths = {
+            "results": "results.json",
+            "instrumentation": "instrumentation.json",
+        }
+        if on_diagnostics:
+            output_paths["ler_diagnostics"] = "ler_diagnostics.json"
+        write_manifest_running(
+            str(self.run_dir),
+            argv=["run_ablation_study.py"],
+            task="mrpc",
+            model_id="modernbert",
+            seed=42,
+            controller_name="RandomSkipPolicy",
+            controller_seed=42,
+            target_skip_rate=0.15,
+            planned_quota=30,
+            total_steps=200,
+            warmup_steps=10,
+            skip_update_mode="freeze",
+            controller_config_effective={"arm": "exact_random"},
+            matched_budget_planned=True,
+            budget_classification="fixed_epoch",
+            output_paths=output_paths,
+            git_provider=FAKE_GIT_CLEAN,
+            version_provider=FAKE_VERSIONS,
+            identity_inputs=identity,
+            fingerprint=fingerprint,
+            attempt=attempt,
+        )
+        results = {
+            "identity_inputs": identity,
+            "fingerprint": fingerprint,
+            "attempt": attempt,
+            "eval_metrics": {"eval_accuracy": 0.9},
+        }
+        (self.run_dir / "results.json").write_text(
+            json.dumps(results), encoding="utf-8"
+        )
+        (self.run_dir / "instrumentation.json").write_text(
+            json.dumps({"batches": 200}), encoding="utf-8"
+        )
+        if on_diagnostics:
+            (self.run_dir / "ler_diagnostics.json").write_text(
+                json.dumps({"ler": 0.1}), encoding="utf-8"
+            )
+        return finalize_manifest_completed(
+            str(self.run_dir),
+            realized_skips=30,
+            realized_skip_rate=0.15,
+            validation_status={"valid_for_matched_budget": True, "ok": True},
+        )
+
+    def _errors(self):
+        return verify_completed_manifest(str(self.run_dir))["errors"]
+
+    def test_verify_valid_off_diagnostics_manifest_ok(self):
+        self._complete()
+        result = verify_completed_manifest(str(self.run_dir))
+        self.assertTrue(result["ok"], result)
+
+    def test_verify_valid_on_diagnostics_manifest_ok(self):
+        self._complete(on_diagnostics=True)
+        result = verify_completed_manifest(str(self.run_dir))
+        self.assertTrue(result["ok"], result)
+
+    def test_verify_missing_required_file_fails(self):
+        self._complete()
+        (self.run_dir / "results.json").unlink()
+        self.assertIn("artifacts.results.json.exists",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_malformed_results_json_fails(self):
+        self._complete()
+        (self.run_dir / "results.json").write_text("{not json", encoding="utf-8")
+        self.assertIn("results.json", [e["field"] for e in self._errors()])
+
+    def test_verify_byte_tampering_fails(self):
+        self._complete()
+        path = self.run_dir / "results.json"
+        path.write_bytes(path.read_bytes() + b" ")
+        self.assertIn("artifacts.results.json.sha256",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_size_tampering_fails(self):
+        self._complete()
+        stored = load_manifest(str(self.run_dir))
+        stored["artifacts"]["results.json"]["size_bytes"] = 0
+        manifest_path_obj = self.run_dir / "run_manifest.json"
+        manifest_path_obj.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertIn("artifacts.results.json.size_bytes",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_hash_tampering_fails(self):
+        self._complete()
+        stored = load_manifest(str(self.run_dir))
+        stored["artifacts"]["results.json"]["sha256"] = "0" * 64
+        manifest_path_obj = self.run_dir / "run_manifest.json"
+        manifest_path_obj.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertIn("artifacts.results.json.sha256",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_identity_mismatch_fails(self):
+        self._complete()
+        results = json.loads(
+            (self.run_dir / "results.json").read_text(encoding="utf-8")
+        )
+        results["identity_inputs"] = {"task": "mnli"}
+        (self.run_dir / "results.json").write_text(
+            json.dumps(results), encoding="utf-8"
+        )
+        self.assertIn("results.json.identity_inputs",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_fingerprint_mismatch_fails(self):
+        self._complete()
+        results = json.loads(
+            (self.run_dir / "results.json").read_text(encoding="utf-8")
+        )
+        results["fingerprint"] = "ffffffffffffffff"
+        (self.run_dir / "results.json").write_text(
+            json.dumps(results), encoding="utf-8"
+        )
+        self.assertIn("results.json.fingerprint",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_attempt_mismatch_fails(self):
+        self._complete()
+        results = json.loads(
+            (self.run_dir / "results.json").read_text(encoding="utf-8")
+        )
+        results["attempt"] = ATTEMPT + 1
+        (self.run_dir / "results.json").write_text(
+            json.dumps(results), encoding="utf-8"
+        )
+        self.assertIn("results.json.attempt",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_self_reference_rejected(self):
+        self._complete()
+        stored = load_manifest(str(self.run_dir))
+        stored["artifacts"]["run_manifest.json"] = {
+            "path": "run_manifest.json",
+            "exists": True,
+            "size_bytes": 123,
+            "sha256": "0" * 64,
+        }
+        manifest_path_obj = self.run_dir / "run_manifest.json"
+        manifest_path_obj.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertIn("artifacts.run_manifest.json",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_unexpected_artifact_rejected(self):
+        self._complete()
+        stored = load_manifest(str(self.run_dir))
+        stored["artifacts"]["extra.bin"] = {
+            "path": "extra.bin",
+            "exists": False,
+            "size_bytes": None,
+            "sha256": None,
+        }
+        manifest_path_obj = self.run_dir / "run_manifest.json"
+        manifest_path_obj.write_text(json.dumps(stored), encoding="utf-8")
+        self.assertIn("artifacts.extra.bin",
+                      [e["field"] for e in self._errors()])
+
+    def test_verify_missing_optional_ler_diagnostics_ok(self):
+        self._complete()
+        stored = load_manifest(str(self.run_dir))
+        stored["artifacts"].pop("ler_diagnostics.json")
+        manifest_path_obj = self.run_dir / "run_manifest.json"
+        manifest_path_obj.write_text(json.dumps(stored), encoding="utf-8")
+        result = verify_completed_manifest(str(self.run_dir))
+        self.assertTrue(result["ok"], result)
+
+    def test_verify_manifest_not_completed_fails(self):
+        write_manifest_running(
+            str(self.run_dir),
+            argv=["run_ablation_study.py"],
+            task="mrpc",
+            model_id="modernbert",
+            seed=42,
+            controller_name="RandomSkipPolicy",
+            controller_seed=42,
+            target_skip_rate=0.15,
+            planned_quota=30,
+            total_steps=200,
+            warmup_steps=10,
+            skip_update_mode="freeze",
+            controller_config_effective={"arm": "exact_random"},
+            matched_budget_planned=True,
+            budget_classification="fixed_epoch",
+            output_paths={"results": "results.json"},
+            git_provider=FAKE_GIT_CLEAN,
+            version_provider=FAKE_VERSIONS,
+        )
+        self.assertIn("status", [e["field"] for e in self._errors()])
+
+
+class LifecycleIntegrationTests(unittest.TestCase):
+    """6B-3 lifecycle and runner integration tests for completed-manifest."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="lerna-lifecycle-")
+        self.run_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_running(self, **overrides):
+        kwargs = dict(
+            argv=["run_ablation_study.py"],
+            task="mrpc",
+            model_id="modernbert",
+            seed=42,
+            controller_name="RandomSkipPolicy",
+            controller_seed=42,
+            target_skip_rate=0.15,
+            planned_quota=30,
+            total_steps=200,
+            warmup_steps=10,
+            skip_update_mode="freeze",
+            controller_config_effective={"arm": "exact_random"},
+            matched_budget_planned=True,
+            budget_classification="fixed_epoch",
+            output_paths={"results": "results.json",
+                          "instrumentation": "instrumentation.json"},
+            git_provider=FAKE_GIT_CLEAN,
+            version_provider=FAKE_VERSIONS,
+        )
+        kwargs.update(overrides)
+        return write_manifest_running(str(self.run_dir), **kwargs)
+
+    def _write_artifacts(self):
+        for name, content in {
+            "results.json": json.dumps({"eval_metrics": {"eval_accuracy": 0.9}}),
+            "instrumentation.json": json.dumps({"batches": 200}),
+        }.items():
+            (self.run_dir / name).write_text(content, encoding="utf-8")
+
+    def _complete(self, **overrides):
+        validation = dict(overrides.pop(
+            "validation_status",
+            {"valid_for_matched_budget": True, "ok": True},
+        ))
+        return finalize_manifest_completed(
+            str(self.run_dir),
+            realized_skips=30,
+            realized_skip_rate=0.15,
+            validation_status=validation,
+            **overrides,
+        )
+
+    def test_completed_to_completed_rejected(self):
+        self._write_running()
+        self._write_artifacts()
+        self._complete()
+        with self.assertRaises(ProvenanceError):
+            self._complete()
+
+    def test_failed_to_completed_rejected(self):
+        self._write_running()
+        self._write_artifacts()
+        finalize_manifest_failed(str(self.run_dir), RuntimeError("crash"))
+        with self.assertRaises(ProvenanceError):
+            self._complete()
+
+    def test_failed_to_failed_rejected(self):
+        self._write_running()
+        self._write_artifacts()
+        finalize_manifest_failed(str(self.run_dir), RuntimeError("first"))
+        with self.assertRaises(ProvenanceError):
+            finalize_manifest_failed(str(self.run_dir), RuntimeError("second"))
+
+    def test_atomic_failed_finalization_keeps_running_manifest(self):
+        self._write_running()
+        self._write_artifacts()
+        before = load_manifest(str(self.run_dir))
+        with mock.patch("os.replace", side_effect=OSError("simulated crash")):
+            with self.assertRaises(OSError):
+                finalize_manifest_failed(
+                    str(self.run_dir), RuntimeError("crash")
+                )
+        self.assertEqual(load_manifest(str(self.run_dir)), before)
+        leftovers = [
+            name for name in os.listdir(self.run_dir) if name.endswith(".tmp")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_completed_manifest_persistence_reload_equality(self):
+        self._write_running()
+        self._write_artifacts()
+        manifest = self._complete()
+        reloaded = load_manifest(str(self.run_dir))
+        self.assertEqual(manifest, reloaded)
+        result = verify_completed_manifest(str(self.run_dir))
+        self.assertTrue(result["ok"], result)
 
 
 if __name__ == "__main__":

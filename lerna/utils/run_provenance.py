@@ -585,6 +585,15 @@ def finalize_manifest_completed(
         }
     )
     _atomic_write_json(manifest_path(run_dir), manifest)
+    verification = verify_completed_manifest(run_dir)
+    if not verification["ok"]:
+        raise ProvenanceError(
+            "Completed manifest failed integrity verification: "
+            + "; ".join(
+                f"{entry['field']}: {entry['message']}"
+                for entry in verification["errors"]
+            )
+        )
     return manifest
 
 
@@ -610,3 +619,174 @@ def finalize_manifest_failed(run_dir: str, exc: BaseException) -> Dict[str, Any]
     )
     _atomic_write_json(manifest_path(run_dir), manifest)
     return manifest
+
+
+_COMPLETED_REQUIRED_FIELDS = (
+    "end_time_utc",
+    "duration_seconds",
+    "artifacts",
+    "realized",
+    "validation",
+)
+_ARTIFACT_METADATA_KEYS = ("path", "exists", "size_bytes", "sha256")
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _verify_artifacts(run_dir: str, manifest: Dict[str, Any],
+                      errors: List[Dict[str, str]]) -> None:
+    """Verify artifact metadata schema, existence, size, and recomputed SHA-256.
+
+    The manifest itself (``run_manifest.json``) is never hashed: hashing it
+    would capture the preceding running manifest, not the final completed one.
+    """
+    raw_artifacts = manifest.get("artifacts")
+    if not isinstance(raw_artifacts, dict):
+        errors.append({
+            "field": "artifacts",
+            "message": "artifacts must be an object",
+        })
+        return
+
+    raw_output_paths = manifest.get("output_paths")
+    output_paths = raw_output_paths if isinstance(raw_output_paths, dict) else {}
+    output_names = {
+        name for name in output_paths.values()
+        if isinstance(name, str) and name != MANIFEST_FILENAME
+    }
+    expected = set(DEFAULT_ARTIFACT_FILENAMES) | output_names
+    required = {"results.json", "instrumentation.json"} | output_names
+
+    for name in sorted(expected):
+        entry = raw_artifacts.get(name)
+        if not isinstance(entry, dict):
+            if name in required:
+                errors.append({
+                    "field": f"artifacts.{name}",
+                    "message": "required artifact metadata entry is missing "
+                               "or not an object",
+                })
+            continue
+        for key in _ARTIFACT_METADATA_KEYS:
+            if key not in entry:
+                errors.append({
+                    "field": f"artifacts.{name}.{key}",
+                    "message": f"artifact metadata key {key!r} is missing",
+                })
+        if entry.get("path") != name:
+            errors.append({
+                "field": f"artifacts.{name}.path",
+                "message": f"artifact path does not match key {name!r}",
+            })
+        sha256 = entry.get("sha256")
+        if sha256 is not None and not _SHA256_HEX_PATTERN.match(str(sha256)):
+            errors.append({
+                "field": f"artifacts.{name}.sha256",
+                "message": "sha256 must be a 64-character lowercase hex digest",
+            })
+        actual_path = os.path.join(run_dir, name)
+        exists = os.path.isfile(actual_path)
+        if entry.get("exists") is not exists:
+            errors.append({
+                "field": f"artifacts.{name}.exists",
+                "message": f"recorded exists={entry.get('exists')!r} but "
+                           f"actual is {exists}",
+            })
+        if exists:
+            actual_size = os.path.getsize(actual_path)
+            if entry.get("size_bytes") != actual_size:
+                errors.append({
+                    "field": f"artifacts.{name}.size_bytes",
+                    "message": f"recorded size {entry.get('size_bytes')!r} "
+                               f"does not match actual {actual_size}",
+                })
+            actual_sha = _sha256_file(actual_path)
+            if sha256 != actual_sha:
+                errors.append({
+                    "field": f"artifacts.{name}.sha256",
+                    "message": "recorded sha256 does not match recomputed digest",
+                })
+        elif name in required:
+            errors.append({
+                "field": f"artifacts.{name}.exists",
+                "message": f"required artifact {name!r} does not exist",
+            })
+
+    for name in sorted(raw_artifacts):
+        if name not in expected:
+            errors.append({
+                "field": f"artifacts.{name}",
+                "message": f"unexpected artifact entry {name!r}",
+            })
+
+
+def _verify_results_identity(run_dir: str, manifest: Dict[str, Any],
+                             errors: List[Dict[str, str]]) -> None:
+    """Verify results.json identity, fingerprint, and attempt match the manifest."""
+    results_path = os.path.join(run_dir, "results.json")
+    if not os.path.isfile(results_path):
+        errors.append({
+            "field": "results.json",
+            "message": "results.json is missing",
+        })
+        return
+    try:
+        with open(results_path, encoding="utf-8") as handle:
+            results = json.load(handle)
+    except (json.JSONDecodeError, OSError) as exc:
+        errors.append({
+            "field": "results.json",
+            "message": f"results.json is unreadable: {exc}",
+        })
+        return
+    if not isinstance(results, dict):
+        errors.append({
+            "field": "results.json",
+            "message": "results.json root must be an object",
+        })
+        return
+
+    manifest_identity = manifest.get("identity_inputs")
+    results_identity = results.get("identity_inputs")
+    if _sanitize(results_identity) != manifest_identity:
+        errors.append({
+            "field": "results.json.identity_inputs",
+            "message": "results.json identity_inputs does not match the manifest",
+        })
+    for key in ("fingerprint", "attempt"):
+        if manifest.get(key) != results.get(key):
+            errors.append({
+                "field": f"results.json.{key}",
+                "message": f"results.json {key} does not match the manifest",
+            })
+
+
+def verify_completed_manifest(run_dir: str) -> Dict[str, Any]:
+    """Verify a completed manifest and its artifacts for scientific integrity.
+
+    Dependency-light: no torch or framework imports. Returns
+    ``{"ok": bool, "errors": [{"field": str, "message": str}, ...]}``.
+    """
+    errors: List[Dict[str, str]] = []
+    try:
+        manifest = load_manifest(run_dir)
+    except (OSError, json.JSONDecodeError, ProvenanceError) as exc:
+        return {
+            "ok": False,
+            "errors": [{"field": "manifest", "message": str(exc)}],
+        }
+
+    if manifest.get("status") != "completed":
+        errors.append({
+            "field": "status",
+            "message": f"expected 'completed', got {manifest.get('status')!r}",
+        })
+    for field in _COMPLETED_REQUIRED_FIELDS:
+        if field not in manifest:
+            errors.append({
+                "field": field,
+                "message": f"completed manifest is missing required field {field!r}",
+            })
+
+    _verify_artifacts(run_dir, manifest, errors)
+    _verify_results_identity(run_dir, manifest, errors)
+    return {"ok": not errors, "errors": errors}
