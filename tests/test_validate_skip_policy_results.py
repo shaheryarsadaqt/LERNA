@@ -2313,3 +2313,89 @@ def test_phase1_3_fixed_budget_top_level_forward_calls_errors(value):
     data["forward_calls"] = value
     vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
     assert "forward_calls" in fields(report, "error")
+
+
+def _mutate_budget_controller(data, run_config, key, value):
+    """Mutate one controller field in both controller_config copies."""
+    for config in (
+        data["controller_config"],
+        run_config["controller_config"],
+    ):
+        if value is _REMOVE:
+            config.pop(key)
+        else:
+            config[key] = value
+
+
+FULL_FINETUNE_QUOTA_CASES = (
+    ("requested_quota", _REMOVE),
+    ("requested_quota", 0),
+    ("requested_quota", 1),
+    ("runtime_quota_total_steps", _REMOVE),
+    ("runtime_quota_total_steps", TOTAL),
+)
+SKIPPING_QUOTA_PLAN_CASES = (
+    ("min_step", _REMOVE),
+    ("min_step", "50"),
+    ("min_step", True),
+    ("min_step", 50.0),
+    ("min_step", 50.5),
+    ("min_step", -1),
+    ("requested_quota", _REMOVE),
+    ("requested_quota", "30"),
+    ("requested_quota", True),
+    ("requested_quota", 30.0),
+    ("requested_quota", 30.5),
+    ("requested_quota", -1),
+    ("requested_quota", QUOTA + 1),
+    ("runtime_quota_total_steps", _REMOVE),
+    ("runtime_quota_total_steps", "200"),
+    ("runtime_quota_total_steps", True),
+    ("runtime_quota_total_steps", 200.0),
+    ("runtime_quota_total_steps", 200.5),
+    ("runtime_quota_total_steps", -1),
+    ("runtime_quota_total_steps", TOTAL - 1),
+)
+
+
+@pytest.mark.parametrize("key, value", FULL_FINETUNE_QUOTA_CASES)
+def test_phase1_3_fixed_budget_full_finetune_quota_field_errors(key, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "full_finetune"
+    )
+    _mutate_budget_controller(data, run_config, key, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "controller_config." + key in fields(report, "error")
+
+
+@pytest.mark.parametrize("key, value", SKIPPING_QUOTA_PLAN_CASES)
+def test_phase1_3_fixed_budget_skipping_quota_plan_field_errors(key, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_controller(data, run_config, key, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "controller_config." + key in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_infeasible_exact_quota_is_rejected():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    assert TOTAL == 200 and QUOTA == 30
+    _mutate_budget_controller(data, run_config, "min_step", 190)
+    assert data["controller_config"]["requested_quota"] == QUOTA
+    assert run_config["controller_config"]["requested_quota"] == QUOTA
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "controller_config.requested_quota" in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_silently_clipped_quota_is_rejected():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_controller(data, run_config, "min_step", 190)
+    _mutate_budget_controller(data, run_config, "requested_quota", 10)
+    assert round(RATE * TOTAL) == QUOTA == 30
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "controller_config.requested_quota" in fields(report, "error")
