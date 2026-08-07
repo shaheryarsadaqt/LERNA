@@ -2399,3 +2399,126 @@ def test_phase1_3_fixed_budget_silently_clipped_quota_is_rejected():
     assert round(RATE * TOTAL) == QUOTA == 30
     vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
     assert "controller_config.requested_quota" in fields(report, "error")
+
+
+DIAG_COUNT_FIELDS = (
+    "quota_total_steps",
+    "quota_size",
+    "decisions_seen",
+    "skip_decisions",
+)
+DIAG_COUNT_INVALID = (_REMOVE, -1, "1", True, 1.0, 1.5)
+DIAG_HORIZON_DISAGREEMENT_FIELDS = ("quota_total_steps", "decisions_seen")
+DIAG_QUOTA_DISAGREEMENT_FIELDS = ("quota_size", "skip_decisions")
+DIAG_REQUESTED_QUOTA_INVALID = ("30", True, 30.0, 30.5, -1, QUOTA + 1)
+QUOTA_EXACT_CONTROLS = (
+    "fixed_phase_strat",
+    "phase_strat_guarded",
+    "ler_guided_stratified",
+    "ler_guided_stratified_safe",
+)
+QUOTA_EXACT_INVALID = (_REMOVE, False, 1, None)
+FULL_FINETUNE_DIAG_QUOTA_CASES = (
+    ("quota_size", 0),
+    ("quota_size", 1),
+    ("requested_quota", 0),
+    ("requested_quota", 1),
+)
+
+
+def _mutate_budget_diag(diag, key, value):
+    """Mutate one policy_diagnostics field, removing it on _REMOVE."""
+    if value is _REMOVE:
+        diag.pop(key, None)
+    else:
+        diag[key] = value
+
+
+@pytest.mark.parametrize("value", DIAG_COUNT_INVALID)
+@pytest.mark.parametrize("field", DIAG_COUNT_FIELDS)
+def test_phase1_3_fixed_budget_diag_count_errors(field, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_diag(diag, field, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics." + field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field", DIAG_HORIZON_DISAGREEMENT_FIELDS)
+def test_phase1_3_fixed_budget_diag_horizon_disagreement_errors(field):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_diag(diag, field, TOTAL - 1)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics." + field in fields(report, "error")
+
+
+@pytest.mark.parametrize("field", DIAG_QUOTA_DISAGREEMENT_FIELDS)
+def test_phase1_3_fixed_budget_diag_quota_disagreement_errors(field):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_diag(diag, field, QUOTA + 1)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics." + field in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_diag_requested_quota_absent_is_valid():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_diag(diag, "requested_quota", _REMOVE)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics.requested_quota" not in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", DIAG_REQUESTED_QUOTA_INVALID)
+def test_phase1_3_fixed_budget_diag_requested_quota_errors(value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    _mutate_budget_diag(diag, "requested_quota", value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics.requested_quota" in fields(report, "error")
+
+
+@pytest.mark.parametrize("value", QUOTA_EXACT_INVALID)
+@pytest.mark.parametrize("control", QUOTA_EXACT_CONTROLS)
+def test_phase1_3_fixed_budget_diag_quota_exact_errors(control, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(control)
+    _mutate_budget_diag(diag, "quota_exact", value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics.quota_exact" in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_exact_random_quota_exact_not_required():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "exact_random"
+    )
+    assert "quota_exact" not in diag
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics.quota_exact" not in fields(report, "error")
+
+
+@pytest.mark.parametrize("key, value", FULL_FINETUNE_DIAG_QUOTA_CASES)
+def test_phase1_3_fixed_budget_full_finetune_diag_quota_errors(key, value):
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "full_finetune"
+    )
+    _mutate_budget_diag(diag, key, value)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    assert "policy_diagnostics." + key in fields(report, "error")
+
+
+def test_phase1_3_fixed_budget_full_finetune_none_diag_quota_is_valid():
+    report, data, run_config, diag, instr = _phase1_3_budget_inputs(
+        "full_finetune"
+    )
+    _mutate_budget_diag(diag, "quota_size", None)
+    _mutate_budget_diag(diag, "requested_quota", None)
+    vspr._check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    error_fields = fields(report, "error")
+    assert "policy_diagnostics.quota_size" not in error_fields
+    assert "policy_diagnostics.requested_quota" not in error_fields
