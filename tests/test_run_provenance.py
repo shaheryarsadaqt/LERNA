@@ -612,6 +612,53 @@ class LifecycleIntegrationTests(unittest.TestCase):
         result = verify_completed_manifest(str(self.run_dir))
         self.assertTrue(result["ok"], result)
 
+    def test_candidate_integrity_failure_keeps_manifest_running(self):
+        self._write_running()
+        self._write_artifacts()
+        before = load_manifest(str(self.run_dir))
+        # Tamper with results.json so the completed candidate fails integrity.
+        (self.run_dir / "results.json").write_text(
+            '{"identity_inputs": {"task": "mnli"}}', encoding="utf-8"
+        )
+        with self.assertRaises(ProvenanceError):
+            self._complete()
+        self.assertEqual(load_manifest(str(self.run_dir)), before)
+        self.assertEqual(before["status"], "running")
+
+    def test_output_paths_rejects_absolute_path(self):
+        with self.assertRaises(ProvenanceError):
+            self._write_running(
+                output_paths={"results": "/tmp/escape.json"}
+            )
+
+    def test_output_paths_rejects_path_separator(self):
+        with self.assertRaises(ProvenanceError):
+            self._write_running(
+                output_paths={"results": "sub/results.json"}
+            )
+
+    def test_output_paths_rejects_dot_entries(self):
+        for bad in (".", ".."):
+            with self.assertRaises(ProvenanceError):
+                self._write_running(output_paths={"results": bad})
+
+    def test_output_paths_rejects_arbitrary_filename(self):
+        with self.assertRaises(ProvenanceError):
+            self._write_running(
+                output_paths={"results": "arbitrary.bin"}
+            )
+
+    def test_output_paths_accepts_canonical_filenames(self):
+        manifest = self._write_running(
+            output_paths={
+                "results": "results.json",
+                "instrumentation": "instrumentation.json",
+                "ler_diagnostics": "ler_diagnostics.json",
+                "manifest": "run_manifest.json",
+            }
+        )
+        self.assertEqual(manifest["status"], "running")
+
 
 if __name__ == "__main__":
     unittest.main()

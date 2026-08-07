@@ -29,6 +29,10 @@ DEFAULT_ARTIFACT_FILENAMES = (
     "ler_diagnostics.json",
 )
 
+_ALLOWED_OUTPUT_PATH_FILENAMES = frozenset(
+    DEFAULT_ARTIFACT_FILENAMES + (MANIFEST_FILENAME,)
+)
+
 _SECRET_KEY_PATTERN = re.compile(
     r"(?:api[_-]?key|access[_-]?key|token|secret|password|credential)",
     re.IGNORECASE,
@@ -152,6 +156,35 @@ def _sanitize_argv(argv: Iterable[str]) -> List[str]:
         if value.startswith("-") and _SECRET_KEY_PATTERN.search(value):
             redact_next = True
     return sanitized
+
+
+def _validate_output_paths(output_paths: Dict[str, str]) -> None:
+    """Reject output paths that could escape the canonical artifact set.
+
+    Absolute paths, path separators, dot entries, and arbitrary filenames
+    would let a caller redirect verification outside the run directory.
+    """
+    if not isinstance(output_paths, dict):
+        raise ProvenanceError("output_paths must be an object")
+    for key, raw_name in output_paths.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ProvenanceError(
+                f"output_paths.{key} must be a non-empty filename"
+            )
+        if os.path.isabs(raw_name) or os.path.basename(raw_name) != raw_name:
+            raise ProvenanceError(
+                f"output_paths.{key} must be a bare filename, not a path: "
+                f"{raw_name!r}"
+            )
+        if raw_name in (".", ".."):
+            raise ProvenanceError(
+                f"output_paths.{key} must not be a dot entry: {raw_name!r}"
+            )
+        if raw_name not in _ALLOWED_OUTPUT_PATH_FILENAMES:
+            raise ProvenanceError(
+                f"output_paths.{key} is not a canonical artifact filename: "
+                f"{raw_name!r}"
+            )
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -487,6 +520,7 @@ def write_manifest_running(
 ) -> Dict[str, Any]:
     """Create the unique initial running manifest atomically."""
     os.makedirs(run_dir, exist_ok=True)
+    _validate_output_paths(output_paths)
     target = manifest_path(run_dir)
     if os.path.exists(target):
         raise ProvenanceError(
@@ -568,11 +602,12 @@ def finalize_manifest_completed(
         )
 
     end_iso = _utc_now_iso()
-    manifest.update(
+    candidate = dict(manifest)
+    candidate.update(
         {
             "status": "completed",
             "end_time_utc": end_iso,
-            "duration_seconds": _duration_seconds(manifest, end_iso),
+            "duration_seconds": _duration_seconds(candidate, end_iso),
             "artifacts": {
                 name: _artifact_check(run_dir, name)
                 for name in artifact_filenames
@@ -584,8 +619,7 @@ def finalize_manifest_completed(
             "validation": validation,
         }
     )
-    _atomic_write_json(manifest_path(run_dir), manifest)
-    verification = verify_completed_manifest(run_dir)
+    verification = _verify_completed_manifest_payload(run_dir, candidate)
     if not verification["ok"]:
         raise ProvenanceError(
             "Completed manifest failed integrity verification: "
@@ -594,7 +628,8 @@ def finalize_manifest_completed(
                 for entry in verification["errors"]
             )
         )
-    return manifest
+    _atomic_write_json(manifest_path(run_dir), candidate)
+    return candidate
 
 
 def finalize_manifest_failed(run_dir: str, exc: BaseException) -> Dict[str, Any]:
@@ -760,21 +795,15 @@ def _verify_results_identity(run_dir: str, manifest: Dict[str, Any],
             })
 
 
-def verify_completed_manifest(run_dir: str) -> Dict[str, Any]:
-    """Verify a completed manifest and its artifacts for scientific integrity.
+def _verify_completed_manifest_payload(run_dir: str,
+                                       manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify a completed manifest payload against current on-disk artifacts.
 
-    Dependency-light: no torch or framework imports. Returns
-    ``{"ok": bool, "errors": [{"field": str, "message": str}, ...]}``.
+    Use before terminal publication so a failed integrity check leaves the
+    persisted manifest running. ``verify_completed_manifest`` delegates here
+    for persisted, already-published manifests.
     """
     errors: List[Dict[str, str]] = []
-    try:
-        manifest = load_manifest(run_dir)
-    except (OSError, json.JSONDecodeError, ProvenanceError) as exc:
-        return {
-            "ok": False,
-            "errors": [{"field": "manifest", "message": str(exc)}],
-        }
-
     if manifest.get("status") != "completed":
         errors.append({
             "field": "status",
@@ -790,3 +819,19 @@ def verify_completed_manifest(run_dir: str) -> Dict[str, Any]:
     _verify_artifacts(run_dir, manifest, errors)
     _verify_results_identity(run_dir, manifest, errors)
     return {"ok": not errors, "errors": errors}
+
+
+def verify_completed_manifest(run_dir: str) -> Dict[str, Any]:
+    """Load the persisted completed manifest and verify its integrity.
+
+    Dependency-light: no torch or framework imports. Returns
+    ``{"ok": bool, "errors": [{"field": str, "message": str}, ...]}``.
+    """
+    try:
+        manifest = load_manifest(run_dir)
+    except (OSError, json.JSONDecodeError, ProvenanceError) as exc:
+        return {
+            "ok": False,
+            "errors": [{"field": "manifest", "message": str(exc)}],
+        }
+    return _verify_completed_manifest_payload(run_dir, manifest)
