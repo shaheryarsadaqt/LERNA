@@ -98,6 +98,10 @@ from lerna.utils.run_provenance import (
     finalize_manifest_failed,
     write_manifest_running,
 )
+from lerna.utils.phase1_3_matrix import (
+    PHASE1_3_CANONICAL_ARMS,
+    PHASE1_3_POLICY_CLASSES,
+)
 from transformers import TrainerCallback
 
 try:
@@ -745,6 +749,309 @@ def compute_authoritative_horizon(
     microbatches = math.ceil(len(train_dataset) / microbatch_size)
     updates_per_epoch = max(microbatches // gradient_accumulation_steps, 1)
     return math.ceil(num_epochs * updates_per_epoch)
+
+
+def resolve_task_data_facts(
+    task_name,
+    tokenizer,
+    max_samples,
+    profile,
+) -> dict:
+    """Resolve task and horizon facts without constructing training state."""
+    hw_cfg = dict(get_training_config(profile))
+    if max_samples is not None:
+        hw_cfg["max_samples"] = max_samples
+
+    task_hp = TASK_HP_OVERRIDES.get(task_name, {})
+    num_epochs = task_hp.get("num_epochs", 3)
+    train_ds, eval_ds, _ = load_glue_task(
+        task_name,
+        tokenizer,
+        max_length=128,
+        max_samples=hw_cfg["max_samples"],
+    )
+
+    visible_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    effective_n_gpu = 1 if visible_gpus > 1 else max(1, visible_gpus)
+    total_steps = compute_authoritative_horizon(
+        train_dataset=train_ds,
+        num_epochs=num_epochs,
+        per_device_train_batch_size=hw_cfg["per_device_train_batch_size"],
+        gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
+        n_gpu=effective_n_gpu,
+    )
+
+    max_samples_effective = hw_cfg["max_samples"]
+    return {
+        "task": str(task_name),
+        "num_epochs": int(num_epochs),
+        "max_samples_requested": (
+            None if max_samples is None else int(max_samples)
+        ),
+        "max_samples_effective": (
+            None
+            if max_samples_effective is None
+            else int(max_samples_effective)
+        ),
+        "train_samples_realized": len(train_ds),
+        "eval_samples_realized": len(eval_ds),
+        "train_dataset_fingerprint": getattr(train_ds, "_fingerprint", None),
+        "eval_dataset_fingerprint": getattr(eval_ds, "_fingerprint", None),
+        "total_steps": int(total_steps),
+        "per_device_train_batch_size": int(
+            hw_cfg["per_device_train_batch_size"]
+        ),
+        "gradient_accumulation_steps": int(
+            hw_cfg["gradient_accumulation_steps"]
+        ),
+        "effective_n_gpu": int(effective_n_gpu),
+    }
+
+
+def plan_phase1_3_cell(
+    *,
+    task_name,
+    training_seed,
+    policy_seed,
+    ablation_name,
+    target_skip_rate,
+    model_name,
+    data_facts,
+    git_sha,
+    base_output_dir,
+    scheduler_step_policy,
+    max_consecutive_skips,
+    probe_interval,
+    rho_veto_threshold,
+    risk_gamma,
+    online_ler_mode,
+    online_ler_parameter_sample_size,
+    online_ler_update_interval,
+    use_rho_vg=True,
+    use_safety_horizon=True,
+) -> dict:
+    """Build one canonical Phase 1.3 cell without execution side effects."""
+    if ablation_name not in PHASE1_3_CANONICAL_ARMS:
+        raise ValueError(
+            f"Unknown Phase 1.3 arm: {ablation_name!r}; expected one of "
+            f"{list(PHASE1_3_CANONICAL_ARMS)}"
+        )
+    if data_facts.get("task") != task_name:
+        raise ValueError(
+            f"data_facts task {data_facts.get('task')!r} does not match "
+            f"planned task {task_name!r}"
+        )
+
+    target_skip_rate = float(target_skip_rate)
+    if not math.isfinite(target_skip_rate) or not 0.0 <= target_skip_rate <= 1.0:
+        raise ValueError("target_skip_rate must be finite and in [0, 1]")
+    if scheduler_step_policy != "skip_on_backward_skip":
+        raise ValueError(
+            "Phase 1.3 planning requires "
+            "scheduler_step_policy='skip_on_backward_skip'"
+        )
+
+    training_seed = int(training_seed)
+    policy_seed = int(policy_seed)
+    num_epochs = int(data_facts["num_epochs"])
+    total_steps = int(data_facts["total_steps"])
+    if total_steps <= POLICY_MIN_STEP:
+        raise ValueError(
+            f"total_steps must be greater than POLICY_MIN_STEP="
+            f"{POLICY_MIN_STEP}; got {total_steps}"
+        )
+
+    is_skipping_arm = ablation_name != "full_finetune"
+    if is_skipping_arm:
+        requested_quota = round(target_skip_rate * total_steps)
+        eligible_count = total_steps - POLICY_MIN_STEP
+        if requested_quota > eligible_count:
+            raise ValueError(
+                f"Infeasible skip quota: requested {requested_quota} skips "
+                f"after min_step={POLICY_MIN_STEP}, but only {eligible_count} "
+                "decisions are eligible; quotas are never clipped"
+            )
+        planned_skips = requested_quota
+        compute_saving_mechanism = "backward_skipping"
+    else:
+        requested_quota = None
+        planned_skips = 0
+        compute_saving_mechanism = "none"
+
+    resolved_online_ler = resolve_online_ler_config(
+        online_ler_mode,
+        effective_control=ablation_name,
+        policy=None,
+        parameter_sample_size=online_ler_parameter_sample_size,
+        update_interval=online_ler_update_interval,
+    )
+    online_diagnostics = build_online_ler_provenance_config(
+        resolved_online_ler,
+        sample_seed=training_seed,
+    )
+    expected_online_mode = (
+        ONLINE_LER_MODE_OFF
+        if ablation_name in ONLINE_LER_SIGNAL_FREE_CONTROLS
+        else ONLINE_LER_MODE_SAMPLED_LAGGED
+    )
+    if online_diagnostics["mode"] != expected_online_mode:
+        raise ValueError(
+            f"Arm {ablation_name!r} requires online LER mode "
+            f"{expected_online_mode!r}; got {online_diagnostics['mode']!r}"
+        )
+
+    identity_inputs = build_identity_inputs(
+        task=task_name,
+        training_seed=training_seed,
+        model_id=model_name,
+        max_samples_requested=data_facts["max_samples_requested"],
+        train_samples_realized=data_facts["train_samples_realized"],
+        eval_samples_realized=data_facts["eval_samples_realized"],
+        train_dataset_fingerprint=data_facts["train_dataset_fingerprint"],
+        eval_dataset_fingerprint=data_facts["eval_dataset_fingerprint"],
+        num_epochs=num_epochs,
+        control=ablation_name,
+        target_skip_rate=target_skip_rate,
+        policy_seed=policy_seed,
+        skip_update_mode="freeze",
+        scheduler_step_policy=scheduler_step_policy,
+        no_early_stopping=True,
+        total_steps=total_steps,
+        git_sha=git_sha,
+    )
+    identity_inputs = add_online_ler_to_identity(
+        identity_inputs,
+        online_diagnostics,
+    )
+
+    controller_config = {
+        "arm": ablation_name,
+        "arm_alias_of": None,
+        "control": ablation_name,
+        "policy_class": PHASE1_3_POLICY_CLASSES[ablation_name],
+        "compute_saving_mechanism": compute_saving_mechanism,
+        "policy_seed": policy_seed,
+        "target_skip_rate": target_skip_rate,
+        "min_step": POLICY_MIN_STEP,
+        "configured_total_steps": total_steps,
+        "requested_quota": requested_quota,
+        "matched_budget": True,
+        "is_skipping_arm": is_skipping_arm,
+        "allow_early_stopping_with_skipping": False,
+        "early_stopping_active": False,
+        "num_epochs": num_epochs,
+        "online_diagnostics": dict(online_diagnostics),
+    }
+
+    if ablation_name in ("fixed_phase_strat", "phase_strat_guarded"):
+        phase_kwargs = {
+            "control": ablation_name,
+            "target_skip_rate": target_skip_rate,
+            "total_steps": total_steps,
+            "policy_seed": policy_seed,
+            "max_consecutive_skips": max_consecutive_skips,
+        }
+        if ablation_name == "phase_strat_guarded":
+            phase_kwargs.update(
+                guarded=True,
+                rho_veto_threshold=rho_veto_threshold,
+                spike_factor=1.0,
+                use_rho_vg=use_rho_vg,
+                use_safety_horizon=use_safety_horizon,
+                risk_gamma=risk_gamma,
+            )
+        identity_inputs["phase_strat_controller"] = (
+            build_phase_strat_controller_config(**phase_kwargs)
+        )
+        controller_config["phase_strat_controller"] = (
+            build_phase_strat_controller_config(**phase_kwargs)
+        )
+    elif ablation_name in LER_GUIDED_CONTROLS:
+        ler_config = build_ler_guided_controller_config(
+            control=ablation_name,
+            target_skip_rate=target_skip_rate,
+            total_steps=total_steps,
+            policy_seed=policy_seed,
+            max_consecutive_skips=max_consecutive_skips,
+            probe_interval=probe_interval,
+            rho_veto_threshold=rho_veto_threshold,
+        )
+        identity_inputs = add_ler_guided_to_identity(
+            identity_inputs,
+            ler_config,
+        )
+        controller_config["ler_guided_controller"] = (
+            copy_ler_guided_config(ler_config)
+        )
+
+    fingerprint = build_scientific_fingerprint(identity_inputs)
+    planned_arm_dir = os.path.join(
+        base_output_dir,
+        ablation_name,
+        fingerprint,
+    )
+    return {
+        "arm": ablation_name,
+        "control": ablation_name,
+        "task": str(task_name),
+        "training_seed": training_seed,
+        "policy_seed": policy_seed,
+        "model_id": str(model_name),
+        "target_skip_rate": target_skip_rate,
+        "num_epochs": num_epochs,
+        "total_steps": total_steps,
+        "min_step": POLICY_MIN_STEP,
+        "requested_quota": requested_quota,
+        "planned_skips": planned_skips,
+        "is_skipping_arm": is_skipping_arm,
+        "matched_budget": True,
+        "no_early_stopping": True,
+        "skip_update_mode": "freeze",
+        "scheduler_step_policy": "skip_on_backward_skip",
+        "online_diagnostics": dict(online_diagnostics),
+        "controller_config": controller_config,
+        "identity_inputs": identity_inputs,
+        "fingerprint": fingerprint,
+        "planned_arm_dir": planned_arm_dir,
+    }
+
+
+def build_phase1_3_matrix_plan(
+    *,
+    tasks,
+    seeds,
+    target_skip_rates,
+    model_name,
+    base_output_dir,
+    data_facts_provider,
+    git_sha,
+    **cell_kwargs,
+) -> list[dict]:
+    """Build the ordered Phase 1.3 matrix without validating or executing."""
+    data_facts_by_task = {}
+    plan = []
+    for task in tasks:
+        if task not in data_facts_by_task:
+            data_facts_by_task[task] = data_facts_provider(task)
+        data_facts = data_facts_by_task[task]
+        for training_seed in seeds:
+            for target_skip_rate in target_skip_rates:
+                for arm in PHASE1_3_CANONICAL_ARMS:
+                    plan.append(
+                        plan_phase1_3_cell(
+                            task_name=task,
+                            training_seed=training_seed,
+                            policy_seed=training_seed,
+                            ablation_name=arm,
+                            target_skip_rate=target_skip_rate,
+                            model_name=model_name,
+                            data_facts=data_facts,
+                            git_sha=git_sha,
+                            base_output_dir=base_output_dir,
+                            **cell_kwargs,
+                        )
+                    )
+    return plan
 
 
 def assert_fixed_budget(
