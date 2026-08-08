@@ -13,6 +13,11 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 _MODERNBERT_PREFIXES = ("answerdotai/ModernBERT",)
 
 
+def load_tokenizer(model_name: str):
+    """Load tokenizer assets without model weights for CPU-side planning."""
+    return AutoTokenizer.from_pretrained(model_name)
+
+
 def load_model_and_tokenizer(
     model_name: str,
     num_labels: int = 2,
@@ -26,7 +31,7 @@ def load_model_and_tokenizer(
     """
     is_modernbert = any(model_name.startswith(p) for p in _MODERNBERT_PREFIXES)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = load_tokenizer(model_name)
 
     model_kwargs = dict(num_labels=num_labels)
     if problem_type is not None:
