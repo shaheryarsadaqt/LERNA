@@ -1,11 +1,15 @@
-"""6C-5: dependency-controlled tests for Phase 1.3 plan construction."""
+"""Phase 1.3 plan construction and strict preflight integration tests."""
 
 import copy
 import itertools
 import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+
 from lerna.utils.phase1_3_matrix import (
     PHASE1_3_CANONICAL_ARMS,
     PLANNED_CELL_REQUIRED_FIELDS,
@@ -447,3 +451,595 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
     ) == []
     assert not base_output_dir.exists()
     assert all(not os.path.exists(cell["planned_arm_dir"]) for cell in plan)
+
+
+STRICT_SEEDS = tuple(range(10))
+STRICT_RATE_ARGS = ("--target-skip-rates", "0.30", "0.40")
+
+
+def _strict_argv(*extra, output_dir=None, tasks=("synthetic",)):
+    argv = [
+        "run_ablation_study.py",
+        "--mode",
+        "phase1_3",
+        "--tasks",
+        *tasks,
+        "--seeds",
+        *(str(seed) for seed in STRICT_SEEDS),
+        *STRICT_RATE_ARGS,
+    ]
+    if output_dir is not None:
+        argv.extend(("--output-dir", str(output_dir)))
+    argv.extend(extra)
+    return argv
+
+
+def _strict_data_facts(task):
+    facts = _data_facts(task=task, total_steps=200, num_epochs=3)
+    facts.update(
+        max_samples_requested=2000,
+        max_samples_effective=2000,
+        train_dataset_fingerprint=f"{task}-strict-train",
+        eval_dataset_fingerprint=f"{task}-strict-eval",
+    )
+    return facts
+
+
+def test_parser_rate_arguments_are_structurally_mutually_exclusive():
+    parser = runner.build_arg_parser()
+    defaults = parser.parse_args([])
+    assert defaults.target_skip_rate is None
+    assert defaults.target_skip_rates is None
+    assert defaults.scheduler_step_policy == "always_step"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--target-skip-rate",
+                "0.20",
+                "--target-skip-rates",
+                "0.30",
+                "0.40",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "argv,error_text",
+    [
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
+             *(str(seed) for seed in STRICT_SEEDS)],
+            "requires --target-skip-rates 0.30 0.40",
+        ),
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
+             *(str(seed) for seed in STRICT_SEEDS), "--target-skip-rate", "0.30"],
+            "requires --target-skip-rates",
+        ),
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
+             *(str(seed) for seed in STRICT_SEEDS), "--target-skip-rates",
+             "0.40", "0.30"],
+            "exact order",
+        ),
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3",
+             *STRICT_RATE_ARGS],
+            "requires explicit --seeds",
+        ),
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
+             *(str(seed) for seed in range(9)), *STRICT_RATE_ARGS],
+            "at least 10 unique seeds",
+        ),
+        (
+            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
+             "0", "1", "2", "3", "4", "5", "6", "7", "8", "8",
+             *STRICT_RATE_ARGS],
+            "duplicate seeds",
+        ),
+        (_strict_argv("--tasks", "synthetic", "synthetic"), "duplicate tasks"),
+        (_strict_argv("--ablations", "exact_random"), "rejects --ablations"),
+        (
+            _strict_argv("--allow-early-stopping-with-skipping"),
+            "forbids early-stopping overrides",
+        ),
+        (
+            _strict_argv("--skip-update-mode", "momentum"),
+            "requires --skip-update-mode freeze",
+        ),
+        (
+            _strict_argv("--policy", "calibrated"),
+            "rejects nondefault legacy --policy",
+        ),
+        (
+            _strict_argv("--rvd-policy-seed", "99"),
+            "rejects --rvd-policy-seed",
+        ),
+        (
+            _strict_argv("--online-ler-mode", "off"),
+            "requires --online-ler-mode auto",
+        ),
+        (
+            _strict_argv(
+                "--provenance-classification", "local_development"
+            ),
+            "requires matched_claim provenance",
+        ),
+    ],
+)
+def test_strict_cli_rejects_invalid_matrix_configuration(
+    monkeypatch,
+    capsys,
+    argv,
+    error_text,
+):
+    profile = mock.Mock(side_effect=AssertionError("profile must not resolve"))
+    monkeypatch.setattr(runner, "detect_device_profile", profile)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit):
+        runner.main()
+
+    assert error_text in capsys.readouterr().err
+    profile.assert_not_called()
+
+
+def test_target_rate_list_is_rejected_by_legacy_modes(monkeypatch, capsys):
+    profile = mock.Mock(side_effect=AssertionError("profile must not resolve"))
+    monkeypatch.setattr(runner, "detect_device_profile", profile)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ablation_study.py",
+            "--mode",
+            "smoke",
+            "--target-skip-rates",
+            "0.30",
+            "0.40",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        runner.main()
+
+    assert "only valid with --mode phase1_3" in capsys.readouterr().err
+    profile.assert_not_called()
+
+
+def test_strict_main_validates_complete_plan_before_any_run(
+    monkeypatch,
+    tmp_path,
+):
+    output_dir = tmp_path / "strict-output"
+    tasks = ("synthetic_a", "synthetic_b")
+    events = []
+    tokenizer = object()
+    load_tokenizer = mock.Mock(
+        side_effect=lambda model_name: events.append("load_tokenizer") or tokenizer
+    )
+    model_loader = mock.Mock(
+        side_effect=AssertionError("model weights must not load in preflight")
+    )
+    provider_calls = []
+
+    def resolve_facts(task, observed_tokenizer, max_samples, profile):
+        assert observed_tokenizer is tokenizer
+        assert max_samples == 2000
+        assert profile == "cpu"
+        provider_calls.append(task)
+        events.append(f"facts:{task}")
+        return _strict_data_facts(task)
+
+    def validate(plan, **kwargs):
+        assert not output_dir.exists()
+        events.append("validate")
+        assert kwargs == {
+            "tasks": list(tasks),
+            "seeds": list(STRICT_SEEDS),
+            "target_skip_rates": [0.30, 0.40],
+            "minimum_seed_count": 10,
+            "base_output_dir": str(output_dir),
+        }
+        return validate_phase1_3_matrix_plan(plan, **kwargs)
+
+    run_calls = []
+
+    def run_cell(**kwargs):
+        assert events[-1] in {"validate", "wandb_finish", "run"}
+        assert "validate" in events
+        assert not output_dir.exists()
+        events.append("run")
+        run_calls.append(kwargs)
+        return {"ablation": kwargs["ablation_name"]}
+
+    finish_wandb = mock.Mock(
+        side_effect=lambda: events.append("wandb_finish")
+    )
+    monkeypatch.setattr(runner, "detect_device_profile", lambda: "cpu")
+    monkeypatch.setattr(runner, "_resolve_git_sha", lambda: "abc123")
+    monkeypatch.setattr(runner, "resolve_task_data_facts", resolve_facts)
+    monkeypatch.setattr(runner, "validate_phase1_3_matrix_plan", validate)
+    monkeypatch.setattr(runner, "run_ablation_single", run_cell)
+    monkeypatch.setattr(runner, "_ensure_wandb_finished", finish_wandb)
+    monkeypatch.setattr(
+        "lerna.utils.model_loader.load_tokenizer", load_tokenizer
+    )
+    monkeypatch.setattr(
+        "lerna.utils.model_loader.load_model_and_tokenizer", model_loader
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _strict_argv(
+            "--wandb",
+            output_dir=output_dir,
+            tasks=tasks,
+        ),
+    )
+
+    runner.main()
+
+    assert events[:4] == [
+        "load_tokenizer",
+        "facts:synthetic_a",
+        "facts:synthetic_b",
+        "validate",
+    ]
+    assert events[4] == "wandb_finish"
+    assert provider_calls == list(tasks)
+    load_tokenizer.assert_called_once()
+    model_loader.assert_not_called()
+    assert len(run_calls) == 240
+    expected_order = [
+        (task, seed, rate, arm)
+        for task in tasks
+        for seed in STRICT_SEEDS
+        for rate in RATES
+        for arm in PHASE1_3_CANONICAL_ARMS
+    ]
+    assert [
+        (
+            call["task_name"],
+            call["seed"],
+            call["target_skip_rate"],
+            call["ablation_name"],
+        )
+        for call in run_calls
+    ] == expected_order
+    assert all(call["planned_cell"] is not None for call in run_calls)
+    assert all(call["no_early_stopping"] is True for call in run_calls)
+    assert all(call["skip_update_mode"] == "freeze" for call in run_calls)
+    assert all(
+        call["scheduler_step_policy"] == "skip_on_backward_skip"
+        for call in run_calls
+    )
+    assert all(
+        call["allow_early_stopping_with_skipping"] is False
+        for call in run_calls
+    )
+    assert output_dir.joinpath("ablation_summary.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "argv,expected_rate,expected_calls",
+    [
+        (
+            ["run_ablation_study.py", "--mode", "smoke"],
+            0.20,
+            len(PHASE1_3_CANONICAL_ARMS),
+        ),
+        (
+            [
+                "run_ablation_study.py",
+                "--mode",
+                "custom",
+                "--tasks",
+                "sst2",
+                "--seeds",
+                "9",
+                "--ablations",
+                "exact_random",
+                "--target-skip-rate",
+                "0.35",
+            ],
+            0.35,
+            1,
+        ),
+    ],
+)
+def test_legacy_main_preserves_scalar_workflows(
+    monkeypatch,
+    tmp_path,
+    argv,
+    expected_rate,
+    expected_calls,
+):
+    output_dir = tmp_path / "legacy-output"
+    argv = [*argv, "--output-dir", str(output_dir)]
+    load_tokenizer = mock.Mock(
+        side_effect=AssertionError("legacy main must not preflight")
+    )
+    run_calls = []
+
+    def run_cell(**kwargs):
+        run_calls.append(kwargs)
+        return {"ablation": kwargs["ablation_name"]}
+
+    monkeypatch.setattr(runner, "detect_device_profile", lambda: "cpu")
+    monkeypatch.setattr(runner, "run_ablation_single", run_cell)
+    monkeypatch.setattr(
+        "lerna.utils.model_loader.load_tokenizer", load_tokenizer
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+
+    runner.main()
+
+    load_tokenizer.assert_not_called()
+    assert len(run_calls) == expected_calls
+    assert all(call["target_skip_rate"] == expected_rate for call in run_calls)
+    assert all(call["planned_cell"] is None for call in run_calls)
+    assert all(call["no_early_stopping"] is False for call in run_calls)
+    assert all(call["skip_update_mode"] is None for call in run_calls)
+    assert all(
+        call["scheduler_step_policy"] == "always_step"
+        for call in run_calls
+    )
+
+
+def _set_nested(mapping, path, value):
+    target = mapping
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    "path,value,error_path",
+    [
+        (("training_seed",), float(SEED), "training_seed"),
+        (("total_steps",), TOTAL_STEPS + 1, "total_steps"),
+        (("requested_quota",), 1, "requested_quota"),
+        (("fingerprint",), "0" * 16, "fingerprint"),
+        (("planned_arm_dir",), "wrong", "planned_arm_dir"),
+        (("identity_inputs", "task"), "other", "identity_inputs.task"),
+        (("online_diagnostics", "mode"), "off", "online_diagnostics.mode"),
+        (
+            ("controller_config", "policy_seed"),
+            SEED + 1,
+            "controller_config.policy_seed",
+        ),
+    ],
+)
+def test_runtime_match_rejects_every_shared_projection_drift(
+    path,
+    value,
+    error_path,
+):
+    planned = _plan_cell("ler_guided_stratified_safe")
+    runtime = copy.deepcopy(planned)
+    runtime["controller_config"]["policy_effective_config"] = {
+        "runtime_only": True
+    }
+    _set_nested(runtime, path, value)
+
+    with pytest.raises(ValueError, match=error_path):
+        runner.assert_phase1_3_runtime_matches_plan(planned, runtime)
+
+
+def test_runtime_match_accepts_only_runtime_controller_extensions():
+    planned = _plan_cell("ler_guided_stratified_safe")
+    runtime = copy.deepcopy(planned)
+    runtime["controller_config"]["policy_effective_config"] = {
+        "runtime_only": True
+    }
+    runner.assert_phase1_3_runtime_matches_plan(planned, runtime)
+
+    runtime = copy.deepcopy(planned)
+    runtime["identity_inputs"]["runtime_only"] = True
+    with pytest.raises(ValueError, match="unexpected runtime field"):
+        runner.assert_phase1_3_runtime_matches_plan(planned, runtime)
+
+
+class _RuntimeGatePassed(Exception):
+    pass
+
+
+class _FakeRuntimeModel:
+    class Config:
+        use_cache = True
+
+    config = Config()
+
+
+def _runtime_facts(task):
+    return {
+        "task": task,
+        "num_epochs": 3,
+        "max_samples_requested": 2000,
+        "max_samples_effective": 2000,
+        "train_samples_realized": 1000,
+        "eval_samples_realized": 1000,
+        "train_dataset_fingerprint": "runtime-dataset-fp",
+        "eval_dataset_fingerprint": "runtime-dataset-fp",
+        "total_steps": 96,
+        "per_device_train_batch_size": 32,
+        "gradient_accumulation_steps": 1,
+        "effective_n_gpu": 1,
+    }
+
+
+def _install_runtime_gate_fakes(monkeypatch, task):
+    hw_config = _hardware_config(max_samples=2000)
+    hw_config.update(fp16=False, bf16=False)
+    dataset = FakeDataset(1000, "runtime-dataset-fp")
+    load_model = mock.Mock(return_value=(_FakeRuntimeModel(), object()))
+    mkdir = mock.Mock()
+    manifest = mock.Mock()
+    power = mock.Mock()
+    trainer = mock.Mock()
+    finish_wandb = mock.Mock()
+    wandb = SimpleNamespace(init=mock.Mock(), Settings=mock.Mock())
+
+    monkeypatch.setitem(runner.GLUE_TASK_CONFIG, task, {"num_labels": 2})
+    monkeypatch.setattr(
+        runner, "get_training_config", lambda profile: dict(hw_config)
+    )
+    monkeypatch.setattr(
+        runner,
+        "load_glue_task",
+        lambda *args, **kwargs: (dataset, dataset, {}),
+    )
+    monkeypatch.setattr(runner, "_resolve_git_sha", lambda: "abc123")
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        "lerna.utils.model_loader.load_model_and_tokenizer", load_model
+    )
+    monkeypatch.setattr(runner.os, "makedirs", mkdir)
+    monkeypatch.setattr(runner, "write_manifest_running", manifest)
+    monkeypatch.setattr(runner, "PowerTelemetryCallback", power)
+    monkeypatch.setattr(runner, "AblationTrainer", trainer)
+    monkeypatch.setattr(runner, "_ensure_wandb_finished", finish_wandb)
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    return {
+        "load_model": load_model,
+        "mkdir": mkdir,
+        "manifest": manifest,
+        "power": power,
+        "trainer": trainer,
+        "finish_wandb": finish_wandb,
+        "wandb": wandb,
+    }
+
+
+@pytest.mark.parametrize("arm", PHASE1_3_CANONICAL_ARMS)
+def test_all_arms_match_runtime_before_any_side_effect(
+    monkeypatch,
+    tmp_path,
+    arm,
+):
+    task = "synthetic_runtime"
+    output_dir = tmp_path / "runtime-output"
+    planned = _plan_cell(
+        arm,
+        task=task,
+        seed=17,
+        facts=_runtime_facts(task),
+        base_output_dir=str(output_dir),
+        online_ler_parameter_sample_size=4096,
+        online_ler_update_interval=1,
+    )
+    side_effects = _install_runtime_gate_fakes(monkeypatch, task)
+    real_assert = runner.assert_phase1_3_runtime_matches_plan
+
+    def stop_after_valid_match(planned_cell, runtime_cell):
+        real_assert(planned_cell, runtime_cell)
+        raise _RuntimeGatePassed
+
+    monkeypatch.setattr(
+        runner,
+        "assert_phase1_3_runtime_matches_plan",
+        stop_after_valid_match,
+    )
+
+    with pytest.raises(_RuntimeGatePassed):
+        runner.run_ablation_single(
+            task_name=task,
+            seed=17,
+            ablation_name=arm,
+            ablation_overrides={"control": arm},
+            model_name=MODEL_ID,
+            profile="cpu",
+            base_output_dir=str(output_dir),
+            use_wandb=True,
+            max_samples_override=2000,
+            no_early_stopping=True,
+            target_skip_rate=RATES[0],
+            skip_update_mode="freeze",
+            scheduler_step_policy="skip_on_backward_skip",
+            online_ler_mode="auto",
+            planned_cell=planned,
+        )
+
+    side_effects["load_model"].assert_called_once()
+    for name in (
+        "mkdir",
+        "manifest",
+        "power",
+        "trainer",
+        "finish_wandb",
+    ):
+        side_effects[name].assert_not_called()
+    side_effects["wandb"].init.assert_not_called()
+    assert not output_dir.exists()
+
+
+def test_runtime_fingerprint_mismatch_aborts_before_side_effects(
+    monkeypatch,
+    tmp_path,
+):
+    task = "synthetic_runtime"
+    output_dir = tmp_path / "runtime-output"
+    planned = _plan_cell(
+        "exact_random",
+        task=task,
+        seed=17,
+        facts=_runtime_facts(task),
+        base_output_dir=str(output_dir),
+        online_ler_parameter_sample_size=4096,
+        online_ler_update_interval=1,
+    )
+    planned["fingerprint"] = "0" * 16
+    side_effects = _install_runtime_gate_fakes(monkeypatch, task)
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        runner.run_ablation_single(
+            task_name=task,
+            seed=17,
+            ablation_name="exact_random",
+            ablation_overrides={"control": "exact_random"},
+            model_name=MODEL_ID,
+            profile="cpu",
+            base_output_dir=str(output_dir),
+            use_wandb=True,
+            max_samples_override=2000,
+            no_early_stopping=True,
+            target_skip_rate=RATES[0],
+            skip_update_mode="freeze",
+            scheduler_step_policy="skip_on_backward_skip",
+            online_ler_mode="auto",
+            planned_cell=planned,
+        )
+
+    for name in (
+        "mkdir",
+        "manifest",
+        "power",
+        "trainer",
+        "finish_wandb",
+    ):
+        side_effects[name].assert_not_called()
+    side_effects["wandb"].init.assert_not_called()
+    assert not output_dir.exists()
+
+
+def test_source_order_freezes_preflight_and_runtime_boundaries():
+    source = Path(runner.__file__).read_text(encoding="utf-8")
+    main_start = source.index("def main():")
+    main_source = source[main_start:]
+    assert main_source.index("load_tokenizer(model_name)") < main_source.index(
+        "validate_phase1_3_matrix_plan("
+    ) < main_source.index("run_ablation_single(")
+
+    run_start = source.index("def run_ablation_single(")
+    run_end = source.index("\ndef build_arg_parser()", run_start)
+    run_source = source[run_start:run_end]
+    gate = run_source.index("assert_phase1_3_runtime_matches_plan(")
+    wandb_init = run_source.index("wandb.init(")
+    allocation = run_source.index("os.makedirs(arm_dir")
+    power_callback = run_source.index("PowerTelemetryCallback(")
+    trainer = run_source.index("trainer = AblationTrainer(")
+    manifest = run_source.index("write_manifest_running(")
+    assert gate < wandb_init < allocation < power_callback < trainer < manifest
