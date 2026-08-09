@@ -330,7 +330,15 @@ def validate_phase1_3_completed_matrix(
                         "message": f"{attempt_name}: unexpected controller field {key!r}",
                     })
                 for key, planned_value in planned_controller.items():
-                    actual_value = manifest_controller.get(key)
+                    if key not in manifest_controller:
+                        attempt_findings.append({
+                            "severity": "error",
+                            "field": f"manifest.controller_config_effective.{key}",
+                            "cell": cell_id,
+                            "message": f"{attempt_name}: missing controller field {key!r}",
+                        })
+                        continue
+                    actual_value = manifest_controller[key]
                     if not _strict_equal(planned_value, actual_value):
                         attempt_findings.append({
                             "severity": "error",
@@ -362,16 +370,24 @@ def validate_phase1_3_completed_matrix(
                 ("matched_budget_planned", cell.get("matched_budget")),
             )
             for manifest_key, planned_value in run_fields:
-                if not _strict_equal(manifest_run.get(manifest_key), planned_value):
+                if manifest_key not in manifest_run:
                     attempt_findings.append({
                         "severity": "error",
                         "field": f"manifest.run.{manifest_key}",
                         "cell": cell_id,
-                        "message": f"{attempt_name}: {manifest_key} drift {manifest_run.get(manifest_key)!r} != {planned_value!r}",
+                        "message": f"{attempt_name}: missing run field {manifest_key!r}",
+                    })
+                    continue
+                if not _strict_equal(manifest_run[manifest_key], planned_value):
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"manifest.run.{manifest_key}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: {manifest_key} drift {manifest_run[manifest_key]!r} != {planned_value!r}",
                     })
 
             manifest_attempt = manifest.get("attempt")
-            if manifest_attempt != attempt_num:
+            if not _strict_equal(manifest_attempt, attempt_num):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "manifest.attempt",
@@ -439,7 +455,7 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: results fingerprint drift",
                 })
 
-            if results.get("attempt") != attempt_num:
+            if not _strict_equal(results.get("attempt"), attempt_num):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "results.json.attempt",
