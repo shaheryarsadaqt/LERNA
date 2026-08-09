@@ -56,7 +56,7 @@ sys.modules[_VALIDATOR_SPEC.name] = _VALIDATOR_MODULE
 _VALIDATOR_SPEC.loader.exec_module(_VALIDATOR_MODULE)
 validate_skip_results = _VALIDATOR_MODULE.validate_results
 
-_ATTEMPT_PATTERN = re.compile(r"attempt-(\d+)\Z")
+_ATTEMPT_PATTERN = re.compile(r"attempt-(\d{3})\Z")
 
 
 class CompletedMatrixError(ValueError):
@@ -68,6 +68,25 @@ class CompletedMatrixError(ValueError):
         super().__init__(
             f"Phase 1.3 completed matrix validation failed with {count} error(s)"
         )
+
+
+def _required_artifacts_for_cell(cell: dict[str, Any]) -> list[str]:
+    online = cell.get("online_diagnostics") or {}
+    if isinstance(online, dict) and online.get("enabled"):
+        return ["instrumentation.json", "ler_diagnostics.json"]
+    return ["instrumentation.json"]
+
+
+def _expected_output_paths_for_cell(cell: dict[str, Any]) -> dict[str, str]:
+    online = cell.get("online_diagnostics") or {}
+    output_paths = {
+        "results": "results.json",
+        "instrumentation": "instrumentation.json",
+        "manifest": "run_manifest.json",
+    }
+    if isinstance(online, dict) and online.get("enabled"):
+        output_paths["ler_diagnostics"] = "ler_diagnostics.json"
+    return output_paths
 
 
 def validate_phase1_3_completed_matrix(
@@ -98,12 +117,19 @@ def validate_phase1_3_completed_matrix(
         )
     except MatrixPlanError as exc:
         findings.extend(exc.findings)
+    except (TypeError, ValueError) as exc:
+        _add_error(findings, "plan", None, f"plan validation failed: {exc}")
 
+    plan_cells: list[tuple[int, Any, tuple[Any, Any, Any, Any] | None]] = []
     plan_map: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
-    for cell in plan:
-        cell_id = _cell_ref(cell)
-        if cell_id is not None and isinstance(cell, dict):
-            plan_map[cell_id] = cell
+    try:
+        for index, cell in enumerate(plan):
+            cell_id = _cell_ref(cell)
+            plan_cells.append((index, cell, cell_id))
+            if cell_id is not None and isinstance(cell, dict):
+                plan_map[cell_id] = cell
+    except TypeError as exc:
+        _add_error(findings, "plan", None, f"plan is not iterable: {exc}")
 
     expected_dirs: set[str] = set()
     for cell_id, cell in plan_map.items():
@@ -147,7 +173,11 @@ def validate_phase1_3_completed_matrix(
             if os.path.isdir(path):
                 m = _ATTEMPT_PATTERN.match(name)
                 if m:
-                    attempt_entries.append((name, int(m.group(1)), path))
+                    attempt_num = int(m.group(1))
+                    if attempt_num < 1:
+                        _add_error(findings, "attempts", cell_id, f"non-positive attempt number: {name}")
+                        continue
+                    attempt_entries.append((name, attempt_num, path))
 
         if not attempt_entries:
             _add_error(findings, "attempts", cell_id, "no attempt directories found")
@@ -160,140 +190,250 @@ def validate_phase1_3_completed_matrix(
         failed_attempts: list[str] = []
 
         for attempt_name, attempt_num, attempt_path in attempt_entries:
+            attempt_findings: list[dict[str, Any]] = []
+
             manifest_file = os.path.join(attempt_path, "run_manifest.json")
             if not os.path.isfile(manifest_file):
-                _add_error(findings, "manifest", cell_id, f"missing run_manifest.json in {attempt_name}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest",
+                    "cell": cell_id,
+                    "message": f"missing run_manifest.json in {attempt_name}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             try:
                 with open(manifest_file, "r", encoding="utf-8") as handle:
                     manifest = json.load(handle)
             except (json.JSONDecodeError, OSError) as exc:
-                _add_error(findings, "manifest", cell_id, f"unreadable run_manifest.json in {attempt_name}: {exc}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest",
+                    "cell": cell_id,
+                    "message": f"unreadable run_manifest.json in {attempt_name}: {exc}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             if not isinstance(manifest, dict):
-                _add_error(findings, "manifest", cell_id, f"run_manifest.json is not an object in {attempt_name}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest",
+                    "cell": cell_id,
+                    "message": f"run_manifest.json is not an object in {attempt_name}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             status = manifest.get("status")
             if status == "running":
                 running_attempts.append(attempt_name)
-                _add_error(findings, "manifest.status", cell_id, f"running attempt found: {attempt_name}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.status",
+                    "cell": cell_id,
+                    "message": f"running attempt found: {attempt_name}",
+                })
+                findings.extend(attempt_findings)
                 continue
             if status == "failed":
                 failed_attempts.append(attempt_name)
                 continue
             if status != "completed":
-                _add_error(findings, "manifest.status", cell_id, f"unexpected manifest status {status!r} in {attempt_name}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.status",
+                    "cell": cell_id,
+                    "message": f"unexpected manifest status {status!r} in {attempt_name}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             verification = verify_completed_manifest(attempt_path)
             if not verification["ok"]:
                 for err in verification["errors"]:
-                    _add_error(
-                        findings,
-                        f"manifest.verification.{err['field']}",
-                        cell_id,
-                        f"{attempt_name}: {err['message']}",
-                    )
-                continue
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"manifest.verification.{err['field']}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: {err['message']}",
+                    })
 
             manifest_fingerprint = manifest.get("fingerprint")
             if manifest_fingerprint != fingerprint:
-                _add_error(
-                    findings,
-                    "manifest.fingerprint",
-                    cell_id,
-                    f"{attempt_name}: fingerprint drift {manifest_fingerprint!r} != {fingerprint!r}",
-                )
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.fingerprint",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: fingerprint drift {manifest_fingerprint!r} != {fingerprint!r}",
+                })
 
             manifest_identity = manifest.get("identity_inputs")
             plan_identity = cell.get("identity_inputs")
             if not _strict_equal(manifest_identity, plan_identity):
-                _add_error(findings, "manifest.identity_inputs", cell_id, f"{attempt_name}: identity drift")
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.identity_inputs",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: identity drift",
+                })
 
             manifest_run = manifest.get("run") or {}
             if manifest_run.get("task") != cell.get("task"):
-                _add_error(findings, "manifest.run.task", cell_id, f"{attempt_name}: task drift")
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.task",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: task drift",
+                })
             if manifest_run.get("seed") != cell.get("training_seed"):
-                _add_error(findings, "manifest.run.seed", cell_id, f"{attempt_name}: training_seed drift")
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.seed",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: training_seed drift",
+                })
             if manifest_run.get("target_skip_rate") != cell.get("target_skip_rate"):
-                _add_error(findings, "manifest.run.target_skip_rate", cell_id, f"{attempt_name}: target_skip_rate drift")
-                continue
-            if manifest_run.get("controller_name") != cell.get("arm"):
-                _add_error(findings, "manifest.run.controller_name", cell_id, f"{attempt_name}: arm drift")
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.target_skip_rate",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: target_skip_rate drift",
+                })
+
+            expected_policy_class = cell.get("controller_config", {}).get("policy_class")
+            if expected_policy_class is not None and manifest_run.get("controller_name") != expected_policy_class:
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.controller_name",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: controller_name drift {manifest_run.get('controller_name')!r} != {expected_policy_class!r}",
+                })
+
+            if manifest_run.get("controller_seed") != cell.get("policy_seed"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.controller_seed",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: policy_seed drift",
+                })
 
             manifest_attempt = manifest.get("attempt")
             if manifest_attempt != attempt_num:
-                _add_error(
-                    findings,
-                    "manifest.attempt",
-                    cell_id,
-                    f"{attempt_name}: manifest attempt {manifest_attempt!r} != directory attempt {attempt_num}",
-                )
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.attempt",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: manifest attempt {manifest_attempt!r} != directory attempt {attempt_num}",
+                })
+
+            expected_output_paths = _expected_output_paths_for_cell(cell)
+            manifest_output_paths = manifest.get("output_paths") or {}
+            for logical_name, expected_filename in expected_output_paths.items():
+                actual_filename = manifest_output_paths.get(logical_name)
+                if actual_filename != expected_filename:
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"manifest.output_paths.{logical_name}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: expected {expected_filename!r}, got {actual_filename!r}",
+                    })
 
             results_file = os.path.join(attempt_path, "results.json")
             if not os.path.isfile(results_file):
-                _add_error(findings, "results.json", cell_id, f"{attempt_name}: missing results.json")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: missing results.json",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             try:
                 with open(results_file, "r", encoding="utf-8") as handle:
                     results = json.load(handle)
             except (json.JSONDecodeError, OSError) as exc:
-                _add_error(findings, "results.json", cell_id, f"{attempt_name}: unreadable results.json: {exc}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: unreadable results.json: {exc}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             if not isinstance(results, dict):
-                _add_error(findings, "results.json", cell_id, f"{attempt_name}: results.json is not an object")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results.json is not an object",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             if results.get("fingerprint") != fingerprint:
-                _add_error(
-                    findings,
-                    "results.json.fingerprint",
-                    cell_id,
-                    f"{attempt_name}: results fingerprint drift",
-                )
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.fingerprint",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results fingerprint drift",
+                })
+
             if results.get("attempt") != attempt_num:
-                _add_error(
-                    findings,
-                    "results.json.attempt",
-                    cell_id,
-                    f"{attempt_name}: results attempt drift",
-                )
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.attempt",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results attempt drift",
+                })
 
             results_identity = results.get("identity_inputs")
             if not _strict_equal(results_identity, plan_identity):
-                _add_error(findings, "results.json.identity_inputs", cell_id, f"{attempt_name}: results identity drift")
-                continue
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.identity_inputs",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results identity drift",
+                })
 
+            required_artifacts = _required_artifacts_for_cell(cell)
             try:
                 validation_report = validate_skip_results(
                     Path(results_file),
-                    required_artifacts=["instrumentation.json"],
+                    required_artifacts=required_artifacts,
                 )
             except Exception as exc:
-                _add_error(findings, "results.json.validation", cell_id, f"{attempt_name}: validator raised {type(exc).__name__}: {exc}")
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.validation",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: validator raised {type(exc).__name__}: {exc}",
+                })
+                findings.extend(attempt_findings)
                 continue
 
             if not validation_report.ok:
                 for err in validation_report.findings:
-                    _add_error(
-                        findings,
-                        f"results.json.validation.{err.field}",
-                        cell_id,
-                        f"{attempt_name}: {err.message}",
-                    )
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"results.json.validation.{err.field}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: {err.message}",
+                    })
+
+            if validation_report.ok and not validation_report.valid_for_matched_budget:
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.valid_for_matched_budget",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results are not valid_for_matched_budget",
+                })
+
+            if attempt_findings:
+                findings.extend(attempt_findings)
                 continue
 
             valid_attempts.append((attempt_name, results_file, manifest))
