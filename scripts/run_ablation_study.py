@@ -1575,6 +1575,11 @@ def run_ablation_single(
     if max_samples_override is not None:
         hw_cfg["max_samples"] = max_samples_override
 
+    use_rho_vg = ablation_overrides.get("use_rho_vg", True)
+    use_ler = ablation_overrides.get("use_ler", True)
+    use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
+    use_hysteresis = ablation_overrides.get("use_hysteresis", True)
+
     # [Phase 1.3 Piece 1] Explicit skipped-step update mode.
     # Legacy 'use_momentum_extrap' overrides are supported ONLY as a logged
     # compatibility path; conflicts with an explicit CLI mode are rejected.
@@ -1652,15 +1657,27 @@ def run_ablation_single(
     )
     eval_steps = max(total_steps // 20, 10)
 
+    quota_control = effective_control
+    if quota_control is None and policy == "random_veto_deferral":
+        quota_control = "rvd"
+    requested_quota = None
+    if quota_control in (
+        "exact_random", "rvd", "fixed_phase_strat", "phase_strat_guarded"
+    ) or quota_control in LER_GUIDED_CONTROLS:
+        try:
+            _, requested_quota = build_exact_random_skip_set(
+                total_steps=total_steps,
+                target_skip_rate=target_skip_rate,
+                min_step=POLICY_MIN_STEP,
+                seed=controller_cfg["policy_seed"],
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid exact quota for arm {ablation_name!r}: {exc}"
+            ) from exc
+
     # [Piece 9] Deterministic scientific fingerprint for collision-proof identity.
-    git_sha = "unknown"
-    try:
-        import subprocess
-        git_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(__file__)
-        ).decode().strip()
-    except Exception:
-        git_sha = "unknown"
+    git_sha = _resolve_git_sha()
 
     # [Piece 9B] Build canonical identity after dataset loading and horizon
     # calculation. This single dictionary is reused for fingerprint, manifest,
@@ -1762,113 +1779,6 @@ def run_ablation_single(
     # Define run_id from task, seed, arm, and fingerprint.
     run_id = f"{task_name}_s{seed}_{ablation_name}_{fingerprint}"
 
-    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
-    if planned_cell is not None:
-        runtime_cell = {
-            "arm": ablation_name,
-            "control": effective_control,
-            "task": str(task_name),
-            "training_seed": int(seed),
-            "policy_seed": int(controller_cfg["policy_seed"]),
-            "model_id": str(model_name),
-            "target_skip_rate": float(target_skip_rate),
-            "num_epochs": int(num_epochs),
-            "total_steps": int(total_steps),
-            "min_step": POLICY_MIN_STEP,
-            "requested_quota": requested_quota,
-            "planned_skips": (
-                int(requested_quota) if requested_quota is not None else 0
-            ),
-            "is_skipping_arm": budget_state["is_skipping_arm"],
-            "matched_budget": budget_state["matched_budget"],
-            "no_early_stopping": bool(no_early_stopping),
-            "skip_update_mode": effective_skip_update_mode,
-            "scheduler_step_policy": scheduler_step_policy,
-            "online_diagnostics": dict(online_diagnostics),
-            "controller_config": controller_config_effective,
-            "identity_inputs": identity_inputs,
-            "fingerprint": fingerprint,
-            "planned_arm_dir": arm_dir,
-        }
-        assert_phase1_3_runtime_matches_plan(planned_cell, runtime_cell)
-
-    if use_wandb:
-        import wandb
-        _ensure_wandb_finished()
-        wandb.init(
-            project=wandb_project,
-            name=run_id,
-            group=wandb_group,
-            job_type=f"ablation-{ablation_name}",
-            tags=[task_name, f"ablation-{ablation_name}", f"seed-{seed}", model_name.split("/")[-1]],
-            reinit=True,
-            settings=wandb.Settings(init_timeout=120),
-            config={
-                "task": task_name,
-                "seed": seed,
-                "ablation": ablation_name,
-                "ablation_overrides": ablation_overrides,
-                "learning_rate": lr,
-                "scheduler_step_policy": scheduler_step_policy,
-                "model": MODEL_NAME,
-                "profile": profile,
-                "max_samples": hw_cfg["max_samples"],
-                "run_index": run_idx,
-                "total_runs": total_runs,
-            },
-        )
-
-    # [Piece 9] Retry-safe directory layout:
-    #   <base>/<ablation>/<fingerprint>/attempt-<N>/
-    # Previous attempts are preserved; never deleted or overwritten.
-    # Every attempt gets a fresh directory via atomic creation.
-    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
-    os.makedirs(arm_dir, exist_ok=True)
-    attempt = 1
-    while True:
-        run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
-        try:
-            os.makedirs(run_dir, exist_ok=False)
-        except FileExistsError:
-            attempt += 1
-            continue
-        break
-    output_dir = run_dir
-
-    print(f"\n{'='*60}")
-    print(f"  Ablation [{ablation_name}]: {task_name} | seed={seed} | lr={lr}")
-    print(f"  Overrides: {ablation_overrides}")
-    print(f"  Skip-update mode: {effective_skip_update_mode}"
-          + ("  (legacy use_momentum_extrap compat)" if skip_mode_legacy_compat_used else ""))
-    print(f"  Profile: {profile} | Output: {output_dir}")
-    print(f"{'='*60}")
-
-    quota_control = effective_control
-    if quota_control is None and policy == "random_veto_deferral":
-        quota_control = "rvd"
-    requested_quota = None
-    if quota_control in (
-        "exact_random", "rvd", "fixed_phase_strat", "phase_strat_guarded"
-    ) or (
-        quota_control in LER_GUIDED_CONTROLS
-    ):
-        try:
-            _, requested_quota = build_exact_random_skip_set(
-                total_steps=total_steps,
-                target_skip_rate=target_skip_rate,
-                min_step=POLICY_MIN_STEP,
-                seed=controller_cfg["policy_seed"],
-            )
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid exact quota for arm {ablation_name!r}: {exc}"
-            ) from exc
-
-    use_rho_vg = ablation_overrides.get("use_rho_vg", True)
-    use_ler = ablation_overrides.get("use_ler", True)
-    use_safety_horizon = ablation_overrides.get("use_safety_horizon", True)
-    use_hysteresis = ablation_overrides.get("use_hysteresis", True)
-
     online_ler_enabled = online_diagnostics["enabled"]
 
     ler_tracker = build_online_ler_tracker(
@@ -1876,13 +1786,6 @@ def run_ablation_single(
         task_name=task_name,
         use_hysteresis=use_hysteresis,
         sample_seed=online_diagnostics["sample_seed"],
-    )
-
-    power_callback = PowerTelemetryCallback(
-        sample_interval_s=1.0,
-        output_dir=os.path.join(output_dir, "power"),
-        wandb_enabled=use_wandb,
-        log_frequency=50,
     )
 
     # Signal-consuming policies use their task calibration; signal-free arms
@@ -2072,9 +1975,105 @@ def run_ablation_single(
                 risk_gamma=risk_gamma,
             )
         )
+    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
+    if planned_cell is not None:
+        runtime_cell = {
+            "arm": ablation_name,
+            "control": effective_control,
+            "task": str(task_name),
+            "training_seed": int(seed),
+            "policy_seed": int(controller_cfg["policy_seed"]),
+            "model_id": str(model_name),
+            "target_skip_rate": float(target_skip_rate),
+            "num_epochs": int(num_epochs),
+            "total_steps": int(total_steps),
+            "min_step": POLICY_MIN_STEP,
+            "requested_quota": requested_quota,
+            "planned_skips": (
+                int(requested_quota) if requested_quota is not None else 0
+            ),
+            "is_skipping_arm": budget_state["is_skipping_arm"],
+            "matched_budget": budget_state["matched_budget"],
+            "no_early_stopping": bool(no_early_stopping),
+            "skip_update_mode": effective_skip_update_mode,
+            "scheduler_step_policy": scheduler_step_policy,
+            "online_diagnostics": dict(online_diagnostics),
+            "controller_config": controller_config_effective,
+            "identity_inputs": identity_inputs,
+            "fingerprint": fingerprint,
+            "planned_arm_dir": arm_dir,
+        }
+        assert_phase1_3_runtime_matches_plan(planned_cell, runtime_cell)
+
     print(
         "  Controller config: "
         + json.dumps(controller_config_effective, sort_keys=True, default=str)
+    )
+
+    if use_wandb:
+        import wandb
+
+        _ensure_wandb_finished()
+        wandb.init(
+            project=wandb_project,
+            name=run_id,
+            group=wandb_group,
+            job_type=f"ablation-{ablation_name}",
+            tags=[
+                task_name,
+                f"ablation-{ablation_name}",
+                f"seed-{seed}",
+                model_name.split("/")[-1],
+            ],
+            reinit=True,
+            settings=wandb.Settings(init_timeout=120),
+            config={
+                "task": task_name,
+                "seed": seed,
+                "ablation": ablation_name,
+                "ablation_overrides": ablation_overrides,
+                "learning_rate": lr,
+                "scheduler_step_policy": scheduler_step_policy,
+                "model": MODEL_NAME,
+                "profile": profile,
+                "max_samples": hw_cfg["max_samples"],
+                "run_index": run_idx,
+                "total_runs": total_runs,
+            },
+        )
+
+    # Retry-safe layout: <base>/<arm>/<fingerprint>/attempt-<N>/.
+    os.makedirs(arm_dir, exist_ok=True)
+    attempt = 1
+    while True:
+        run_dir = os.path.join(arm_dir, f"attempt-{attempt:03d}")
+        try:
+            os.makedirs(run_dir, exist_ok=False)
+        except FileExistsError:
+            attempt += 1
+            continue
+        break
+    output_dir = run_dir
+
+    print(f"\n{'='*60}")
+    print(f"  Ablation [{ablation_name}]: {task_name} | seed={seed} | lr={lr}")
+    print(f"  Overrides: {ablation_overrides}")
+    print(
+        f"  Skip-update mode: {effective_skip_update_mode}"
+        + (
+            "  (legacy use_momentum_extrap compat)"
+            if skip_mode_legacy_compat_used
+            else ""
+        )
+    )
+    print(f"  Profile: {profile} | Output: {output_dir}")
+    print(f"{'='*60}")
+
+    power_callback = PowerTelemetryCallback(
+        sample_interval_s=1.0,
+        output_dir=os.path.join(output_dir, "power"),
+        wandb_enabled=use_wandb,
+        log_frequency=50,
     )
 
     trainer_holder = [None]
