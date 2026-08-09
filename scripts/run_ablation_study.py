@@ -101,6 +101,9 @@ from lerna.utils.run_provenance import (
 from lerna.utils.phase1_3_matrix import (
     PHASE1_3_CANONICAL_ARMS,
     PHASE1_3_POLICY_CLASSES,
+    PLANNED_CELL_REQUIRED_FIELDS,
+    STRICT_TARGET_SKIP_RATES,
+    validate_phase1_3_matrix_plan,
 )
 from transformers import TrainerCallback
 
@@ -1054,6 +1057,108 @@ def build_phase1_3_matrix_plan(
     return plan
 
 
+def _resolve_git_sha() -> str:
+    """Resolve the current checkout SHA without changing repository state."""
+    try:
+        import subprocess
+
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _collect_planned_runtime_mismatches(
+    planned,
+    runtime,
+    *,
+    path: str,
+    mismatches: list[str],
+    allow_runtime_extra_keys: bool = False,
+) -> None:
+    """Collect type-strict differences in one planned/runtime value."""
+    if type(planned) is not type(runtime):
+        mismatches.append(
+            f"{path}: planned type {type(planned).__name__} != "
+            f"runtime type {type(runtime).__name__}"
+        )
+        return
+    if type(planned) is dict:
+        if not allow_runtime_extra_keys:
+            for key in runtime.keys() - planned.keys():
+                child_path = f"{path}.{key}" if path else str(key)
+                mismatches.append(f"{child_path}: unexpected runtime field")
+        for key, planned_value in planned.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key not in runtime:
+                mismatches.append(f"{child_path}: missing from runtime")
+                continue
+            _collect_planned_runtime_mismatches(
+                planned_value,
+                runtime[key],
+                path=child_path,
+                mismatches=mismatches,
+            )
+        return
+    if type(planned) is list:
+        if len(planned) != len(runtime):
+            mismatches.append(
+                f"{path}: planned length {len(planned)} != "
+                f"runtime length {len(runtime)}"
+            )
+            return
+        for index, (planned_value, runtime_value) in enumerate(
+            zip(planned, runtime)
+        ):
+            _collect_planned_runtime_mismatches(
+                planned_value,
+                runtime_value,
+                path=f"{path}[{index}]",
+                mismatches=mismatches,
+            )
+        return
+    if planned != runtime:
+        mismatches.append(f"{path}: planned {planned!r} != runtime {runtime!r}")
+
+
+def assert_phase1_3_runtime_matches_plan(
+    planned_cell: dict,
+    runtime_cell: dict,
+) -> None:
+    """Abort a strict cell before side effects when runtime identity drifts."""
+    if type(planned_cell) is not dict or type(runtime_cell) is not dict:
+        raise TypeError("planned_cell and runtime_cell must be dictionaries")
+
+    mismatches = []
+    for field in planned_cell.keys() - PLANNED_CELL_REQUIRED_FIELDS:
+        mismatches.append(f"{field}: unexpected planned-cell field")
+    for field in runtime_cell.keys() - PLANNED_CELL_REQUIRED_FIELDS:
+        mismatches.append(f"{field}: unexpected runtime-cell field")
+    for field in sorted(PLANNED_CELL_REQUIRED_FIELDS):
+        if field not in planned_cell:
+            mismatches.append(f"{field}: missing from planned cell")
+            continue
+        if field not in runtime_cell:
+            mismatches.append(f"{field}: missing from runtime cell")
+            continue
+        _collect_planned_runtime_mismatches(
+            planned_cell[field],
+            runtime_cell[field],
+            path=field,
+            mismatches=mismatches,
+            allow_runtime_extra_keys=(field == "controller_config"),
+        )
+
+    if mismatches:
+        details = "; ".join(mismatches[:20])
+        if len(mismatches) > 20:
+            details += f"; ... and {len(mismatches) - 20} more"
+        raise ValueError(f"Planned/runtime mismatch: {details}")
+
+
 def assert_fixed_budget(
     *,
     ablation_name: str,
@@ -1414,6 +1519,7 @@ def run_ablation_single(
     online_ler_mode=ONLINE_LER_MODE_AUTO,
     online_ler_parameter_sample_size=4096,
     online_ler_update_interval=1,
+    planned_cell=None,
 ):
     """Run a single experiment with a specific ablation config."""
 
@@ -1655,6 +1761,36 @@ def run_ablation_single(
 
     # Define run_id from task, seed, arm, and fingerprint.
     run_id = f"{task_name}_s{seed}_{ablation_name}_{fingerprint}"
+
+    arm_dir = os.path.join(base_output_dir, ablation_name, fingerprint)
+    if planned_cell is not None:
+        runtime_cell = {
+            "arm": ablation_name,
+            "control": effective_control,
+            "task": str(task_name),
+            "training_seed": int(seed),
+            "policy_seed": int(controller_cfg["policy_seed"]),
+            "model_id": str(model_name),
+            "target_skip_rate": float(target_skip_rate),
+            "num_epochs": int(num_epochs),
+            "total_steps": int(total_steps),
+            "min_step": POLICY_MIN_STEP,
+            "requested_quota": requested_quota,
+            "planned_skips": (
+                int(requested_quota) if requested_quota is not None else 0
+            ),
+            "is_skipping_arm": budget_state["is_skipping_arm"],
+            "matched_budget": budget_state["matched_budget"],
+            "no_early_stopping": bool(no_early_stopping),
+            "skip_update_mode": effective_skip_update_mode,
+            "scheduler_step_policy": scheduler_step_policy,
+            "online_diagnostics": dict(online_diagnostics),
+            "controller_config": controller_config_effective,
+            "identity_inputs": identity_inputs,
+            "fingerprint": fingerprint,
+            "planned_arm_dir": arm_dir,
+        }
+        assert_phase1_3_runtime_matches_plan(planned_cell, runtime_cell)
 
     if use_wandb:
         import wandb
@@ -2306,7 +2442,11 @@ def run_ablation_single(
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="LERNA Ablation Study")
-    parser.add_argument("--mode", choices=["smoke", "full", "custom"], default="smoke")
+    parser.add_argument(
+        "--mode",
+        choices=["smoke", "full", "custom", "phase1_3"],
+        default="smoke",
+    )
     parser.add_argument("--tasks", nargs="+", default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--ablations", nargs="+", default=None,
@@ -2344,7 +2484,20 @@ def build_arg_parser():
     parser.add_argument("--risk-gamma", type=float, default=0.0)
     parser.add_argument("--guard-mode", choices=["on", "off"], default="on",
                         help="on=full guarded stochastic LERNA; off=pure exact-quota random (debug parity check)")
-    parser.add_argument("--target-skip-rate", type=float, default=0.20)
+    target_rate_group = parser.add_mutually_exclusive_group()
+    target_rate_group.add_argument(
+        "--target-skip-rate",
+        type=float,
+        default=None,
+        help="Scalar rate for legacy smoke/full/custom workflows",
+    )
+    target_rate_group.add_argument(
+        "--target-skip-rates",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Ordered rate list required by strict Phase 1.3 mode",
+    )
     parser.add_argument("--max-consecutive-skips", type=int, default=4)
     parser.add_argument("--probe-interval", type=int, default=8)
     parser.add_argument(
@@ -2432,29 +2585,106 @@ def build_arg_parser():
 
 
 def main():
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    strict_phase1_3 = args.mode == "phase1_3"
+
+    if strict_phase1_3:
+        if args.target_skip_rate is not None:
+            parser.error(
+                "--mode phase1_3 requires --target-skip-rates, not "
+                "--target-skip-rate"
+            )
+        if args.target_skip_rates != list(STRICT_TARGET_SKIP_RATES):
+            parser.error(
+                "--mode phase1_3 requires --target-skip-rates 0.30 0.40 "
+                "in that exact order"
+            )
+        if args.seeds is None:
+            parser.error("--mode phase1_3 requires explicit --seeds")
+        if len(args.seeds) != len(set(args.seeds)):
+            parser.error("--mode phase1_3 rejects duplicate seeds")
+        if len(args.seeds) < 10:
+            parser.error("--mode phase1_3 requires at least 10 unique seeds")
+        if args.tasks is not None and len(args.tasks) != len(set(args.tasks)):
+            parser.error("--mode phase1_3 rejects duplicate tasks")
+        if args.ablations is not None:
+            parser.error(
+                "--mode phase1_3 uses the canonical six arms and rejects "
+                "--ablations"
+            )
+        if args.allow_early_stopping_with_skipping:
+            parser.error(
+                "--mode phase1_3 forbids early-stopping overrides"
+            )
+        if args.skip_update_mode not in (None, "freeze"):
+            parser.error("--mode phase1_3 requires --skip-update-mode freeze")
+        if args.policy != "hybrid":
+            parser.error(
+                "--mode phase1_3 rejects nondefault legacy --policy values"
+            )
+        if args.rvd_policy_seed is not None:
+            parser.error(
+                "--mode phase1_3 pairs policy_seed with training_seed and "
+                "rejects --rvd-policy-seed"
+            )
+        if args.online_ler_mode != ONLINE_LER_MODE_AUTO:
+            parser.error(
+                "--mode phase1_3 requires --online-ler-mode auto for the "
+                "canonical per-arm diagnostic modes"
+            )
+        if args.provenance_classification != CLASSIFICATION_MATCHED_CLAIM:
+            parser.error(
+                "--mode phase1_3 requires matched_claim provenance"
+            )
+    elif args.target_skip_rates is not None:
+        parser.error("--target-skip-rates is only valid with --mode phase1_3")
 
     profile = detect_device_profile()
 
-    if args.mode == "smoke":
-        tasks = ["sst2"]
-        seeds = [42]
-        ablations_to_run = list(PHASE1_3_MATRIX)
-    elif args.mode == "full":
-        tasks = ABLATION_GLUE_TASKS
-        seeds = SEEDS
-        ablations_to_run = list(DEFAULT_ABLATIONS)
+    if strict_phase1_3:
+        tasks = list(args.tasks or ["sst2"])
+        seeds = list(args.seeds)
+        ablations_to_run = list(PHASE1_3_CANONICAL_ARMS)
+        target_skip_rates = list(STRICT_TARGET_SKIP_RATES)
+        legacy_target_skip_rate = None
+        effective_no_early_stopping = True
+        effective_skip_update_mode = "freeze"
+        effective_scheduler_step_policy = (
+            SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
+        )
+        effective_allow_early_stopping = False
     else:
-        tasks = args.tasks or ["sst2"]
-        seeds = args.seeds or [42]
-        ablations_to_run = args.ablations or list(DEFAULT_ABLATIONS)
+        if args.mode == "smoke":
+            tasks = ["sst2"]
+            seeds = [42]
+            ablations_to_run = list(PHASE1_3_MATRIX)
+        elif args.mode == "full":
+            tasks = ABLATION_GLUE_TASKS
+            seeds = SEEDS
+            ablations_to_run = list(DEFAULT_ABLATIONS)
+        else:
+            tasks = args.tasks or ["sst2"]
+            seeds = args.seeds or [42]
+            ablations_to_run = args.ablations or list(DEFAULT_ABLATIONS)
 
-    if args.tasks:
-        tasks = args.tasks
-    if args.seeds:
-        seeds = args.seeds
-    if args.ablations:
-        ablations_to_run = args.ablations
+        if args.tasks:
+            tasks = args.tasks
+        if args.seeds:
+            seeds = args.seeds
+        if args.ablations:
+            ablations_to_run = args.ablations
+
+        target_skip_rates = None
+        legacy_target_skip_rate = (
+            0.20 if args.target_skip_rate is None else args.target_skip_rate
+        )
+        effective_no_early_stopping = args.no_early_stopping
+        effective_skip_update_mode = args.skip_update_mode
+        effective_scheduler_step_policy = args.scheduler_step_policy
+        effective_allow_early_stopping = (
+            args.allow_early_stopping_with_skipping
+        )
 
     effective_max_samples = args.max_samples
     if effective_max_samples is None and not args.unlimited:
@@ -2462,102 +2692,184 @@ def main():
 
     from lerna.utils.model_loader import MODELS
     model_name = MODELS[args.model]
-    wandb_group = args.wandb_group or f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    wandb_group = args.wandb_group or (
+        f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    )
 
-    total_runs = len(tasks) * len(seeds) * len(ablations_to_run)
-    print(f"\n  ═══════════════════════════════════════════════════════")
-    print(f"  LERNA Ablation Study")
-    print(f"  ═══════════════════════════════════════════════════════")
+    if strict_phase1_3:
+        from lerna.utils.model_loader import load_tokenizer
+
+        tokenizer = load_tokenizer(model_name)
+        git_sha = _resolve_git_sha()
+
+        def data_facts_provider(task):
+            return resolve_task_data_facts(
+                task,
+                tokenizer,
+                effective_max_samples,
+                profile,
+            )
+
+        matrix_plan = build_phase1_3_matrix_plan(
+            tasks=tasks,
+            seeds=seeds,
+            target_skip_rates=target_skip_rates,
+            model_name=model_name,
+            base_output_dir=args.output_dir,
+            data_facts_provider=data_facts_provider,
+            git_sha=git_sha,
+            scheduler_step_policy=(
+                SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
+            ),
+            max_consecutive_skips=args.max_consecutive_skips,
+            probe_interval=args.probe_interval,
+            rho_veto_threshold=args.rho_veto_threshold,
+            risk_gamma=args.risk_gamma,
+            online_ler_mode=ONLINE_LER_MODE_AUTO,
+            online_ler_parameter_sample_size=args.online_ler_sample_size,
+            online_ler_update_interval=args.online_ler_update_interval,
+            use_rho_vg=True,
+            use_safety_horizon=True,
+        )
+        validate_phase1_3_matrix_plan(
+            matrix_plan,
+            tasks=tasks,
+            seeds=seeds,
+            target_skip_rates=target_skip_rates,
+            minimum_seed_count=10,
+            base_output_dir=args.output_dir,
+        )
+        del tokenizer
+        run_specs = [
+            (
+                cell["task"],
+                cell["training_seed"],
+                cell["arm"],
+                cell["target_skip_rate"],
+                cell,
+            )
+            for cell in matrix_plan
+        ]
+    else:
+        run_specs = [
+            (task, seed, ablation_name, legacy_target_skip_rate, None)
+            for task in tasks
+            for seed in seeds
+            for ablation_name in ablations_to_run
+        ]
+
+    total_runs = len(run_specs)
+    print("\n  ═══════════════════════════════════════════════════════")
+    print("  LERNA Ablation Study")
+    print("  ═══════════════════════════════════════════════════════")
     print(f"  Tasks: {tasks}")
     print(f"  Seeds: {seeds}")
     print(f"  Ablations: {ablations_to_run}")
+    if target_skip_rates is not None:
+        print(f"  Target skip rates: {target_skip_rates}")
     print(f"  Total runs: {total_runs}")
     print(f"  Max samples/task: {effective_max_samples or 'unlimited'}")
-    print(f"  ═══════════════════════════════════════════════════════\n")
+    print("  ═══════════════════════════════════════════════════════\n")
 
     if args.wandb:
         _ensure_wandb_finished()
 
     all_results = []
-    run_idx = 0
     overall_start = time.time()
 
-    for task in tasks:
-        for seed in seeds:
-            for ablation_name in ablations_to_run:
-                run_idx += 1
+    for run_idx, (
+        task,
+        seed,
+        ablation_name,
+        run_target_skip_rate,
+        planned_cell,
+    ) in enumerate(run_specs, start=1):
+        if run_idx > 1:
+            elapsed = time.time() - overall_start
+            avg_per_run = elapsed / (run_idx - 1)
+            remaining = (total_runs - run_idx + 1) * avg_per_run
+            print(
+                f"\n  ═══ Run {run_idx}/{total_runs} | "
+                f"ETA: {timedelta(seconds=int(remaining))} ═══"
+            )
+        else:
+            print(f"\n  ═══ Run {run_idx}/{total_runs} ═══")
 
-                if run_idx > 1:
-                    elapsed = time.time() - overall_start
-                    avg_per_run = elapsed / (run_idx - 1)
-                    remaining = (total_runs - run_idx + 1) * avg_per_run
-                    print(f"\n  ═══ Run {run_idx}/{total_runs} | ETA: {timedelta(seconds=int(remaining))} ═══")
-                else:
-                    print(f"\n  ═══ Run {run_idx}/{total_runs} ═══")
+        task_hp = TASK_HP_OVERRIDES.get(task, {})
+        try:
+            result = run_ablation_single(
+                task_name=task,
+                seed=seed,
+                ablation_name=ablation_name,
+                ablation_overrides=ABLATIONS[ablation_name],
+                model_name=model_name,
+                profile=profile,
+                base_output_dir=args.output_dir,
+                use_wandb=args.wandb,
+                max_samples_override=effective_max_samples,
+                run_idx=run_idx,
+                total_runs=total_runs,
+                wandb_project=args.wandb_project,
+                wandb_group=wandb_group,
+                num_epochs=task_hp.get("num_epochs", 3),
+                warmup_ratio=task_hp.get("warmup_ratio", 0.1),
+                early_stopping_patience=task_hp.get(
+                    "early_stopping_patience", 5
+                ),
+                metric_for_best_model=task_hp.get(
+                    "metric_for_best_model", "eval_loss"
+                ),
+                greater_is_better=task_hp.get("greater_is_better", False),
+                init_from_mnli=task_hp.get("init_from_mnli", False),
+                no_early_stopping=effective_no_early_stopping,
+                target_skip_rate=run_target_skip_rate,
+                max_consecutive_skips=args.max_consecutive_skips,
+                probe_interval=args.probe_interval,
+                policy=args.policy,
+                rho_veto_threshold=args.rho_veto_threshold,
+                risk_gamma=args.risk_gamma,
+                guard_mode=args.guard_mode,
+                skip_update_mode=effective_skip_update_mode,
+                scheduler_step_policy=effective_scheduler_step_policy,
+                allow_early_stopping_with_skipping=(
+                    effective_allow_early_stopping
+                ),
+                rvd_veto_mode=args.rvd_veto_mode,
+                rvd_margin_rank_floor=args.rvd_margin_rank_floor,
+                rvd_spike_factor=args.rvd_spike_factor,
+                rvd_spike_ema_window=args.rvd_spike_ema_window,
+                rvd_repay_mode=args.rvd_repay_mode,
+                rvd_repay_protect_dangerous=(
+                    args.rvd_repay_protect_dangerous
+                ),
+                rvd_policy_seed=args.rvd_policy_seed,
+                provenance_classification=args.provenance_classification,
+                online_ler_mode=args.online_ler_mode,
+                online_ler_parameter_sample_size=args.online_ler_sample_size,
+                online_ler_update_interval=args.online_ler_update_interval,
+                planned_cell=planned_cell,
+            )
+            all_results.append(result)
+        except Exception as exc:
+            print(
+                f"  FAILED: {task} seed={seed} "
+                f"ablation={ablation_name}: {exc}"
+            )
+            import traceback
 
-                task_hp = TASK_HP_OVERRIDES.get(task, {})
-                try:
-                    result = run_ablation_single(
-                        task_name=task,
-                        seed=seed,
-                        ablation_name=ablation_name,
-                        ablation_overrides=ABLATIONS[ablation_name],
-                        model_name=model_name,
-                        profile=profile,
-                        base_output_dir=args.output_dir,
-                        use_wandb=args.wandb,
-                        max_samples_override=effective_max_samples,
-                        run_idx=run_idx,
-                        total_runs=total_runs,
-                        wandb_project=args.wandb_project,
-                        wandb_group=wandb_group,
-                        num_epochs=task_hp.get("num_epochs", 3),
-                        warmup_ratio=task_hp.get("warmup_ratio", 0.1),
-                        early_stopping_patience=task_hp.get("early_stopping_patience", 5),
-                        metric_for_best_model=task_hp.get("metric_for_best_model", "eval_loss"),
-                        greater_is_better=task_hp.get("greater_is_better", False),
-                        init_from_mnli=task_hp.get("init_from_mnli", False),
-                        no_early_stopping=args.no_early_stopping,
-                        target_skip_rate=args.target_skip_rate,
-                        max_consecutive_skips=args.max_consecutive_skips,
-                        probe_interval=args.probe_interval,
-                        policy=args.policy,
-                        rho_veto_threshold=args.rho_veto_threshold,
-                        risk_gamma=args.risk_gamma,
-                        guard_mode=args.guard_mode,
-                        skip_update_mode=args.skip_update_mode,
-                        scheduler_step_policy=args.scheduler_step_policy,
-                        allow_early_stopping_with_skipping=(
-                            args.allow_early_stopping_with_skipping
-                        ),
-                        rvd_veto_mode=args.rvd_veto_mode,
-                        rvd_margin_rank_floor=args.rvd_margin_rank_floor,
-                        rvd_spike_factor=args.rvd_spike_factor,
-                        rvd_spike_ema_window=args.rvd_spike_ema_window,
-                        rvd_repay_mode=args.rvd_repay_mode,
-                        rvd_repay_protect_dangerous=(
-                            args.rvd_repay_protect_dangerous
-                        ),
-                        rvd_policy_seed=args.rvd_policy_seed,
-                        provenance_classification=args.provenance_classification,
-                        online_ler_mode=args.online_ler_mode,
-                        online_ler_parameter_sample_size=(
-                            args.online_ler_sample_size
-                        ),
-                        online_ler_update_interval=(
-                            args.online_ler_update_interval
-                        ),
-                    )
-                    all_results.append(result)
-                except Exception as e:
-                    print(f"  FAILED: {task} seed={seed} ablation={ablation_name}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    all_results.append({
-                        "task": task, "seed": seed,
-                        "ablation": ablation_name, "error": str(e)})
-                    if args.wandb:
-                        _ensure_wandb_finished()
+            traceback.print_exc()
+            all_results.append(
+                {
+                    "task": task,
+                    "seed": seed,
+                    "ablation": ablation_name,
+                    "error": str(exc),
+                }
+            )
+            if args.wandb:
+                _ensure_wandb_finished()
+            if strict_phase1_3:
+                raise
 
     summary_path = os.path.join(args.output_dir, "ablation_summary.json")
     os.makedirs(args.output_dir, exist_ok=True)
