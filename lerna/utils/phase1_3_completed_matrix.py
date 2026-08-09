@@ -57,6 +57,12 @@ _VALIDATOR_SPEC.loader.exec_module(_VALIDATOR_MODULE)
 validate_skip_results = _VALIDATOR_MODULE.validate_results
 
 _ATTEMPT_PATTERN = re.compile(r"attempt-(\d{3})\Z")
+_RUNTIME_ONLY_CONTROLLER_KEYS = frozenset(
+    {
+        "policy_effective_config",
+        "runtime_quota_total_steps",
+    }
+)
 
 
 class CompletedMatrixError(ValueError):
@@ -101,7 +107,12 @@ def validate_phase1_3_completed_matrix(
     findings: list[dict[str, Any]] = []
     valid_runs: list[dict[str, Any]] = []
 
-    base = os.fspath(base_output_dir) if base_output_dir is not None else None
+    try:
+        base = os.fspath(base_output_dir) if base_output_dir is not None else None
+    except TypeError as exc:
+        _add_error(findings, "base_output_dir", None, f"base_output_dir is not a path: {exc}")
+        raise CompletedMatrixError(findings)
+
     if not isinstance(base, str) or not base:
         _add_error(findings, "base_output_dir", None, "base_output_dir must resolve to a non-empty string path")
         raise CompletedMatrixError(findings)
@@ -296,6 +307,38 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: identity drift",
                 })
 
+            manifest_controller = manifest.get("controller_config_effective")
+            if not isinstance(manifest_controller, dict):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.controller_config_effective",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: controller_config_effective is not an object",
+                })
+            else:
+                planned_controller = cell.get("controller_config") or {}
+                if not isinstance(planned_controller, dict):
+                    planned_controller = {}
+                manifest_keys = set(manifest_controller.keys())
+                planned_keys = set(planned_controller.keys())
+                unexpected_keys = manifest_keys - planned_keys - _RUNTIME_ONLY_CONTROLLER_KEYS
+                for key in sorted(unexpected_keys):
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"manifest.controller_config_effective.{key}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: unexpected controller field {key!r}",
+                    })
+                for key, planned_value in planned_controller.items():
+                    actual_value = manifest_controller.get(key)
+                    if not _strict_equal(planned_value, actual_value):
+                        attempt_findings.append({
+                            "severity": "error",
+                            "field": f"manifest.controller_config_effective.{key}",
+                            "cell": cell_id,
+                            "message": f"{attempt_name}: controller field {key} drift {actual_value!r} != {planned_value!r}",
+                        })
+
             manifest_run = manifest.get("run")
             if not isinstance(manifest_run, dict):
                 manifest_run = {}
@@ -306,84 +349,26 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: manifest run is not an object",
                 })
 
-            if manifest_run.get("task") != cell.get("task"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.task",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: task drift",
-                })
-            if manifest_run.get("seed") != cell.get("training_seed"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.seed",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: training_seed drift",
-                })
-            if manifest_run.get("target_skip_rate") != cell.get("target_skip_rate"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.target_skip_rate",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: target_skip_rate drift",
-                })
-
-            expected_policy_class = cell.get("controller_config", {}).get("policy_class")
-            if expected_policy_class is not None and manifest_run.get("controller_name") != expected_policy_class:
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.controller_name",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: controller_name drift {manifest_run.get('controller_name')!r} != {expected_policy_class!r}",
-                })
-
-            if manifest_run.get("controller_seed") != cell.get("policy_seed"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.controller_seed",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: policy_seed drift",
-                })
-
-            if manifest_run.get("model_id") != cell.get("model_id"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.model_id",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: model_id drift",
-                })
-
-            if manifest_run.get("planned_quota") != cell.get("requested_quota"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.planned_quota",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: planned_quota drift",
-                })
-
-            if manifest_run.get("total_steps") != cell.get("total_steps"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.total_steps",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: total_steps drift",
-                })
-
-            if manifest_run.get("skip_update_mode") != cell.get("skip_update_mode"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.skip_update_mode",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: skip_update_mode drift",
-                })
-
-            if manifest_run.get("matched_budget_planned") != cell.get("matched_budget"):
-                attempt_findings.append({
-                    "severity": "error",
-                    "field": "manifest.run.matched_budget_planned",
-                    "cell": cell_id,
-                    "message": f"{attempt_name}: matched_budget_planned drift",
-                })
+            run_fields = (
+                ("task", cell.get("task")),
+                ("seed", cell.get("training_seed")),
+                ("target_skip_rate", cell.get("target_skip_rate")),
+                ("controller_name", cell.get("controller_config", {}).get("policy_class")),
+                ("controller_seed", cell.get("policy_seed")),
+                ("model_id", cell.get("model_id")),
+                ("planned_quota", cell.get("requested_quota")),
+                ("total_steps", cell.get("total_steps")),
+                ("skip_update_mode", cell.get("skip_update_mode")),
+                ("matched_budget_planned", cell.get("matched_budget")),
+            )
+            for manifest_key, planned_value in run_fields:
+                if not _strict_equal(manifest_run.get(manifest_key), planned_value):
+                    attempt_findings.append({
+                        "severity": "error",
+                        "field": f"manifest.run.{manifest_key}",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: {manifest_key} drift {manifest_run.get(manifest_key)!r} != {planned_value!r}",
+                    })
 
             manifest_attempt = manifest.get("attempt")
             if manifest_attempt != attempt_num:
@@ -462,7 +447,7 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: results attempt drift",
                 })
 
-            if results.get("task") != cell.get("task"):
+            if not _strict_equal(results.get("task"), cell.get("task")):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "results.json.task",
@@ -470,7 +455,7 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: results task drift",
                 })
 
-            if results.get("seed") != cell.get("training_seed"):
+            if not _strict_equal(results.get("seed"), cell.get("training_seed")):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "results.json.seed",
@@ -478,7 +463,7 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: results seed drift",
                 })
 
-            if results.get("ablation") != cell.get("arm"):
+            if not _strict_equal(results.get("ablation"), cell.get("arm")):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "results.json.ablation",
