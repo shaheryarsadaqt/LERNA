@@ -106,6 +106,7 @@ def validate_phase1_3_completed_matrix(
         _add_error(findings, "base_output_dir", None, "base_output_dir must resolve to a non-empty string path")
         raise CompletedMatrixError(findings)
 
+    plan_valid = True
     try:
         validate_phase1_3_matrix_plan(
             plan,
@@ -117,8 +118,10 @@ def validate_phase1_3_completed_matrix(
         )
     except MatrixPlanError as exc:
         findings.extend(exc.findings)
+        plan_valid = False
     except (TypeError, ValueError) as exc:
         _add_error(findings, "plan", None, f"plan validation failed: {exc}")
+        plan_valid = False
 
     plan_cells: list[tuple[int, Any, tuple[Any, Any, Any, Any] | None]] = []
     plan_map: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
@@ -130,6 +133,12 @@ def validate_phase1_3_completed_matrix(
                 plan_map[cell_id] = cell
     except TypeError as exc:
         _add_error(findings, "plan", None, f"plan is not iterable: {exc}")
+        plan_valid = False
+
+    if not plan_valid:
+        if findings:
+            raise CompletedMatrixError(findings)
+        return {"valid_runs": [], "findings": findings}
 
     expected_dirs: set[str] = set()
     for cell_id, cell in plan_map.items():
@@ -250,6 +259,14 @@ def validate_phase1_3_completed_matrix(
                 findings.extend(attempt_findings)
                 continue
 
+            if manifest.get("provenance_classification") != "matched_claim":
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.provenance_classification",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: provenance classification is not matched_claim",
+                })
+
             verification = verify_completed_manifest(attempt_path)
             if not verification["ok"]:
                 for err in verification["errors"]:
@@ -279,7 +296,16 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: identity drift",
                 })
 
-            manifest_run = manifest.get("run") or {}
+            manifest_run = manifest.get("run")
+            if not isinstance(manifest_run, dict):
+                manifest_run = {}
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: manifest run is not an object",
+                })
+
             if manifest_run.get("task") != cell.get("task"):
                 attempt_findings.append({
                     "severity": "error",
@@ -319,6 +345,46 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: policy_seed drift",
                 })
 
+            if manifest_run.get("model_id") != cell.get("model_id"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.model_id",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: model_id drift",
+                })
+
+            if manifest_run.get("planned_quota") != cell.get("requested_quota"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.planned_quota",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: planned_quota drift",
+                })
+
+            if manifest_run.get("total_steps") != cell.get("total_steps"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.total_steps",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: total_steps drift",
+                })
+
+            if manifest_run.get("skip_update_mode") != cell.get("skip_update_mode"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.skip_update_mode",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: skip_update_mode drift",
+                })
+
+            if manifest_run.get("matched_budget_planned") != cell.get("matched_budget"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.run.matched_budget_planned",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: matched_budget_planned drift",
+                })
+
             manifest_attempt = manifest.get("attempt")
             if manifest_attempt != attempt_num:
                 attempt_findings.append({
@@ -329,16 +395,22 @@ def validate_phase1_3_completed_matrix(
                 })
 
             expected_output_paths = _expected_output_paths_for_cell(cell)
-            manifest_output_paths = manifest.get("output_paths") or {}
-            for logical_name, expected_filename in expected_output_paths.items():
-                actual_filename = manifest_output_paths.get(logical_name)
-                if actual_filename != expected_filename:
-                    attempt_findings.append({
-                        "severity": "error",
-                        "field": f"manifest.output_paths.{logical_name}",
-                        "cell": cell_id,
-                        "message": f"{attempt_name}: expected {expected_filename!r}, got {actual_filename!r}",
-                    })
+            manifest_output_paths = manifest.get("output_paths")
+            if not isinstance(manifest_output_paths, dict):
+                manifest_output_paths = {}
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.output_paths",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: output_paths is not an object",
+                })
+            if manifest_output_paths != expected_output_paths:
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "manifest.output_paths",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: output_paths mismatch {manifest_output_paths!r} != {expected_output_paths!r}",
+                })
 
             results_file = os.path.join(attempt_path, "results.json")
             if not os.path.isfile(results_file):
@@ -388,6 +460,30 @@ def validate_phase1_3_completed_matrix(
                     "field": "results.json.attempt",
                     "cell": cell_id,
                     "message": f"{attempt_name}: results attempt drift",
+                })
+
+            if results.get("task") != cell.get("task"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.task",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results task drift",
+                })
+
+            if results.get("seed") != cell.get("training_seed"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.seed",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results seed drift",
+                })
+
+            if results.get("ablation") != cell.get("arm"):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.ablation",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results ablation drift",
                 })
 
             results_identity = results.get("identity_inputs")
@@ -452,7 +548,7 @@ def validate_phase1_3_completed_matrix(
                 "manifest": manifest,
             })
 
-    plan_order = [_cell_ref(cell) for cell in plan]
+    plan_order = [cell_id for _, _, cell_id in plan_cells]
     valid_runs.sort(key=lambda run: plan_order.index(run["cell_id"]) if run["cell_id"] in plan_order else len(plan_order))
 
     missing_cells = [cell_id for cell_id in plan_map if cell_id not in {run["cell_id"] for run in valid_runs}]
