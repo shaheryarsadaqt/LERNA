@@ -1,5 +1,3 @@
-"""Dependency-light tests for the pure Phase 1.3 matrix-plan validator (6C-3)."""
-
 import copy
 import importlib.util
 import os
