@@ -357,22 +357,28 @@ def test_diagnostics_report_probe_guidance_and_quota_invariants():
     assert cfg["required_tracker_timing"] == "post_decision_after_backward"
 
 
-def test_fixed_baseline_remains_unchanged():
+@pytest.mark.parametrize("rate", (0.30, 0.40))
+def test_fixed_baseline_remains_signal_free_and_reaches_exact_quota(rate):
     assert issubclass(LERGuidedStratifiedPolicy, FixedPhaseStratifiedRandomPolicy)
     assert FixedPhaseStratifiedRandomPolicy.name == "fixed_phase_strat"
     fixed = FixedPhaseStratifiedRandomPolicy(
-        target_skip_rate=RATE,
+        target_skip_rate=rate,
         total_steps=TOTAL_STEPS,
-        min_step=MIN_STEP,
-        seed=123,
+        min_step=50,
+        seed=7,
+        max_consecutive_skips=4,
     )
     trainer = FakeTrainer(TOTAL_STEPS)
     skips = sum(
         bool(fixed.should_skip(trainer, None, None)) for _ in range(TOTAL_STEPS)
     )
     diag = fixed.get_diagnostics()
-    assert skips == diag["skip_decisions"]
-    assert diag["quota_exact"] is False
+    expected_quota = round(rate * TOTAL_STEPS)
+    assert skips == diag["skip_decisions"] == expected_quota
+    assert diag["quota_size"] == expected_quota
+    assert diag["decisions_seen"] == TOTAL_STEPS
+    assert diag["quota_exact"] is True
+    assert diag["forced_global_tail_skip_count"] >= 0
     for key in (
         "safety_enabled",
         "probe_decision_count",

@@ -1778,14 +1778,14 @@ class FixedPhaseStratifiedRandomPolicy:
             self._consecutive_skips = 0
             return False
 
+        if remaining_skips >= remaining_decisions:
+            self._forced_global_tail_skip += 1
+            return self._do_skip(ph)
+
         if self._consecutive_skips >= self.max_consecutive_skips:
             self._max_consec_veto += 1
             self._consecutive_skips = 0
             return False
-
-        if remaining_skips >= remaining_decisions:
-            self._forced_global_tail_skip += 1
-            return self._do_skip(ph)
 
         q_left = self._cum_phase_quota[ph] - self._skip_decisions
         if q_left <= 0:
