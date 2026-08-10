@@ -96,6 +96,19 @@ LER_ARMS = ("ler_guided_stratified", "ler_guided_stratified_safe")
 
 FULL, RANDOM, FIXED, GUARDED, LER, LER_SAFE = range(6)
 
+BOUND_MANIFEST_RUN_FIELDS = (
+    "task",
+    "seed",
+    "target_skip_rate",
+    "controller_name",
+    "controller_seed",
+    "model_id",
+    "planned_quota",
+    "total_steps",
+    "skip_update_mode",
+    "matched_budget_planned",
+)
+
 # ── Import guard ───────────────────────────────────────────────────────────
 _IMPORT_GUARD_SCRIPT = """
 import importlib.util
@@ -243,7 +256,6 @@ def _build_cell(
         "min_step": POLICY_MIN_STEP,
         "configured_total_steps": total_steps,
         "requested_quota": quota,
-        "runtime_quota_total_steps": None if not skipping else total_steps,
         "matched_budget": True,
         "is_skipping_arm": skipping,
         "allow_early_stopping_with_skipping": False,
@@ -374,7 +386,12 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
     if arm != "exact_random" and "seed" in diag:
         del diag["seed"]
 
-    cc = cell["controller_config"]
+    cc = copy.deepcopy(cell["controller_config"])
+    cc["policy_effective_config"] = {
+        "policy_class": POLICY_CLASSES[arm],
+        "configured_total_steps": total_steps,
+    }
+    cc["runtime_quota_total_steps"] = total_steps if skipping else None
     run_config = {
         "policy": arm,
         "target_skip_rate": rate,
@@ -481,7 +498,6 @@ def _create_cell_fixture(
     rate = cell["target_skip_rate"]
     total_steps = cell["total_steps"]
     quota = round(rate * total_steps)
-    online = cell["online_diagnostics"]
     is_online = arm not in OFFLINE_ARMS
 
     # Build the results payload first so the running manifest can reference
@@ -499,7 +515,11 @@ def _create_cell_fixture(
         fingerprint_val = results.get("fingerprint", fingerprint_val)
         if isinstance(results.get("identity_inputs"), dict):
             identity = results["identity_inputs"]
-    controller_cc = cell["controller_config"]
+    controller_cc = copy.deepcopy(cell["controller_config"])
+    controller_cc["policy_effective_config"] = {
+        "policy_class": POLICY_CLASSES[arm],
+        "configured_total_steps": total_steps,
+    }
 
     # Write the running manifest first: write_manifest_running refuses to
     # start in a directory that already contains canonical artifacts.
@@ -568,20 +588,9 @@ def _create_cell_fixture(
             artifact_filenames=artifact_filenames,
         )
     elif status == "failed":
-        # Write a fake failed manifest
-        try:
-            manifest = provenance.finalize_manifest_failed(
-                attempt_dir, RuntimeError("simulated failure")
-            )
-        except Exception:
-            # If already running, write directly
-            manifest_path = os.path.join(attempt_dir, "run_manifest.json")
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-            manifest["status"] = "failed"
-            manifest["end_time_utc"] = "2026-01-01T00:00:00+00:00"
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f)
+        manifest = provenance.finalize_manifest_failed(
+            attempt_dir, RuntimeError("simulated failure")
+        )
 
     if tamper_manifest:
         manifest_path = os.path.join(attempt_dir, "run_manifest.json")
@@ -630,6 +639,33 @@ def _has_field_prefix(findings, prefix):
         f.get("severity") == "error" and f.get("field", "").startswith(prefix)
         for f in findings
     )
+
+
+def _read_json(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+def _attempt_dir(base, cell, attempt_num=1):
+    return os.path.join(
+        base,
+        cell["arm"],
+        cell["fingerprint"],
+        f"attempt-{attempt_num:03d}",
+    )
+
+
+def _manifest_path(base, cell, attempt_num=1):
+    return os.path.join(_attempt_dir(base, cell, attempt_num), "run_manifest.json")
+
+
+def _results_path(base, cell, attempt_num=1):
+    return os.path.join(_attempt_dir(base, cell, attempt_num), "results.json")
 
 
 # ── Test class ─────────────────────────────────────────────────────────────
@@ -1008,6 +1044,41 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                     _error_fields(exc.findings),
                 )
 
+    def test_malformed_manifest_and_results_objects_are_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            malformed_manifest_values = (
+                (plan[0], "run"),
+                (plan[1], "controller_config_effective"),
+                (plan[2], "output_paths"),
+            )
+            for cell, key in malformed_manifest_values:
+                manifest_path = _manifest_path(base, cell)
+                manifest = _read_json(manifest_path)
+                manifest[key] = []
+                _write_json(manifest_path, manifest)
+
+            _write_json(_results_path(base, plan[3]), [])
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn("manifest.run", fields)
+            self.assertIn("manifest.controller_config_effective", fields)
+            self.assertIn("manifest.output_paths", fields)
+            self.assertIn("results.json", fields)
+
     # ── 15. Online cells require ler_diagnostics.json ──────────────────────
 
     def test_online_cell_requires_ler_diagnostics(self):
@@ -1181,16 +1252,19 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
 
     # ── 21. Run field drift ────────────────────────────────────────────────
 
-    def test_run_field_drift_rejected(self):
+    def test_every_bound_manifest_run_field_requires_presence(self):
         with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
             base = os.path.join(tmp, "output")
             plan = _build_plan(base_output_dir=base)
-            for cell in plan:
-                def tamper(m):
-                    m["run"]["task"] = "wrong_task"
-                _create_cell_fixture(base, cell, 1, tamper_manifest=tamper)
+            _create_full_fixture(base, plan)
 
-            try:
+            manifest_path = _manifest_path(base, plan[FULL])
+            manifest = _read_json(manifest_path)
+            for key in BOUND_MANIFEST_RUN_FIELDS:
+                manifest["run"].pop(key)
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
                 validate_phase1_3_completed_matrix(
                     plan,
                     tasks=[TASK],
@@ -1199,12 +1273,80 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                     minimum_seed_count=1,
                     base_output_dir=base,
                 )
-                self.fail("expected CompletedMatrixError")
-            except CompletedMatrixError as exc:
-                self.assertIn(
-                    "manifest.run.task",
-                    _error_fields(exc.findings),
+
+            fields = _error_fields(raised.exception.findings)
+            for key in BOUND_MANIFEST_RUN_FIELDS:
+                with self.subTest(key=key):
+                    self.assertIn(f"manifest.run.{key}", fields)
+
+    def test_every_bound_manifest_run_field_rejects_value_drift(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            manifest_path = _manifest_path(base, plan[RANDOM])
+            manifest = _read_json(manifest_path)
+            for key in BOUND_MANIFEST_RUN_FIELDS:
+                manifest["run"][key] = {"drift": key}
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
                 )
+
+            fields = _error_fields(raised.exception.findings)
+            for key in BOUND_MANIFEST_RUN_FIELDS:
+                with self.subTest(key=key):
+                    self.assertIn(f"manifest.run.{key}", fields)
+
+    def test_manifest_run_numeric_type_drift_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            manifest_path = _manifest_path(base, plan[RANDOM])
+            manifest = _read_json(manifest_path)
+            manifest["run"]["seed"] = float(manifest["run"]["seed"])
+            manifest["run"]["controller_seed"] = float(
+                manifest["run"]["controller_seed"]
+            )
+            manifest["run"]["planned_quota"] = float(
+                manifest["run"]["planned_quota"]
+            )
+            manifest["run"]["total_steps"] = float(
+                manifest["run"]["total_steps"]
+            )
+            manifest["run"]["matched_budget_planned"] = 1
+            _write_json(manifest_path, manifest)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+
+            fields = _error_fields(raised.exception.findings)
+            for key in (
+                "seed",
+                "controller_seed",
+                "planned_quota",
+                "total_steps",
+                "matched_budget_planned",
+            ):
+                with self.subTest(key=key):
+                    self.assertIn(f"manifest.run.{key}", fields)
 
     # ── 22. Attempt bound ──────────────────────────────────────────────────
 
@@ -1214,7 +1356,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
             plan = _build_plan(base_output_dir=base)
             for cell in plan:
                 def tamper(m):
-                    m["attempt"] = 99
+                    m["attempt"] = 1.0
                 _create_cell_fixture(base, cell, 1, tamper_manifest=tamper)
 
             try:
@@ -1295,6 +1437,8 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
             plan = _build_plan(base_output_dir=base)
             for cell in plan:
                 def tamper(data):
+                    data["task"] = "wrong_task"
+                    data["seed"] = 999
                     data["ablation"] = "wrong_arm"
                 _create_cell_fixture(base, cell, 1, tamper_results=tamper)
 
@@ -1309,10 +1453,63 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 )
                 self.fail("expected CompletedMatrixError")
             except CompletedMatrixError as exc:
-                self.assertIn(
-                    "results.json.ablation",
-                    _error_fields(exc.findings),
+                fields = _error_fields(exc.findings)
+                self.assertIn("results.json.task", fields)
+                self.assertIn("results.json.seed", fields)
+                self.assertIn("results.json.ablation", fields)
+
+    def test_results_grouping_and_attempt_fields_require_presence(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            results_path = _results_path(base, plan[FULL])
+            results = _read_json(results_path)
+            for key in ("task", "seed", "ablation", "attempt"):
+                results.pop(key)
+            _write_json(results_path, results)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
                 )
+
+            fields = _error_fields(raised.exception.findings)
+            for key in ("task", "seed", "ablation", "attempt"):
+                with self.subTest(key=key):
+                    self.assertIn(f"results.json.{key}", fields)
+
+    def test_results_seed_and_attempt_type_drift_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            results_path = _results_path(base, plan[FULL])
+            results = _read_json(results_path)
+            results["seed"] = float(results["seed"])
+            results["attempt"] = float(results["attempt"])
+            _write_json(results_path, results)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn("results.json.seed", fields)
+            self.assertIn("results.json.attempt", fields)
 
     # ── 26. Missing None fields rejected ───────────────────────────────────
 
@@ -1320,11 +1517,12 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
             base = os.path.join(tmp, "output")
             plan = _build_plan(base_output_dir=base)
-            # full_finetune has requested_quota=None - remove it from run manifest
+            # full_finetune plans both fields explicitly as None.
             for cell in plan:
                 if cell["arm"] == "full_finetune":
                     def tamper(m):
-                        m["run"].pop("planned_quota", None)
+                        m["controller_config_effective"].pop("arm_alias_of")
+                        m["controller_config_effective"].pop("requested_quota")
                     _create_cell_fixture(base, cell, 1, tamper_manifest=tamper)
                 else:
                     _create_cell_fixture(base, cell, 1)
@@ -1340,9 +1538,14 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 )
                 self.fail("expected CompletedMatrixError")
             except CompletedMatrixError as exc:
+                fields = _error_fields(exc.findings)
                 self.assertIn(
-                    "manifest.run.planned_quota",
-                    _error_fields(exc.findings),
+                    "manifest.controller_config_effective.arm_alias_of",
+                    fields,
+                )
+                self.assertIn(
+                    "manifest.controller_config_effective.requested_quota",
+                    fields,
                 )
 
     # ── 27. Only policy_effective_config and runtime_quota_total_steps ─────
@@ -1373,6 +1576,106 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                     any("bogus_field" in f for f in fields),
                     msg=f"unexpected key not found in {fields}",
                 )
+
+    def test_documented_runtime_controller_extras_are_accepted(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            for cell in plan:
+                self.assertNotIn(
+                    "policy_effective_config", cell["controller_config"]
+                )
+                self.assertNotIn(
+                    "runtime_quota_total_steps", cell["controller_config"]
+                )
+            _create_full_fixture(base, plan)
+
+            for cell in plan:
+                manifest_path = _manifest_path(base, cell)
+                manifest = _read_json(manifest_path)
+                self.assertIn(
+                    "policy_effective_config",
+                    manifest["controller_config_effective"],
+                )
+                manifest["controller_config_effective"][
+                    "runtime_quota_total_steps"
+                ] = cell["total_steps"] if cell["is_skipping_arm"] else None
+                _write_json(manifest_path, manifest)
+
+            result = validate_phase1_3_completed_matrix(
+                plan,
+                tasks=[TASK],
+                seeds=[SEED],
+                target_skip_rates=list(RATES),
+                minimum_seed_count=1,
+                base_output_dir=base,
+            )
+            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(result["findings"], [])
+
+    def test_every_planned_controller_field_requires_presence(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+            expected_fields = set()
+
+            for cell in plan:
+                manifest_path = _manifest_path(base, cell)
+                manifest = _read_json(manifest_path)
+                for key in cell["controller_config"]:
+                    expected_fields.add(
+                        f"manifest.controller_config_effective.{key}"
+                    )
+                    manifest["controller_config_effective"].pop(key)
+                _write_json(manifest_path, manifest)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+
+            self.assertTrue(
+                expected_fields <= _error_fields(raised.exception.findings)
+            )
+
+    def test_every_planned_controller_field_rejects_value_drift(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+            expected_fields = set()
+
+            for cell in plan:
+                manifest_path = _manifest_path(base, cell)
+                manifest = _read_json(manifest_path)
+                for key in cell["controller_config"]:
+                    expected_fields.add(
+                        f"manifest.controller_config_effective.{key}"
+                    )
+                    manifest["controller_config_effective"][key] = {
+                        "drift": key
+                    }
+                _write_json(manifest_path, manifest)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+
+            self.assertTrue(
+                expected_fields <= _error_fields(raised.exception.findings)
+            )
 
     # ── 28. Hash tampering ─────────────────────────────────────────────────
 
