@@ -498,6 +498,7 @@ def write_manifest_running(
     argv: List[str],
     task: str,
     model_id: str,
+    model_revision: Optional[str] = None,
     seed: int,
     controller_name: str,
     controller_seed: Optional[int],
@@ -554,6 +555,7 @@ def write_manifest_running(
         "run": {
             "task": task,
             "model_id": model_id,
+            "model_revision": model_revision,
             "seed": seed,
             "controller_name": controller_name,
             "controller_seed": controller_seed,

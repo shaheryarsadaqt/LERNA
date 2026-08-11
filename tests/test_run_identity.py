@@ -30,6 +30,7 @@ def _make_identity_inputs(**overrides):
         task="mrpc",
         training_seed=42,
         model_id="modernbert",
+        model_revision=None,
         max_samples_requested=None,
         train_samples_realized=1000,
         eval_samples_realized=200,

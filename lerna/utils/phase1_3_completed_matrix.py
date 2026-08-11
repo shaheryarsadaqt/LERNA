@@ -364,6 +364,7 @@ def validate_phase1_3_completed_matrix(
                 ("controller_name", cell.get("controller_config", {}).get("policy_class")),
                 ("controller_seed", cell.get("policy_seed")),
                 ("model_id", cell.get("model_id")),
+                ("model_revision", cell.get("model_revision")),
                 ("planned_quota", cell.get("requested_quota")),
                 ("total_steps", cell.get("total_steps")),
                 ("skip_update_mode", cell.get("skip_update_mode")),
@@ -485,6 +486,14 @@ def validate_phase1_3_completed_matrix(
                     "field": "results.json.ablation",
                     "cell": cell_id,
                     "message": f"{attempt_name}: results ablation drift",
+                })
+
+            if not _strict_equal(results.get("model_revision"), cell.get("model_revision")):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.model_revision",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results model_revision drift",
                 })
 
             results_identity = results.get("identity_inputs")

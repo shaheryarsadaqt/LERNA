@@ -202,6 +202,15 @@ def _require_fresh_output(base_output_dir: Path) -> None:
         )
 
 
+def _verify_ettin_cache() -> None:
+    snapshot = Path("/raid/hf_cache/models--jhu-clsp--ettin-encoder-150m/snapshots/45d08642849e5c5701b162671ac811b7654bfd9f")
+    if not snapshot.is_dir():
+        raise RuntimeError(
+            "Ettin snapshot 45d08642849e5c5701b162671ac811b7654bfd9f "
+            "is not present in /raid/hf_cache"
+        )
+
+
 def _set_training_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -241,6 +250,7 @@ def _plan_matrix(
         seeds=[training_seed],
         target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
         model_name=SYNTHETIC_MODEL_ID,
+        model_revision=None,
         base_output_dir=base_output_dir,
         data_facts_provider=lambda task: dict(facts),
         git_sha=git_sha,
@@ -444,6 +454,7 @@ def _runtime_cell(
         ablation_name=planned_cell["arm"],
         target_skip_rate=planned_cell["target_skip_rate"],
         model_name=planned_cell["model_id"],
+        model_revision=planned_cell.get("model_revision"),
         data_facts=facts,
         git_sha=git_sha,
         base_output_dir=base_output_dir,
@@ -619,6 +630,7 @@ def _build_results(
         "seed": cell["training_seed"],
         "ablation": cell["arm"],
         "model": cell["model_id"],
+        "model_revision": cell.get("model_revision"),
         "profile": "synthetic_cpu",
         "eval_metrics": _json_ready(eval_metrics),
         "train_loss": float(train_result.training_loss),
@@ -696,6 +708,7 @@ def _execute_cell(
         argv=list(sys.argv),
         task=cell["task"],
         model_id=cell["model_id"],
+        model_revision=cell.get("model_revision"),
         seed=cell["training_seed"],
         controller_name=type(policy).__name__,
         controller_seed=cell["policy_seed"],
@@ -875,6 +888,7 @@ def main(argv: list[str] | None = None) -> int:
 
     git_sha = _resolve_git_sha()
     _require_claim_ready_checkout(git_sha)
+    _verify_ettin_cache()
     base_output_dir = Path(args.output_dir).expanduser().resolve()
 
     train_dataset = SyntheticDataset(

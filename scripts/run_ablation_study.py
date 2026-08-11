@@ -819,6 +819,7 @@ def plan_phase1_3_cell(
     ablation_name,
     target_skip_rate,
     model_name,
+    model_revision,
     data_facts,
     git_sha,
     base_output_dir,
@@ -922,6 +923,8 @@ def plan_phase1_3_cell(
         total_steps=total_steps,
         git_sha=git_sha,
     )
+    if model_revision is not None:
+        identity_inputs["model_revision"] = str(model_revision)
     identity_inputs = add_online_ler_to_identity(
         identity_inputs,
         online_diagnostics,
@@ -1000,6 +1003,7 @@ def plan_phase1_3_cell(
         "training_seed": training_seed,
         "policy_seed": policy_seed,
         "model_id": str(model_name),
+        "model_revision": model_revision,
         "target_skip_rate": target_skip_rate,
         "num_epochs": num_epochs,
         "total_steps": total_steps,
@@ -1025,6 +1029,7 @@ def build_phase1_3_matrix_plan(
     seeds,
     target_skip_rates,
     model_name,
+    model_revision=None,
     base_output_dir,
     data_facts_provider,
     git_sha,
@@ -1048,6 +1053,7 @@ def build_phase1_3_matrix_plan(
                             ablation_name=arm,
                             target_skip_rate=target_skip_rate,
                             model_name=model_name,
+                            model_revision=model_revision,
                             data_facts=data_facts,
                             git_sha=git_sha,
                             base_output_dir=base_output_dir,
@@ -1520,11 +1526,14 @@ def run_ablation_single(
     online_ler_parameter_sample_size=4096,
     online_ler_update_interval=1,
     planned_cell=None,
+    model_revision=None,
 ):
     """Run a single experiment with a specific ablation config."""
 
     control = ablation_overrides.get("control")
     effective_control = "exact_random" if control == "random_skip" else control
+    if planned_cell is not None and model_revision is None:
+        model_revision = planned_cell.get("model_revision")
     budget_state = assert_fixed_budget(
         ablation_name=ablation_name,
         control=effective_control,
@@ -1618,8 +1627,18 @@ def run_ablation_single(
     mnli_checkpoint_dir = os.path.join(base_output_dir, "mnli_finetuned")
     if init_from_mnli and os.path.exists(mnli_checkpoint_dir):
         from transformers import AutoConfig
-        mnli_model, _ = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
-        model, _ = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
+        mnli_model, _ = load_model_and_tokenizer(
+            model_name,
+            num_labels=cfg["num_labels"],
+            revision=model_revision,
+            local_files_only=True,
+        )
+        model, _ = load_model_and_tokenizer(
+            model_name,
+            num_labels=cfg["num_labels"],
+            revision=model_revision,
+            local_files_only=True,
+        )
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                         if "classifier" not in k and "pooler" not in k}
         model.load_state_dict(encoder_state, strict=False)
@@ -1628,7 +1647,12 @@ def run_ablation_single(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     else:
-        model, tokenizer = load_model_and_tokenizer(model_name, num_labels=cfg["num_labels"])
+        model, tokenizer = load_model_and_tokenizer(
+            model_name,
+            num_labels=cfg["num_labels"],
+            revision=model_revision,
+            local_files_only=True,
+        )
 
     if hw_cfg["gradient_checkpointing"]:
         try:
@@ -2847,6 +2871,9 @@ def main():
                 online_ler_parameter_sample_size=args.online_ler_sample_size,
                 online_ler_update_interval=args.online_ler_update_interval,
                 planned_cell=planned_cell,
+                model_revision=(
+                    planned_cell.get("model_revision") if planned_cell else None
+                ),
             )
             all_results.append(result)
         except Exception as exc:
