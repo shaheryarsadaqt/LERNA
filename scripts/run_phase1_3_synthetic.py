@@ -73,6 +73,7 @@ from scripts.validate_skip_policy_results import validate_results
 
 SYNTHETIC_TASK = "phase1_3_synthetic"
 SYNTHETIC_MODEL_ID = "tiny-linear-cpu"
+SYNTHETIC_MODEL_REVISION = "synthetic-cpu-local-v1"
 SYNTHETIC_TOTAL_STEPS = 100
 SYNTHETIC_NUM_EPOCHS = 1
 SYNTHETIC_TRAIN_SIZE = 100
@@ -202,15 +203,6 @@ def _require_fresh_output(base_output_dir: Path) -> None:
         )
 
 
-def _verify_ettin_cache() -> None:
-    snapshot = Path("/raid/hf_cache/models--jhu-clsp--ettin-encoder-150m/snapshots/45d08642849e5c5701b162671ac811b7654bfd9f")
-    if not snapshot.is_dir():
-        raise RuntimeError(
-            "Ettin snapshot 45d08642849e5c5701b162671ac811b7654bfd9f "
-            "is not present in /raid/hf_cache"
-        )
-
-
 def _set_training_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -250,7 +242,7 @@ def _plan_matrix(
         seeds=[training_seed],
         target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
         model_name=SYNTHETIC_MODEL_ID,
-        model_revision=None,
+        model_revision=SYNTHETIC_MODEL_REVISION,
         base_output_dir=base_output_dir,
         data_facts_provider=lambda task: dict(facts),
         git_sha=git_sha,
@@ -888,7 +880,6 @@ def main(argv: list[str] | None = None) -> int:
 
     git_sha = _resolve_git_sha()
     _require_claim_ready_checkout(git_sha)
-    _verify_ettin_cache()
     base_output_dir = Path(args.output_dir).expanduser().resolve()
 
     train_dataset = SyntheticDataset(

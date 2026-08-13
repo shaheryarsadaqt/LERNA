@@ -204,6 +204,10 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
         assert results["task"] == synthetic.SYNTHETIC_TASK
         assert results["seed"] == 7
         assert results["ablation"] == arm
+        assert results["model"] == synthetic.SYNTHETIC_MODEL_ID
+        assert results["model_revision"] == synthetic.SYNTHETIC_MODEL_REVISION
+        assert manifest["run"]["model_id"] == synthetic.SYNTHETIC_MODEL_ID
+        assert manifest["run"]["model_revision"] == synthetic.SYNTHETIC_MODEL_REVISION
         assert instrumentation["forward_calls"] == 100
         assert instrumentation["backward_calls"] == expected_backward
         assert instrumentation["skipped_backward_steps"] == expected_skips
@@ -492,8 +496,16 @@ def test_harness_source_excludes_external_execution_paths():
         "http://",
         "https://",
         "MRPC",
+        "/raid/hf_cache",
     ):
         assert prohibited not in source
     assert 'os.environ["CUDA_VISIBLE_DEVICES"] = ""' in source
     assert 'os.environ["WANDB_DISABLED"] = "true"' in source
     assert "if torch.cuda.is_available():" in source
+
+
+def test_synthetic_model_revision_is_stable_local_identity():
+    assert synthetic.SYNTHETIC_MODEL_REVISION == "synthetic-cpu-local-v1"
+    assert synthetic.SYNTHETIC_MODEL_REVISION != "45d08642849e5c5701b162671ac811b7654bfd9f"
+    assert synthetic.SYNTHETIC_MODEL_ID == "tiny-linear-cpu"
+    assert synthetic.SYNTHETIC_MODEL_ID != "jhu-clsp/ettin-encoder-150m"

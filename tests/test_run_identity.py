@@ -80,6 +80,14 @@ def test_fingerprint_changes_when_scientific_input_differs():
     changed["scheduler_step_policy"] = "skip_on_backward_skip"
     assert build_scientific_fingerprint(changed) != base_fp
 
+    changed = dict(base)
+    changed["model_revision"] = "45d08642849e5c5701b162671ac811b7654bfd9f"
+    assert build_scientific_fingerprint(changed) != base_fp
+
+    changed = dict(base)
+    changed["model_revision"] = None
+    assert build_scientific_fingerprint(changed) == base_fp
+
 
 def test_retry_preserves_previous_attempt(tmp_path):
     """Retries must preserve previous attempts and not overwrite artifacts."""

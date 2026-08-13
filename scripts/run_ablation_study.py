@@ -105,6 +105,14 @@ from lerna.utils.phase1_3_matrix import (
     STRICT_TARGET_SKIP_RATES,
     validate_phase1_3_matrix_plan,
 )
+from lerna.utils.model_loader import (
+    ETTIN_MODEL_ID,
+    ETTIN_REVISION,
+    load_model_and_tokenizer,
+    load_tokenizer,
+    MODELS,
+    validate_ettin_revision,
+)
 from transformers import TrainerCallback
 
 try:
@@ -908,6 +916,7 @@ def plan_phase1_3_cell(
         task=task_name,
         training_seed=training_seed,
         model_id=model_name,
+        model_revision=model_revision,
         max_samples_requested=data_facts["max_samples_requested"],
         train_samples_realized=data_facts["train_samples_realized"],
         eval_samples_realized=data_facts["eval_samples_realized"],
@@ -923,8 +932,6 @@ def plan_phase1_3_cell(
         total_steps=total_steps,
         git_sha=git_sha,
     )
-    if model_revision is not None:
-        identity_inputs["model_revision"] = str(model_revision)
     identity_inputs = add_online_ler_to_identity(
         identity_inputs,
         online_diagnostics,
@@ -1534,6 +1541,8 @@ def run_ablation_single(
     effective_control = "exact_random" if control == "random_skip" else control
     if planned_cell is not None and model_revision is None:
         model_revision = planned_cell.get("model_revision")
+
+    model_revision = validate_ettin_revision(model_name, model_revision)
     budget_state = assert_fixed_budget(
         ablation_name=ablation_name,
         control=effective_control,
@@ -1631,13 +1640,13 @@ def run_ablation_single(
             model_name,
             num_labels=cfg["num_labels"],
             revision=model_revision,
-            local_files_only=True,
+            local_files_only=bool(model_revision),
         )
         model, _ = load_model_and_tokenizer(
             model_name,
             num_labels=cfg["num_labels"],
             revision=model_revision,
-            local_files_only=True,
+            local_files_only=bool(model_revision),
         )
         encoder_state = {k: v for k, v in mnli_model.state_dict().items()
                         if "classifier" not in k and "pooler" not in k}
@@ -1651,7 +1660,7 @@ def run_ablation_single(
             model_name,
             num_labels=cfg["num_labels"],
             revision=model_revision,
-            local_files_only=True,
+            local_files_only=bool(model_revision),
         )
 
     if hw_cfg["gradient_checkpointing"]:
@@ -1713,6 +1722,7 @@ def run_ablation_single(
         task=task_name,
         training_seed=seed,
         model_id=model_name,
+        model_revision=model_revision,
         max_samples_requested=max_samples_requested,
         train_samples_realized=len(train_ds),
         eval_samples_realized=len(eval_ds),
@@ -2008,6 +2018,7 @@ def run_ablation_single(
             "training_seed": int(seed),
             "policy_seed": int(controller_cfg["policy_seed"]),
             "model_id": str(model_name),
+            "model_revision": model_revision,
             "target_skip_rate": float(target_skip_rate),
             "num_epochs": int(num_epochs),
             "total_steps": int(total_steps),
@@ -2215,6 +2226,7 @@ def run_ablation_single(
         argv=list(sys.argv),
         task=task_name,
         model_id=model_name,
+        model_revision=model_revision,
         seed=seed,
         controller_name=type(skip_policy).__name__,
         controller_seed=controller_cfg["policy_seed"],
@@ -2294,7 +2306,8 @@ def run_ablation_single(
             "ablation_overrides": ablation_overrides,
             "learning_rate": lr,
             "profile": profile,
-            "model": MODEL_NAME,
+            "model": model_name,
+            "model_revision": model_revision,
             "train_runtime_s": total_time,
             "train_loss": train_result.training_loss,
             "eval_metrics": eval_result,
@@ -2478,7 +2491,7 @@ def build_arg_parser():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="lerna-ablation")
     parser.add_argument("--wandb-group", default=None)
-    parser.add_argument("--model", default="modernbert", choices=["roberta", "modernbert", "deberta"],
+    parser.add_argument("--model", default="modernbert", choices=["roberta", "modernbert", "deberta", "ettin"],
                         help="Model to use for ablation study")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--unlimited", action="store_true")
@@ -2719,10 +2732,16 @@ def main():
         f"ablation-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
 
-    if strict_phase1_3:
-        from lerna.utils.model_loader import load_tokenizer
+    model_revision = None
+    if args.model == "ettin":
+        model_revision = ETTIN_REVISION
 
-        tokenizer = load_tokenizer(model_name)
+    if strict_phase1_3:
+        tokenizer = load_tokenizer(
+            model_name,
+            revision=model_revision,
+            local_files_only=bool(model_revision),
+        )
         git_sha = _resolve_git_sha()
 
         def data_facts_provider(task):
@@ -2738,6 +2757,7 @@ def main():
             seeds=seeds,
             target_skip_rates=target_skip_rates,
             model_name=model_name,
+            model_revision=model_revision,
             base_output_dir=args.output_dir,
             data_facts_provider=data_facts_provider,
             git_sha=git_sha,
@@ -2872,7 +2892,9 @@ def main():
                 online_ler_update_interval=args.online_ler_update_interval,
                 planned_cell=planned_cell,
                 model_revision=(
-                    planned_cell.get("model_revision") if planned_cell else None
+                    planned_cell.get("model_revision")
+                    if planned_cell
+                    else model_revision
                 ),
             )
             all_results.append(result)

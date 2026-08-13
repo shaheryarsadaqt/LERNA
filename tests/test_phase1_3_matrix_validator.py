@@ -1220,6 +1220,43 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
         else:
             self.fail("expected one MatrixPlanError collecting all findings")
 
+    def test_revision_consistency_across_paired_arms(self):
+        plan = _build_plan()
+        plan[RANDOM]["model_revision"] = "wrongsha" * 5
+        findings = _findings(plan)
+        self.assertTrue(
+            any(
+                "model_revision" in field
+                for field in _fields(findings)
+            )
+        )
+
+    def test_malformed_model_revision_rejected(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["model_revision"] = "UPPERCASE"
+        findings = _findings(plan)
+        self.assertTrue(
+            any(
+                "model_revision" in field
+                for field in _fields(findings)
+            )
+        )
+
+    def test_cell_identity_model_revision_mismatch_rejected(self):
+        plan = _build_plan()
+        revision = "a" * 40
+        for cell in plan:
+            cell["model_revision"] = revision
+            cell["identity_inputs"]["model_revision"] = revision
+        plan[RANDOM]["identity_inputs"]["model_revision"] = "b" * 40
+        _refresh(plan[RANDOM])
+        findings = _findings(plan)
+        self.assertIn(
+            "identity value must equal planned cell model_revision",
+            _messages(findings, "identity_inputs.model_revision"),
+        )
+
     # 22. First validator load cannot import the scientific stack.
     def test_first_validator_load_cannot_import_scientific_stack(self):
         result = subprocess.run(

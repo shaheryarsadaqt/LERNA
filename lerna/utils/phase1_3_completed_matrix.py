@@ -565,6 +565,15 @@ def validate_phase1_3_completed_matrix(
     for cell_id in missing_cells:
         _add_error(findings, "cell_completion", cell_id, "no valid completed attempt found")
 
+    revisions = [cell.get("model_revision") for _, cell, _ in plan_cells]
+    if len(set(revisions)) > 1:
+        _add_error(
+            findings,
+            "plan_revision_consistency",
+            None,
+            f"model_revision drift across plan: {revisions!r}",
+        )
+
     if findings:
         raise CompletedMatrixError(findings)
 

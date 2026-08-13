@@ -442,6 +442,7 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
     data = {
         "task": cell["task"],
         "seed": cell["training_seed"],
+        "model_revision": cell.get("model_revision"),
         "eval_metrics": {"eval_accuracy": 0.9},
         "skip_update_mode": "freeze",
         "scheduler_step_policy": "skip_on_backward_skip",
@@ -1889,6 +1890,81 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
             self.fail("expected CompletedMatrixError")
         except CompletedMatrixError as exc:
             self.assertIn("arm", _error_fields(exc.findings))
+
+    def test_model_revision_propagates_to_manifest_and_results(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            revision = "a" * 40
+            for cell in plan:
+                cell["model_revision"] = revision
+                cell["identity_inputs"]["model_revision"] = revision
+                cell["fingerprint"] = build_scientific_fingerprint(
+                    cell["identity_inputs"]
+                )
+                cell["planned_arm_dir"] = os.path.join(
+                    base, cell["arm"], cell["fingerprint"]
+                )
+            _create_full_fixture(base, plan)
+            plan_path = os.path.join(base, "matrix_plan.json")
+            _write_json(plan_path, plan)
+
+            result = validate_phase1_3_completed_matrix(
+                plan,
+                tasks=[TASK],
+                seeds=[SEED],
+                target_skip_rates=list(RATES),
+                minimum_seed_count=1,
+                base_output_dir=base,
+            )
+            self.assertEqual(len(result["valid_runs"]), 12)
+            for run in result["valid_runs"]:
+                manifest = run["manifest"]
+                self.assertEqual(manifest["run"]["model_revision"], revision)
+                results = _read_json(run["results_path"])
+                self.assertEqual(results["model_revision"], revision)
+
+    def test_cross_arm_model_revision_drift_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            revision = "a" * 40
+            for cell in plan:
+                cell["model_revision"] = revision
+                cell["identity_inputs"]["model_revision"] = revision
+                cell["fingerprint"] = build_scientific_fingerprint(
+                    cell["identity_inputs"]
+                )
+                cell["planned_arm_dir"] = os.path.join(
+                    base, cell["arm"], cell["fingerprint"]
+                )
+            plan[RANDOM]["model_revision"] = "b" * 40
+            plan[RANDOM]["identity_inputs"]["model_revision"] = "b" * 40
+            plan[RANDOM]["fingerprint"] = build_scientific_fingerprint(
+                plan[RANDOM]["identity_inputs"]
+            )
+            plan[RANDOM]["planned_arm_dir"] = os.path.join(
+                base, plan[RANDOM]["arm"], plan[RANDOM]["fingerprint"]
+            )
+            _create_full_fixture(base, plan)
+            plan_path = os.path.join(base, "matrix_plan.json")
+            _write_json(plan_path, plan)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+            fields = _error_fields(raised.exception.findings)
+            self.assertTrue(
+                "plan_revision_consistency" in fields
+                or "paired_group.model_revision" in fields,
+                msg=f"revision drift not rejected; got {fields}",
+            )
 
 
 if __name__ == "__main__":

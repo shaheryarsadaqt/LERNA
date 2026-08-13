@@ -869,7 +869,7 @@ Examples:
     parser.add_argument("--output-dir", required=True)
     # Model & data
     parser.add_argument("--model", default="modernbert",
-                        choices=["roberta", "modernbert", "deberta"])
+                        choices=["roberta", "modernbert", "deberta", "ettin"])
     parser.add_argument("--lr", type=float, default=2e-5,
                         help="Default learning rate (default: 2e-5)")
     parser.add_argument("--max-samples", type=int, default=None)

@@ -507,6 +507,25 @@ def _validate_cell_schema(
             "value must be null or an integer; bools and floats are invalid",
         )
 
+    model_revision = cell.get("model_revision", _MISSING)
+    if model_revision is not _MISSING and model_revision is not None:
+        if not _is_nonempty_str(model_revision):
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                "value must be null or a non-empty string",
+            )
+        elif len(model_revision) != 40 or any(
+            ch not in "0123456789abcdef" for ch in model_revision
+        ):
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                "value must be a 40-character lowercase hex SHA when present",
+            )
+
     for field in ("online_diagnostics", "controller_config", "identity_inputs"):
         if field in cell and type(cell[field]) is not dict:
             _add_error(findings, field, cell_id, "value must be an object")
@@ -769,6 +788,7 @@ def _validate_identity(
         "task",
         "training_seed",
         "model_id",
+        "model_revision",
         "num_epochs",
         "control",
         "target_skip_rate",
@@ -1508,6 +1528,7 @@ def _validate_pairing(
     paired_fields = (
         "task",
         "model_id",
+        "model_revision",
         "total_steps",
         "num_epochs",
         "training_seed",
