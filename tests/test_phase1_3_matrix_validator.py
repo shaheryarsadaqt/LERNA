@@ -1289,6 +1289,28 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             )
         )
 
+    def test_ettin_non_string_revision_rejected_in_plan(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["model_id"] = "jhu-clsp/ettin-encoder-150m"
+            cell["model_revision"] = 123
+            cell["identity_inputs"]["model_id"] = "jhu-clsp/ettin-encoder-150m"
+            cell["identity_inputs"]["model_revision"] = 123
+            _refresh(cell)
+        findings = _findings(plan)
+        self.assertTrue(
+            any(
+                "model_revision" in field
+                for field in _fields(findings)
+            )
+        )
+        self.assertFalse(
+            any(
+                finding.get("field") == "plan"
+                for finding in findings
+            )
+        )
+
     # 22. First validator load cannot import the scientific stack.
     def test_first_validator_load_cannot_import_scientific_stack(self):
         result = subprocess.run(

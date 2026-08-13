@@ -13,6 +13,11 @@ def validate_ettin_revision(model_name, model_revision):
             f"Ettin model requires an explicit revision; "
             f"expected {ETTIN_REVISION!r}"
         )
+    if not isinstance(model_revision, str):
+        raise ValueError(
+            "Ettin revision must be a 40-character lowercase hex SHA; "
+            f"got {model_revision!r}"
+        )
     if model_revision != model_revision.lower():
         raise ValueError(
             f"Ettin revision must be lowercase SHA; got {model_revision!r}"

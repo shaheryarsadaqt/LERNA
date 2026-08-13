@@ -72,6 +72,31 @@ def test_legacy_model_without_revision_returns_none():
     assert validate_ettin_revision("roberta-base", None) is None
 
 
+def test_ettin_non_string_int_revision_rejected():
+    with pytest.raises(ValueError, match="40-character lowercase hex SHA"):
+        validate_ettin_revision(ETTIN_MODEL_ID, 123)
+
+
+def test_ettin_non_string_float_revision_rejected():
+    with pytest.raises(ValueError, match="40-character lowercase hex SHA"):
+        validate_ettin_revision(ETTIN_MODEL_ID, 3.14)
+
+
+def test_ettin_non_string_bool_revision_rejected():
+    with pytest.raises(ValueError, match="40-character lowercase hex SHA"):
+        validate_ettin_revision(ETTIN_MODEL_ID, True)
+
+
+def test_ettin_non_string_list_revision_rejected():
+    with pytest.raises(ValueError, match="40-character lowercase hex SHA"):
+        validate_ettin_revision(ETTIN_MODEL_ID, ["a"])
+
+
+def test_ettin_non_string_dict_revision_rejected():
+    with pytest.raises(ValueError, match="40-character lowercase hex SHA"):
+        validate_ettin_revision(ETTIN_MODEL_ID, {"sha": "a" * 40})
+
+
 def test_ettin_parser_selection_maps_to_model_id():
     assert ETTIN_MODEL_ID == "jhu-clsp/ettin-encoder-150m"
     assert MODELS["ettin"] == ETTIN_MODEL_ID

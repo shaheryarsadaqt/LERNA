@@ -213,6 +213,41 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
                 )
             self.assertIn("requires an explicit revision", str(ctx.exception))
 
+    def test_load_model_and_tokenizer_ettin_non_string_revision_rejected(self):
+        with mock.patch.object(
+            model_loader.AutoModelForSequenceClassification,
+            "from_pretrained",
+            return_value=object(),
+        ) as model_from_pretrained:
+            with mock.patch.object(
+                model_loader.AutoTokenizer,
+                "from_pretrained",
+                return_value=object(),
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    model_loader.load_model_and_tokenizer(
+                        model_loader.ETTIN_MODEL_ID,
+                        num_labels=2,
+                        revision=123,
+                        local_files_only=False,
+                    )
+                self.assertIn("40-character lowercase hex SHA", str(ctx.exception))
+        model_from_pretrained.assert_not_called()
+
+    def test_load_tokenizer_ettin_non_string_revision_rejected(self):
+        with mock.patch.object(
+            model_loader.AutoTokenizer,
+            "from_pretrained",
+            return_value=object(),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                model_loader.load_tokenizer(
+                    model_loader.ETTIN_MODEL_ID,
+                    revision=True,
+                    local_files_only=False,
+                )
+            self.assertIn("40-character lowercase hex SHA", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2002,6 +2002,41 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 msg=f"wrong synthetic revision not rejected; got {fields}",
             )
 
+    def test_ettin_non_string_revision_rejected_in_completed(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            for cell in plan:
+                cell["model_id"] = "jhu-clsp/ettin-encoder-150m"
+                cell["model_revision"] = 123
+                cell["identity_inputs"]["model_id"] = "jhu-clsp/ettin-encoder-150m"
+                cell["identity_inputs"]["model_revision"] = 123
+                cell["fingerprint"] = build_scientific_fingerprint(
+                    cell["identity_inputs"]
+                )
+                cell["planned_arm_dir"] = os.path.join(
+                    base, cell["arm"], cell["fingerprint"]
+                )
+            _create_full_fixture(base, plan)
+            plan_path = os.path.join(base, "matrix_plan.json")
+            _write_json(plan_path, plan)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn(
+                "model_revision",
+                fields,
+                msg=f"non-string Ettin revision not rejected; got {fields}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
