@@ -30,6 +30,7 @@ try:
         ETTIN_MODEL_ID,
         ETTIN_REVISION,
         SYNTHETIC_MODEL_ID,
+        SYNTHETIC_MODEL_REVISION,
         validate_ettin_revision,
     )
 except ImportError:
@@ -44,6 +45,7 @@ except ImportError:
     ETTIN_MODEL_ID = _ETTIN_MODULE.ETTIN_MODEL_ID
     ETTIN_REVISION = _ETTIN_MODULE.ETTIN_REVISION
     SYNTHETIC_MODEL_ID = _ETTIN_MODULE.SYNTHETIC_MODEL_ID
+    SYNTHETIC_MODEL_REVISION = _ETTIN_MODULE.SYNTHETIC_MODEL_REVISION
     validate_ettin_revision = _ETTIN_MODULE.validate_ettin_revision
 
 
@@ -530,7 +532,35 @@ def _validate_cell_schema(
 
     model_id = cell.get("model_id")
     model_revision = cell.get("model_revision", _MISSING)
-    if model_revision is not _MISSING and model_revision is not None:
+    if model_id == ETTIN_MODEL_ID:
+        try:
+            validate_ettin_revision(
+                model_id,
+                model_revision if model_revision is not _MISSING else None,
+            )
+        except ValueError as exc:
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                str(exc),
+            )
+    elif model_id == SYNTHETIC_MODEL_ID:
+        if model_revision is _MISSING or model_revision is None:
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                f"synthetic model requires exact revision {SYNTHETIC_MODEL_REVISION!r}",
+            )
+        elif model_revision != SYNTHETIC_MODEL_REVISION:
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                f"synthetic model revision mismatch: expected {SYNTHETIC_MODEL_REVISION!r}, got {model_revision!r}",
+            )
+    elif model_revision is not _MISSING and model_revision is not None:
         if not _is_nonempty_str(model_revision):
             _add_error(
                 findings,
@@ -538,26 +568,15 @@ def _validate_cell_schema(
                 cell_id,
                 "value must be null or a non-empty string",
             )
-        elif model_id == ETTIN_MODEL_ID:
-            try:
-                validate_ettin_revision(model_id, model_revision)
-            except ValueError as exc:
-                _add_error(
-                    findings,
-                    "model_revision",
-                    cell_id,
-                    str(exc),
-                )
-        elif model_id != SYNTHETIC_MODEL_ID:
-            if len(model_revision) != 40 or any(
-                ch not in "0123456789abcdef" for ch in model_revision
-            ):
-                _add_error(
-                    findings,
-                    "model_revision",
-                    cell_id,
-                    "value must be a 40-character lowercase hex SHA when present",
-                )
+        elif len(model_revision) != 40 or any(
+            ch not in "0123456789abcdef" for ch in model_revision
+        ):
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                "value must be a 40-character lowercase hex SHA when present",
+            )
 
     for field in ("online_diagnostics", "controller_config", "identity_inputs"):
         if field in cell and type(cell[field]) is not dict:

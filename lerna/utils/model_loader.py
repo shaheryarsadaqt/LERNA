@@ -30,8 +30,21 @@ _MODERNBERT_PREFIXES = ("answerdotai/ModernBERT",)
 _ETTIN_PREFIXES = ("jhu-clsp/ettin-encoder-150m",)
 
 
+def is_ettin_model(model_name: str) -> bool:
+    return any(model_name.startswith(p) for p in _ETTIN_PREFIXES)
+
+
 def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_files_only: bool = False):
     """Load tokenizer assets without model weights for CPU-side planning."""
+    if is_ettin_model(model_name):
+        validated_revision = validate_ettin_revision(model_name, revision)
+        if validated_revision is None:
+            raise ValueError(
+                f"Ettin model requires an explicit revision; "
+                f"expected {ETTIN_REVISION!r}"
+            )
+        revision = validated_revision
+        local_files_only = True
     kwargs = {}
     if revision is not None:
         kwargs["revision"] = revision
@@ -54,7 +67,17 @@ def load_model_and_tokenizer(
     Others: standard AutoModel loading
     """
     is_modernbert = any(model_name.startswith(p) for p in _MODERNBERT_PREFIXES)
-    is_ettin = any(model_name.startswith(p) for p in _ETTIN_PREFIXES)
+    is_ettin = is_ettin_model(model_name)
+
+    if is_ettin:
+        validated_revision = validate_ettin_revision(model_name, revision)
+        if validated_revision is None:
+            raise ValueError(
+                f"Ettin model requires an explicit revision; "
+                f"expected {ETTIN_REVISION!r}"
+            )
+        revision = validated_revision
+        local_files_only = True
 
     tokenizer = load_tokenizer(
         model_name,

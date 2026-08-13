@@ -48,6 +48,11 @@ def test_ettin_missing_revision_rejected():
         validate_ettin_revision(ETTIN_MODEL_ID, None)
 
 
+def test_ettin_empty_string_revision_rejected():
+    with pytest.raises(ValueError, match="requires an explicit revision"):
+        validate_ettin_revision(ETTIN_MODEL_ID, "")
+
+
 def test_ettin_uppercase_revision_rejected():
     with pytest.raises(ValueError, match="must be lowercase SHA"):
         validate_ettin_revision(ETTIN_MODEL_ID, ETTIN_REVISION.upper())

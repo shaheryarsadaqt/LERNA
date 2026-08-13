@@ -1257,6 +1257,38 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             _messages(findings, "identity_inputs.model_revision"),
         )
 
+    def test_ettin_null_revision_rejected_in_plan(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["model_id"] = "jhu-clsp/ettin-encoder-150m"
+            cell["model_revision"] = None
+            cell["identity_inputs"]["model_id"] = "jhu-clsp/ettin-encoder-150m"
+            cell["identity_inputs"]["model_revision"] = None
+            _refresh(cell)
+        findings = _findings(plan)
+        self.assertTrue(
+            any(
+                "Ettin model requires an explicit revision" in msg
+                for msg in _messages(findings, "model_revision")
+            )
+        )
+
+    def test_synthetic_wrong_revision_rejected_in_plan(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["model_id"] = "tiny-linear-cpu"
+            cell["model_revision"] = "arbitrary-local-revision"
+            cell["identity_inputs"]["model_id"] = "tiny-linear-cpu"
+            cell["identity_inputs"]["model_revision"] = "arbitrary-local-revision"
+            _refresh(cell)
+        findings = _findings(plan)
+        self.assertTrue(
+            any(
+                "synthetic model revision mismatch" in msg
+                for msg in _messages(findings, "model_revision")
+            )
+        )
+
     # 22. First validator load cannot import the scientific stack.
     def test_first_validator_load_cannot_import_scientific_stack(self):
         result = subprocess.run(

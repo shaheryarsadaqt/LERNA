@@ -96,30 +96,37 @@ def test_legacy_loader_call_does_not_gain_revision_kwargs():
     from types import ModuleType
     from unittest import mock
 
+    _original_transformers = sys.modules.get("transformers")
     transformers_mock = ModuleType("transformers")
     transformers_mock.AutoModelForSequenceClassification = mock.MagicMock()
     transformers_mock.AutoTokenizer = mock.MagicMock()
     sys.modules["transformers"] = transformers_mock
 
-    _LOADER_PATH = REPO_ROOT / "lerna" / "utils" / "model_loader.py"
-    _LOADER_SPEC = importlib.util.spec_from_file_location(
-        "lerna_model_loader_for_identity_inputs",
-        _LOADER_PATH,
-    )
-    model_loader = importlib.util.module_from_spec(_LOADER_SPEC)
-    _LOADER_SPEC.loader.exec_module(model_loader)
+    try:
+        _LOADER_PATH = REPO_ROOT / "lerna" / "utils" / "model_loader.py"
+        _LOADER_SPEC = importlib.util.spec_from_file_location(
+            "lerna_model_loader_for_identity_inputs",
+            _LOADER_PATH,
+        )
+        model_loader = importlib.util.module_from_spec(_LOADER_SPEC)
+        _LOADER_SPEC.loader.exec_module(model_loader)
 
-    with mock.patch.object(
-        model_loader.AutoTokenizer,
-        "from_pretrained",
-        return_value=object(),
-    ):
         with mock.patch.object(
-            model_loader.AutoModelForSequenceClassification,
+            model_loader.AutoTokenizer,
             "from_pretrained",
             return_value=object(),
-        ) as model_from_pretrained:
-            model_loader.load_model_and_tokenizer("roberta-base", num_labels=2)
-    _, kwargs = model_from_pretrained.call_args
-    assert "revision" not in kwargs
-    assert "local_files_only" not in kwargs
+        ):
+            with mock.patch.object(
+                model_loader.AutoModelForSequenceClassification,
+                "from_pretrained",
+                return_value=object(),
+            ) as model_from_pretrained:
+                model_loader.load_model_and_tokenizer("roberta-base", num_labels=2)
+        _, kwargs = model_from_pretrained.call_args
+        assert "revision" not in kwargs
+        assert "local_files_only" not in kwargs
+    finally:
+        if _original_transformers is not None:
+            sys.modules["transformers"] = _original_transformers
+        else:
+            del sys.modules["transformers"]

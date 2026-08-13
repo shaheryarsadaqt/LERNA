@@ -1967,6 +1967,41 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 msg=f"revision drift not rejected; got {fields}",
             )
 
+    def test_synthetic_wrong_revision_rejected_in_completed(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            for cell in plan:
+                cell["model_id"] = "tiny-linear-cpu"
+                cell["model_revision"] = "arbitrary-local-revision"
+                cell["identity_inputs"]["model_id"] = "tiny-linear-cpu"
+                cell["identity_inputs"]["model_revision"] = "arbitrary-local-revision"
+                cell["fingerprint"] = build_scientific_fingerprint(
+                    cell["identity_inputs"]
+                )
+                cell["planned_arm_dir"] = os.path.join(
+                    base, cell["arm"], cell["fingerprint"]
+                )
+            _create_full_fixture(base, plan)
+            plan_path = os.path.join(base, "matrix_plan.json")
+            _write_json(plan_path, plan)
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn(
+                "model_revision",
+                fields,
+                msg=f"wrong synthetic revision not rejected; got {fields}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

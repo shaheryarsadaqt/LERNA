@@ -903,6 +903,11 @@ Examples:
     parser.add_argument("--timeout", type=int, default=7200,
                         help="Timeout per run in seconds (default: 7200)")
     args = parser.parse_args()
+    if args.model == "ettin" and args.phase != "ablation":
+        parser.error(
+            "--model ettin is only supported with --phase ablation "
+            "in this repair commit"
+        )
     # Default wandb group
     if args.wandb_group is None:
         args.wandb_group = f"{args.phase}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
