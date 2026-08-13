@@ -63,7 +63,7 @@ def test_build_identity_inputs_omits_model_revision_when_none():
         total_steps=100,
         git_sha="def456",
     )
-    assert "model_revision" not in identity
+    assert identity["model_revision"] is None
 
 
 def test_fingerprint_changes_when_model_revision_changes():

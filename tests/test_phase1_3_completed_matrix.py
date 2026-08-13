@@ -442,6 +442,7 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
     data = {
         "task": cell["task"],
         "seed": cell["training_seed"],
+        "model": cell.get("model_id"),
         "model_revision": cell.get("model_revision"),
         "eval_metrics": {"eval_accuracy": 0.9},
         "skip_update_mode": "freeze",

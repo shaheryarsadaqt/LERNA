@@ -5,15 +5,29 @@ attention implementations, etc.) so experiment scripts stay clean.
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from typing import Optional, Tuple
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+try:
+    from .ettin_constants import ETTIN_MODEL_ID, ETTIN_REVISION, validate_ettin_revision
+except ImportError:
+    _ETTIN_SPEC = importlib.util.spec_from_file_location(
+        "lerna_model_loader_ettin_constants",
+        Path(__file__).with_name("ettin_constants.py"),
+    )
+    if _ETTIN_SPEC is None or _ETTIN_SPEC.loader is None:
+        raise ImportError("could not load lerna.utils.ettin_constants")
+    _ETTIN_MODULE = importlib.util.module_from_spec(_ETTIN_SPEC)
+    _ETTIN_SPEC.loader.exec_module(_ETTIN_MODULE)
+    ETTIN_MODEL_ID = _ETTIN_MODULE.ETTIN_MODEL_ID
+    ETTIN_REVISION = _ETTIN_MODULE.ETTIN_REVISION
+    validate_ettin_revision = _ETTIN_MODULE.validate_ettin_revision
 
 _MODERNBERT_PREFIXES = ("answerdotai/ModernBERT",)
 _ETTIN_PREFIXES = ("jhu-clsp/ettin-encoder-150m",)
-ETTIN_MODEL_ID = "jhu-clsp/ettin-encoder-150m"
-ETTIN_REVISION = "45d08642849e5c5701b162671ac811b7654bfd9f"
 
 
 def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_files_only: bool = False):
@@ -24,40 +38,6 @@ def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_fil
     if local_files_only:
         kwargs["local_files_only"] = local_files_only
     return AutoTokenizer.from_pretrained(model_name, **kwargs)
-
-
-def validate_ettin_revision(model_name: str, model_revision: Optional[str]) -> Optional[str]:
-    """Validate and return the immutable Ettin revision for production runs.
-
-    Returns the validated revision (or None for non-Ettin models). Raises
-    ValueError for missing, uppercase, malformed, non-40-character, or
-    incorrect revisions so production Ettin runs can never bind to the
-    wrong scientific base.
-    """
-    if model_name != ETTIN_MODEL_ID:
-        return None
-    if not model_revision:
-        raise ValueError(
-            f"Ettin model requires an explicit revision; "
-            f"expected {ETTIN_REVISION!r}"
-        )
-    if model_revision != model_revision.lower():
-        raise ValueError(
-            f"Ettin revision must be lowercase SHA; got {model_revision!r}"
-        )
-    if len(model_revision) != 40 or any(
-        ch not in "0123456789abcdef" for ch in model_revision
-    ):
-        raise ValueError(
-            f"Ettin revision must be a 40-character lowercase hex SHA; "
-            f"got {model_revision!r}"
-        )
-    if model_revision != ETTIN_REVISION:
-        raise ValueError(
-            f"Ettin revision mismatch: expected {ETTIN_REVISION!r}, "
-            f"got {model_revision!r}"
-        )
-    return model_revision
 
 
 def load_model_and_tokenizer(

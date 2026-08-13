@@ -11,19 +11,25 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Mock transformers before loading the model_loader module.
+_original_transformers = sys.modules.get("transformers")
 transformers_mock = ModuleType("transformers")
 transformers_mock.AutoModelForSequenceClassification = mock.MagicMock()
 transformers_mock.AutoTokenizer = mock.MagicMock()
 sys.modules["transformers"] = transformers_mock
 
-_LOADER_PATH = REPO_ROOT / "lerna" / "utils" / "model_loader.py"
-_LOADER_SPEC = importlib.util.spec_from_file_location(
-    "lerna_model_loader_for_loader_tests",
-    _LOADER_PATH,
-)
-model_loader = importlib.util.module_from_spec(_LOADER_SPEC)
-_LOADER_SPEC.loader.exec_module(model_loader)
+try:
+    _LOADER_PATH = REPO_ROOT / "lerna" / "utils" / "model_loader.py"
+    _LOADER_SPEC = importlib.util.spec_from_file_location(
+        "lerna_model_loader_for_loader_tests",
+        _LOADER_PATH,
+    )
+    model_loader = importlib.util.module_from_spec(_LOADER_SPEC)
+    _LOADER_SPEC.loader.exec_module(model_loader)
+finally:
+    if _original_transformers is not None:
+        sys.modules["transformers"] = _original_transformers
+    else:
+        del sys.modules["transformers"]
 
 
 class TokenizerOnlyLoaderTests(unittest.TestCase):

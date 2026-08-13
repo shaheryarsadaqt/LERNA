@@ -32,6 +32,8 @@ _strict_equal = _MATRIX_MODULE._strict_equal
 _add_error = _MATRIX_MODULE._add_error
 _FINGERPRINT_PATTERN = _MATRIX_MODULE._FINGERPRINT_PATTERN
 build_scientific_fingerprint = _MATRIX_MODULE.build_scientific_fingerprint
+ETTIN_MODEL_ID = _MATRIX_MODULE.ETTIN_MODEL_ID
+ETTIN_REVISION = _MATRIX_MODULE.ETTIN_REVISION
 
 _PROVENANCE_PATH = _THIS_DIR / "run_provenance.py"
 _PROVENANCE_SPEC = importlib.util.spec_from_file_location(
@@ -488,6 +490,14 @@ def validate_phase1_3_completed_matrix(
                     "message": f"{attempt_name}: results ablation drift",
                 })
 
+            if not _strict_equal(results.get("model"), cell.get("model_id")):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.model",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results model drift",
+                })
+
             if not _strict_equal(results.get("model_revision"), cell.get("model_revision")):
                 attempt_findings.append({
                     "severity": "error",
@@ -573,6 +583,15 @@ def validate_phase1_3_completed_matrix(
             None,
             f"model_revision drift across plan: {revisions!r}",
         )
+
+    for _, cell, cell_id in plan_cells:
+        if cell.get("model_id") == ETTIN_MODEL_ID and cell.get("model_revision") != ETTIN_REVISION:
+            _add_error(
+                findings,
+                "model_revision",
+                cell_id,
+                f"Ettin model requires exact revision {ETTIN_REVISION!r}",
+            )
 
     if findings:
         raise CompletedMatrixError(findings)

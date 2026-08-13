@@ -358,6 +358,10 @@ class AblationAdapter(PhaseAdapter):
         if effective_max is None and not args.unlimited:
             effective_max = 2000 if profile != "server" else 25000
         task_hp = self._task_hp.get(p["task"], {})
+        model_revision = None
+        if args.model == "ettin":
+            from lerna.utils.ettin_constants import ETTIN_REVISION
+            model_revision = ETTIN_REVISION
         return self._run_fn(
             task_name=p["task"],
             seed=p["seed"],
@@ -378,6 +382,7 @@ class AblationAdapter(PhaseAdapter):
             metric_for_best_model=task_hp.get("metric_for_best_model", "eval_loss"),
             greater_is_better=task_hp.get("greater_is_better", False),
             init_from_mnli=task_hp.get("init_from_mnli", False),
+            model_revision=model_revision,
         )
 # ──────────────────────────────────────────────────────────────────────────────
 #  ADAPTER: Phase 1.1 Baseline GLUE

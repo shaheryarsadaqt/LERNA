@@ -290,6 +290,7 @@ def build_identity_inputs(
         "task": str(task),
         "training_seed": int(training_seed),
         "model_id": str(model_id),
+        "model_revision": str(model_revision) if model_revision is not None else None,
         "max_samples_requested": max_samples_requested,
         "train_samples_realized": int(train_samples_realized),
         "eval_samples_realized": int(eval_samples_realized),
@@ -305,8 +306,6 @@ def build_identity_inputs(
         "total_steps": int(total_steps),
         "git_sha": str(git_sha),
     }
-    if model_revision is not None:
-        identity["model_revision"] = str(model_revision)
     return identity
 
 

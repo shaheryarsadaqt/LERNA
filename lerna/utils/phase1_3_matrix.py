@@ -25,6 +25,27 @@ except ImportError:
         _PROVENANCE_MODULE.build_scientific_fingerprint
     )
 
+try:
+    from .ettin_constants import (
+        ETTIN_MODEL_ID,
+        ETTIN_REVISION,
+        SYNTHETIC_MODEL_ID,
+        validate_ettin_revision,
+    )
+except ImportError:
+    _ETTIN_SPEC = importlib.util.spec_from_file_location(
+        "lerna_ettin_constants_for_matrix",
+        Path(__file__).with_name("ettin_constants.py"),
+    )
+    if _ETTIN_SPEC is None or _ETTIN_SPEC.loader is None:
+        raise ImportError("could not load lerna.utils.ettin_constants")
+    _ETTIN_MODULE = importlib.util.module_from_spec(_ETTIN_SPEC)
+    _ETTIN_SPEC.loader.exec_module(_ETTIN_MODULE)
+    ETTIN_MODEL_ID = _ETTIN_MODULE.ETTIN_MODEL_ID
+    ETTIN_REVISION = _ETTIN_MODULE.ETTIN_REVISION
+    SYNTHETIC_MODEL_ID = _ETTIN_MODULE.SYNTHETIC_MODEL_ID
+    validate_ettin_revision = _ETTIN_MODULE.validate_ettin_revision
+
 
 PHASE1_3_CANONICAL_ARMS: tuple[str, ...] = (
     "full_finetune",
@@ -507,6 +528,7 @@ def _validate_cell_schema(
             "value must be null or an integer; bools and floats are invalid",
         )
 
+    model_id = cell.get("model_id")
     model_revision = cell.get("model_revision", _MISSING)
     if model_revision is not _MISSING and model_revision is not None:
         if not _is_nonempty_str(model_revision):
@@ -516,15 +538,26 @@ def _validate_cell_schema(
                 cell_id,
                 "value must be null or a non-empty string",
             )
-        elif len(model_revision) != 40 or any(
-            ch not in "0123456789abcdef" for ch in model_revision
-        ):
-            _add_error(
-                findings,
-                "model_revision",
-                cell_id,
-                "value must be a 40-character lowercase hex SHA when present",
-            )
+        elif model_id == ETTIN_MODEL_ID:
+            try:
+                validate_ettin_revision(model_id, model_revision)
+            except ValueError as exc:
+                _add_error(
+                    findings,
+                    "model_revision",
+                    cell_id,
+                    str(exc),
+                )
+        elif model_id != SYNTHETIC_MODEL_ID:
+            if len(model_revision) != 40 or any(
+                ch not in "0123456789abcdef" for ch in model_revision
+            ):
+                _add_error(
+                    findings,
+                    "model_revision",
+                    cell_id,
+                    "value must be a 40-character lowercase hex SHA when present",
+                )
 
     for field in ("online_diagnostics", "controller_config", "identity_inputs"):
         if field in cell and type(cell[field]) is not dict:
