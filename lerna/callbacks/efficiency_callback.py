@@ -554,7 +554,7 @@ class PowerTelemetryCallback(TrainerCallback):
     def _detect_gpu(self):
         try:
             result = subprocess.run(
-                ["nvidia-smi", "-i", str(self.gpu_index), "--query-gpu=name", "--format=csv,noheader"],
+                ["nvidia-smi", "-i", self.gpu_selector, "--query-gpu=name", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 self._gpu_name = result.stdout.strip()
@@ -578,7 +578,7 @@ class PowerTelemetryCallback(TrainerCallback):
     def _query_nvidia_smi(self) -> Optional[Dict]:
         try:
             result = subprocess.run(
-                ["nvidia-smi", "-i", str(self.gpu_index),
+                ["nvidia-smi", "-i", self.gpu_selector,
                  "--query-gpu=power.draw,temperature.gpu,utilization.gpu",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5)

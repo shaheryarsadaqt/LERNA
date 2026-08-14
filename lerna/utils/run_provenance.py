@@ -22,6 +22,7 @@ MANIFEST_FILENAME = "run_manifest.json"
 
 CLASSIFICATION_MATCHED_CLAIM = "matched_claim"
 CLASSIFICATION_LOCAL_DEVELOPMENT = "local_development"
+CLASSIFICATION_PILOT_NON_CLAIM = "pilot_non_claim"
 
 DEFAULT_ARTIFACT_FILENAMES = (
     "results.json",
@@ -472,9 +473,25 @@ def classify_run(
     skip_update_mode: Optional[str],
     requested_classification: str = CLASSIFICATION_MATCHED_CLAIM,
 ) -> str:
-    """Validate whether a run may request matched-claim provenance."""
+    """Validate whether a run may request matched-claim or pilot provenance."""
     if requested_classification == CLASSIFICATION_LOCAL_DEVELOPMENT:
         return CLASSIFICATION_LOCAL_DEVELOPMENT
+    if requested_classification == CLASSIFICATION_PILOT_NON_CLAIM:
+        if git_dirty:
+            raise ProvenanceError(
+                "Refusing pilot_non_claim: tracked git state is dirty or unavailable"
+            )
+        if not matched_budget_planned:
+            raise ProvenanceError(
+                "Refusing pilot_non_claim: the run is configured as unmatched "
+                "(for example, early stopping is active)"
+            )
+        if skip_update_mode != "freeze":
+            raise ProvenanceError(
+                "Refusing pilot_non_claim: authoritative Phase 1.3 requires "
+                "skip_update_mode='freeze'"
+            )
+        return CLASSIFICATION_PILOT_NON_CLAIM
     if requested_classification != CLASSIFICATION_MATCHED_CLAIM:
         raise ProvenanceError(
             f"Unknown provenance classification: {requested_classification!r}"

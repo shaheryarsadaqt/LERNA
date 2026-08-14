@@ -172,6 +172,22 @@ def test_run_consumes_persisted_plan_in_exact_order(monkeypatch, tmp_path):
         for call, cell in zip(run_cell.call_args_list, bundle["plan"])
     )
     assert all(call.kwargs["skip_update_mode"] == "freeze" for call in run_cell.call_args_list)
+    assert all(call.kwargs["max_consecutive_skips"] == 4 for call in run_cell.call_args_list)
+    assert all(call.kwargs["probe_interval"] == 8 for call in run_cell.call_args_list)
+    assert all(call.kwargs["rho_veto_threshold"] == -0.2 for call in run_cell.call_args_list)
+    assert all(call.kwargs["risk_gamma"] == 0.0 for call in run_cell.call_args_list)
+    assert all(
+        call.kwargs["online_ler_parameter_sample_size"] == 4096
+        for call in run_cell.call_args_list
+    )
+    assert all(
+        call.kwargs["online_ler_update_interval"] == 1
+        for call in run_cell.call_args_list
+    )
+    assert all(
+        call.kwargs["provenance_classification"] == runner.CLASSIFICATION_PILOT_NON_CLAIM
+        for call in run_cell.call_args_list
+    )
     tokenizer.assert_not_called()
     freeze.assert_called_once_with(bundle)
 

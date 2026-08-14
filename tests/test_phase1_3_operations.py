@@ -142,7 +142,20 @@ def test_environment_lock_enforces_offline_v100_and_exact_equality(
     monkeypatch.setattr(
         operations,
         "_package_versions",
-        lambda: {"torch": "2.5.1"},
+        lambda: {
+            "torch": "2.5.1",
+            "transformers": "4.48.3",
+            "datasets": "3.2.0",
+            "evaluate": "0.4.3",
+            "numpy": "1.26.4",
+            "accelerate": "1.3.0",
+            "scipy": "1.11.4",
+            "scikit-learn": "1.5.0",
+            "pyarrow": "15.0.0",
+            "tokenizers": "0.19.1",
+            "safetensors": "0.4.3",
+            "huggingface_hub": "0.21.2",
+        },
     )
     monkeypatch.setattr(
         operations,
@@ -339,8 +352,18 @@ def test_validation_freeze_hashes_results_and_power_evidence_immutably(tmp_path)
     attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
     power = {
         "authoritative_copy": "results.json",
+        "measurement_source": "nvidia-smi",
         "energy_valid": True,
-        "raw_samples": [{"power_w": 200.0, "timestamp": 1.0}],
+        "energy_invalid_reason": "ok",
+        "gpu_name": "V100",
+        "gpu_index": 0,
+        "gpu_selector": "0",
+        "sample_interval_s": 1.0,
+        "nvidia_smi_query_count": 1,
+        "nvidia_smi_success_count": 1,
+        "total_energy_kwh": 0.001,
+        "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+        "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
     }
     _write_json(attempt / "results.json", {"power_evidence": power})
     _write_json(attempt / "run_manifest.json", {"status": "completed"})
@@ -375,5 +398,285 @@ def test_validation_freeze_hashes_results_and_power_evidence_immutably(tmp_path)
         operations.freeze_matrix_validation(
             base_output_dir=root,
             bundle=bundle,
+            valid_runs=valid_runs,
+        )
+
+
+def test_power_evidence_validation_rejects_malformed_power(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    cell = bundle["plan"][0]
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    _write_json(attempt / "run_manifest.json", {"status": "completed"})
+
+    with pytest.raises(operations.Phase13OperationalError, match="lacks power_evidence"):
+        operations.validate_power_evidence({})
+
+    with pytest.raises(operations.Phase13OperationalError, match="authority drift"):
+        operations.validate_power_evidence({
+            "power_evidence": {"authoritative_copy": "manifest.json"}
+        })
+
+    with pytest.raises(operations.Phase13OperationalError, match="missing measurement_source"):
+        operations.validate_power_evidence({
+            "power_evidence": {
+                "authoritative_copy": "results.json",
+                "energy_valid": True,
+            }
+        })
+
+    bogus_power = {
+        "authoritative_copy": "results.json",
+        "measurement_source": "nvidia-smi",
+        "energy_valid": True,
+        "energy_invalid_reason": "ok",
+    }
+    with pytest.raises(operations.Phase13OperationalError, match="missing gpu_name"):
+        operations.validate_power_evidence({"power_evidence": bogus_power})
+
+    bogus_power.update({
+        "gpu_name": "V100",
+        "gpu_index": 0,
+        "gpu_selector": "0",
+        "sample_interval_s": 1.0,
+        "nvidia_smi_query_count": 1,
+        "nvidia_smi_success_count": 1,
+        "total_energy_kwh": 0.0,
+        "raw_samples": [],
+        "per_step_energy": [],
+    })
+    with pytest.raises(operations.Phase13OperationalError, match="non-empty list"):
+        operations.validate_power_evidence({"power_evidence": bogus_power})
+
+    bogus_power["raw_samples"] = [{"timestamp": "not_a_number", "power_w": 200.0}]
+    with pytest.raises(operations.Phase13OperationalError, match="numeric timestamp"):
+        operations.validate_power_evidence({"power_evidence": bogus_power})
+
+
+def test_freeze_rejects_malformed_power_evidence(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    cell = bundle["plan"][0]
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    _write_json(attempt / "results.json", {"power_evidence": {"bogus": 1}})
+    _write_json(attempt / "run_manifest.json", {"status": "completed"})
+    valid_runs = [
+        {
+            "cell_id": ("mrpc", 7, 0.30, "full_finetune"),
+            "attempt_num": 1,
+            "results_path": str(attempt / "results.json"),
+        }
+    ]
+    with pytest.raises(operations.Phase13OperationalError, match="authority drift"):
+        operations.freeze_matrix_validation(
+            base_output_dir=root,
+            bundle=bundle,
+            valid_runs=valid_runs,
+        )
+
+
+def test_stale_recovery_is_fail_closed_with_foreign_root(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    cell = bundle["plan"][0]
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    now = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    _write_json(
+        attempt / "run_manifest.json",
+        {
+            "status": "running",
+            "start_time_utc": (now - timedelta(hours=13)).isoformat(),
+            "fingerprint": cell["fingerprint"],
+            "identity_inputs": cell["identity_inputs"],
+            "attempt": 1,
+        },
+    )
+    foreign = root / "foreign_arm"
+    foreign.mkdir()
+    (foreign / "some_fp").mkdir()
+    (foreign / "some_fp" / "attempt-001").mkdir()
+    _write_json(
+        foreign / "some_fp" / "attempt-001" / "run_manifest.json",
+        {
+            "status": "running",
+            "start_time_utc": (now - timedelta(hours=13)).isoformat(),
+        },
+    )
+    with pytest.raises(operations.Phase13OperationalError, match="unexpected matrix root directory"):
+        operations.recover_stale_running_attempts(
+            bundle["plan"],
+            base_output_dir=root,
+            stale_after_hours=12,
+            now=now,
+        )
+
+
+def test_progress_scanner_rejects_foreign_root_file(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    (root / "unexpected_file.txt").write_text("foreign", encoding="utf-8")
+    with pytest.raises(operations.Phase13OperationalError, match="unexpected root file"):
+        operations.scan_phase1_3_progress(
+            bundle["plan"], base_output_dir=root
+        )
+
+
+def test_cache_content_hashing_detects_same_size_mutation(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    original = cache_dir / "data.bin"
+    original.write_bytes(b"original_content_here")
+    evidence = operations._cache_tree_evidence(cache_dir, label="test")
+    assert evidence["file_count"] == 1
+    original.write_bytes(b"tampered_content_here")
+    new_evidence = operations._cache_tree_evidence(cache_dir, label="test")
+    assert evidence["inventory_sha256"] != new_evidence["inventory_sha256"]
+
+
+def test_dependency_evidence_rejects_unavailable_packages(monkeypatch, tmp_path):
+    for key, value in operations._REQUIRED_OFFLINE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.setattr(
+        operations,
+        "_selected_gpu_evidence",
+        lambda: {
+            "selector": "0",
+            "name": "NVIDIA V100-SXM2-32GB",
+            "uuid": "GPU-1",
+            "memory_total_mib": 32510,
+            "driver_version": "555.1",
+        },
+    )
+    monkeypatch.setattr(
+        operations,
+        "_ettin_snapshot_evidence",
+        lambda *args, **kwargs: {
+            "snapshot_path": "/raid/hf_cache/snapshot",
+            "file_count": 5,
+            "inventory_sha256": "d" * 64,
+            "entries": [],
+        },
+    )
+    monkeypatch.setattr(
+        operations,
+        "_cache_tree_evidence",
+        lambda path, label: {
+            "path": str(path),
+            "file_count": 2,
+            "total_bytes": 100,
+            "inventory_sha256": "f" * 64,
+        },
+    )
+    def missing_package():
+        raise operations.Phase13OperationalError(
+            "required package 'transformers' is not installed"
+        )
+    monkeypatch.setattr(operations, "_package_versions", missing_package)
+    with pytest.raises(operations.Phase13OperationalError, match="required package"):
+        operations.collect_phase1_3_environment(
+            repo_root=tmp_path,
+            profile="server",
+            model_id="test",
+            model_revision="rev",
+            hardware_config={
+                "fp16": True,
+                "bf16": False,
+            },
+        )
+
+
+def test_pilot_non_claim_classification_in_evidence(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    cell = bundle["plan"][0]
+    cell["provenance_classification"] = "pilot_non_claim"
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    _write_json(
+        attempt / "run_manifest.json",
+        {
+            "status": "completed",
+            "provenance_classification": "pilot_non_claim",
+            "fingerprint": cell["fingerprint"],
+            "identity_inputs": cell["identity_inputs"],
+            "attempt": 1,
+            "output_paths": {
+                "results": "results.json",
+                "instrumentation": "instrumentation.json",
+                "manifest": "run_manifest.json",
+            },
+            "end_time_utc": "2026-08-14T17:00:00Z",
+            "duration_seconds": 100.0,
+            "artifacts": {
+                "results.json": {
+                    "path": "results.json",
+                    "exists": True,
+                    "size_bytes": 100,
+                    "sha256": "a" * 64,
+                }
+            },
+            "realized": {},
+            "validation": {"valid_for_matched_budget": True},
+        },
+    )
+    verified = {
+        "attempt": 1,
+        "attempt_dir": attempt,
+        "manifest": {"status": "completed", "provenance_classification": "pilot_non_claim"},
+        "results": {"task": "mrpc"},
+    }
+    reader = lambda observed_cell, observed_dir, observed_num: verified
+    original_reader = operations._read_completed_attempt
+    operations._read_completed_attempt = reader
+    try:
+        progress = operations.scan_phase1_3_progress(
+            bundle["plan"], base_output_dir=root
+        )
+        assert progress[0]["state"] == "completed"
+    finally:
+        operations._read_completed_attempt = original_reader
+
+    production_bundle = dict(bundle)
+    production_bundle["envelope"] = dict(bundle["envelope"])
+    production_bundle["envelope"]["matrix_kind"] = "production"
+    valid_runs = [
+        {
+            "cell_id": ("mrpc", 7, 0.30, "full_finetune"),
+            "attempt_num": 1,
+            "results_path": str(attempt / "results.json"),
+        }
+    ]
+    _write_json(
+        attempt / "results.json",
+        {
+            "task": "mrpc",
+            "seed": 7,
+            "ablation": "full_finetune",
+            "model": cell["model_id"],
+            "model_revision": cell.get("model_revision"),
+            "fingerprint": cell["fingerprint"],
+            "identity_inputs": cell["identity_inputs"],
+            "attempt": 1,
+            "power_evidence": {
+                "authoritative_copy": "results.json",
+                "measurement_source": "nvidia-smi",
+                "energy_valid": True,
+                "energy_invalid_reason": "ok",
+                "gpu_name": "V100",
+                "gpu_index": 0,
+                "gpu_selector": "0",
+                "sample_interval_s": 1.0,
+                "nvidia_smi_query_count": 1,
+                "nvidia_smi_success_count": 1,
+                "total_energy_kwh": 0.001,
+                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+                "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+            },
+        },
+    )
+    with pytest.raises(operations.Phase13OperationalError, match="pilot evidence"):
+        operations.freeze_matrix_validation(
+            base_output_dir=root,
+            bundle=production_bundle,
             valid_runs=valid_runs,
         )

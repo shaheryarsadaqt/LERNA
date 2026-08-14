@@ -272,12 +272,15 @@ def validate_phase1_3_completed_matrix(
                 findings.extend(attempt_findings)
                 continue
 
-            if manifest.get("provenance_classification") != "matched_claim":
+            if manifest.get("provenance_classification") not in (
+                "matched_claim",
+                "pilot_non_claim",
+            ):
                 attempt_findings.append({
                     "severity": "error",
                     "field": "manifest.provenance_classification",
                     "cell": cell_id,
-                    "message": f"{attempt_name}: provenance classification is not matched_claim",
+                    "message": f"{attempt_name}: provenance classification is not matched_claim or pilot_non_claim",
                 })
 
             verification = verify_completed_manifest(attempt_path)

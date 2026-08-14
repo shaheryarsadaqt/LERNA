@@ -53,6 +53,26 @@ _REQUIRED_OFFLINE_ENV = {
 _ATTEMPT_PREFIX = "attempt-"
 _PROVENANCE_CACHE = None
 _RESULTS_VALIDATOR_CACHE = None
+_REQUIRED_PACKAGES = (
+    "torch",
+    "transformers",
+    "datasets",
+    "evaluate",
+    "numpy",
+    "accelerate",
+    "scipy",
+    "scikit-learn",
+    "pyarrow",
+    "tokenizers",
+    "safetensors",
+    "huggingface_hub",
+)
+_ALLOWED_ROOT_FILES = {
+    PLAN_FILENAME,
+    PLAN_CHECKSUM_FILENAME,
+    ENVIRONMENT_FILENAME,
+    VALIDATION_FILENAME,
+}
 
 
 class Phase13OperationalError(RuntimeError):
@@ -81,6 +101,14 @@ def canonical_sha256(value: Any) -> str:
 
 
 def file_sha256(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _content_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -167,6 +195,75 @@ def _run_command(command: list[str], *, cwd: Path | None = None) -> str:
         ) from exc
 
 
+def _validate_root_structure(root: Path) -> None:
+    for child in root.iterdir():
+        if child.is_dir():
+            continue
+        if child.name not in _ALLOWED_ROOT_FILES:
+            raise Phase13OperationalError(
+                f"unexpected root file: {child}"
+            )
+
+
+def validate_power_evidence(results: dict[str, Any]) -> None:
+    power = results.get("power_evidence")
+    if not isinstance(power, dict):
+        raise Phase13OperationalError("results.json lacks power_evidence object")
+    if power.get("authoritative_copy") != "results.json":
+        raise Phase13OperationalError(
+            f"power evidence authority drift: {power.get('authoritative_copy')!r}"
+        )
+    if not isinstance(power.get("measurement_source"), str):
+        raise Phase13OperationalError("power evidence missing measurement_source")
+    if not isinstance(power.get("energy_valid"), bool):
+        raise Phase13OperationalError("power evidence energy_valid is not bool")
+    if not isinstance(power.get("energy_invalid_reason"), str):
+        raise Phase13OperationalError("power evidence energy_invalid_reason is not str")
+    if not isinstance(power.get("gpu_name"), str) or not power.get("gpu_name"):
+        raise Phase13OperationalError("power evidence missing gpu_name")
+    gpu_index = power.get("gpu_index")
+    if not isinstance(gpu_index, int) or isinstance(gpu_index, bool):
+        raise Phase13OperationalError("power evidence gpu_index is not int")
+    if not isinstance(power.get("gpu_selector"), str) or not power.get("gpu_selector"):
+        raise Phase13OperationalError("power evidence missing gpu_selector")
+    sample_interval = power.get("sample_interval_s")
+    if not isinstance(sample_interval, (int, float)) or isinstance(sample_interval, bool) or sample_interval <= 0:
+        raise Phase13OperationalError("power evidence sample_interval_s is not positive number")
+    query_count = power.get("nvidia_smi_query_count")
+    if not isinstance(query_count, int) or isinstance(query_count, bool) or query_count < 0:
+        raise Phase13OperationalError("power evidence nvidia_smi_query_count is not non-negative int")
+    success_count = power.get("nvidia_smi_success_count")
+    if not isinstance(success_count, int) or isinstance(success_count, bool) or success_count < 0:
+        raise Phase13OperationalError("power evidence nvidia_smi_success_count is not non-negative int")
+    if success_count > query_count:
+        raise Phase13OperationalError(
+            f"power evidence success_count {success_count} > query_count {query_count}"
+        )
+    total_energy = power.get("total_energy_kwh")
+    if not isinstance(total_energy, (int, float)) or isinstance(total_energy, bool) or total_energy < 0:
+        raise Phase13OperationalError("power evidence total_energy_kwh is not non-negative number")
+    raw_samples = power.get("raw_samples")
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise Phase13OperationalError("power evidence raw_samples is not a non-empty list")
+    for index, sample in enumerate(raw_samples):
+        if not isinstance(sample, dict):
+            raise Phase13OperationalError(f"power evidence raw_samples[{index}] is not an object")
+        if not isinstance(sample.get("timestamp"), (int, float)) or isinstance(sample.get("timestamp"), bool):
+            raise Phase13OperationalError(f"power evidence raw_samples[{index}] missing numeric timestamp")
+        if not isinstance(sample.get("power_w"), (int, float)) or isinstance(sample.get("power_w"), bool):
+            raise Phase13OperationalError(f"power evidence raw_samples[{index}] missing numeric power_w")
+    per_step = power.get("per_step_energy")
+    if not isinstance(per_step, list):
+        raise Phase13OperationalError("power evidence per_step_energy is not a list")
+    for index, step in enumerate(per_step):
+        if not isinstance(step, dict):
+            raise Phase13OperationalError(f"power evidence per_step_energy[{index}] is not an object")
+        if not isinstance(step.get("step"), int) or isinstance(step.get("step"), bool):
+            raise Phase13OperationalError(f"power evidence per_step_energy[{index}] missing int step")
+        if not isinstance(step.get("step_kwh"), (int, float)) or isinstance(step.get("step_kwh"), bool):
+            raise Phase13OperationalError(f"power evidence per_step_energy[{index}] missing numeric step_kwh")
+
+
 def require_clean_git_state(
     repo_root: str | os.PathLike[str],
     *,
@@ -194,18 +291,19 @@ def require_clean_git_state(
 
 def _package_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
-    for distribution in (
-        "torch",
-        "transformers",
-        "datasets",
-        "evaluate",
-        "numpy",
-        "accelerate",
-    ):
+    for distribution in _REQUIRED_PACKAGES:
         try:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
-            versions[distribution] = "unavailable"
+            raise Phase13OperationalError(
+                f"required package {distribution!r} is not installed"
+            )
+    cuda_version = os.environ.get("CUDA_VERSION")
+    if cuda_version:
+        versions["cuda"] = cuda_version
+    cudnn_version = os.environ.get("CUDNN_VERSION")
+    if cudnn_version:
+        versions["cudnn"] = cudnn_version
     return versions
 
 
@@ -284,6 +382,7 @@ def _cache_tree_evidence(path: Path, *, label: str) -> dict[str, Any]:
                 "link_target": os.readlink(item) if item.is_symlink() else None,
                 "resolved_name": resolved.name,
                 "size": size,
+                "content_sha256": _content_sha256(resolved),
             }
         )
     if not entries:
@@ -327,6 +426,7 @@ def _ettin_snapshot_evidence(
                 "link_target": os.readlink(path) if path.is_symlink() else None,
                 "resolved_name": resolved.name,
                 "size": resolved.stat().st_size,
+                "content_sha256": _content_sha256(resolved),
             }
         )
     if not entries:
@@ -636,12 +736,16 @@ def _read_completed_attempt(
         )
     expected_manifest_values = {
         "status": "completed",
-        "provenance_classification": "matched_claim",
         "fingerprint": cell["fingerprint"],
         "identity_inputs": cell["identity_inputs"],
         "attempt": attempt_num,
         "output_paths": _expected_output_paths(cell),
     }
+    expected_classification = cell.get(
+        "provenance_classification", "matched_claim"
+    )
+    if expected_classification in ("matched_claim", "pilot_non_claim"):
+        expected_manifest_values["provenance_classification"] = expected_classification
     for key, expected in expected_manifest_values.items():
         if type(manifest.get(key)) is not type(expected) or manifest.get(key) != expected:
             raise Phase13OperationalError(
@@ -677,19 +781,7 @@ def _read_completed_attempt(
         raise Phase13OperationalError(
             f"Piece 5 validation failed for completed attempt: {attempt_dir}"
         )
-    power = results.get("power_evidence")
-    if not isinstance(power, dict):
-        raise Phase13OperationalError(
-            f"results.json lacks manifest-hashed power_evidence: {attempt_dir}"
-        )
-    if power.get("authoritative_copy") != "results.json":
-        raise Phase13OperationalError(
-            f"power evidence authority drift in {attempt_dir}"
-        )
-    if not isinstance(power.get("raw_samples"), list):
-        raise Phase13OperationalError(
-            f"power evidence raw_samples is not a list in {attempt_dir}"
-        )
+    validate_power_evidence(results)
     return {
         "attempt": attempt_num,
         "attempt_dir": attempt_dir,
@@ -715,24 +807,29 @@ def scan_phase1_3_progress(
 ) -> list[dict[str, Any]]:
     """Classify every planned cell without modifying attempts."""
     root = Path(base_output_dir)
+    _validate_root_structure(root)
     expected_fingerprints = {
         (cell["arm"], cell["fingerprint"]) for cell in plan
     }
     for child in root.iterdir():
-        if not child.is_dir():
-            continue
-        if child.name not in {cell["arm"] for cell in plan}:
-            raise Phase13OperationalError(
-                f"unexpected directory in matrix root: {child}"
-            )
-        for fingerprint_dir in child.iterdir():
-            if not fingerprint_dir.is_dir():
+        if child.is_dir():
+            if child.name not in {cell["arm"] for cell in plan}:
                 raise Phase13OperationalError(
-                    f"unexpected non-directory in arm path: {fingerprint_dir}"
+                    f"unexpected directory in matrix root: {child}"
                 )
-            if (child.name, fingerprint_dir.name) not in expected_fingerprints:
+            for fingerprint_dir in child.iterdir():
+                if not fingerprint_dir.is_dir():
+                    raise Phase13OperationalError(
+                        f"unexpected non-directory in arm path: {fingerprint_dir}"
+                    )
+                if (child.name, fingerprint_dir.name) not in expected_fingerprints:
+                    raise Phase13OperationalError(
+                        f"foreign cell directory in matrix root: {fingerprint_dir}"
+                    )
+        else:
+            if child.name not in _ALLOWED_ROOT_FILES:
                 raise Phase13OperationalError(
-                    f"foreign cell directory in matrix root: {fingerprint_dir}"
+                    f"unexpected root file: {child}"
                 )
 
     progress: list[dict[str, Any]] = []
@@ -827,22 +924,99 @@ def recover_stale_running_attempts(
     if current.tzinfo is None:
         raise Phase13OperationalError("recovery clock must be timezone-aware")
     root = Path(base_output_dir)
-    candidates: list[Path] = []
+
+    expected_fingerprints = {
+        (cell["arm"], cell["fingerprint"]) for cell in plan
+    }
     blockers: list[str] = []
+    for child in root.iterdir():
+        if child.is_dir():
+            if child.name not in {cell["arm"] for cell in plan}:
+                blockers.append(f"unexpected matrix root directory: {child}")
+            for fingerprint_dir in child.iterdir():
+                if not fingerprint_dir.is_dir():
+                    blockers.append(
+                        f"unexpected non-directory in arm path: {fingerprint_dir}"
+                    )
+                    continue
+                if (child.name, fingerprint_dir.name) not in expected_fingerprints:
+                    blockers.append(
+                        f"foreign cell directory in matrix root: {fingerprint_dir}"
+                    )
+                cell_dir = child / fingerprint_dir.name
+                for attempt_dir in sorted(cell_dir.iterdir()):
+                    if not attempt_dir.is_dir():
+                        blockers.append(f"unexpected file in cell directory: {attempt_dir}")
+                        continue
+                    if _attempt_number(attempt_dir.name) is None:
+                        blockers.append(
+                            f"noncanonical attempt directory: {attempt_dir}"
+                        )
+                        continue
+                    manifest = _load_json(attempt_dir / "run_manifest.json")
+                    if not isinstance(manifest, dict):
+                        blockers.append(f"malformed manifest {attempt_dir}")
+                        continue
+                    cell = next(
+                        (
+                            cell
+                            for cell in plan
+                            if cell["arm"] == child.name
+                            and cell["fingerprint"] == fingerprint_dir.name
+                        ),
+                        None,
+                    )
+                    if cell is None:
+                        blockers.append(
+                            f"foreign cell without plan binding: {attempt_dir}"
+                        )
+                        continue
+                    _assert_attempt_manifest_binding(
+                        cell,
+                        manifest,
+                        _attempt_number(attempt_dir.name),
+                        attempt_dir,
+                    )
+                    status = manifest.get("status")
+                    if status == "running":
+                        started = manifest.get("start_time_utc")
+                        try:
+                            start_time = datetime.fromisoformat(started)
+                        except (TypeError, ValueError):
+                            blockers.append(
+                                f"invalid running start_time_utc {attempt_dir}"
+                            )
+                            continue
+                        if start_time.tzinfo is None:
+                            blockers.append(
+                                f"naive running start_time_utc {attempt_dir}"
+                            )
+                            continue
+                        age_hours = (current - start_time).total_seconds() / 3600.0
+                        if age_hours < stale_after_hours:
+                            blockers.append(
+                                f"running attempt is only {age_hours:.2f}h old: {attempt_dir}"
+                            )
+        else:
+            if child.name not in _ALLOWED_ROOT_FILES:
+                blockers.append(f"unexpected root file: {child}")
+    if blockers:
+        raise Phase13OperationalError(
+            "stale recovery refused: " + "; ".join(blockers)
+        )
+
+    candidates: list[Path] = []
     for cell in plan:
         cell_dir = root / cell["arm"] / cell["fingerprint"]
         if not cell_dir.is_dir():
             continue
         for attempt_dir in sorted(cell_dir.iterdir()):
             if not attempt_dir.is_dir():
-                blockers.append(f"unexpected file {attempt_dir}")
                 continue
             if _attempt_number(attempt_dir.name) is None:
-                blockers.append(f"noncanonical attempt {attempt_dir}")
                 continue
             manifest = _load_json(attempt_dir / "run_manifest.json")
             if not isinstance(manifest, dict):
-                blockers.append(f"malformed manifest {attempt_dir}")
                 continue
             if manifest.get("status") != "running":
                 continue
@@ -856,22 +1030,12 @@ def recover_stale_running_attempts(
             try:
                 start_time = datetime.fromisoformat(started)
             except (TypeError, ValueError):
-                blockers.append(f"invalid running start_time_utc {attempt_dir}")
                 continue
             if start_time.tzinfo is None:
-                blockers.append(f"naive running start_time_utc {attempt_dir}")
                 continue
             age_hours = (current - start_time).total_seconds() / 3600.0
-            if age_hours < stale_after_hours:
-                blockers.append(
-                    f"running attempt is only {age_hours:.2f}h old: {attempt_dir}"
-                )
-            else:
+            if age_hours >= stale_after_hours:
                 candidates.append(attempt_dir)
-    if blockers:
-        raise Phase13OperationalError(
-            "stale recovery refused: " + "; ".join(blockers)
-        )
     if not candidates:
         return []
     provenance = _provenance_module()
@@ -902,6 +1066,15 @@ def freeze_matrix_validation(
     for run in valid_runs:
         attempt_dir = Path(run["results_path"]).parent
         results = _load_json(attempt_dir / "results.json")
+        manifest = _load_json(attempt_dir / "run_manifest.json")
+        validate_power_evidence(results)
+        if bundle["envelope"]["matrix_kind"] == "production":
+            classification = manifest.get("provenance_classification")
+            if classification == "pilot_non_claim":
+                raise Phase13OperationalError(
+                    "production matrix validation rejects pilot evidence: "
+                    f"{attempt_dir}"
+                )
         relative_attempt = str(attempt_dir.relative_to(root))
         runs.append(
             {

@@ -92,6 +92,7 @@ from lerna.trainers.true_skip_trainer import (
 from lerna.utils.run_provenance import (
     CLASSIFICATION_LOCAL_DEVELOPMENT,
     CLASSIFICATION_MATCHED_CLAIM,
+    CLASSIFICATION_PILOT_NON_CLAIM,
     build_identity_inputs,
     build_scientific_fingerprint,
     finalize_manifest_completed,
@@ -1070,6 +1071,14 @@ def plan_phase1_3_cell(
         "identity_inputs": identity_inputs,
         "fingerprint": fingerprint,
         "planned_arm_dir": planned_arm_dir,
+        "max_consecutive_skips": int(max_consecutive_skips),
+        "probe_interval": int(probe_interval),
+        "rho_veto_threshold": float(rho_veto_threshold),
+        "risk_gamma": float(risk_gamma),
+        "online_ler_parameter_sample_size": int(online_ler_parameter_sample_size),
+        "online_ler_update_interval": int(online_ler_update_interval),
+        "use_rho_vg": bool(use_rho_vg),
+        "use_safety_horizon": bool(use_safety_horizon),
     }
 
 
@@ -2149,6 +2158,7 @@ def run_ablation_single(
 
     power_callback = PowerTelemetryCallback(
         sample_interval_s=1.0,
+        gpu_index=int(os.environ.get("LERNA_NVIDIA_SMI_GPU", "0")),
         output_dir=os.path.join(output_dir, "power"),
         wandb_enabled=use_wandb,
         log_frequency=50,
@@ -2796,6 +2806,30 @@ def _main_phase1_3(args, parser):
                 "run/resume/validate consume persisted dimensions and reject "
                 "task, seed, rate, and sample overrides"
             )
+        if args.max_consecutive_skips != 4:
+            parser.error(
+                "run/resume/validate consume persisted max_consecutive_skips"
+            )
+        if args.probe_interval != 8:
+            parser.error(
+                "run/resume/validate consume persisted probe_interval"
+            )
+        if args.rho_veto_threshold != -0.2:
+            parser.error(
+                "run/resume/validate consume persisted rho_veto_threshold"
+            )
+        if args.risk_gamma != 0.0:
+            parser.error(
+                "run/resume/validate consume persisted risk_gamma"
+            )
+        if args.online_ler_sample_size != 4096:
+            parser.error(
+                "run/resume/validate consume persisted online_ler_parameter_sample_size"
+            )
+        if args.online_ler_update_interval != 1:
+            parser.error(
+                "run/resume/validate consume persisted online_ler_update_interval"
+            )
         tasks = None
         seeds = None
         minimum_seed_count = None
@@ -2974,6 +3008,11 @@ def _main_phase1_3(args, parser):
             print(f"\n  === Matrix cell {run_idx}/{total_runs} ===")
         task = cell["task"]
         task_hp = TASK_HP_OVERRIDES.get(task, {})
+        cell_classification = (
+            CLASSIFICATION_PILOT_NON_CLAIM
+            if expected_pilot
+            else CLASSIFICATION_MATCHED_CLAIM
+        )
         run_ablation_single(
             task_name=task,
             seed=cell["training_seed"],
@@ -3002,11 +3041,11 @@ def _main_phase1_3(args, parser):
             init_from_mnli=task_hp.get("init_from_mnli", False),
             no_early_stopping=True,
             target_skip_rate=cell["target_skip_rate"],
-            max_consecutive_skips=args.max_consecutive_skips,
-            probe_interval=args.probe_interval,
+            max_consecutive_skips=cell["max_consecutive_skips"],
+            probe_interval=cell["probe_interval"],
             policy=args.policy,
-            rho_veto_threshold=args.rho_veto_threshold,
-            risk_gamma=args.risk_gamma,
+            rho_veto_threshold=cell["rho_veto_threshold"],
+            risk_gamma=cell["risk_gamma"],
             guard_mode=args.guard_mode,
             skip_update_mode="freeze",
             scheduler_step_policy=(
@@ -3020,10 +3059,10 @@ def _main_phase1_3(args, parser):
             rvd_repay_mode=args.rvd_repay_mode,
             rvd_repay_protect_dangerous=args.rvd_repay_protect_dangerous,
             rvd_policy_seed=None,
-            provenance_classification=CLASSIFICATION_MATCHED_CLAIM,
+            provenance_classification=cell_classification,
             online_ler_mode=ONLINE_LER_MODE_AUTO,
-            online_ler_parameter_sample_size=args.online_ler_sample_size,
-            online_ler_update_interval=args.online_ler_update_interval,
+            online_ler_parameter_sample_size=cell["online_ler_parameter_sample_size"],
+            online_ler_update_interval=cell["online_ler_update_interval"],
             planned_cell=cell,
             model_revision=cell["model_revision"],
         )
