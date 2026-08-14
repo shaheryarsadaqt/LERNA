@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+import json
 import os
 import sys
 from pathlib import Path
@@ -455,21 +456,29 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
     assert all(not os.path.exists(cell["planned_arm_dir"]) for cell in plan)
 
 
-STRICT_SEEDS = tuple(range(10))
+STRICT_SEEDS = runner.PRODUCTION_SEEDS
 STRICT_RATE_ARGS = ("--target-skip-rates", "0.30", "0.40")
 
 
-def _strict_argv(*extra, output_dir=None, tasks=("synthetic",)):
+def _strict_plan_argv(*extra, output_dir=None, pilot=False):
+    seeds = (runner.PILOT_SEED,) if pilot else STRICT_SEEDS
     argv = [
         "run_ablation_study.py",
         "--mode",
         "phase1_3",
+        "--phase1-3-action",
+        "plan",
+        "--model",
+        "ettin",
         "--tasks",
-        *tasks,
+        "mrpc",
         "--seeds",
-        *(str(seed) for seed in STRICT_SEEDS),
+        *(str(seed) for seed in seeds),
         *STRICT_RATE_ARGS,
+        "--unlimited",
     ]
+    if pilot:
+        argv.append("--pilot")
     if output_dir is not None:
         argv.extend(("--output-dir", str(output_dir)))
     argv.extend(extra)
@@ -477,10 +486,12 @@ def _strict_argv(*extra, output_dir=None, tasks=("synthetic",)):
 
 
 def _strict_data_facts(task):
-    facts = _data_facts(task=task, total_steps=200, num_epochs=3)
+    facts = _data_facts(task=task, total_steps=575, num_epochs=3)
     facts.update(
-        max_samples_requested=2000,
-        max_samples_effective=2000,
+        max_samples_requested=None,
+        max_samples_effective=25000,
+        train_samples_realized=3668,
+        eval_samples_realized=408,
         train_dataset_fingerprint=f"{task}-strict-train",
         eval_dataset_fingerprint=f"{task}-strict-eval",
     )
@@ -510,64 +521,109 @@ def test_parser_rate_arguments_are_structurally_mutually_exclusive():
     "argv,error_text",
     [
         (
-            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
-             *(str(seed) for seed in STRICT_SEEDS)],
+            ["run_ablation_study.py", "--mode", "phase1_3"],
+            "requires --phase1-3-action",
+        ),
+        (
+            [
+                "run_ablation_study.py",
+                "--mode",
+                "phase1_3",
+                "--phase1-3-action",
+                "plan",
+            ],
+            "requires --model ettin",
+        ),
+        (
+            [
+                value
+                for value in _strict_plan_argv()
+                if value not in STRICT_RATE_ARGS
+            ]
+            + ["--target-skip-rate", "0.30"],
+            "not --target-skip-rate",
+        ),
+        (
+            [
+                value
+                for value in _strict_plan_argv()
+                if value not in STRICT_RATE_ARGS
+            ],
             "requires --target-skip-rates 0.30 0.40",
         ),
         (
-            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
-             *(str(seed) for seed in STRICT_SEEDS), "--target-skip-rate", "0.30"],
-            "requires --target-skip-rates",
+            _strict_plan_argv("--tasks", "sst2"),
+            "frozen to MRPC",
         ),
         (
-            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
-             *(str(seed) for seed in STRICT_SEEDS), "--target-skip-rates",
-             "0.40", "0.30"],
-            "exact order",
+            _strict_plan_argv("--seeds", "7", pilot=False),
+            "frozen ten seeds",
         ),
         (
-            ["run_ablation_study.py", "--mode", "phase1_3",
-             *STRICT_RATE_ARGS],
-            "requires explicit --seeds",
+            _strict_plan_argv("--seeds", "8", pilot=True),
+            "exactly --seeds 7",
         ),
         (
-            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
-             *(str(seed) for seed in range(9)), *STRICT_RATE_ARGS],
-            "at least 10 unique seeds",
+            [value for value in _strict_plan_argv() if value != "--unlimited"],
+            "requires --unlimited",
         ),
         (
-            ["run_ablation_study.py", "--mode", "phase1_3", "--seeds",
-             "0", "1", "2", "3", "4", "5", "6", "7", "8", "8",
-             *STRICT_RATE_ARGS],
-            "duplicate seeds",
+            _strict_plan_argv("--ablations", "exact_random"),
+            "rejects --ablations",
         ),
-        (_strict_argv("--tasks", "synthetic", "synthetic"), "duplicate tasks"),
-        (_strict_argv("--ablations", "exact_random"), "rejects --ablations"),
         (
-            _strict_argv("--allow-early-stopping-with-skipping"),
+            _strict_plan_argv("--allow-early-stopping-with-skipping"),
             "forbids early-stopping overrides",
         ),
         (
-            _strict_argv("--skip-update-mode", "momentum"),
+            _strict_plan_argv("--skip-update-mode", "momentum"),
             "requires --skip-update-mode freeze",
         ),
         (
-            _strict_argv("--policy", "calibrated"),
+            _strict_plan_argv("--policy", "calibrated"),
             "rejects nondefault legacy --policy",
         ),
         (
-            _strict_argv("--rvd-policy-seed", "99"),
+            _strict_plan_argv("--rvd-policy-seed", "99"),
             "rejects --rvd-policy-seed",
         ),
         (
-            _strict_argv("--online-ler-mode", "off"),
+            _strict_plan_argv("--online-ler-mode", "off"),
             "requires --online-ler-mode auto",
         ),
         (
-            _strict_argv(
+            _strict_plan_argv(
                 "--provenance-classification", "local_development"
             ),
             "requires matched_claim provenance",
+        ),
+        (
+            [
+                "run_ablation_study.py",
+                "--mode",
+                "phase1_3",
+                "--phase1-3-action",
+                "run",
+                "--model",
+                "ettin",
+                "--tasks",
+                "mrpc",
+            ],
+            "consume persisted dimensions",
+        ),
+        (
+            [
+                "run_ablation_study.py",
+                "--mode",
+                "phase1_3",
+                "--phase1-3-action",
+                "run",
+                "--model",
+                "ettin",
+                "--recover-stale-running-after-hours",
+                "12",
+            ],
+            "only valid with --phase1-3-action resume",
         ),
     ],
 )
@@ -611,118 +667,92 @@ def test_target_rate_list_is_rejected_by_legacy_modes(monkeypatch, capsys):
     profile.assert_not_called()
 
 
-def test_strict_main_validates_complete_plan_before_any_run(
-    monkeypatch,
-    tmp_path,
-):
+def test_strict_plan_persists_before_any_run(monkeypatch, tmp_path):
     output_dir = tmp_path / "strict-output"
-    tasks = ("synthetic_a", "synthetic_b")
     events = []
     tokenizer = object()
     load_tokenizer = mock.Mock(
-        side_effect=lambda model_name: events.append("load_tokenizer") or tokenizer
+        side_effect=lambda *args, **kwargs: events.append("load_tokenizer")
+        or tokenizer
     )
-    model_loader = mock.Mock(
-        side_effect=AssertionError("model weights must not load in preflight")
+    run_cell = mock.Mock(
+        side_effect=AssertionError("planning must not execute cells")
     )
-    provider_calls = []
+    metric = mock.Mock(
+        side_effect=lambda task: events.append("metric") or object()
+    )
 
     def resolve_facts(task, observed_tokenizer, max_samples, profile):
+        assert task == "mrpc"
         assert observed_tokenizer is tokenizer
-        assert max_samples == 2000
-        assert profile == "cpu"
-        provider_calls.append(task)
-        events.append(f"facts:{task}")
+        assert max_samples is None
+        assert profile == "server"
+        events.append("facts")
         return _strict_data_facts(task)
 
     def validate(plan, **kwargs):
         assert not output_dir.exists()
         events.append("validate")
         assert kwargs == {
-            "tasks": list(tasks),
-            "seeds": list(STRICT_SEEDS),
+            "tasks": ["mrpc"],
+            "seeds": [runner.PILOT_SEED],
             "target_skip_rates": [0.30, 0.40],
-            "minimum_seed_count": 10,
+            "minimum_seed_count": 1,
             "base_output_dir": str(output_dir),
         }
         return validate_phase1_3_matrix_plan(plan, **kwargs)
 
-    run_calls = []
-
-    def run_cell(**kwargs):
-        assert events[-1] in {"validate", "wandb_finish", "run"}
-        assert "validate" in events
-        assert not output_dir.exists()
-        events.append("run")
-        run_calls.append(kwargs)
-        return {"ablation": kwargs["ablation_name"]}
-
-    finish_wandb = mock.Mock(
-        side_effect=lambda: events.append("wandb_finish")
+    monkeypatch.setattr(runner, "detect_device_profile", lambda: "server")
+    monkeypatch.setattr(
+        runner,
+        "get_training_config",
+        lambda profile: _hardware_config(max_samples=25000),
     )
-    monkeypatch.setattr(runner, "detect_device_profile", lambda: "cpu")
-    monkeypatch.setattr(runner, "_resolve_git_sha", lambda: "abc123")
+    monkeypatch.setattr(
+        runner,
+        "require_clean_git_state",
+        lambda *args, **kwargs: {
+            "commit_sha": "abc123",
+            "status_entries": [],
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "collect_phase1_3_environment",
+        lambda **kwargs: {"locked": True},
+    )
+    monkeypatch.setattr(runner, "load_tokenizer", load_tokenizer)
     monkeypatch.setattr(runner, "resolve_task_data_facts", resolve_facts)
+    monkeypatch.setattr(runner, "build_compute_metrics", metric)
     monkeypatch.setattr(runner, "validate_phase1_3_matrix_plan", validate)
     monkeypatch.setattr(runner, "run_ablation_single", run_cell)
-    monkeypatch.setattr(runner, "_ensure_wandb_finished", finish_wandb)
-    monkeypatch.setattr(
-        "lerna.utils.model_loader.load_tokenizer", load_tokenizer
-    )
-    monkeypatch.setattr(
-        "lerna.utils.model_loader.load_model_and_tokenizer", model_loader
-    )
     monkeypatch.setattr(
         sys,
         "argv",
-        _strict_argv(
-            "--wandb",
-            output_dir=output_dir,
-            tasks=tasks,
-        ),
+        _strict_plan_argv(output_dir=output_dir, pilot=True),
     )
 
     runner.main()
 
-    assert events[:4] == [
-        "load_tokenizer",
-        "facts:synthetic_a",
-        "facts:synthetic_b",
-        "validate",
-    ]
-    assert events[4] == "wandb_finish"
-    assert provider_calls == list(tasks)
-    load_tokenizer.assert_called_once()
-    model_loader.assert_not_called()
-    assert len(run_calls) == 240
-    expected_order = [
-        (task, seed, rate, arm)
-        for task in tasks
-        for seed in STRICT_SEEDS
-        for rate in RATES
-        for arm in PHASE1_3_CANONICAL_ARMS
-    ]
-    assert [
-        (
-            call["task_name"],
-            call["seed"],
-            call["target_skip_rate"],
-            call["ablation_name"],
-        )
-        for call in run_calls
-    ] == expected_order
-    assert all(call["planned_cell"] is not None for call in run_calls)
-    assert all(call["no_early_stopping"] is True for call in run_calls)
-    assert all(call["skip_update_mode"] == "freeze" for call in run_calls)
-    assert all(
-        call["scheduler_step_policy"] == "skip_on_backward_skip"
-        for call in run_calls
+    assert events == ["load_tokenizer", "facts", "validate", "metric"]
+    metric.assert_called_once_with("mrpc")
+    run_cell.assert_not_called()
+    load_tokenizer.assert_called_once_with(
+        runner.MODELS["ettin"],
+        revision=runner.ETTIN_REVISION,
+        local_files_only=True,
     )
-    assert all(
-        call["allow_early_stopping_with_skipping"] is False
-        for call in run_calls
+    envelope = json.loads(
+        output_dir.joinpath("matrix_plan.json").read_text(encoding="utf-8")
     )
-    assert output_dir.joinpath("ablation_summary.json").is_file()
+    assert envelope["matrix_kind"] == "pilot"
+    assert len(envelope["plan"]) == 12
+    assert output_dir.joinpath("matrix_environment.json").is_file()
+    assert not output_dir.joinpath("ablation_summary.json").exists()
+    assert all(
+        not output_dir.joinpath(cell["arm"], cell["fingerprint"]).exists()
+        for cell in envelope["plan"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1029,11 +1059,16 @@ def test_runtime_fingerprint_mismatch_aborts_before_side_effects(
 
 def test_source_order_freezes_preflight_and_runtime_boundaries():
     source = Path(runner.__file__).read_text(encoding="utf-8")
-    main_start = source.index("def main():")
-    main_source = source[main_start:]
-    assert main_source.index("load_tokenizer(model_name)") < main_source.index(
+    strict_start = source.index("def _main_phase1_3(")
+    strict_end = source.index("\ndef main():", strict_start)
+    strict_source = source[strict_start:strict_end]
+    assert strict_source.index("load_tokenizer(") < strict_source.index(
         "validate_phase1_3_matrix_plan("
-    ) < main_source.index("run_ablation_single(")
+    ) < strict_source.index("build_compute_metrics(\"mrpc\")") < (
+        strict_source.index("collect_phase1_3_environment(")
+    ) < strict_source.index("persist_phase1_3_plan(") < strict_source.index(
+        "load_phase1_3_plan("
+    ) < strict_source.index("run_ablation_single(")
 
     run_start = source.index("def run_ablation_single(")
     run_end = source.index("\ndef build_arg_parser()", run_start)

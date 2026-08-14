@@ -36,7 +36,7 @@ import time
 import argparse
 import gc
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -97,6 +97,24 @@ from lerna.utils.run_provenance import (
     finalize_manifest_completed,
     finalize_manifest_failed,
     write_manifest_running,
+)
+from lerna.utils.phase1_3_completed_matrix import (
+    validate_phase1_3_completed_matrix,
+)
+from lerna.utils.phase1_3_operations import (
+    PILOT_SEED,
+    PRODUCTION_SEEDS,
+    Phase13OperationalError,
+    assert_environment_matches,
+    assert_fresh_execution,
+    collect_phase1_3_environment,
+    freeze_matrix_validation,
+    load_phase1_3_plan,
+    persist_phase1_3_plan,
+    recover_stale_running_attempts,
+    require_clean_git_state,
+    require_frozen_mrpc_facts,
+    scan_phase1_3_progress,
 )
 from lerna.utils.phase1_3_matrix import (
     PHASE1_3_CANONICAL_ARMS,
@@ -734,6 +752,31 @@ def build_online_ler_artifact_contract(online_diagnostics):
     return {
         "output_paths": output_paths,
         "required_artifacts": required_artifacts,
+    }
+
+
+def build_power_evidence(power_callback):
+    """Return the authoritative raw power evidence embedded in results.json."""
+    return {
+        "authoritative_copy": "results.json",
+        "measurement_source": power_callback.energy_measurement_source,
+        "energy_valid": bool(power_callback.energy_valid),
+        "energy_invalid_reason": power_callback.energy_invalid_reason,
+        "gpu_name": power_callback._gpu_name,
+        "gpu_index": int(power_callback.gpu_index),
+        "gpu_selector": str(power_callback.gpu_selector),
+        "sample_interval_s": float(power_callback.sample_interval_s),
+        "nvidia_smi_query_count": int(
+            power_callback._nvidia_smi_query_count
+        ),
+        "nvidia_smi_success_count": int(
+            power_callback._nvidia_smi_success_count
+        ),
+        "total_energy_kwh": float(power_callback.cumulative_kwh),
+        "raw_samples": [dict(sample) for sample in power_callback._power_samples],
+        "per_step_energy": [
+            dict(sample) for sample in power_callback.step_energies
+        ],
     }
 
 
@@ -2313,6 +2356,7 @@ def run_ablation_single(
             "eval_metrics": eval_result,
             "energy_kwh": power_callback.cumulative_kwh,
             "power_avg_watts": avg_power,
+            "power_evidence": build_power_evidence(power_callback),
             "ler_final": ler_final,
             "online_diagnostics": online_diagnostics_runtime,
             "true_skip_instrumentation": instrumentation,
@@ -2483,6 +2527,29 @@ def build_arg_parser():
         choices=["smoke", "full", "custom", "phase1_3"],
         default="smoke",
     )
+    parser.add_argument(
+        "--phase1-3-action",
+        choices=["plan", "run", "resume", "validate"],
+        default=None,
+        help=(
+            "Explicit strict-matrix action. Planning persists immutable "
+            "evidence; all other actions consume it."
+        ),
+    )
+    parser.add_argument(
+        "--pilot",
+        action="store_true",
+        help="Use the frozen one-seed, 12-cell seed-7 non-claim pilot.",
+    )
+    parser.add_argument(
+        "--recover-stale-running-after-hours",
+        type=float,
+        default=None,
+        help=(
+            "Resume only: mark running attempts older than this threshold "
+            "failed before retrying."
+        ),
+    )
     parser.add_argument("--tasks", nargs="+", default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--ablations", nargs="+", default=None,
@@ -2620,107 +2687,404 @@ def build_arg_parser():
     return parser
 
 
-def main():
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    strict_phase1_3 = args.mode == "phase1_3"
+def _validate_and_freeze_strict_matrix(bundle):
+    dimensions = bundle["dimensions"]
+    result = validate_phase1_3_completed_matrix(
+        bundle["plan"],
+        tasks=dimensions["tasks"],
+        seeds=dimensions["seeds"],
+        target_skip_rates=dimensions["target_skip_rates"],
+        minimum_seed_count=(
+            1 if bundle["envelope"]["matrix_kind"] == "pilot" else 10
+        ),
+        base_output_dir=str(bundle["root"]),
+    )
+    return freeze_matrix_validation(
+        base_output_dir=str(bundle["root"]),
+        bundle=bundle,
+        valid_runs=result["valid_runs"],
+    )
 
-    if strict_phase1_3:
+
+def _main_phase1_3(args, parser):
+    action = args.phase1_3_action
+    if action is None:
+        parser.error("--mode phase1_3 requires --phase1-3-action")
+    if args.model != "ettin":
+        parser.error("--mode phase1_3 requires --model ettin")
+    if args.ablations is not None:
+        parser.error(
+            "--mode phase1_3 uses the canonical six arms and rejects "
+            "--ablations"
+        )
+    if args.allow_early_stopping_with_skipping:
+        parser.error("--mode phase1_3 forbids early-stopping overrides")
+    if args.skip_update_mode not in (None, "freeze"):
+        parser.error("--mode phase1_3 requires --skip-update-mode freeze")
+    if args.policy != "hybrid":
+        parser.error(
+            "--mode phase1_3 rejects nondefault legacy --policy values"
+        )
+    if args.rvd_policy_seed is not None:
+        parser.error(
+            "--mode phase1_3 pairs policy_seed with training_seed and "
+            "rejects --rvd-policy-seed"
+        )
+    if args.online_ler_mode != ONLINE_LER_MODE_AUTO:
+        parser.error(
+            "--mode phase1_3 requires --online-ler-mode auto for the "
+            "canonical per-arm diagnostic modes"
+        )
+    if args.provenance_classification != CLASSIFICATION_MATCHED_CLAIM:
+        parser.error("--mode phase1_3 requires matched_claim provenance")
+    if (
+        args.recover_stale_running_after_hours is not None
+        and action != "resume"
+    ):
+        parser.error(
+            "--recover-stale-running-after-hours is only valid with "
+            "--phase1-3-action resume"
+        )
+
+    if action == "plan":
         if args.target_skip_rate is not None:
             parser.error(
-                "--mode phase1_3 requires --target-skip-rates, not "
+                "Phase 1.3 planning requires --target-skip-rates, not "
                 "--target-skip-rate"
             )
         if args.target_skip_rates != list(STRICT_TARGET_SKIP_RATES):
             parser.error(
-                "--mode phase1_3 requires --target-skip-rates 0.30 0.40 "
+                "Phase 1.3 planning requires --target-skip-rates 0.30 0.40 "
                 "in that exact order"
             )
+        tasks = list(args.tasks or ["mrpc"])
+        if tasks != ["mrpc"]:
+            parser.error("Phase 1.3 production planning is frozen to MRPC")
         if args.seeds is None:
-            parser.error("--mode phase1_3 requires explicit --seeds")
-        if len(args.seeds) != len(set(args.seeds)):
-            parser.error("--mode phase1_3 rejects duplicate seeds")
-        if len(args.seeds) < 10:
-            parser.error("--mode phase1_3 requires at least 10 unique seeds")
-        if args.tasks is not None and len(args.tasks) != len(set(args.tasks)):
-            parser.error("--mode phase1_3 rejects duplicate tasks")
-        if args.ablations is not None:
+            parser.error("Phase 1.3 planning requires explicit --seeds")
+        seeds = list(args.seeds)
+        if args.pilot:
+            if seeds != [PILOT_SEED]:
+                parser.error("the pilot requires exactly --seeds 7")
+            minimum_seed_count = 1
+            matrix_kind = "pilot"
+        else:
+            if seeds != list(PRODUCTION_SEEDS):
+                parser.error(
+                    "the production matrix requires the frozen ten seeds in "
+                    "their registered order"
+                )
+            minimum_seed_count = 10
+            matrix_kind = "production"
+        if args.max_samples is not None or not args.unlimited:
             parser.error(
-                "--mode phase1_3 uses the canonical six arms and rejects "
-                "--ablations"
+                "Phase 1.3 planning requires --unlimited and rejects "
+                "--max-samples"
             )
-        if args.allow_early_stopping_with_skipping:
+    else:
+        if any(
+            value is not None
+            for value in (
+                args.tasks,
+                args.seeds,
+                args.target_skip_rate,
+                args.target_skip_rates,
+                args.max_samples,
+            )
+        ) or args.unlimited:
             parser.error(
-                "--mode phase1_3 forbids early-stopping overrides"
+                "run/resume/validate consume persisted dimensions and reject "
+                "task, seed, rate, and sample overrides"
             )
-        if args.skip_update_mode not in (None, "freeze"):
-            parser.error("--mode phase1_3 requires --skip-update-mode freeze")
-        if args.policy != "hybrid":
-            parser.error(
-                "--mode phase1_3 rejects nondefault legacy --policy values"
+        tasks = None
+        seeds = None
+        minimum_seed_count = None
+        matrix_kind = None
+
+    if action in {"plan", "validate"} and args.wandb:
+        parser.error("plan and validate actions do not initialize W&B")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    profile = detect_device_profile()
+    model_name = MODELS["ettin"]
+    model_revision = ETTIN_REVISION
+    git_state = require_clean_git_state(repo_root)
+
+    if action == "plan":
+        hw_config = dict(get_training_config(profile))
+        tokenizer = load_tokenizer(
+            model_name,
+            revision=model_revision,
+            local_files_only=True,
+        )
+
+        resolved_facts = {}
+
+        def data_facts_provider(task):
+            facts = resolve_task_data_facts(task, tokenizer, None, profile)
+            resolved_facts[task] = facts
+            return facts
+
+        matrix_plan = build_phase1_3_matrix_plan(
+            tasks=tasks,
+            seeds=seeds,
+            target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
+            model_name=model_name,
+            model_revision=model_revision,
+            base_output_dir=args.output_dir,
+            data_facts_provider=data_facts_provider,
+            git_sha=git_state["commit_sha"],
+            scheduler_step_policy=SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP,
+            max_consecutive_skips=args.max_consecutive_skips,
+            probe_interval=args.probe_interval,
+            rho_veto_threshold=args.rho_veto_threshold,
+            risk_gamma=args.risk_gamma,
+            online_ler_mode=ONLINE_LER_MODE_AUTO,
+            online_ler_parameter_sample_size=args.online_ler_sample_size,
+            online_ler_update_interval=args.online_ler_update_interval,
+            use_rho_vg=True,
+            use_safety_horizon=True,
+        )
+        validate_phase1_3_matrix_plan(
+            matrix_plan,
+            tasks=tasks,
+            seeds=seeds,
+            target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
+            minimum_seed_count=minimum_seed_count,
+            base_output_dir=args.output_dir,
+        )
+        require_frozen_mrpc_facts(resolved_facts["mrpc"])
+        metric_probe = build_compute_metrics("mrpc")
+        del metric_probe, tokenizer
+        environment = collect_phase1_3_environment(
+            repo_root=repo_root,
+            profile=profile,
+            model_id=model_name,
+            model_revision=model_revision,
+            hardware_config=hw_config,
+        )
+        envelope = persist_phase1_3_plan(
+            base_output_dir=args.output_dir,
+            plan=matrix_plan,
+            tasks=tasks,
+            seeds=seeds,
+            target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
+            matrix_kind=matrix_kind,
+            git_sha=git_state["commit_sha"],
+            environment=environment,
+        )
+        print(
+            f"Persisted {len(matrix_plan)} {matrix_kind} cells to "
+            f"{os.path.join(args.output_dir, 'matrix_plan.json')}"
+        )
+        print(f"Plan SHA-256: {envelope['plan_sha256']}")
+        return
+
+    bundle = load_phase1_3_plan(args.output_dir)
+    dimensions = bundle["dimensions"]
+    expected_pilot = bundle["envelope"]["matrix_kind"] == "pilot"
+    if args.pilot is not expected_pilot:
+        parser.error(
+            "--pilot must be present exactly when consuming a pilot plan"
+        )
+    require_clean_git_state(
+        repo_root,
+        expected_sha=bundle["envelope"]["git_sha"],
+    )
+    plan_models = {
+        (cell.get("model_id"), cell.get("model_revision"))
+        for cell in bundle["plan"]
+    }
+    if plan_models != {(model_name, model_revision)}:
+        raise Phase13OperationalError(
+            f"persisted plan model identity drift: {plan_models!r}"
+        )
+    hw_config = dict(get_training_config(profile))
+    planned_hw = bundle["environment"].get("hardware_config")
+    if isinstance(planned_hw, dict):
+        hw_config["max_samples"] = planned_hw.get("max_samples")
+    current_environment = collect_phase1_3_environment(
+        repo_root=repo_root,
+        profile=profile,
+        model_id=model_name,
+        model_revision=model_revision,
+        hardware_config=hw_config,
+    )
+    assert_environment_matches(bundle["environment"], current_environment)
+    minimum_seed_count = 1 if expected_pilot else 10
+    validate_phase1_3_matrix_plan(
+        bundle["plan"],
+        tasks=dimensions["tasks"],
+        seeds=dimensions["seeds"],
+        target_skip_rates=dimensions["target_skip_rates"],
+        minimum_seed_count=minimum_seed_count,
+        base_output_dir=args.output_dir,
+    )
+
+    if action == "validate":
+        report = _validate_and_freeze_strict_matrix(bundle)
+        print(
+            f"Validated {report['n_valid_runs']} completed cells; "
+            f"evidence: {os.path.join(args.output_dir, 'matrix_validation.json')}"
+        )
+        return
+
+    if action == "run":
+        assert_fresh_execution(
+            bundle["plan"], base_output_dir=args.output_dir
+        )
+    elif args.recover_stale_running_after_hours is not None:
+        recovered = recover_stale_running_attempts(
+            bundle["plan"],
+            base_output_dir=args.output_dir,
+            stale_after_hours=args.recover_stale_running_after_hours,
+        )
+        print(f"Recovered {len(recovered)} stale running attempts")
+
+    progress = scan_phase1_3_progress(
+        bundle["plan"], base_output_dir=args.output_dir
+    )
+    pending = [item for item in progress if item["state"] == "pending"]
+    print(
+        f"Phase 1.3 {action}: {len(pending)} pending, "
+        f"{len(progress) - len(pending)} verified completed"
+    )
+    wandb_group = args.wandb_group or (
+        f"phase1-3-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    )
+    overall_start = time.time()
+    total_runs = len(bundle["plan"])
+    plan_index = {
+        cell["fingerprint"]: index
+        for index, cell in enumerate(bundle["plan"], start=1)
+    }
+    for execution_index, item in enumerate(pending, start=1):
+        cell = item["cell"]
+        run_idx = plan_index[cell["fingerprint"]]
+        if execution_index > 1:
+            elapsed = time.time() - overall_start
+            remaining = len(pending) - execution_index + 1
+            eta = timedelta(
+                seconds=int((elapsed / (execution_index - 1)) * remaining)
             )
-        if args.rvd_policy_seed is not None:
-            parser.error(
-                "--mode phase1_3 pairs policy_seed with training_seed and "
-                "rejects --rvd-policy-seed"
+            print(
+                f"\n  === Matrix cell {run_idx}/{total_runs} | ETA: {eta} ==="
             )
-        if args.online_ler_mode != ONLINE_LER_MODE_AUTO:
-            parser.error(
-                "--mode phase1_3 requires --online-ler-mode auto for the "
-                "canonical per-arm diagnostic modes"
-            )
-        if args.provenance_classification != CLASSIFICATION_MATCHED_CLAIM:
-            parser.error(
-                "--mode phase1_3 requires matched_claim provenance"
-            )
-    elif args.target_skip_rates is not None:
+        else:
+            print(f"\n  === Matrix cell {run_idx}/{total_runs} ===")
+        task = cell["task"]
+        task_hp = TASK_HP_OVERRIDES.get(task, {})
+        run_ablation_single(
+            task_name=task,
+            seed=cell["training_seed"],
+            ablation_name=cell["arm"],
+            ablation_overrides=ABLATIONS[cell["arm"]],
+            model_name=cell["model_id"],
+            profile=profile,
+            base_output_dir=args.output_dir,
+            use_wandb=args.wandb,
+            max_samples_override=cell["identity_inputs"].get(
+                "max_samples_requested"
+            ),
+            run_idx=run_idx,
+            total_runs=total_runs,
+            wandb_project=args.wandb_project,
+            wandb_group=wandb_group,
+            num_epochs=task_hp.get("num_epochs", 3),
+            warmup_ratio=task_hp.get("warmup_ratio", 0.1),
+            early_stopping_patience=task_hp.get(
+                "early_stopping_patience", 5
+            ),
+            metric_for_best_model=task_hp.get(
+                "metric_for_best_model", "eval_loss"
+            ),
+            greater_is_better=task_hp.get("greater_is_better", False),
+            init_from_mnli=task_hp.get("init_from_mnli", False),
+            no_early_stopping=True,
+            target_skip_rate=cell["target_skip_rate"],
+            max_consecutive_skips=args.max_consecutive_skips,
+            probe_interval=args.probe_interval,
+            policy=args.policy,
+            rho_veto_threshold=args.rho_veto_threshold,
+            risk_gamma=args.risk_gamma,
+            guard_mode=args.guard_mode,
+            skip_update_mode="freeze",
+            scheduler_step_policy=(
+                SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
+            ),
+            allow_early_stopping_with_skipping=False,
+            rvd_veto_mode=args.rvd_veto_mode,
+            rvd_margin_rank_floor=args.rvd_margin_rank_floor,
+            rvd_spike_factor=args.rvd_spike_factor,
+            rvd_spike_ema_window=args.rvd_spike_ema_window,
+            rvd_repay_mode=args.rvd_repay_mode,
+            rvd_repay_protect_dangerous=args.rvd_repay_protect_dangerous,
+            rvd_policy_seed=None,
+            provenance_classification=CLASSIFICATION_MATCHED_CLAIM,
+            online_ler_mode=ONLINE_LER_MODE_AUTO,
+            online_ler_parameter_sample_size=args.online_ler_sample_size,
+            online_ler_update_interval=args.online_ler_update_interval,
+            planned_cell=cell,
+            model_revision=cell["model_revision"],
+        )
+
+    report = _validate_and_freeze_strict_matrix(bundle)
+    print(
+        f"Phase 1.3 matrix complete: {report['n_valid_runs']} validated cells"
+    )
+    print(
+        f"Frozen evidence: {os.path.join(args.output_dir, 'matrix_validation.json')}"
+    )
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    if args.mode == "phase1_3":
+        return _main_phase1_3(args, parser)
+    if args.phase1_3_action is not None or args.pilot:
+        parser.error(
+            "--phase1-3-action and --pilot require --mode phase1_3"
+        )
+    if args.recover_stale_running_after_hours is not None:
+        parser.error(
+            "--recover-stale-running-after-hours requires --mode phase1_3"
+        )
+    if args.target_skip_rates is not None:
         parser.error("--target-skip-rates is only valid with --mode phase1_3")
 
     profile = detect_device_profile()
 
-    if strict_phase1_3:
-        tasks = list(args.tasks or ["sst2"])
-        seeds = list(args.seeds)
-        ablations_to_run = list(PHASE1_3_CANONICAL_ARMS)
-        target_skip_rates = list(STRICT_TARGET_SKIP_RATES)
-        legacy_target_skip_rate = None
-        effective_no_early_stopping = True
-        effective_skip_update_mode = "freeze"
-        effective_scheduler_step_policy = (
-            SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
-        )
-        effective_allow_early_stopping = False
+    if args.mode == "smoke":
+        tasks = ["sst2"]
+        seeds = [42]
+        ablations_to_run = list(PHASE1_3_MATRIX)
+    elif args.mode == "full":
+        tasks = ABLATION_GLUE_TASKS
+        seeds = SEEDS
+        ablations_to_run = list(DEFAULT_ABLATIONS)
     else:
-        if args.mode == "smoke":
-            tasks = ["sst2"]
-            seeds = [42]
-            ablations_to_run = list(PHASE1_3_MATRIX)
-        elif args.mode == "full":
-            tasks = ABLATION_GLUE_TASKS
-            seeds = SEEDS
-            ablations_to_run = list(DEFAULT_ABLATIONS)
-        else:
-            tasks = args.tasks or ["sst2"]
-            seeds = args.seeds or [42]
-            ablations_to_run = args.ablations or list(DEFAULT_ABLATIONS)
+        tasks = args.tasks or ["sst2"]
+        seeds = args.seeds or [42]
+        ablations_to_run = args.ablations or list(DEFAULT_ABLATIONS)
 
-        if args.tasks:
-            tasks = args.tasks
-        if args.seeds:
-            seeds = args.seeds
-        if args.ablations:
-            ablations_to_run = args.ablations
+    if args.tasks:
+        tasks = args.tasks
+    if args.seeds:
+        seeds = args.seeds
+    if args.ablations:
+        ablations_to_run = args.ablations
 
-        target_skip_rates = None
-        legacy_target_skip_rate = (
-            0.20 if args.target_skip_rate is None else args.target_skip_rate
-        )
-        effective_no_early_stopping = args.no_early_stopping
-        effective_skip_update_mode = args.skip_update_mode
-        effective_scheduler_step_policy = args.scheduler_step_policy
-        effective_allow_early_stopping = (
-            args.allow_early_stopping_with_skipping
-        )
+    target_skip_rates = None
+    legacy_target_skip_rate = (
+        0.20 if args.target_skip_rate is None else args.target_skip_rate
+    )
+    effective_no_early_stopping = args.no_early_stopping
+    effective_skip_update_mode = args.skip_update_mode
+    effective_scheduler_step_policy = args.scheduler_step_policy
+    effective_allow_early_stopping = (
+        args.allow_early_stopping_with_skipping
+    )
 
     effective_max_samples = args.max_samples
     if effective_max_samples is None and not args.unlimited:
@@ -2736,70 +3100,12 @@ def main():
     if args.model == "ettin":
         model_revision = ETTIN_REVISION
 
-    if strict_phase1_3:
-        tokenizer = load_tokenizer(
-            model_name,
-            revision=model_revision,
-            local_files_only=bool(model_revision),
-        )
-        git_sha = _resolve_git_sha()
-
-        def data_facts_provider(task):
-            return resolve_task_data_facts(
-                task,
-                tokenizer,
-                effective_max_samples,
-                profile,
-            )
-
-        matrix_plan = build_phase1_3_matrix_plan(
-            tasks=tasks,
-            seeds=seeds,
-            target_skip_rates=target_skip_rates,
-            model_name=model_name,
-            model_revision=model_revision,
-            base_output_dir=args.output_dir,
-            data_facts_provider=data_facts_provider,
-            git_sha=git_sha,
-            scheduler_step_policy=(
-                SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
-            ),
-            max_consecutive_skips=args.max_consecutive_skips,
-            probe_interval=args.probe_interval,
-            rho_veto_threshold=args.rho_veto_threshold,
-            risk_gamma=args.risk_gamma,
-            online_ler_mode=ONLINE_LER_MODE_AUTO,
-            online_ler_parameter_sample_size=args.online_ler_sample_size,
-            online_ler_update_interval=args.online_ler_update_interval,
-            use_rho_vg=True,
-            use_safety_horizon=True,
-        )
-        validate_phase1_3_matrix_plan(
-            matrix_plan,
-            tasks=tasks,
-            seeds=seeds,
-            target_skip_rates=target_skip_rates,
-            minimum_seed_count=10,
-            base_output_dir=args.output_dir,
-        )
-        del tokenizer
-        run_specs = [
-            (
-                cell["task"],
-                cell["training_seed"],
-                cell["arm"],
-                cell["target_skip_rate"],
-                cell,
-            )
-            for cell in matrix_plan
-        ]
-    else:
-        run_specs = [
-            (task, seed, ablation_name, legacy_target_skip_rate, None)
-            for task in tasks
-            for seed in seeds
-            for ablation_name in ablations_to_run
-        ]
+    run_specs = [
+        (task, seed, ablation_name, legacy_target_skip_rate, None)
+        for task in tasks
+        for seed in seeds
+        for ablation_name in ablations_to_run
+    ]
 
     total_runs = len(run_specs)
     print("\n  ═══════════════════════════════════════════════════════")
@@ -2916,8 +3222,6 @@ def main():
             )
             if args.wandb:
                 _ensure_wandb_finished()
-            if strict_phase1_3:
-                raise
 
     summary_path = os.path.join(args.output_dir, "ablation_summary.json")
     os.makedirs(args.output_dir, exist_ok=True)
