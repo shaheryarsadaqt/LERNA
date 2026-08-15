@@ -2101,6 +2101,7 @@ def run_ablation_single(
             "online_ler_update_interval": int(online_ler_update_interval),
             "use_rho_vg": bool(use_rho_vg),
             "use_safety_horizon": bool(use_safety_horizon),
+            "provenance_classification": provenance_classification,
         }
         assert_phase1_3_runtime_matches_plan(planned_cell, runtime_cell)
 
@@ -2386,6 +2387,7 @@ def run_ablation_single(
             "controller_config": controller_config_effective,
             "timestamp": datetime.now().isoformat(),
             "hw_config": {k: v for k, v in hw_cfg.items() if k != "max_samples"},
+            "provenance_classification": provenance_classification,
         }
         _instr = instrumentation or {}
         results["skip_ratio"] = _instr.get("skip_ratio_by_batch")
@@ -2903,6 +2905,7 @@ def _main_phase1_3(args, parser):
             target_skip_rates=list(STRICT_TARGET_SKIP_RATES),
             minimum_seed_count=minimum_seed_count,
             base_output_dir=args.output_dir,
+            matrix_kind=matrix_kind,
         )
         require_frozen_mrpc_facts(resolved_facts["mrpc"])
         metric_probe = build_compute_metrics("mrpc")
@@ -2970,6 +2973,7 @@ def _main_phase1_3(args, parser):
         target_skip_rates=dimensions["target_skip_rates"],
         minimum_seed_count=minimum_seed_count,
         base_output_dir=args.output_dir,
+        matrix_kind=bundle["envelope"]["matrix_kind"],
     )
 
     if action == "validate":

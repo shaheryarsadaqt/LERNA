@@ -314,6 +314,7 @@ def _build_cell(
         "online_ler_update_interval": 1,
         "use_rho_vg": True,
         "use_safety_horizon": True,
+        "provenance_classification": "matched_claim",
     }
 
 
@@ -1330,6 +1331,57 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("GUARDED_LOAD_OK", result.stdout)
+
+    def test_provenance_classification_missing_rejected(self):
+        plan = _build_plan()
+        del plan[RANDOM]["provenance_classification"]
+        findings = _findings(plan)
+        self.assertIn(
+            "required field 'provenance_classification' is missing",
+            _messages(findings, "provenance_classification"),
+        )
+
+    def test_provenance_classification_wrong_type_rejected(self):
+        plan = _build_plan()
+        plan[RANDOM]["provenance_classification"] = 7
+        findings = _findings(plan)
+        self.assertIn(
+            "value must be a non-empty string",
+            _messages(findings, "provenance_classification"),
+        )
+
+    def test_provenance_classification_invalid_value_rejected(self):
+        plan = _build_plan()
+        plan[RANDOM]["provenance_classification"] = "bogus"
+        findings = _findings(plan)
+        self.assertIn(
+            "value must be 'matched_claim' or 'pilot_non_claim'",
+            _messages(findings, "provenance_classification"),
+        )
+
+    def test_provenance_classification_must_match_matrix_kind_pilot(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["provenance_classification"] = "matched_claim"
+        findings = _findings(plan, matrix_kind="pilot")
+        self.assertTrue(
+            any(
+                "does not match envelope matrix_kind" in msg
+                for msg in _messages(findings, "provenance_classification")
+            )
+        )
+
+    def test_provenance_classification_must_match_matrix_kind_production(self):
+        plan = _build_plan()
+        for cell in plan:
+            cell["provenance_classification"] = "pilot_non_claim"
+        findings = _findings(plan, matrix_kind="production")
+        self.assertTrue(
+            any(
+                "does not match envelope matrix_kind" in msg
+                for msg in _messages(findings, "provenance_classification")
+            )
+        )
 
 
 if __name__ == "__main__":

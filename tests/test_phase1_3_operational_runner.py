@@ -52,6 +52,7 @@ def _bundle(root: Path):
         online_ler_update_interval=1,
         use_rho_vg=True,
         use_safety_horizon=True,
+        provenance_classification=runner.CLASSIFICATION_PILOT_NON_CLAIM,
     )
     environment = {
         "hardware_config": {"max_samples": 25000},

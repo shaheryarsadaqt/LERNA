@@ -256,6 +256,7 @@ def _plan_matrix(
         online_ler_update_interval=ONLINE_LER_UPDATE_INTERVAL,
         use_rho_vg=True,
         use_safety_horizon=True,
+        provenance_classification="matched_claim",
     )
     findings = validate_phase1_3_matrix_plan(
         plan,
@@ -460,6 +461,7 @@ def _runtime_cell(
         online_ler_update_interval=ONLINE_LER_UPDATE_INTERVAL,
         use_rho_vg=True,
         use_safety_horizon=True,
+        provenance_classification=planned_cell.get("provenance_classification", "matched_claim"),
     )
     runtime["controller_config"] = controller
     return runtime

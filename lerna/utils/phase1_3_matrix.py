@@ -111,6 +111,7 @@ PLANNED_CELL_REQUIRED_FIELDS = frozenset(
         "online_ler_update_interval",
         "use_rho_vg",
         "use_safety_horizon",
+        "provenance_classification",
     }
 )
 
@@ -485,6 +486,7 @@ def _validate_cell_schema(
         "scheduler_step_policy",
         "fingerprint",
         "planned_arm_dir",
+        "provenance_classification",
     )
     integer_fields = (
         "training_seed",
@@ -519,6 +521,18 @@ def _validate_cell_schema(
     for field in boolean_fields:
         if field in cell and type(cell[field]) is not bool:
             _add_error(findings, field, cell_id, "value must be a boolean")
+
+    provenance = cell.get("provenance_classification")
+    if provenance is not None and provenance not in (
+        "matched_claim",
+        "pilot_non_claim",
+    ):
+        _add_error(
+            findings,
+            "provenance_classification",
+            cell_id,
+            "value must be 'matched_claim' or 'pilot_non_claim'",
+        )
 
     rate = cell.get("target_skip_rate", _MISSING)
     if rate is not _MISSING and not _is_float(rate):
@@ -1674,6 +1688,7 @@ def validate_phase1_3_matrix_plan(
     target_skip_rates: list[float],
     minimum_seed_count: int,
     base_output_dir: os.PathLike[str] | str,
+    matrix_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     """Validate a complete Phase 1.3 plan without filesystem writes.
 
@@ -1727,6 +1742,26 @@ def validate_phase1_3_matrix_plan(
                 base_output_dir=normalized_output_dir,
                 findings=findings,
             )
+
+    if matrix_kind is not None and not any(
+        finding["severity"] == "error" for finding in findings
+    ):
+        expected = (
+            "pilot_non_claim" if matrix_kind == "pilot" else "matched_claim"
+        )
+        for index, cell in enumerate(plan):
+            if type(cell) is not dict:
+                continue
+            classification = cell.get("provenance_classification")
+            if classification != expected:
+                _add_error(
+                    findings,
+                    "provenance_classification",
+                    _cell_ref(cell),
+                    f"plan cell {index} classification {classification!r} "
+                    f"does not match envelope matrix_kind {matrix_kind!r}; "
+                    f"expected {expected!r}",
+                )
 
     if any(finding["severity"] == "error" for finding in findings):
         raise MatrixPlanError(findings)

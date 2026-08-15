@@ -326,6 +326,7 @@ def _build_cell(
         "online_ler_update_interval": 1,
         "use_rho_vg": True,
         "use_safety_horizon": True,
+        "provenance_classification": "matched_claim",
     }
 
 

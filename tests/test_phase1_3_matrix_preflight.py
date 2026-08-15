@@ -126,6 +126,7 @@ def _plan_cell(
         data_facts=_data_facts(task) if facts is None else facts,
         git_sha="abc123",
         base_output_dir=base_output_dir,
+        provenance_classification="matched_claim",
         **kwargs,
     )
 
@@ -418,6 +419,7 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
         base_output_dir=base_output_dir,
         data_facts_provider=provider,
         git_sha="abc123",
+        provenance_classification="matched_claim",
         **CELL_KWARGS,
     )
 
@@ -699,6 +701,7 @@ def test_strict_plan_persists_before_any_run(monkeypatch, tmp_path):
             "target_skip_rates": [0.30, 0.40],
             "minimum_seed_count": 1,
             "base_output_dir": str(output_dir),
+            "matrix_kind": "pilot",
         }
         return validate_phase1_3_matrix_plan(plan, **kwargs)
 

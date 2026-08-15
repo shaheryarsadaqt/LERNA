@@ -741,12 +741,8 @@ def _read_completed_attempt(
         "identity_inputs": cell["identity_inputs"],
         "attempt": attempt_num,
         "output_paths": _expected_output_paths(cell),
+        "provenance_classification": cell["provenance_classification"],
     }
-    expected_classification = cell.get(
-        "provenance_classification", "matched_claim"
-    )
-    if expected_classification in ("matched_claim", "pilot_non_claim"):
-        expected_manifest_values["provenance_classification"] = expected_classification
     for key, expected in expected_manifest_values.items():
         if type(manifest.get(key)) is not type(expected) or manifest.get(key) != expected:
             raise Phase13OperationalError(
@@ -761,6 +757,7 @@ def _read_completed_attempt(
         "fingerprint": cell["fingerprint"],
         "identity_inputs": cell["identity_inputs"],
         "attempt": attempt_num,
+        "provenance_classification": cell["provenance_classification"],
     }
     for key, expected in expected_results.items():
         if type(results.get(key)) is not type(expected) or results.get(key) != expected:
