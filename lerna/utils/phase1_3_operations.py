@@ -1067,16 +1067,27 @@ def freeze_matrix_validation(
         manifest = _load_json(attempt_dir / "run_manifest.json")
         validate_power_evidence(results)
         matrix_kind = bundle["envelope"]["matrix_kind"]
-        classification = manifest.get("provenance_classification")
-        if matrix_kind == "production" and classification == "pilot_non_claim":
+        if matrix_kind not in ("pilot", "production"):
             raise Phase13OperationalError(
-                "production matrix validation rejects pilot evidence: "
-                f"{attempt_dir}"
+                f"freeze_matrix_validation requires matrix_kind to be "
+                f"'pilot' or 'production'; got {matrix_kind!r}"
             )
-        if matrix_kind == "pilot" and classification == "matched_claim":
+        expected_classification = (
+            "pilot_non_claim" if matrix_kind == "pilot" else "matched_claim"
+        )
+        manifest_classification = manifest.get("provenance_classification")
+        if type(manifest_classification) is not str or manifest_classification != expected_classification:
             raise Phase13OperationalError(
-                "pilot matrix validation rejects matched_claim evidence: "
-                f"{attempt_dir}"
+                f"freeze_matrix_validation requires manifest "
+                f"provenance_classification to be {expected_classification!r}; "
+                f"got {manifest_classification!r} in {attempt_dir}"
+            )
+        results_classification = results.get("provenance_classification")
+        if type(results_classification) is not str or results_classification != expected_classification:
+            raise Phase13OperationalError(
+                f"freeze_matrix_validation requires results "
+                f"provenance_classification to be {expected_classification!r}; "
+                f"got {results_classification!r} in {attempt_dir}"
             )
         relative_attempt = str(attempt_dir.relative_to(root))
         runs.append(

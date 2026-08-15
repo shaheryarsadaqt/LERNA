@@ -365,8 +365,20 @@ def test_validation_freeze_hashes_results_and_power_evidence_immutably(tmp_path)
         "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
         "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
     }
-    _write_json(attempt / "results.json", {"power_evidence": power})
-    _write_json(attempt / "run_manifest.json", {"status": "completed"})
+    _write_json(
+        attempt / "results.json",
+        {
+            "power_evidence": power,
+            "provenance_classification": "pilot_non_claim",
+        },
+    )
+    _write_json(
+        attempt / "run_manifest.json",
+        {
+            "status": "completed",
+            "provenance_classification": "pilot_non_claim",
+        },
+    )
     valid_runs = [
         {
             "cell_id": ("mrpc", 7, 0.30, "full_finetune"),
@@ -674,7 +686,7 @@ def test_pilot_non_claim_classification_in_evidence(tmp_path):
             },
         },
     )
-    with pytest.raises(operations.Phase13OperationalError, match="pilot evidence"):
+    with pytest.raises(operations.Phase13OperationalError, match="provenance_classification"):
         operations.freeze_matrix_validation(
             base_output_dir=root,
             bundle=production_bundle,
@@ -729,7 +741,70 @@ def test_freeze_rejects_matched_claim_evidence_for_pilot(tmp_path):
             "results_path": str(attempt / "results.json"),
         }
     ]
-    with pytest.raises(operations.Phase13OperationalError, match="matched_claim evidence"):
+    with pytest.raises(operations.Phase13OperationalError, match="provenance_classification"):
+        operations.freeze_matrix_validation(
+            base_output_dir=root,
+            bundle=bundle,
+            valid_runs=valid_runs,
+        )
+
+
+@pytest.mark.parametrize("matrix_kind", ["pilot", "production"])
+@pytest.mark.parametrize("tamper_target", ["manifest", "results"])
+def test_freeze_rejects_missing_or_arbitrary_provenance(tmp_path, matrix_kind, tamper_target):
+    root = tmp_path / "matrix"
+    bundle = _persist(root, environment={"locked": True, "matrix_kind": matrix_kind})
+    if matrix_kind == "production":
+        bundle["envelope"] = dict(bundle["envelope"])
+        bundle["envelope"]["matrix_kind"] = "production"
+    cell = bundle["plan"][0]
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    expected_classification = "pilot_non_claim" if matrix_kind == "pilot" else "matched_claim"
+    power_evidence = {
+        "authoritative_copy": "results.json",
+        "measurement_source": "nvidia-smi",
+        "energy_valid": True,
+        "energy_invalid_reason": "ok",
+        "gpu_name": "V100",
+        "gpu_index": 0,
+        "gpu_selector": "0",
+        "sample_interval_s": 1.0,
+        "nvidia_smi_query_count": 1,
+        "nvidia_smi_success_count": 1,
+        "total_energy_kwh": 0.001,
+        "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+        "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+    }
+    results_data = {
+        "task": "mrpc",
+        "seed": 7,
+        "ablation": "full_finetune",
+        "model": cell["model_id"],
+        "model_revision": cell.get("model_revision"),
+        "fingerprint": cell["fingerprint"],
+        "identity_inputs": cell["identity_inputs"],
+        "attempt": 1,
+        "power_evidence": power_evidence,
+    }
+    manifest_data = {
+        "status": "completed",
+    }
+    if tamper_target == "manifest":
+        manifest_data["provenance_classification"] = "bogus"
+        results_data["provenance_classification"] = expected_classification
+    else:
+        manifest_data["provenance_classification"] = expected_classification
+        results_data["provenance_classification"] = "bogus"
+    _write_json(attempt / "results.json", results_data)
+    _write_json(attempt / "run_manifest.json", manifest_data)
+    valid_runs = [
+        {
+            "cell_id": ("mrpc", 7, 0.30, "full_finetune"),
+            "attempt_num": 1,
+            "results_path": str(attempt / "results.json"),
+        }
+    ]
+    with pytest.raises(operations.Phase13OperationalError):
         operations.freeze_matrix_validation(
             base_output_dir=root,
             bundle=bundle,

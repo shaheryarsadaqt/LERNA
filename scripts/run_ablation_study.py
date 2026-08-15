@@ -2722,6 +2722,7 @@ def _validate_and_freeze_strict_matrix(bundle):
             1 if bundle["envelope"]["matrix_kind"] == "pilot" else 10
         ),
         base_output_dir=str(bundle["root"]),
+        matrix_kind=bundle["envelope"]["matrix_kind"],
     )
     return freeze_matrix_validation(
         base_output_dir=str(bundle["root"]),
