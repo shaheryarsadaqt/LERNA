@@ -885,6 +885,7 @@ def plan_phase1_3_cell(
     online_ler_update_interval,
     use_rho_vg=True,
     use_safety_horizon=True,
+    provenance_classification=None,
 ) -> dict:
     """Build one canonical Phase 1.3 cell without execution side effects."""
     if ablation_name not in PHASE1_3_CANONICAL_ARMS:
@@ -1047,7 +1048,7 @@ def plan_phase1_3_cell(
         ablation_name,
         fingerprint,
     )
-    return {
+    cell = {
         "arm": ablation_name,
         "control": ablation_name,
         "task": str(task_name),
@@ -1080,6 +1081,9 @@ def plan_phase1_3_cell(
         "use_rho_vg": bool(use_rho_vg),
         "use_safety_horizon": bool(use_safety_horizon),
     }
+    if provenance_classification is not None:
+        cell["provenance_classification"] = str(provenance_classification)
+    return cell
 
 
 def build_phase1_3_matrix_plan(
@@ -2886,6 +2890,11 @@ def _main_phase1_3(args, parser):
             online_ler_update_interval=args.online_ler_update_interval,
             use_rho_vg=True,
             use_safety_horizon=True,
+            provenance_classification=(
+                CLASSIFICATION_PILOT_NON_CLAIM
+                if matrix_kind == "pilot"
+                else CLASSIFICATION_MATCHED_CLAIM
+            ),
         )
         validate_phase1_3_matrix_plan(
             matrix_plan,

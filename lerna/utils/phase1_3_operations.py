@@ -394,6 +394,7 @@ def _cache_tree_evidence(path: Path, *, label: str) -> dict[str, Any]:
         "file_count": len(entries),
         "total_bytes": total_bytes,
         "inventory_sha256": canonical_sha256(entries),
+        "entries": entries,
     }
 
 
