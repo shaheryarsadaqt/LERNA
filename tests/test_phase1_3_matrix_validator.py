@@ -306,6 +306,14 @@ def _build_cell(
         "identity_inputs": identity,
         "fingerprint": fingerprint,
         "planned_arm_dir": os.path.join(base_output_dir, arm, fingerprint),
+        "max_consecutive_skips": 4,
+        "probe_interval": 8,
+        "rho_veto_threshold": -0.2,
+        "risk_gamma": 0.0,
+        "online_ler_parameter_sample_size": 4096,
+        "online_ler_update_interval": 1,
+        "use_rho_vg": True,
+        "use_safety_horizon": True,
     }
 
 

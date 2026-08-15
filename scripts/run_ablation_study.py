@@ -2089,6 +2089,14 @@ def run_ablation_single(
             "identity_inputs": identity_inputs,
             "fingerprint": fingerprint,
             "planned_arm_dir": arm_dir,
+            "max_consecutive_skips": int(max_consecutive_skips),
+            "probe_interval": int(probe_interval),
+            "rho_veto_threshold": float(rho_veto_threshold),
+            "risk_gamma": float(risk_gamma),
+            "online_ler_parameter_sample_size": int(online_ler_parameter_sample_size),
+            "online_ler_update_interval": int(online_ler_update_interval),
+            "use_rho_vg": bool(use_rho_vg),
+            "use_safety_horizon": bool(use_safety_horizon),
         }
         assert_phase1_3_runtime_matches_plan(planned_cell, runtime_cell)
 
