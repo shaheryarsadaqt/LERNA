@@ -468,6 +468,7 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
         "forward_calls": total_steps,
         "backward_calls": backward,
         "skipped_backward_steps": quota if skipping else 0,
+        "provenance_classification": cell.get("provenance_classification", "matched_claim"),
     }
 
     if tamper:
@@ -2044,6 +2045,72 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 "model_revision",
                 fields,
                 msg=f"non-string Ettin revision not rejected; got {fields}",
+            )
+
+    def test_manifest_provenance_drift_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            tamper_path = os.path.join(
+                base, "full_finetune", plan[0]["fingerprint"], "attempt-001",
+                "run_manifest.json",
+            )
+            with open(tamper_path, "r+", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+                manifest["provenance_classification"] = "pilot_non_claim"
+                handle.seek(0)
+                json.dump(manifest, handle)
+                handle.truncate()
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn(
+                "manifest.provenance_classification",
+                fields,
+                msg=f"manifest provenance drift not rejected; got {fields}",
+            )
+
+    def test_results_provenance_drift_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
+            base = os.path.join(tmp, "output")
+            plan = _build_plan(base_output_dir=base)
+            _create_full_fixture(base, plan)
+
+            tamper_path = os.path.join(
+                base, "full_finetune", plan[0]["fingerprint"], "attempt-001",
+                "results.json",
+            )
+            with open(tamper_path, "r+", encoding="utf-8") as handle:
+                results = json.load(handle)
+                results["provenance_classification"] = "pilot_non_claim"
+                handle.seek(0)
+                json.dump(results, handle)
+                handle.truncate()
+
+            with self.assertRaises(CompletedMatrixError) as raised:
+                validate_phase1_3_completed_matrix(
+                    plan,
+                    tasks=[TASK],
+                    seeds=[SEED],
+                    target_skip_rates=list(RATES),
+                    minimum_seed_count=1,
+                    base_output_dir=base,
+                )
+            fields = _error_fields(raised.exception.findings)
+            self.assertIn(
+                "results.json.provenance_classification",
+                fields,
+                msg=f"results provenance drift not rejected; got {fields}",
             )
 
 

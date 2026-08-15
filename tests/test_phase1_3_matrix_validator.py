@@ -1383,6 +1383,16 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             )
         )
 
+    def test_invalid_matrix_kind_rejected(self):
+        plan = _build_plan()
+        findings = _findings(plan, matrix_kind="bogus")
+        self.assertTrue(
+            any(
+                "matrix_kind must be 'pilot' or 'production'" in msg
+                for msg in _messages(findings, "matrix_kind")
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

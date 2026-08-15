@@ -650,6 +650,7 @@ def _build_results(
         "code_git_sha": git_sha,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "synthetic_protocol": True,
+        "provenance_classification": cell.get("provenance_classification", "matched_claim"),
     }
 
 

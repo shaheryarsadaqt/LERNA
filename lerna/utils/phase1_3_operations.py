@@ -1066,13 +1066,18 @@ def freeze_matrix_validation(
         results = _load_json(attempt_dir / "results.json")
         manifest = _load_json(attempt_dir / "run_manifest.json")
         validate_power_evidence(results)
-        if bundle["envelope"]["matrix_kind"] == "production":
-            classification = manifest.get("provenance_classification")
-            if classification == "pilot_non_claim":
-                raise Phase13OperationalError(
-                    "production matrix validation rejects pilot evidence: "
-                    f"{attempt_dir}"
-                )
+        matrix_kind = bundle["envelope"]["matrix_kind"]
+        classification = manifest.get("provenance_classification")
+        if matrix_kind == "production" and classification == "pilot_non_claim":
+            raise Phase13OperationalError(
+                "production matrix validation rejects pilot evidence: "
+                f"{attempt_dir}"
+            )
+        if matrix_kind == "pilot" and classification == "matched_claim":
+            raise Phase13OperationalError(
+                "pilot matrix validation rejects matched_claim evidence: "
+                f"{attempt_dir}"
+            )
         relative_attempt = str(attempt_dir.relative_to(root))
         runs.append(
             {

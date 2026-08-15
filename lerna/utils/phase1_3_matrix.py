@@ -1743,7 +1743,14 @@ def validate_phase1_3_matrix_plan(
                 findings=findings,
             )
 
-    if matrix_kind is not None and not any(
+    if matrix_kind is not None and matrix_kind not in ("pilot", "production"):
+        _add_error(
+            findings,
+            "matrix_kind",
+            None,
+            f"matrix_kind must be 'pilot' or 'production'; got {matrix_kind!r}",
+        )
+    elif matrix_kind is not None and not any(
         finding["severity"] == "error" for finding in findings
     ):
         expected = (

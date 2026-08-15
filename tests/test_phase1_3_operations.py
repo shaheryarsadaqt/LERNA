@@ -680,3 +680,58 @@ def test_pilot_non_claim_classification_in_evidence(tmp_path):
             bundle=production_bundle,
             valid_runs=valid_runs,
         )
+
+
+def test_freeze_rejects_matched_claim_evidence_for_pilot(tmp_path):
+    root = tmp_path / "matrix"
+    bundle = _persist(root)
+    cell = bundle["plan"][0]
+    attempt = root / cell["arm"] / cell["fingerprint"] / "attempt-001"
+    _write_json(
+        attempt / "results.json",
+        {
+            "task": "mrpc",
+            "seed": 7,
+            "ablation": "full_finetune",
+            "model": cell["model_id"],
+            "model_revision": cell.get("model_revision"),
+            "fingerprint": cell["fingerprint"],
+            "identity_inputs": cell["identity_inputs"],
+            "attempt": 1,
+            "power_evidence": {
+                "authoritative_copy": "results.json",
+                "measurement_source": "nvidia-smi",
+                "energy_valid": True,
+                "energy_invalid_reason": "ok",
+                "gpu_name": "V100",
+                "gpu_index": 0,
+                "gpu_selector": "0",
+                "sample_interval_s": 1.0,
+                "nvidia_smi_query_count": 1,
+                "nvidia_smi_success_count": 1,
+                "total_energy_kwh": 0.001,
+                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+                "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+            },
+        },
+    )
+    _write_json(
+        attempt / "run_manifest.json",
+        {
+            "status": "completed",
+            "provenance_classification": "matched_claim",
+        },
+    )
+    valid_runs = [
+        {
+            "cell_id": ("mrpc", 7, 0.30, "full_finetune"),
+            "attempt_num": 1,
+            "results_path": str(attempt / "results.json"),
+        }
+    ]
+    with pytest.raises(operations.Phase13OperationalError, match="matched_claim evidence"):
+        operations.freeze_matrix_validation(
+            base_output_dir=root,
+            bundle=bundle,
+            valid_runs=valid_runs,
+        )

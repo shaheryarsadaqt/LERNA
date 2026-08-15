@@ -105,6 +105,7 @@ def validate_phase1_3_completed_matrix(
     target_skip_rates,
     minimum_seed_count,
     base_output_dir,
+    matrix_kind=None,
 ) -> dict:
     findings: list[dict[str, Any]] = []
     valid_runs: list[dict[str, Any]] = []
@@ -128,6 +129,7 @@ def validate_phase1_3_completed_matrix(
             target_skip_rates=target_skip_rates,
             minimum_seed_count=minimum_seed_count,
             base_output_dir=base_output_dir,
+            matrix_kind=matrix_kind,
         )
     except MatrixPlanError as exc:
         findings.extend(exc.findings)
@@ -272,15 +274,13 @@ def validate_phase1_3_completed_matrix(
                 findings.extend(attempt_findings)
                 continue
 
-            if manifest.get("provenance_classification") not in (
-                "matched_claim",
-                "pilot_non_claim",
-            ):
+            expected_classification = cell.get("provenance_classification")
+            if manifest.get("provenance_classification") != expected_classification:
                 attempt_findings.append({
                     "severity": "error",
                     "field": "manifest.provenance_classification",
                     "cell": cell_id,
-                    "message": f"{attempt_name}: provenance classification is not matched_claim or pilot_non_claim",
+                    "message": f"{attempt_name}: manifest classification {manifest.get('provenance_classification')!r} does not match planned cell classification {expected_classification!r}",
                 })
 
             verification = verify_completed_manifest(attempt_path)
@@ -507,6 +507,14 @@ def validate_phase1_3_completed_matrix(
                     "field": "results.json.model_revision",
                     "cell": cell_id,
                     "message": f"{attempt_name}: results model_revision drift",
+                })
+
+            if not _strict_equal(results.get("provenance_classification"), cell.get("provenance_classification")):
+                attempt_findings.append({
+                    "severity": "error",
+                    "field": "results.json.provenance_classification",
+                    "cell": cell_id,
+                    "message": f"{attempt_name}: results provenance_classification drift",
                 })
 
             results_identity = results.get("identity_inputs")
