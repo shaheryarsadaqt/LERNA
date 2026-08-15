@@ -103,6 +103,14 @@ PLANNED_CELL_REQUIRED_FIELDS = frozenset(
         "identity_inputs",
         "fingerprint",
         "planned_arm_dir",
+        "max_consecutive_skips",
+        "probe_interval",
+        "rho_veto_threshold",
+        "risk_gamma",
+        "online_ler_parameter_sample_size",
+        "online_ler_update_interval",
+        "use_rho_vg",
+        "use_safety_horizon",
     }
 )
 
