@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +15,20 @@ SAMPLED_LAGGED_TIMING = "post_decision_after_backward"
 _LER_FLOOR = 1e-8
 _EMA_KEEP = 0.7
 _EMA_NEW = 0.3
+
+
+class TerminalInvalidObservation(Exception):
+    """Raised when a sampled observation contains non-finite values.
+
+    This is a terminal event for the attempt. The attempt must stop before
+    the pending optimizer/scheduler action.
+    """
+    def __init__(self, event_type: str, decision_index: int, operands: Dict[str, Any], valid_prefix: Dict[str, Any]):
+        self.event_type = event_type
+        self.decision_index = decision_index
+        self.operands = operands
+        self.valid_prefix = valid_prefix
+        super().__init__(f"Terminal invalid observation: {event_type} at decision {decision_index}")
 
 
 class SampledLaggedLERTracker:
@@ -56,6 +71,14 @@ class SampledLaggedLERTracker:
         self._decisions_at_last_update: Optional[int] = None
         self._last_noted_decision: Optional[int] = None
 
+        # Terminal contract counters
+        self.observation_attempts = 0          # Every update() call
+        self.warmup_updates = 0                # Finite update without LER emission (insufficient history)
+        self.valid_emissions = 0               # Successfully emitted LER (finite)
+        self.invalid_emission_events = 0       # Non-finite inputs rejected
+        self.terminal_invalid_event = None     # Dict with event details, or None
+        self.last_valid_emission_decision: Optional[int] = None  # Zero-based decision index
+
     def set_optimizer(self, optimizer) -> None:
         self._optimizer = optimizer
 
@@ -73,14 +96,49 @@ class SampledLaggedLERTracker:
         optimizer=None,
         decision_index: Optional[int] = None,
     ) -> None:
-        """Commit one observation after a successful real backward pass."""
+        """Commit one observation after a successful real backward pass.
+
+        Validates all inputs before committing any state. On first non-finite
+        observation, raises TerminalInvalidObservation with the valid prefix
+        preserved and invalid operands recorded.
+        """
         del accuracy
         opt = optimizer if optimizer is not None else self._optimizer
-        self.loss_history.append(float(loss))
-        self.entropy_history.append(self._compute_entropy(logits))
+
+        # Increment attempt counter at start
+        self.observation_attempts += 1
+
+        # Validate loss BEFORE appending to history
+        loss_val = float(loss)
+        if not math.isfinite(loss_val):
+            tagged = {"loss": self._make_tagged_operand(loss_val)}
+            self._record_terminal_invalid("nonfinite_loss", decision_index, tagged)
+            raise TerminalInvalidObservation(
+                "nonfinite_loss",
+                decision_index if decision_index is not None else self._last_noted_decision or 0,
+                tagged,
+                self._get_valid_prefix()
+            )
+
+        # Compute and validate entropy BEFORE appending
+        entropy = self._compute_entropy(logits)
+        if not math.isfinite(entropy):
+            tagged = {"entropy": self._make_tagged_operand(entropy)}
+            self._record_terminal_invalid("nonfinite_entropy", decision_index, tagged)
+            raise TerminalInvalidObservation(
+                "nonfinite_entropy",
+                decision_index if decision_index is not None else self._last_noted_decision or 0,
+                tagged,
+                self._get_valid_prefix()
+            )
+
+        # Now append to histories (both are finite)
+        self.loss_history.append(loss_val)
+        self.entropy_history.append(entropy)
 
         velocity: Optional[float] = None
         rho: Optional[float] = None
+        new_samples = None
         if model is not None:
             if self._sample_plan is None:
                 self._build_sample_plan(model)
@@ -88,20 +146,81 @@ class SampledLaggedLERTracker:
                 self._prev_samples = self._capture_samples(model)
             else:
                 velocity, rho, new_samples = self._sampled_dynamics(model, opt)
+                # Validate velocity and rho before committing
+                if velocity is not None and not math.isfinite(velocity):
+                    tagged = {"velocity": self._make_tagged_operand(velocity)}
+                    self._record_terminal_invalid("nonfinite_velocity", decision_index, tagged)
+                    raise TerminalInvalidObservation(
+                        "nonfinite_velocity",
+                        decision_index if decision_index is not None else self._last_noted_decision or 0,
+                        tagged,
+                        self._get_valid_prefix()
+                    )
+                if rho is not None and not math.isfinite(rho):
+                    tagged = {"rho": self._make_tagged_operand(rho)}
+                    self._record_terminal_invalid("nonfinite_rho", decision_index, tagged)
+                    raise TerminalInvalidObservation(
+                        "nonfinite_rho",
+                        decision_index if decision_index is not None else self._last_noted_decision or 0,
+                        tagged,
+                        self._get_valid_prefix()
+                    )
+                # Commit new_samples only after validation passes
                 self._prev_samples = new_samples
 
         if velocity is not None:
             self.velocity_history.append(velocity)
         if rho is not None:
             self.rho_vg_history.append(rho)
+
+        # Try to append LER - this validates gain and entropy again
         self._maybe_append_ler(velocity)
 
+        # Update counters
         self.n_updates += 1
         if decision_index is not None:
             self.last_update_decision = int(decision_index)
         elif self._last_noted_decision is not None:
             self.last_update_decision = self._last_noted_decision
         self._decisions_at_last_update = self.n_decisions
+
+        # Track whether we emitted a valid LER
+        if self.ler_raw_history and (self.valid_emissions == 0 or len(self.ler_raw_history) > self.valid_emissions):
+            self.valid_emissions += 1
+            if self.last_update_decision is not None:
+                self.last_valid_emission_decision = self.last_update_decision
+        elif len(self.loss_history) < 2:
+            # Legitimate warmup - finite update but no LER yet
+            self.warmup_updates += 1
+
+    def _get_valid_prefix(self) -> Dict[str, Any]:
+        """Return the finite accepted prefix for failure evidence."""
+        return {
+            "observation_attempts": self.observation_attempts,
+            "warmup_updates": self.warmup_updates,
+            "valid_emissions": self.valid_emissions,
+            "ler_raw_history": [float(v) for v in self.ler_raw_history],
+            "ler_history": [float(v) for v in self.ler_history],
+            "velocity_history": [float(v) for v in self.velocity_history],
+            "rho_vg_history": [float(v) for v in self.rho_vg_history],
+            "loss_history": [float(v) for v in self.loss_history],
+            "entropy_history": [float(v) for v in self.entropy_history],
+        }
+
+    def _make_tagged_operand(self, value: float) -> Dict[str, str]:
+        """Create tagged operand for terminal contract (kind='nonfinite', value='NaN'|'+Infinity'|'-Infinity')."""
+        return {"kind": "nonfinite", "value": "NaN" if math.isnan(value) else ("+Infinity" if value > 0 else "-Infinity")}
+
+    def _record_terminal_invalid(self, event_type: str, decision_index: Optional[int], operands: Dict[str, Any]) -> None:
+        """Record terminal invalid event (only first one)."""
+        if self.terminal_invalid_event is None:
+            self.invalid_emission_events += 1
+            self.terminal_invalid_event = {
+                "event_type": event_type,
+                "decision_index": decision_index if decision_index is not None else self._last_noted_decision,
+                "observation_attempt": self.observation_attempts,
+                "operands": operands,
+            }
 
     def get_diagnostics(self) -> Dict:
         if self._decisions_at_last_update is None:
@@ -127,6 +246,19 @@ class SampledLaggedLERTracker:
             "n_rho_vg_samples": len(self.rho_vg_history),
             "full_parameter_snapshots": False,
             "full_vector_concatenation": False,
+            # Terminal contract fields
+            "observation_attempts": self.observation_attempts,
+            "warmup_updates": self.warmup_updates,
+            "valid_emissions": self.valid_emissions,
+            "invalid_emission_events": self.invalid_emission_events,
+            "terminal_invalid_event": self.terminal_invalid_event,
+            "last_valid_emission_decision": self.last_valid_emission_decision,
+            "ler_raw_history": [float(v) for v in self.ler_raw_history],
+            "ler_history": [float(v) for v in self.ler_history],
+            "velocity_history": [float(v) for v in self.velocity_history],
+            "rho_vg_history": [float(v) for v in self.rho_vg_history],
+            "loss_history": [float(v) for v in self.loss_history],
+            "entropy_history": [float(v) for v in self.entropy_history],
         }
 
     def _build_sample_plan(self, model: torch.nn.Module) -> None:
@@ -293,6 +425,17 @@ class SampledLaggedLERTracker:
             ler = velocity * gain * average_entropy
         else:
             ler = gain * average_entropy
+        # Validate LER before appending
+        if not math.isfinite(ler):
+            # This should not happen if inputs were validated, but guard anyway
+            tagged = {"ler": self._make_tagged_operand(ler)}
+            self._record_terminal_invalid("nonfinite_ler", self._last_noted_decision or 0, tagged)
+            raise TerminalInvalidObservation(
+                "nonfinite_ler",
+                self._last_noted_decision or 0,
+                tagged,
+                self._get_valid_prefix()
+            )
         ler = max(float(ler), _LER_FLOOR)
         self.ler_raw_history.append(ler)
         if self.ler_history:

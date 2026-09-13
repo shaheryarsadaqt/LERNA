@@ -1915,6 +1915,12 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
         self._fallback_random_skip_count = 0
         self._forced_quota_decision_count = 0
 
+        # Terminal contract: track valid emissions consumed
+        self._accepted_emissions = 0
+        self._last_valid_emission_decision: Optional[int] = None
+        self._terminal_invalid_observed = False
+        self._invalid_emission_events = 0
+
     @classmethod
     def _validate_tracker(cls, ler_tracker) -> None:
         if ler_tracker is None:
@@ -1948,31 +1954,60 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
         obs = self._ler_observations
         if not obs:
             return 0.5
+        if not math.isfinite(value):
+            return 0.5
         less = sum(1 for v in obs if v < value)
         equal = sum(1 for v in obs if v == value)
         return (less + 0.5 * equal) / len(obs)
 
     def _observe_signal(self) -> None:
+        """Observe new valid LER emissions from tracker.
+
+        Only consumes emissions when tracker.valid_emissions increases.
+        Uses zero-based decision indices for age calculation.
+        """
+        if self._terminal_invalid_observed:
+            return
+
         diag = self.ler_tracker.get_diagnostics()
-        ler = diag.get("ler_raw")
-        if ler is None:
-            ler = diag.get("ler")
-        age = diag.get("observation_age_decisions")
-        self._current_signal_age = age
-        if age is not None:
-            self._max_signal_age_observed = max(
-                self._max_signal_age_observed, int(age)
-            )
-        lud = diag.get("last_update_decision")
-        if (
-            ler is not None
-            and lud is not None
-            and lud != self._last_signal_update_decision
-        ):
-            self._ler_observations.append(float(ler))
-            self._last_signal_update_decision = int(lud)
-            self._current_ler = float(ler)
-            self._current_ler_rank = self._percentile_rank(float(ler))
+
+        # Check for terminal invalid event from tracker
+        terminal_event = diag.get("terminal_invalid_event")
+        if terminal_event is not None:
+            self._terminal_invalid_observed = True
+            return
+
+        valid_emissions = diag.get("valid_emissions", 0)
+        last_valid_emission_decision = diag.get("last_valid_emission_decision")
+        ler_raw = diag.get("ler_raw")
+
+        # Only observe when a NEW valid emission is available
+        if valid_emissions > self._accepted_emissions and ler_raw is not None:
+            # New emission available - consume it
+            self._ler_observations.append(float(ler_raw))
+            self._accepted_emissions = valid_emissions
+            self._last_valid_emission_decision = last_valid_emission_decision
+            self._current_ler = float(ler_raw)
+            self._current_ler_rank = self._percentile_rank(float(ler_raw))
+            self._current_signal_age = 0
+        elif self._accepted_emissions > 0:
+            # No new emission, age increases
+            if last_valid_emission_decision is not None:
+                # Age = current zero-based decision index - last valid emission decision index
+                # At the start of should_skip, di = _decisions_seen (0-based for current decision)
+                current_di = self._decisions_seen
+                self._current_signal_age = current_di - last_valid_emission_decision
+                self._max_signal_age_observed = max(
+                    self._max_signal_age_observed, self._current_signal_age
+                )
+            else:
+                self._current_signal_age = self._decisions_seen
+        else:
+            # No valid emissions yet (warmup)
+            self._current_signal_age = self._decisions_seen
+
+        # Also check invalid_emission_events for diagnostics
+        self._invalid_emission_events = diag.get("invalid_emission_events", 0)
 
     def _safety_veto_kind(self) -> Optional[str]:
         """Return 'rho', 'spike', or None without mutating counters."""
@@ -1992,6 +2027,11 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
         self._decisions_seen += 1
         self._lazy_init(trainer)
         self._observe_signal()
+
+        # Terminal contract: stop on first invalid observation
+        if self._terminal_invalid_observed:
+            self._consecutive_skips = 0
+            return False
 
         if di < self.min_step or self._quota_size is None:
             self._warmup_veto += 1
@@ -2051,7 +2091,7 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             self._consecutive_skips = 0
             return False
 
-        if self._current_ler is None or self._last_signal_update_decision is None:
+        if self._current_ler is None or self._last_valid_emission_decision is None:
             self._probe_decision_count += 1
             self._missing_signal_probe_count += 1
             self._consecutive_skips = 0
@@ -2113,6 +2153,11 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
                 "fallback_random_decision_count": self._fallback_random_decision_count,
                 "fallback_random_skip_count": self._fallback_random_skip_count,
                 "forced_quota_decision_count": self._forced_quota_decision_count,
+                # Terminal contract fields
+                "accepted_emissions": self._accepted_emissions,
+                "last_valid_emission_decision": self._last_valid_emission_decision,
+                "terminal_invalid_observed": self._terminal_invalid_observed,
+                "invalid_emission_events": self._invalid_emission_events,
             }
         )
         return d

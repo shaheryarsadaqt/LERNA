@@ -44,6 +44,24 @@ ONLINE_LER_MODE_TO_TIMING = {
 }
 
 
+class ObservationFailureError(RuntimeError):
+    """Raised when a post-backward observation fails terminally.
+
+    This is distinct from a policy decision failure - it occurs during the
+    sampled LER update after a real backward pass, before the pending
+    optimizer/scheduler action. The attempt must be terminated and the
+    failure evidence flushed.
+    """
+    def __init__(self, tracker_event: dict, valid_prefix: dict, original_exception: Exception):
+        self.tracker_event = tracker_event
+        self.valid_prefix = valid_prefix
+        self.original_exception = original_exception
+        super().__init__(
+            f"Terminal observation failure: {tracker_event.get('event_type', 'unknown')} "
+            f"at decision {tracker_event.get('decision_index', 'unknown')}"
+        )
+
+
 class _OptimizerStepWrapper:
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
         self._trainer = trainer
@@ -466,6 +484,23 @@ class TrueBackwardSkippingTrainer(Trainer):
         self.instr.online_ler_update_attempts += 1
         try:
             trk.update(loss=float(loss_value), logits=logits, accuracy=None, model=model)
+        except TerminalInvalidObservation as tio:
+            self._dump_instrumentation()
+            terminal_event = trk.terminal_invalid_event if trk.terminal_invalid_event is not None else {
+                "event_type": tio.event_type,
+                "decision_index": tio.decision_index,
+                "observation_attempt": getattr(tio, 'observation_attempt', None),
+                "operands": tio.operands,
+            }
+            self._dump_ler_diagnostics(
+                valid_prefix=tio.valid_prefix,
+                terminal_event=terminal_event,
+            )
+            raise ObservationFailureError(
+                tracker_event=terminal_event,
+                valid_prefix=tio.valid_prefix,
+                original_exception=tio,
+            ) from tio
         except Exception as exc:
             logger.debug(f"[TrueSkip] online LER update failed: {exc!r}")
             return False
@@ -509,6 +544,23 @@ class TrueBackwardSkippingTrainer(Trainer):
                 optimizer=self.optimizer,
                 decision_index=decision_index,
             )
+        except TerminalInvalidObservation as tio:
+            self._dump_instrumentation()
+            terminal_event = tracker.terminal_invalid_event if tracker.terminal_invalid_event is not None else {
+                "event_type": tio.event_type,
+                "decision_index": tio.decision_index,
+                "observation_attempt": getattr(tio, 'observation_attempt', None),
+                "operands": tio.operands,
+            }
+            self._dump_ler_diagnostics(
+                valid_prefix=tio.valid_prefix,
+                terminal_event=terminal_event,
+            )
+            raise ObservationFailureError(
+                tracker_event=terminal_event,
+                valid_prefix=tio.valid_prefix,
+                original_exception=tio,
+            ) from tio
         except Exception as exc:
             logger.debug("[TrueSkip] sampled LER update failed: %r", exc)
             return False
@@ -747,6 +799,34 @@ class TrueBackwardSkippingTrainer(Trainer):
             logger.info(f"[TrueSkip] Instrumentation saved: {self.instrumentation_path}")
         except Exception as exc:
             logger.warning(f"[TrueSkip] Could not save instrumentation: {exc!r}")
+
+    def _dump_ler_diagnostics(self, valid_prefix: dict, terminal_event: dict) -> bool:
+        """Save LER diagnostics with finite prefix and terminal event for failure evidence.
+
+        Called on terminal invalid observation BEFORE raising ObservationFailureError.
+        Returns True on success, False on failure (original exception preserved).
+        """
+        if not self.args.output_dir:
+            return False
+        diag_path = os.path.join(self.args.output_dir, "ler_diagnostics.json")
+        try:
+            os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+            # Build diagnostics from tracker if available, otherwise use provided prefix
+            tracker = getattr(self, "ler_tracker", None) or getattr(self, "_ler_tracker", None)
+            if tracker is not None and hasattr(tracker, "get_diagnostics"):
+                diag = tracker.get_diagnostics()
+            else:
+                diag = {}
+            # Merge in the terminal event and valid prefix
+            diag["terminal_invalid_event"] = terminal_event
+            diag["valid_prefix"] = valid_prefix
+            with open(diag_path, "w") as f:
+                json.dump(diag, f, indent=2, default=str)
+            logger.info(f"[TrueSkip] LER diagnostics (terminal) saved: {diag_path}")
+            return True
+        except Exception as exc:
+            logger.warning(f"[TrueSkip] Could not save LER diagnostics: {exc!r}")
+            return False
 
     def get_instrumentation(self) -> Dict[str, Any]:
         return self.instr.as_dict()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -65,6 +66,333 @@ _RUNTIME_ONLY_CONTROLLER_KEYS = frozenset(
         "runtime_quota_total_steps",
     }
 )
+
+
+def _check_signal_integrity(attempt_path: str, cell_id: Any, attempt_name: str, findings: list) -> bool:
+    """Check signal integrity for terminal invalidity per terminal contract.
+
+    Rejects any run where the LER diagnostics contain a terminal_invalid_event.
+    This enforces the terminal contract: first invalid sampled observation
+    terminates attempt before pending optimizer/scheduler action.
+
+    Returns True if signal integrity passes (no terminal invalidity), False otherwise.
+    """
+    ler_diag_path = os.path.join(attempt_path, "ler_diagnostics.json")
+    if not os.path.isfile(ler_diag_path):
+        # No LER diagnostics - not an error, just no signal to check
+        return True
+
+    try:
+        with open(ler_diag_path, "r", encoding="utf-8") as f:
+            ler_diagnostics = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json",
+            "cell": cell_id,
+            "message": f"{attempt_name}: unreadable ler_diagnostics.json: {exc}",
+        })
+        return False
+
+    if not isinstance(ler_diagnostics, dict):
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json",
+            "cell": cell_id,
+            "message": f"{attempt_name}: ler_diagnostics.json is not an object",
+        })
+        return False
+
+    # Check for terminal invalid event (terminal contract)
+    terminal_invalid = ler_diagnostics.get("terminal_invalid_event")
+    if terminal_invalid is not None:
+        event_type = terminal_invalid.get("event_type", "unknown")
+        decision_index = terminal_invalid.get("decision_index", "unknown")
+        observation_attempt = terminal_invalid.get("observation_attempt", "unknown")
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.terminal_invalid_event",
+            "cell": cell_id,
+            "message": (
+                f"{attempt_name}: TERMINAL INVALID OBSERVATION - "
+                f"event_type={event_type!r}, decision_index={decision_index!r}, "
+                f"observation_attempt={observation_attempt!r}. "
+                f"Terminal contract: attempt must stop before pending optimizer/scheduler action."
+            ),
+        })
+        return False
+
+    # Check for any NaN/Infinity in LER histories (should have been caught by tracker)
+    for history_key in ["ler_history", "ler_raw_history", "velocity_history", "rho_vg_history"]:
+        history = ler_diagnostics.get(history_key, [])
+        if isinstance(history, list):
+            for i, val in enumerate(history):
+                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    findings.append({
+                        "severity": "error",
+                        "field": f"ler_diagnostics.json.{history_key}[{i}]",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: non-finite value in {history_key}[{i}] = {val!r} (should have been terminal)",
+                    })
+                    return False
+
+    return True
+
+
+def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_name: str, findings: list) -> bool:
+    """Validate LER diagnostics against the complete terminal contract schema.
+
+    Enforces:
+    - Terminal event/positive invalid count rejection (already checked in _check_signal_integrity)
+    - Required typed fields present
+    - Finite accepted raw/smoothed histories and final values
+    - Emission, counter and age consistency
+    - Rejection of purported valid online runs without valid emissions
+    - Null/missing/malformed field detection
+    - Smoothed NaN with finite raw history detection
+
+    Returns True if schema validation passes, False otherwise.
+    """
+    ler_diag_path = os.path.join(attempt_path, "ler_diagnostics.json")
+    if not os.path.isfile(ler_diag_path):
+        # No LER diagnostics - not an error if online LER was disabled
+        return True
+
+    try:
+        with open(ler_diag_path, "r", encoding="utf-8") as f:
+            diag = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json",
+            "cell": cell_id,
+            "message": f"{attempt_name}: unreadable ler_diagnostics.json: {exc}",
+        })
+        return False
+
+    if not isinstance(diag, dict):
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json",
+            "cell": cell_id,
+            "message": f"{attempt_name}: ler_diagnostics.json is not an object",
+        })
+        return False
+
+    # Required typed fields (per terminal contract)
+    required_fields = {
+        "mode": str,
+        "timing": str,
+        "parameter_sample_size_requested": int,
+        "parameter_sample_size_realized": int,
+        "sampled_tensor_count": int,
+        "n_updates": int,
+        "n_decisions": int,
+        "observation_age_decisions": (int, type(None)),
+        "observation_attempts": int,
+        "warmup_updates": int,
+        "valid_emissions": int,
+        "invalid_emission_events": int,
+        "terminal_invalid_event": (dict, type(None)),
+        "last_valid_emission_decision": (int, type(None)),
+        "ler_raw_history": list,
+        "ler_history": list,
+        "velocity_history": list,
+        "rho_vg_history": list,
+        "loss_history": list,
+        "entropy_history": list,
+    }
+
+    for field, expected_type in required_fields.items():
+        if field not in diag:
+            findings.append({
+                "severity": "error",
+                "field": f"ler_diagnostics.json.{field}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: missing required field {field!r}",
+            })
+        elif not isinstance(diag[field], expected_type):
+            findings.append({
+                "severity": "error",
+                "field": f"ler_diagnostics.json.{field}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: field {field!r} has wrong type {type(diag[field]).__name__}, expected {expected_type if isinstance(expected_type, tuple) else expected_type.__name__}",
+            })
+
+    if findings:
+        return False
+
+    # Finite accepted raw/smoothed histories and final values
+    history_fields = ["ler_raw_history", "ler_history", "velocity_history", "rho_vg_history", "loss_history", "entropy_history"]
+    for hf in history_fields:
+        history = diag.get(hf, [])
+        if isinstance(history, list):
+            for i, val in enumerate(history):
+                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    findings.append({
+                        "severity": "error",
+                        "field": f"ler_diagnostics.json.{hf}[{i}]",
+                        "cell": cell_id,
+                        "message": f"{attempt_name}: non-finite value in accepted {hf}[{i}] = {val!r}",
+                    })
+                    return False
+
+    # Final values (ler, ler_raw, rho_vg, param_velocity) must be finite or null
+    final_value_fields = {
+        "ler": diag.get("ler"),
+        "ler_raw": diag.get("ler_raw"),
+        "rho_vg": diag.get("rho_vg"),
+        "param_velocity": diag.get("param_velocity"),
+    }
+    for fv_name, fv in final_value_fields.items():
+        if fv is not None and isinstance(fv, float) and (math.isnan(fv) or math.isinf(fv)):
+            findings.append({
+                "severity": "error",
+                "field": f"ler_diagnostics.json.{fv_name}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: non-finite final value {fv_name} = {fv!r}",
+            })
+            return False
+
+    # Terminal event already rejected by _check_signal_integrity, but also check invalid_emission_events > 0
+    invalid_count = diag.get("invalid_emission_events", 0)
+    if invalid_count > 0:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.invalid_emission_events",
+            "cell": cell_id,
+            "message": f"{attempt_name}: invalid_emission_events = {invalid_count} > 0 (terminal contract violation)",
+        })
+        return False
+
+    # Emission/counter/age consistency
+    n_updates = diag.get("n_updates", 0)
+    warmup_updates = diag.get("warmup_updates", 0)
+    valid_emissions = diag.get("valid_emissions", 0)
+    obs_attempts = diag.get("observation_attempts", 0)
+    n_decisions = diag.get("n_decisions", 0)
+    obs_age = diag.get("observation_age_decisions")
+    last_valid_decision = diag.get("last_valid_emission_decision")
+
+    # Counters must be non-negative
+    for counter_name, counter_val in [
+        ("n_updates", n_updates), ("warmup_updates", warmup_updates),
+        ("valid_emissions", valid_emissions), ("observation_attempts", obs_attempts),
+        ("n_decisions", n_decisions),
+    ]:
+        if not isinstance(counter_val, int) or counter_val < 0:
+            findings.append({
+                "severity": "error",
+                "field": f"ler_diagnostics.json.{counter_name}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: {counter_name} must be non-negative integer, got {counter_val!r}",
+            })
+            return False
+
+    # observation_attempts == warmup_updates + valid_emissions + invalid_emission_events (but invalid already checked >0)
+    # Note: invalid_emission_events is 0 here (rejected above)
+    if obs_attempts != warmup_updates + valid_emissions:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.counter_consistency",
+            "cell": cell_id,
+            "message": f"{attempt_name}: observation_attempts ({obs_attempts}) != warmup_updates ({warmup_updates}) + valid_emissions ({valid_emissions}) + invalid_emission_events ({invalid_count})",
+        })
+        return False
+
+    # History lengths should match counters
+    if len(diag.get("ler_raw_history", [])) != valid_emissions:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.ler_raw_history.length",
+            "cell": cell_id,
+            "message": f"{attempt_name}: ler_raw_history length {len(diag.get('ler_raw_history', []))} != valid_emissions {valid_emissions}",
+        })
+        return False
+
+    if len(diag.get("ler_history", [])) != valid_emissions:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.ler_history.length",
+            "cell": cell_id,
+            "message": f"{attempt_name}: ler_history length {len(diag.get('ler_history', []))} != valid_emissions {valid_emissions}",
+        })
+        return False
+
+    # observation_age_decisions consistency
+    if obs_age is not None and obs_age < 0:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.observation_age_decisions",
+            "cell": cell_id,
+            "message": f"{attempt_name}: observation_age_decisions must be non-negative, got {obs_age}",
+        })
+        return False
+
+    if last_valid_decision is not None:
+        if last_valid_decision < 0:
+            findings.append({
+                "severity": "error",
+                "field": "ler_diagnostics.json.last_valid_emission_decision",
+                "cell": cell_id,
+                "message": f"{attempt_name}: last_valid_emission_decision must be non-negative, got {last_valid_decision}",
+            })
+            return False
+        if n_decisions > 0 and last_valid_decision >= n_decisions:
+            findings.append({
+                "severity": "error",
+                "field": "ler_diagnostics.json.last_valid_emission_decision",
+                "cell": cell_id,
+                "message": f"{attempt_name}: last_valid_emission_decision ({last_valid_decision}) >= n_decisions ({n_decisions})",
+            })
+            return False
+
+    # Rejection of purported valid online runs without valid emissions
+    # If online diagnostics were enabled (n_updates > 0), must have valid_emissions > 0 or still in warmup
+    if n_updates > 0 and valid_emissions == 0 and warmup_updates == 0:
+        findings.append({
+            "severity": "error",
+            "field": "ler_diagnostics.json.valid_emissions",
+            "cell": cell_id,
+            "message": f"{attempt_name}: valid_emissions == 0 but n_updates > 0 and warmup_updates == 0 (no valid emissions, no warmup)",
+        })
+        return False
+
+    # Smoothed NaN with finite raw history detection
+    # If ler_raw_history is all finite but ler_history has NaN, that's an error
+    ler_raw = diag.get("ler_raw_history", [])
+    ler_smooth = diag.get("ler_history", [])
+    if ler_raw and ler_smooth:
+        all_raw_finite = all(isinstance(v, (int, float)) and math.isfinite(v) for v in ler_raw)
+        any_smooth_nonfinite = any(isinstance(v, float) and (math.isnan(v) or math.isinf(v)) for v in ler_smooth)
+        if all_raw_finite and any_smooth_nonfinite:
+            findings.append({
+                "severity": "error",
+                "field": "ler_diagnostics.json.ler_history.smoothed_nan",
+                "cell": cell_id,
+                "message": f"{attempt_name}: ler_history contains non-finite values while ler_raw_history is all finite (smoothing produced NaN/Inf)",
+            })
+            return False
+
+    # Terminal invalid event operands must use explicit non-finite tags (kind/value)
+    terminal_event = diag.get("terminal_invalid_event")
+    if terminal_event is not None:
+        operands = terminal_event.get("operands", {})
+        if isinstance(operands, dict):
+            for op_name, op_data in operands.items():
+                if isinstance(op_data, dict):
+                    kind = op_data.get("kind")
+                    value = op_data.get("value")
+                    if kind != "nonfinite" or value not in ("NaN", "+Infinity", "-Infinity"):
+                        findings.append({
+                            "severity": "error",
+                            "field": f"ler_diagnostics.json.terminal_invalid_event.operands.{op_name}",
+                            "cell": cell_id,
+                            "message": f"{attempt_name}: terminal invalid operand {op_name!r} must use explicit non-finite tags (kind='nonfinite', value in ['NaN', '+Infinity', '-Infinity']), got {op_data!r}",
+                        })
+                        return False
+
+    return True
 
 
 class CompletedMatrixError(ValueError):
@@ -558,6 +886,16 @@ def validate_phase1_3_completed_matrix(
                     "cell": cell_id,
                     "message": f"{attempt_name}: results are not valid_for_matched_budget",
                 })
+
+            # Signal integrity check: reject terminal invalidity per terminal contract
+            if not _check_signal_integrity(attempt_path, cell_id, attempt_name, attempt_findings):
+                # Findings already added by _check_signal_integrity
+                pass
+
+            # Full LER diagnostics schema validation
+            if not _validate_ler_diagnostics_schema(attempt_path, cell_id, attempt_name, attempt_findings):
+                # Findings already added by _validate_ler_diagnostics_schema
+                pass
 
             if attempt_findings:
                 findings.extend(attempt_findings)

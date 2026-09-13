@@ -117,6 +117,53 @@ from lerna.utils.phase1_3_operations import (
     require_frozen_mrpc_facts,
     scan_phase1_3_progress,
 )
+
+
+def strict_json_serializer(obj):
+    """Strict JSON serializer for terminal contract compliance.
+
+    Does NOT use default=str. Does NOT convert NaN/Inf to null.
+    Accepted numerical histories must contain finite numbers only.
+    Terminal-event operands must use explicit non-finite tags (kind/value).
+    Legitimate missing/warmup values remain distinguishable (null for absent).
+
+    Raises TypeError for unsupported types (strict mode).
+    """
+    import base64
+
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+    if isinstance(obj, float):
+        return obj  # Pass through - validation rejects non-finite in accepted data
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return [strict_json_serializer(x) for x in obj.tolist()]
+    if isinstance(obj, torch.Tensor):
+        return [strict_json_serializer(x) for x in obj.detach().cpu().tolist()]
+    if isinstance(obj, (set, frozenset)):
+        return [strict_json_serializer(x) for x in obj]
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode('ascii')
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {strict_json_serializer(k): strict_json_serializer(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [strict_json_serializer(x) for x in obj]
+    if hasattr(obj, '__dict__'):
+        return {k: strict_json_serializer(v) for k, v in obj.__dict__.items() if not k.startswith('_')}
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable (strict mode)")
+
+
+def strict_json_dumps(obj, indent=2):
+    """Serialize to JSON string using strict serializer."""
+    return json.dumps(strict_json_serializer(obj), indent=indent, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def strict_json_dump(obj, fp, indent=2):
+    """Write JSON to file using strict serializer."""
+    json.dump(strict_json_serializer(obj), fp, indent=indent, ensure_ascii=False, sort_keys=True, allow_nan=False)
 from lerna.utils.phase1_3_matrix import (
     PHASE1_3_CANONICAL_ARMS,
     PHASE1_3_POLICY_CLASSES,
@@ -1542,7 +1589,7 @@ class AblationDiagnosticsCallback:
             tracker_diagnostics=tracker_diagnostics,
         )
         with open(diag_path, "w") as f:
-            json.dump(final, f, indent=2, default=str)
+            strict_json_dump(final, f, indent=2)
         print(f"  LER diagnostics saved: {diag_path}")
 
 
@@ -2479,7 +2526,7 @@ def run_ablation_single(
 
         results_path = os.path.join(output_dir, "results.json")
         with open(results_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
+            strict_json_dump(results, f, indent=2)
 
         if use_wandb:
             try:
@@ -3287,7 +3334,7 @@ def main():
     summary_path = os.path.join(args.output_dir, "ablation_summary.json")
     os.makedirs(args.output_dir, exist_ok=True)
     with open(summary_path, "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
+        strict_json_dump(all_results, f, indent=2)
 
     total_elapsed = time.time() - overall_start
     successful = [r for r in all_results if "error" not in r]
