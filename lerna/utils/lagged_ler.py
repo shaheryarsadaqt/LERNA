@@ -101,14 +101,28 @@ class SampledLaggedLERTracker:
         Validates all inputs before committing any state. On first non-finite
         observation, raises TerminalInvalidObservation with the valid prefix
         preserved and invalid operands recorded.
+
+        Once a terminal invalid event is recorded, the tracker enters an
+        absorbing terminal state: all subsequent updates immediately raise
+        TerminalInvalidObservation without modifying state.
         """
         del accuracy
         opt = optimizer if optimizer is not None else self._optimizer
 
+        # Absorbing terminal state: if already terminal, re-raise immediately
+        if self.terminal_invalid_event is not None:
+            raise TerminalInvalidObservation(
+                "terminal_invalid_already_recorded",
+                decision_index if decision_index is not None else self._last_noted_decision or 0,
+                {"note": "tracker already in terminal state"},
+                self._get_valid_prefix()
+            )
+
         # Increment attempt counter at start
         self.observation_attempts += 1
 
-        # Validate loss BEFORE appending to history
+        # --- Phase 1: Compute all values without committing state ---
+        # Validate loss
         loss_val = float(loss)
         if not math.isfinite(loss_val):
             tagged = {"loss": self._make_tagged_operand(loss_val)}
@@ -120,7 +134,7 @@ class SampledLaggedLERTracker:
                 self._get_valid_prefix()
             )
 
-        # Compute and validate entropy BEFORE appending
+        # Compute and validate entropy
         entropy = self._compute_entropy(logits)
         if not math.isfinite(entropy):
             tagged = {"entropy": self._make_tagged_operand(entropy)}
@@ -132,10 +146,7 @@ class SampledLaggedLERTracker:
                 self._get_valid_prefix()
             )
 
-        # Now append to histories (both are finite)
-        self.loss_history.append(loss_val)
-        self.entropy_history.append(entropy)
-
+        # Compute velocity and rho (but don't commit yet)
         velocity: Optional[float] = None
         rho: Optional[float] = None
         new_samples = None
@@ -143,6 +154,7 @@ class SampledLaggedLERTracker:
             if self._sample_plan is None:
                 self._build_sample_plan(model)
             if self._prev_samples is None:
+                # First update with model: capture initial samples, no dynamics yet
                 self._prev_samples = self._capture_samples(model)
             else:
                 velocity, rho, new_samples = self._sampled_dynamics(model, opt)
@@ -165,16 +177,75 @@ class SampledLaggedLERTracker:
                         tagged,
                         self._get_valid_prefix()
                     )
-                # Commit new_samples only after validation passes
-                self._prev_samples = new_samples
 
+        # Pre-validate LER emission (would be emitted if sufficient history)
+        # We need to simulate _maybe_append_ler logic to check if LER would be non-finite
+        # This ensures atomic commit: either all histories updated or none
+        # Check if AFTER appending this loss/entropy, there would be sufficient history
+        loss_history_len_after = len(self.loss_history) + 1
+        # Need at least 2 losses for gain calculation
+        will_emit_ler = loss_history_len_after >= 2
+        if will_emit_ler:
+            # Compute gain as it would be after append (matching _loss_gain logic)
+            if loss_history_len_after >= 4:
+                window_size = min(self.window_size, loss_history_len_after)
+                half = window_size // 2
+                older_start = loss_history_len_after - window_size
+                older_end = loss_history_len_after - half
+                # Build older and newer windows as _loss_gain would
+                older_losses = list(self.loss_history[older_start:older_end])
+                newer_losses = list(self.loss_history[older_end:]) + [loss_val]
+                # If the new loss_val falls in older window, adjust
+                if older_end == loss_history_len_after:
+                    older_losses.append(loss_val)
+                    newer_losses = list(self.loss_history[older_end:])
+                gain = (sum(older_losses) / len(older_losses)) - (sum(newer_losses) / len(newer_losses))
+            else:
+                # Simple difference between last two losses
+                if len(self.loss_history) >= 1:
+                    gain = self.loss_history[-1] - loss_val
+                else:
+                    gain = 0.0
+            gain = max(float(gain), 0.0)
+            
+            # Entropy window: take up to window_size entries from history + new entropy
+            entropy_window = list(self.entropy_history[-self.window_size:]) + [entropy]
+            average_entropy = sum(entropy_window) / len(entropy_window)
+            if velocity is not None and velocity > 0:
+                ler_candidate = velocity * gain * average_entropy
+            else:
+                ler_candidate = gain * average_entropy
+            if not math.isfinite(ler_candidate):
+                tagged = {"ler": self._make_tagged_operand(ler_candidate)}
+                self._record_terminal_invalid("nonfinite_ler", decision_index, tagged)
+                raise TerminalInvalidObservation(
+                    "nonfinite_ler",
+                    decision_index if decision_index is not None else self._last_noted_decision or 0,
+                    tagged,
+                    self._get_valid_prefix()
+                )
+            ler_candidate = max(float(ler_candidate), _LER_FLOOR)
+
+        # --- Phase 2: All validations passed, commit atomically ---
+        self.loss_history.append(loss_val)
+        self.entropy_history.append(entropy)
+
+        if model is not None and self._prev_samples is not None and new_samples is not None:
+            self._prev_samples = new_samples
         if velocity is not None:
             self.velocity_history.append(velocity)
         if rho is not None:
             self.rho_vg_history.append(rho)
 
-        # Try to append LER - this validates gain and entropy again
-        self._maybe_append_ler(velocity)
+        # Actually emit LER if we would
+        if will_emit_ler:
+            self.ler_raw_history.append(ler_candidate)
+            if self.ler_history:
+                ler_candidate = _EMA_KEEP * self.ler_history[-1] + _EMA_NEW * ler_candidate
+            self.ler_history.append(ler_candidate)
+            emitted_ler = True
+        else:
+            emitted_ler = False
 
         # Update counters
         self.n_updates += 1
@@ -184,13 +255,12 @@ class SampledLaggedLERTracker:
             self.last_update_decision = self._last_noted_decision
         self._decisions_at_last_update = self.n_decisions
 
-        # Track whether we emitted a valid LER
-        if self.ler_raw_history and (self.valid_emissions == 0 or len(self.ler_raw_history) > self.valid_emissions):
+        # Track whether we emitted a valid LER.
+        if emitted_ler:
             self.valid_emissions += 1
             if self.last_update_decision is not None:
                 self.last_valid_emission_decision = self.last_update_decision
-        elif len(self.loss_history) < 2:
-            # Legitimate warmup - finite update but no LER yet
+        else:
             self.warmup_updates += 1
 
     def _get_valid_prefix(self) -> Dict[str, Any]:
@@ -199,12 +269,12 @@ class SampledLaggedLERTracker:
             "observation_attempts": self.observation_attempts,
             "warmup_updates": self.warmup_updates,
             "valid_emissions": self.valid_emissions,
-            "ler_raw_history": [float(v) for v in self.ler_raw_history],
-            "ler_history": [float(v) for v in self.ler_history],
-            "velocity_history": [float(v) for v in self.velocity_history],
-            "rho_vg_history": [float(v) for v in self.rho_vg_history],
-            "loss_history": [float(v) for v in self.loss_history],
-            "entropy_history": [float(v) for v in self.entropy_history],
+            "ler_raw_history": list(self.ler_raw_history),
+            "ler_history": list(self.ler_history),
+            "velocity_history": list(self.velocity_history),
+            "rho_vg_history": list(self.rho_vg_history),
+            "loss_history": list(self.loss_history),
+            "entropy_history": list(self.entropy_history),
         }
 
     def _make_tagged_operand(self, value: float) -> Dict[str, str]:
@@ -253,12 +323,12 @@ class SampledLaggedLERTracker:
             "invalid_emission_events": self.invalid_emission_events,
             "terminal_invalid_event": self.terminal_invalid_event,
             "last_valid_emission_decision": self.last_valid_emission_decision,
-            "ler_raw_history": [float(v) for v in self.ler_raw_history],
-            "ler_history": [float(v) for v in self.ler_history],
-            "velocity_history": [float(v) for v in self.velocity_history],
-            "rho_vg_history": [float(v) for v in self.rho_vg_history],
-            "loss_history": [float(v) for v in self.loss_history],
-            "entropy_history": [float(v) for v in self.entropy_history],
+            "ler_raw_history": list(self.ler_raw_history),
+            "ler_history": list(self.ler_history),
+            "velocity_history": list(self.velocity_history),
+            "rho_vg_history": list(self.rho_vg_history),
+            "loss_history": list(self.loss_history),
+            "entropy_history": list(self.entropy_history),
         }
 
     def _build_sample_plan(self, model: torch.nn.Module) -> None:
@@ -414,33 +484,6 @@ class SampledLaggedLERTracker:
         else:
             gain = self.loss_history[-2] - self.loss_history[-1]
         return max(float(gain), 0.0)
-
-    def _maybe_append_ler(self, velocity: Optional[float]) -> None:
-        gain = self._loss_gain()
-        if gain is None:
-            return
-        entropy_window = self.entropy_history[-self.window_size:]
-        average_entropy = sum(entropy_window) / len(entropy_window)
-        if velocity is not None and velocity > 0:
-            ler = velocity * gain * average_entropy
-        else:
-            ler = gain * average_entropy
-        # Validate LER before appending
-        if not math.isfinite(ler):
-            # This should not happen if inputs were validated, but guard anyway
-            tagged = {"ler": self._make_tagged_operand(ler)}
-            self._record_terminal_invalid("nonfinite_ler", self._last_noted_decision or 0, tagged)
-            raise TerminalInvalidObservation(
-                "nonfinite_ler",
-                self._last_noted_decision or 0,
-                tagged,
-                self._get_valid_prefix()
-            )
-        ler = max(float(ler), _LER_FLOOR)
-        self.ler_raw_history.append(ler)
-        if self.ler_history:
-            ler = _EMA_KEEP * self.ler_history[-1] + _EMA_NEW * ler
-        self.ler_history.append(ler)
 
     def _window_mean(self, history: List[float]) -> Optional[float]:
         if not history:

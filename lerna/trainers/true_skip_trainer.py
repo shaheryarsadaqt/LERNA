@@ -21,6 +21,8 @@ from typing import Any, Dict, Optional, Protocol
 import torch
 from transformers import Trainer, TrainerCallback
 
+from lerna.utils.lagged_ler import TerminalInvalidObservation
+
 logger = logging.getLogger(__name__)
 
 # --- Online LER diagnostic mode constants ---
@@ -269,6 +271,9 @@ class SkipInstrumentation:
     online_ler_enabled: bool = True
     online_ler_mode: str = ONLINE_LER_MODE_LEGACY_DENSE
     online_ler_update_timing: str = ONLINE_LER_TIMING_PRE_DECISION
+    # Consistent mode/timing keys matching tracker diagnostics and runtime metadata
+    mode: str = ONLINE_LER_MODE_LEGACY_DENSE
+    timing: str = ONLINE_LER_TIMING_PRE_DECISION
     online_ler_update_interval: int = 1
     online_ler_update_attempts: int = 0
     online_ler_update_successes: int = 0
@@ -437,6 +442,8 @@ class TrueBackwardSkippingTrainer(Trainer):
             online_ler_enabled=self.online_ler_enabled,
             online_ler_mode=self.online_ler_mode,
             online_ler_update_timing=self.online_ler_update_timing,
+            mode=self.online_ler_mode,
+            timing=self.online_ler_update_timing,
             online_ler_update_interval=self.online_ler_update_interval,
             capture_logits_enabled=self.capture_logits,
             grad_norm_capture_enabled=hasattr(self.skip_policy, "record_grad_norm"),
@@ -470,6 +477,33 @@ class TrueBackwardSkippingTrainer(Trainer):
     def on_skipped_backward_step(self, loss, model, inputs) -> None:
         return None
 
+    def _raise_required_observation_failure(self, tracker, exc: Exception) -> None:
+        self.instr.run_invalidated = True
+        self._dump_instrumentation()
+        try:
+            valid_prefix = tracker.get_diagnostics()
+        except Exception:
+            valid_prefix = {}
+        terminal_event = {
+            "event_type": "diagnostic_update_error",
+            "decision_index": max(self.instr.batches_seen - 1, 0),
+            "observation_attempt": self.instr.online_ler_update_attempts,
+            "operands": {
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            },
+        }
+        self._dump_ler_diagnostics(
+            valid_prefix=valid_prefix,
+            terminal_event=terminal_event,
+        )
+        self._uninstall_wrappers()
+        raise ObservationFailureError(
+            tracker_event=terminal_event,
+            valid_prefix=valid_prefix,
+            original_exception=exc,
+        ) from exc
+
     # ----------------------------------------------------- online LER update (FIX P0-3)
     def _online_ler_update(self, loss_value, logits, model) -> bool:
         """Update legacy dense diagnostics before the current decision."""
@@ -485,6 +519,7 @@ class TrueBackwardSkippingTrainer(Trainer):
         try:
             trk.update(loss=float(loss_value), logits=logits, accuracy=None, model=model)
         except TerminalInvalidObservation as tio:
+            self.instr.run_invalidated = True
             self._dump_instrumentation()
             terminal_event = trk.terminal_invalid_event if trk.terminal_invalid_event is not None else {
                 "event_type": tio.event_type,
@@ -496,6 +531,7 @@ class TrueBackwardSkippingTrainer(Trainer):
                 valid_prefix=tio.valid_prefix,
                 terminal_event=terminal_event,
             )
+            self._uninstall_wrappers()
             raise ObservationFailureError(
                 tracker_event=terminal_event,
                 valid_prefix=tio.valid_prefix,
@@ -545,6 +581,7 @@ class TrueBackwardSkippingTrainer(Trainer):
                 decision_index=decision_index,
             )
         except TerminalInvalidObservation as tio:
+            self.instr.run_invalidated = True
             self._dump_instrumentation()
             terminal_event = tracker.terminal_invalid_event if tracker.terminal_invalid_event is not None else {
                 "event_type": tio.event_type,
@@ -556,14 +593,14 @@ class TrueBackwardSkippingTrainer(Trainer):
                 valid_prefix=tio.valid_prefix,
                 terminal_event=terminal_event,
             )
+            self._uninstall_wrappers()
             raise ObservationFailureError(
                 tracker_event=terminal_event,
                 valid_prefix=tio.valid_prefix,
                 original_exception=tio,
             ) from tio
         except Exception as exc:
-            logger.debug("[TrueSkip] sampled LER update failed: %r", exc)
-            return False
+            self._raise_required_observation_failure(tracker, exc)
         self.instr.online_ler_update_successes += 1
         self.instr.online_ler_last_update_decision = decision_index
         return True

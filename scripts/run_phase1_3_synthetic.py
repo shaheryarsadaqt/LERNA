@@ -794,13 +794,12 @@ def _execute_cell(
 
         _atomic_write_json(attempt_dir / "instrumentation.json", instrumentation)
         if online["enabled"]:
+            diagnostics = copy.deepcopy(tracker_diagnostics)
+            diagnostics["online_diagnostics"] = online_runtime
+            diagnostics["policy_diagnostics"] = policy_diagnostics
             _atomic_write_json(
                 attempt_dir / "ler_diagnostics.json",
-                {
-                    "online_diagnostics": online_runtime,
-                    "tracker_diagnostics": tracker_diagnostics,
-                    "policy_diagnostics": policy_diagnostics,
-                },
+                diagnostics,
             )
         results_path = attempt_dir / "results.json"
         _atomic_write_json(results_path, results)

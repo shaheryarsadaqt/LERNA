@@ -36,12 +36,19 @@ class FakeLaggedTracker:
         self.extra = {}
         self.update_calls = 0
         self.note_calls = 0
+        # Terminal contract fields
+        self.valid_emissions = 0
+        self.last_valid_emission_decision = None
+        self.invalid_emission_events = 0
+        self.terminal_invalid_event = None
 
     def commit(self, ler, decision_index):
         self.ler_raw = ler
         self.ler = ler
         self.last_update_decision = decision_index
         self.observation_age_decisions = 0
+        self.valid_emissions += 1
+        self.last_valid_emission_decision = decision_index
 
     def tick(self):
         self.observation_age_decisions += 1
@@ -60,6 +67,11 @@ class FakeLaggedTracker:
             "ler": self.ler,
             "last_update_decision": self.last_update_decision,
             "observation_age_decisions": self.observation_age_decisions,
+            # Terminal contract fields
+            "valid_emissions": self.valid_emissions,
+            "last_valid_emission_decision": self.last_valid_emission_decision,
+            "invalid_emission_events": self.invalid_emission_events,
+            "terminal_invalid_event": self.terminal_invalid_event,
         }
         d.update(self.extra)
         return d
@@ -197,7 +209,7 @@ def test_low_ler_skips_more_than_high_ler_under_identical_rng():
         tracker = FakeLaggedTracker()
         policy = make_policy(tracker)
         trainer = FakeTrainer(TOTAL_STEPS)
-        commits = {0: (1.0, 0), 1: (2.0, 1), 2: (3.0, 2), 19: (final_ler, 3)}
+        commits = {0: (1.0, 0), 1: (2.0, 1), 2: (3.0, 2), 19: (final_ler, 19)}
         for di in range(20):
             if di in commits:
                 tracker.commit(*commits[di])

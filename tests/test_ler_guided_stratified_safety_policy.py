@@ -30,6 +30,11 @@ class FakeSampledLaggedTracker:
         self.loss_history = []
         self.update_calls = 0
         self.note_calls = 0
+        # Terminal contract fields
+        self.valid_emissions = 0
+        self.last_valid_emission_decision = None
+        self.invalid_emission_events = 0
+        self.terminal_invalid_event = None
 
     def update(self, *args, **kwargs):
         self.update_calls += 1
@@ -47,6 +52,11 @@ class FakeSampledLaggedTracker:
             "last_update_decision": self.last_update_decision,
             "rho_vg_raw": self.rho_vg_raw,
             "rho_vg": self.rho_vg,
+            # Terminal contract fields
+            "valid_emissions": self.valid_emissions,
+            "last_valid_emission_decision": self.last_valid_emission_decision,
+            "invalid_emission_events": self.invalid_emission_events,
+            "terminal_invalid_event": self.terminal_invalid_event,
         }
 
 
@@ -71,6 +81,9 @@ def prime_guided_skip(policy, tracker):
     tracker.ler_raw = 0.1
     tracker.observation_age_decisions = 0
     tracker.last_update_decision = 3
+    # Terminal contract fields
+    tracker.valid_emissions = 1
+    tracker.last_valid_emission_decision = 3
     policy._ler_observations = [1.0, 2.0, 0.1]
     policy._last_signal_update_decision = 3
     policy._current_ler = 0.1

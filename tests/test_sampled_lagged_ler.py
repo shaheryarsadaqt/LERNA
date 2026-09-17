@@ -48,6 +48,19 @@ CANONICAL_KEYS = {
     "n_rho_vg_samples",
     "full_parameter_snapshots",
     "full_vector_concatenation",
+    # Terminal contract fields
+    "observation_attempts",
+    "warmup_updates",
+    "valid_emissions",
+    "invalid_emission_events",
+    "terminal_invalid_event",
+    "last_valid_emission_decision",
+    "ler_raw_history",
+    "ler_history",
+    "velocity_history",
+    "rho_vg_history",
+    "loss_history",
+    "entropy_history",
 }
 
 

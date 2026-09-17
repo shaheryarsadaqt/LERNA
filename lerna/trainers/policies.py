@@ -21,6 +21,32 @@ import torch
 from lerna.callbacks.lerna_switching import SafetyHorizon
 
 
+class TerminalInvalidPolicyError(RuntimeError):
+    """Raised when a policy observes a terminal invalid tracker event.
+
+    The run must terminate immediately. No later decision is allowed after
+    the first terminal observation. The trainer wraps this in
+    SkipPolicyDecisionError, which marks the run invalidated and flushes
+    instrumentation before propagating.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy_name: str,
+        decision_index: int,
+        terminal_event: dict,
+    ):
+        self.policy_name = policy_name
+        self.decision_index = int(decision_index)
+        self.terminal_event = terminal_event
+        super().__init__(
+            f"Policy {policy_name!r} observed terminal invalid event "
+            f"{terminal_event.get('event_type', 'unknown')!r} at decision "
+            f"{decision_index}; the run must terminate"
+        )
+
+
 def build_exact_random_skip_set(
     total_steps: int,
     target_skip_rate: float,
@@ -1960,11 +1986,15 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
         equal = sum(1 for v in obs if v == value)
         return (less + 0.5 * equal) / len(obs)
 
-    def _observe_signal(self) -> None:
+    def _observe_signal(self, current_decision_index: int) -> None:
         """Observe new valid LER emissions from tracker.
 
         Only consumes emissions when tracker.valid_emissions increases.
         Uses zero-based decision indices for age calculation.
+
+        Args:
+            current_decision_index: The zero-based decision index for the
+                current should_skip call (before incrementing _decisions_seen).
         """
         if self._terminal_invalid_observed:
             return
@@ -1983,28 +2013,34 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
 
         # Only observe when a NEW valid emission is available
         if valid_emissions > self._accepted_emissions and ler_raw is not None:
+            # R4: Reject non-finite raw emissions before ranking
+            if not math.isfinite(ler_raw):
+                # This should not happen if tracker validates, but guard anyway
+                self._terminal_invalid_observed = True
+                return
             # New emission available - consume it
             self._ler_observations.append(float(ler_raw))
             self._accepted_emissions = valid_emissions
             self._last_valid_emission_decision = last_valid_emission_decision
+            self._last_signal_update_decision = last_valid_emission_decision
             self._current_ler = float(ler_raw)
             self._current_ler_rank = self._percentile_rank(float(ler_raw))
             self._current_signal_age = 0
         elif self._accepted_emissions > 0:
             # No new emission, age increases
             if last_valid_emission_decision is not None:
-                # Age = current zero-based decision index - last valid emission decision index
-                # At the start of should_skip, di = _decisions_seen (0-based for current decision)
-                current_di = self._decisions_seen
+                # R5: Use actual current decision index (passed as argument),
+                # not _decisions_seen which has already been incremented for next decision
+                current_di = current_decision_index
                 self._current_signal_age = current_di - last_valid_emission_decision
                 self._max_signal_age_observed = max(
                     self._max_signal_age_observed, self._current_signal_age
                 )
             else:
-                self._current_signal_age = self._decisions_seen
+                self._current_signal_age = current_decision_index
         else:
             # No valid emissions yet (warmup)
-            self._current_signal_age = self._decisions_seen
+            self._current_signal_age = current_decision_index
 
         # Also check invalid_emission_events for diagnostics
         self._invalid_emission_events = diag.get("invalid_emission_events", 0)
@@ -2026,12 +2062,26 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
         di = self._decisions_seen
         self._decisions_seen += 1
         self._lazy_init(trainer)
-        self._observe_signal()
+        # Pass current decision index (di) for correct signal-age accounting
+        self._observe_signal(di)
 
-        # Terminal contract: stop on first invalid observation
+        # Terminal contract: stop on first invalid observation.
+        # Returning False would select real backward and continue training,
+        # which violates the terminal contract. Raise instead so the trainer
+        # marks the run invalidated and flushes evidence before propagating.
         if self._terminal_invalid_observed:
-            self._consecutive_skips = 0
-            return False
+            diag = self.ler_tracker.get_diagnostics()
+            terminal_event = diag.get("terminal_invalid_event") or {
+                "event_type": "terminal_invalid_observed",
+                "decision_index": di,
+                "observation_attempt": diag.get("observation_attempts"),
+                "operands": {},
+            }
+            raise TerminalInvalidPolicyError(
+                policy_name=self.name,
+                decision_index=di,
+                terminal_event=terminal_event,
+            )
 
         if di < self.min_step or self._quota_size is None:
             self._warmup_veto += 1

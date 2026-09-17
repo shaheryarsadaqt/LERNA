@@ -577,7 +577,38 @@ def _create_cell_fixture(
     if is_online:
         ler_path = os.path.join(attempt_dir, "ler_diagnostics.json")
         with open(ler_path, "w", encoding="utf-8") as f:
-            json.dump({"ler_estimate": 0.05}, f)
+            json.dump({
+                "mode": "sampled_lagged",
+                "timing": "post_decision_after_backward",
+                "parameter_sample_size_requested": 4096,
+                "parameter_sample_size_realized": 4096,
+                "sampled_tensor_count": 12,
+                "n_updates": 5,
+                "n_decisions": 50,
+                "last_update_decision": 45,
+                "observation_age_decisions": 5,
+                "ler": 0.012,
+                "ler_raw": 0.0125,
+                "rho_vg": 0.01,
+                "rho_vg_raw": 0.01,
+                "param_velocity": 0.001,
+                "n_velocity_samples": 5,
+                "n_rho_vg_samples": 5,
+                "full_parameter_snapshots": False,
+                "full_vector_concatenation": False,
+                "observation_attempts": 5,
+                "warmup_updates": 2,
+                "valid_emissions": 3,
+                "invalid_emission_events": 0,
+                "terminal_invalid_event": None,
+                "last_valid_emission_decision": 45,
+                "ler_raw_history": [0.01, 0.011, 0.0125],
+                "ler_history": [0.01, 0.0105, 0.011],
+                "velocity_history": [0.001] * 5,
+                "rho_vg_history": [0.01] * 5,
+                "loss_history": [0.5, 0.48, 0.47, 0.46, 0.45],
+                "entropy_history": [1.0, 1.1, 1.05, 1.08, 1.06],
+            }, f)
 
     if status == "running":
         return  # Don't finalize

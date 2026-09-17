@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+from numbers import Real
 import os
 import re
 import sys
@@ -228,12 +229,12 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         history = diag.get(hf, [])
         if isinstance(history, list):
             for i, val in enumerate(history):
-                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                if isinstance(val, bool) or not isinstance(val, Real) or not math.isfinite(float(val)):
                     findings.append({
                         "severity": "error",
                         "field": f"ler_diagnostics.json.{hf}[{i}]",
                         "cell": cell_id,
-                        "message": f"{attempt_name}: non-finite value in accepted {hf}[{i}] = {val!r}",
+                        "message": f"{attempt_name}: history value in {hf}[{i}] must be a finite real number, got {val!r}",
                     })
                     return False
 
@@ -245,12 +246,12 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         "param_velocity": diag.get("param_velocity"),
     }
     for fv_name, fv in final_value_fields.items():
-        if fv is not None and isinstance(fv, float) and (math.isnan(fv) or math.isinf(fv)):
+        if fv is not None and (isinstance(fv, bool) or not isinstance(fv, Real) or not math.isfinite(float(fv))):
             findings.append({
                 "severity": "error",
                 "field": f"ler_diagnostics.json.{fv_name}",
                 "cell": cell_id,
-                "message": f"{attempt_name}: non-finite final value {fv_name} = {fv!r}",
+                "message": f"{attempt_name}: final value {fv_name} must be a finite real number or null, got {fv!r}",
             })
             return False
 

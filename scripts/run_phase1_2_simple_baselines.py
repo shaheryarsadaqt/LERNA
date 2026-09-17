@@ -150,12 +150,31 @@ from lerna.trainers.policies import (
 
 def safe_from_pretrained(*args, **kwargs):
     try:
-        return AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
+        model = AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
     except TypeError as exc:
         if "reference_compile" in str(exc) or "unexpected keyword argument" in str(exc):
             kwargs.pop("reference_compile", None)
-            return AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
-        raise
+            model = AutoModelForSequenceClassification.from_pretrained(*args, **kwargs)
+        else:
+            raise
+    config = model.config
+    removed_biases = []
+    if getattr(config, "norm_bias", True) is False:
+        for module_name, module in model.named_modules():
+            if isinstance(module, torch.nn.LayerNorm) and module.bias is not None:
+                module.register_parameter("bias", None)
+                removed_biases.append(f"{module_name}.bias")
+    if getattr(config, "classifier_bias", True) is False:
+        classifier = getattr(model, "classifier", None)
+        if classifier is not None and getattr(classifier, "bias", None) is not None:
+            classifier.register_parameter("bias", None)
+            removed_biases.append("classifier.bias")
+    model._lerna_removed_disabled_biases = tuple(removed_biases)
+    expected_head = ["classifier.weight"]
+    if getattr(config, "classifier_bias", True):
+        expected_head.append("classifier.bias")
+    model._lerna_expected_task_head_initialization = tuple(expected_head)
+    return model
 
 logger = logging.getLogger(__name__)
 
@@ -844,6 +863,15 @@ def run_single_baseline_experiment(
         "learning_rate": lr,
         "model_name": model_name,
         "model_revision": model_revision,
+        "model_loading_contract": {
+            "expected_task_head_initialization": list(
+                getattr(model, "_lerna_expected_task_head_initialization", ())
+            ),
+            "removed_disabled_biases": list(
+                getattr(model, "_lerna_removed_disabled_biases", ())
+            ),
+            "base_model_biases_reinitialized": False,
+        },
         "profile": profile,
         "training_device": str(training_args.device),
         "cuda_available": torch.cuda.is_available(),

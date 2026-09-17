@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
 from lerna.trainers import AlwaysFalsePolicy, RandomSkipPolicy, TrueBackwardSkippingTrainer
+from lerna.trainers.true_skip_trainer import ObservationFailureError
 
 
 class TinyDataset(Dataset):
@@ -155,6 +156,27 @@ def test_failed_tracker_updates_are_attempted_but_not_successful():
         assert tracker.calls == diagnostics["batches_seen"]
         assert diagnostics["online_ler_update_attempts"] == tracker.calls
         assert diagnostics["online_ler_update_successes"] == 0
+
+
+def test_sampled_tracker_failure_invalidates_run_and_restores_wrappers():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tracker = CountingTracker(fail=True)
+        trainer = build_trainer(
+            tmpdir,
+            tracker=tracker,
+            online_ler_mode="sampled_lagged",
+            online_ler_update_interval=1,
+        )
+
+        with pytest.raises(ObservationFailureError) as failure:
+            trainer.train()
+
+        diagnostics = trainer.get_instrumentation()
+        assert isinstance(failure.value.__cause__, RuntimeError)
+        assert diagnostics["run_invalidated"] is True
+        assert diagnostics["online_ler_update_attempts"] == 1
+        assert diagnostics["online_ler_update_successes"] == 0
+        assert trainer._wrappers_installed is False
 
 
 def test_grad_norm_scan_runs_only_for_consuming_policy():
