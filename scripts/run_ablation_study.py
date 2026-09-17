@@ -1078,9 +1078,7 @@ def plan_phase1_3_cell(
             target_skip_rate=target_skip_rate,
             total_steps=total_steps,
             policy_seed=policy_seed,
-            max_consecutive_skips=controller_cfg.get(
-                "max_consecutive_skips", 4
-            ),
+            max_consecutive_skips=max_consecutive_skips,
             probe_interval=probe_interval,
             rho_veto_threshold=rho_veto_threshold,
         )
