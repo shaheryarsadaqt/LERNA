@@ -507,6 +507,7 @@ def build_phase_strat_controller_config(
         "phase_quota": phase_quota,
         "phase_eligible": phase_eligible,
         "requested_quota": requested_quota,
+        "probe_interval": 8,
     }
     if guarded:
         # phase_strat_guarded consumes max_consecutive_skips and risk_gamma;
@@ -1077,7 +1078,9 @@ def plan_phase1_3_cell(
             target_skip_rate=target_skip_rate,
             total_steps=total_steps,
             policy_seed=policy_seed,
-            max_consecutive_skips=max_consecutive_skips,
+            max_consecutive_skips=controller_cfg.get(
+                "max_consecutive_skips", 4
+            ),
             probe_interval=probe_interval,
             rho_veto_threshold=rho_veto_threshold,
         )
@@ -1357,6 +1360,14 @@ def build_skip_policy(
             total_steps=total_steps,
             min_step=POLICY_MIN_STEP,
             seed=controller_cfg["policy_seed"],
+            n_phases=controller_cfg.get("n_phases", 4),
+            phase_weights=controller_cfg.get(
+                "phase_weights", [0.22, 0.24, 0.26, 0.28]
+            ),
+            max_consecutive_skips=controller_cfg.get(
+                "max_consecutive_skips", 4
+            ),
+            probe_interval=probe_interval,
         )
     if control == "phase_strat_guarded":
         return PhaseStratifiedGuardedRandomPolicy(

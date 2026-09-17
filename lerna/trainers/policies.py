@@ -1376,7 +1376,8 @@ class LERNAPhaseStratifiedPolicy:
         seed: int = 42,
         n_phases: int = 4,
         phase_weights: Optional[List[float]] = None,
-        max_consecutive_skips: int = 1,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
         rho_veto_threshold: float = -0.2,
         spike_factor: float = 1.0,
         use_rho_vg: bool = True,
@@ -1385,7 +1386,6 @@ class LERNAPhaseStratifiedPolicy:
         fallback_threshold: float = 0.01,
         calibration_steps: int = 60,
         recalibrate_every: int = 200,
-        probe_interval: int = 8,
         use_ler: bool = True,
         use_grad_norm: bool = True,
     ):
@@ -1400,6 +1400,7 @@ class LERNAPhaseStratifiedPolicy:
         s = sum(phase_weights) or 1.0
         self.phase_weights = [w / s for w in phase_weights]
         self.max_consecutive_skips = int(max_consecutive_skips)
+        self.probe_interval = int(probe_interval)
         self.rho_veto_threshold = float(rho_veto_threshold)
         self.spike_factor = float(spike_factor)
         self.use_rho_vg = use_rho_vg
@@ -1420,6 +1421,7 @@ class LERNAPhaseStratifiedPolicy:
 
         self._grad_norm_last: Optional[float] = None
         self._consecutive_skips = 0
+        self._steps_since_probe = 0
         self._decisions_seen = 0
         self._skip_decisions = 0
         self._cur_phase = -1
@@ -1520,6 +1522,7 @@ class LERNAPhaseStratifiedPolicy:
         if di < self.min_step or self._quota_size is None:
             self._warmup_veto += 1
             self._consecutive_skips = 0
+            self._steps_since_probe = 0
             return False
 
         ph = self._phase_of(di)
@@ -1541,6 +1544,7 @@ class LERNAPhaseStratifiedPolicy:
         if remaining_skips <= 0:
             self._quota_exhausted += 1
             self._consecutive_skips = 0
+            self._steps_since_probe = 0
             return False
 
         diag = self.trk.get_diagnostics()
@@ -1619,6 +1623,7 @@ class LERNAPhaseStratifiedPolicy:
             "phase_quota": self._phase_quota,
             "phase_skips": self._phase_skips,
             "phase_eligible": self._phase_eligible,
+            "probe_interval": self.probe_interval,
             "decisions_seen": self._decisions_seen,
             "skip_decisions": self._skip_decisions,
             "realized_skip_rate": self._skip_decisions / denom,
@@ -1666,7 +1671,8 @@ class FixedPhaseStratifiedRandomPolicy:
         seed: int = 42,
         n_phases: int = 4,
         phase_weights: Optional[List[float]] = None,
-        max_consecutive_skips: int = 1,
+        max_consecutive_skips: int = 4,
+        probe_interval: int = 8,
     ):
         self.target_skip_rate = float(target_skip_rate)
         self.total_steps = total_steps
@@ -1677,6 +1683,7 @@ class FixedPhaseStratifiedRandomPolicy:
         s = sum(phase_weights) or 1.0
         self.phase_weights = [w / s for w in phase_weights]
         self.max_consecutive_skips = int(max_consecutive_skips)
+        self.probe_interval = int(probe_interval)
         self.risk_gamma = 0.0
 
         self._rng = random.Random(seed)
@@ -1689,6 +1696,7 @@ class FixedPhaseStratifiedRandomPolicy:
 
         self._cum_phase_quota: List[int] = []
         self._consecutive_skips = 0
+        self._steps_since_probe = 0
         self._decisions_seen = 0
         self._skip_decisions = 0
         self._cur_phase = -1
@@ -1771,6 +1779,7 @@ class FixedPhaseStratifiedRandomPolicy:
         self._skip_decisions += 1
         self._phase_skips[ph] += 1
         self._consecutive_skips += 1
+        self._steps_since_probe += 1
         return True
 
     def should_skip(self, trainer, model, inputs) -> bool:
@@ -1811,12 +1820,19 @@ class FixedPhaseStratifiedRandomPolicy:
         if self._consecutive_skips >= self.max_consecutive_skips:
             self._max_consec_veto += 1
             self._consecutive_skips = 0
+            self._steps_since_probe = 0
+            return False
+
+        if self._steps_since_probe >= self.probe_interval:
+            self._steps_since_probe = 0
+            self._consecutive_skips = 0
             return False
 
         q_left = self._cum_phase_quota[ph] - self._skip_decisions
         if q_left <= 0:
             self._quota_exhausted += 1
             self._consecutive_skips = 0
+            self._steps_since_probe = 0
             return False
         decisions_left_in_phase = max(self._phase_bounds[ph + 1] - di, 1)
 
@@ -1831,6 +1847,7 @@ class FixedPhaseStratifiedRandomPolicy:
             self._random_safe_skip += 1
             return self._do_skip(ph)
         self._consecutive_skips = 0
+        self._steps_since_probe = 0
         return False
 
     def get_diagnostics(self) -> dict:
@@ -2142,6 +2159,14 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             return False
 
         if self._current_ler is None or self._last_valid_emission_decision is None:
+            if self.ler_guidance_strength == 0.0:
+                base_pressure = q_left / decisions_left_in_phase
+                if self._rng.random() < min(max(base_pressure, 0.0), 1.0):
+                    self._random_safe_skip += 1
+                    return self._do_skip(ph)
+                self._consecutive_skips = 0
+                self._steps_since_probe = 0
+                return False
             self._probe_decision_count += 1
             self._missing_signal_probe_count += 1
             self._consecutive_skips = 0
@@ -2151,6 +2176,14 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             self._current_signal_age is not None
             and self._current_signal_age >= self.probe_interval
         ):
+            if self.ler_guidance_strength == 0.0:
+                base_pressure = q_left / decisions_left_in_phase
+                if self._rng.random() < min(max(base_pressure, 0.0), 1.0):
+                    self._random_safe_skip += 1
+                    return self._do_skip(ph)
+                self._consecutive_skips = 0
+                self._steps_since_probe = 0
+                return False
             self._probe_decision_count += 1
             self._stale_signal_probe_count += 1
             self._consecutive_skips = 0
@@ -2229,6 +2262,7 @@ class LERGuidedStratifiedPolicy(FixedPhaseStratifiedRandomPolicy):
             "required_tracker_mode": self.REQUIRED_TRACKER_MODE,
             "required_tracker_timing": self.REQUIRED_TRACKER_TIMING,
             "safety_enabled": False,
+            "ler_guidance_enabled": self.ler_guidance_strength > 0.0,
         }
 
 

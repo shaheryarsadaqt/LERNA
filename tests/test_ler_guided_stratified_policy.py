@@ -398,3 +398,35 @@ def test_fixed_baseline_remains_signal_free_and_reaches_exact_quota(rate):
     ):
         assert key not in diag
     assert not hasattr(FixedPhaseStratifiedRandomPolicy, "effective_config")
+
+
+def test_fixed_and_ler_guidance_off_share_decision_stream():
+    trainer = FakeTrainer(TOTAL_STEPS)
+    fixed = FixedPhaseStratifiedRandomPolicy(
+        target_skip_rate=RATE,
+        total_steps=TOTAL_STEPS,
+        min_step=MIN_STEP,
+        seed=123,
+        max_consecutive_skips=4,
+        probe_interval=8,
+    )
+    tracker = FakeLaggedTracker()
+    guidance_off = make_policy(
+        tracker,
+        ler_guidance_strength=0.0,
+        max_consecutive_skips=4,
+        probe_interval=8,
+    )
+
+    fixed_decisions = [
+        bool(fixed.should_skip(trainer, None, None))
+        for _ in range(TOTAL_STEPS)
+    ]
+    guidance_off_decisions = run_stream(
+        guidance_off, tracker, commits={}, total=TOTAL_STEPS
+    )
+
+    assert guidance_off_decisions == fixed_decisions
+    assert fixed.get_diagnostics()["skip_decisions"] == guidance_off.get_diagnostics()[
+        "skip_decisions"
+    ]
