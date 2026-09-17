@@ -20,7 +20,7 @@ EXPECTED_BRANCH = os.environ.get(
     'LERNA_EXPECTED_BRANCH', 'candidate/terminal-invalid-observation-0f55d012'
 )
 EXPECTED_HEAD = os.environ.get(
-    'LERNA_EXPECTED_HEAD', '243b7eed6053fd3bfaced122f4345b6a4660800d'
+    'LERNA_EXPECTED_HEAD', 'a048dc99645a2ff228e60aa4d3917bb6acf3dbc9'
 )
 sys.path.insert(0, str(ROOT))
 
