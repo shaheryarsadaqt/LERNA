@@ -126,25 +126,15 @@ class SampledLaggedLERTracker:
         loss_val = float(loss)
         if not math.isfinite(loss_val):
             tagged = {"loss": self._make_tagged_operand(loss_val)}
-            self._record_terminal_invalid("nonfinite_loss", decision_index, tagged)
-            raise TerminalInvalidObservation(
-                "nonfinite_loss",
-                decision_index if decision_index is not None else self._last_noted_decision or 0,
-                tagged,
-                self._get_valid_prefix()
-            )
+            self.invalid_emission_events += 1
+            return
 
         # Compute and validate entropy
         entropy = self._compute_entropy(logits)
         if not math.isfinite(entropy):
             tagged = {"entropy": self._make_tagged_operand(entropy)}
-            self._record_terminal_invalid("nonfinite_entropy", decision_index, tagged)
-            raise TerminalInvalidObservation(
-                "nonfinite_entropy",
-                decision_index if decision_index is not None else self._last_noted_decision or 0,
-                tagged,
-                self._get_valid_prefix()
-            )
+            self.invalid_emission_events += 1
+            return
 
         # Compute velocity and rho (but don't commit yet)
         velocity: Optional[float] = None
