@@ -277,6 +277,7 @@ class SkipInstrumentation:
     online_ler_update_interval: int = 1
     online_ler_update_attempts: int = 0
     online_ler_update_successes: int = 0
+    online_ler_update_failures: int = 0
     online_ler_last_update_decision: Optional[int] = None
     capture_logits_enabled: bool = True
     grad_norm_capture_enabled: bool = False
@@ -593,12 +594,8 @@ class TrueBackwardSkippingTrainer(Trainer):
                 valid_prefix=tio.valid_prefix,
                 terminal_event=terminal_event,
             )
-            self._uninstall_wrappers()
-            raise ObservationFailureError(
-                tracker_event=terminal_event,
-                valid_prefix=tio.valid_prefix,
-                original_exception=tio,
-            ) from tio
+            self.instr.online_ler_update_failures += 1
+            return False
         except Exception as exc:
             self._raise_required_observation_failure(tracker, exc)
         self.instr.online_ler_update_successes += 1
