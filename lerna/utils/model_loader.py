@@ -92,7 +92,7 @@ def load_model_and_tokenizer(
         model_kwargs["device_map"] = device_map
     if is_modernbert or is_ettin:
         model_kwargs["reference_compile"] = False
-        model_kwargs["attn_implementation"] = "sdpa"
+        model_kwargs["attn_implementation"] = "eager"
     if is_ettin:
         if revision is not None:
             model_kwargs["revision"] = revision
