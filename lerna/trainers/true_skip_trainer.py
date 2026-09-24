@@ -64,6 +64,16 @@ class ObservationFailureError(RuntimeError):
         )
 
 
+class NonfiniteForwardLossError(RuntimeError):
+    """Strict protocol: a non-finite training forward loss terminates the attempt."""
+    def __init__(self, record: dict):
+        super().__init__(
+            f"nonfinite_forward_loss at decision {record['decision_index']} "
+            f"(global_step {record['global_step']}): {record['value']}"
+        )
+        self.record = record
+
+
 class _OptimizerStepWrapper:
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
         self._trainer = trainer
@@ -654,6 +664,19 @@ class TrueBackwardSkippingTrainer(Trainer):
         self.instr.forward_calls += 1
         if self.args.n_gpu > 1:
             loss = loss.mean()
+
+        # [M2] Non-finite forward loss terminates the attempt (strict protocol).
+        loss_val = float(loss.detach())
+        if not math.isfinite(loss_val):
+            record = {
+                "decision_index": max(self.instr.batches_seen - 1, 0),
+                "global_step": int(getattr(self.state, "global_step", 0)),
+                "value": loss_val,
+            }
+            self.instr.run_invalidated = True
+            self._dump_instrumentation()
+            self._uninstall_wrappers()
+            raise NonfiniteForwardLossError(record)
 
         # Legacy dense diagnostics remain available only when explicitly enabled.
         self._online_ler_update(loss.detach(), self._last_real_logits, model)

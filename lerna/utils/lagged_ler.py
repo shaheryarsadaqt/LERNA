@@ -78,6 +78,7 @@ class SampledLaggedLERTracker:
         self.invalid_emission_events = 0       # Non-finite inputs rejected
         self.terminal_invalid_event = None     # Dict with event details, or None
         self.last_valid_emission_decision: Optional[int] = None  # Zero-based decision index
+        self.terminal_forensics = None         # Forensics captured at first terminal event
 
     def set_optimizer(self, optimizer) -> None:
         self._optimizer = optimizer
@@ -126,20 +127,33 @@ class SampledLaggedLERTracker:
         loss_val = float(loss)
         if not math.isfinite(loss_val):
             tagged = {"loss": self._make_tagged_operand(loss_val)}
-            self.invalid_emission_events += 1
-            return
+            self._capture_forensics_best_effort("nonfinite_loss", decision_index, loss_val, logits)
+            self._record_terminal_invalid("nonfinite_loss", decision_index, tagged)
+            raise TerminalInvalidObservation(
+                "nonfinite_loss",
+                decision_index if decision_index is not None else self._last_noted_decision or 0,
+                tagged,
+                self._get_valid_prefix()
+            )
 
         # Compute and validate entropy
         entropy = self._compute_entropy(logits)
         if not math.isfinite(entropy):
             tagged = {"entropy": self._make_tagged_operand(entropy)}
-            self.invalid_emission_events += 1
-            return
+            self._capture_forensics_best_effort("nonfinite_entropy", decision_index, loss_val, logits)
+            self._record_terminal_invalid("nonfinite_entropy", decision_index, tagged)
+            raise TerminalInvalidObservation(
+                "nonfinite_entropy",
+                decision_index if decision_index is not None else self._last_noted_decision or 0,
+                tagged,
+                self._get_valid_prefix()
+            )
 
         # Compute velocity and rho (but don't commit yet)
         velocity: Optional[float] = None
         rho: Optional[float] = None
         new_samples = None
+        candidate_prev_samples = None
         if model is not None:
             if self._sample_plan is None:
                 self._build_sample_plan(model)
@@ -148,9 +162,11 @@ class SampledLaggedLERTracker:
                 self._prev_samples = self._capture_samples(model)
             else:
                 velocity, rho, new_samples = self._sampled_dynamics(model, opt)
+                candidate_prev_samples = new_samples
                 # Validate velocity and rho before committing
                 if velocity is not None and not math.isfinite(velocity):
                     tagged = {"velocity": self._make_tagged_operand(velocity)}
+                    self._capture_forensics_best_effort("nonfinite_velocity", decision_index, loss_val, logits)
                     self._record_terminal_invalid("nonfinite_velocity", decision_index, tagged)
                     raise TerminalInvalidObservation(
                         "nonfinite_velocity",
@@ -160,6 +176,7 @@ class SampledLaggedLERTracker:
                     )
                 if rho is not None and not math.isfinite(rho):
                     tagged = {"rho": self._make_tagged_operand(rho)}
+                    self._capture_forensics_best_effort("nonfinite_rho", decision_index, loss_val, logits)
                     self._record_terminal_invalid("nonfinite_rho", decision_index, tagged)
                     raise TerminalInvalidObservation(
                         "nonfinite_rho",
@@ -220,8 +237,8 @@ class SampledLaggedLERTracker:
         self.loss_history.append(loss_val)
         self.entropy_history.append(entropy)
 
-        if model is not None and self._prev_samples is not None and new_samples is not None:
-            self._prev_samples = new_samples
+        if candidate_prev_samples is not None:
+            self._prev_samples = candidate_prev_samples
         if velocity is not None:
             self.velocity_history.append(velocity)
         if rho is not None:
@@ -281,6 +298,33 @@ class SampledLaggedLERTracker:
                 "observation_attempt": self.observation_attempts,
                 "operands": operands,
             }
+
+    def _capture_forensics_best_effort(self, event_type: str, decision_index: Optional[int], loss_val: float, logits: Optional[torch.Tensor]) -> None:
+        """Capture forensics at first terminal event (best effort, never raises)."""
+        if self.terminal_forensics is not None:
+            return
+        info = {
+            "event_type": event_type,
+            "decision_index": decision_index if decision_index is not None else self._last_noted_decision,
+            "observation_attempt": self.observation_attempts,
+            "loss_repr": repr(loss_val),
+        }
+        try:
+            if logits is not None:
+                t = logits.detach()
+                f = t.float()
+                fin = torch.isfinite(f)
+                info["logits"] = {
+                    "dtype": str(t.dtype),
+                    "shape": list(t.shape),
+                    "n_nan": int(torch.isnan(f).sum()),
+                    "n_posinf": int(torch.isposinf(f).sum()),
+                    "n_neginf": int(torch.isneginf(f).sum()),
+                    "max_abs_finite": float(f[fin].abs().max()) if bool(fin.any()) else None,
+                }
+        except Exception as exc:
+            info["forensics_error"] = f"{type(exc).__name__}: {exc}"
+        self.terminal_forensics = info
 
     def get_diagnostics(self) -> Dict:
         if self._decisions_at_last_update is None:
