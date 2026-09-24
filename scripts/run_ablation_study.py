@@ -3091,52 +3091,53 @@ def _main_phase1_3(args, parser):
             if expected_pilot
             else CLASSIFICATION_MATCHED_CLAIM
         )
-        run_ablation_single(
-            task_name=task,
-            seed=cell["training_seed"],
-            ablation_name=cell["arm"],
-            ablation_overrides=ABLATIONS[cell["arm"]],
-            model_name=cell["model_id"],
-            profile=profile,
-            base_output_dir=args.output_dir,
-            use_wandb=args.wandb,
-            max_samples_override=cell["identity_inputs"].get(
-                "max_samples_requested"
-            ),
-            run_idx=run_idx,
-            total_runs=total_runs,
-            wandb_project=args.wandb_project,
-            wandb_group=wandb_group,
-            num_epochs=task_hp.get("num_epochs", 3),
-            warmup_ratio=task_hp.get("warmup_ratio", 0.1),
-            early_stopping_patience=task_hp.get(
-                "early_stopping_patience", 5
-            ),
-            metric_for_best_model=task_hp.get(
-                "metric_for_best_model", "eval_loss"
-            ),
-            greater_is_better=task_hp.get("greater_is_better", False),
-            init_from_mnli=task_hp.get("init_from_mnli", False),
-            no_early_stopping=True,
-            target_skip_rate=cell["target_skip_rate"],
-            max_consecutive_skips=cell["max_consecutive_skips"],
-            probe_interval=cell["probe_interval"],
-            policy=args.policy,
-            rho_veto_threshold=cell["rho_veto_threshold"],
-            risk_gamma=cell["risk_gamma"],
-            guard_mode=args.guard_mode,
-            skip_update_mode="freeze",
-            scheduler_step_policy=(
-                SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
-            ),
-            allow_early_stopping_with_skipping=False,
-            rvd_veto_mode=args.rvd_veto_mode,
-            rvd_margin_rank_floor=args.rvd_margin_rank_floor,
-            rvd_spike_factor=args.rvd_spike_factor,
-            rvd_spike_ema_window=args.rvd_spike_ema_window,
-            rvd_repay_mode=args.rvd_repay_mode,
-            rvd_repay_protect_dangerous=args.rvd_repay_protect_dangerous,
-            rvd_policy_seed=None,
+        try:
+            run_ablation_single(
+                task_name=task,
+                seed=cell["training_seed"],
+                ablation_name=cell["arm"],
+                ablation_overrides=ABLATIONS[cell["arm"]],
+                model_name=cell["model_id"],
+                profile=profile,
+                base_output_dir=args.output_dir,
+                use_wandb=args.wandb,
+                max_samples_override=cell["identity_inputs"].get(
+                    "max_samples_requested"
+                ),
+                run_idx=run_idx,
+                total_runs=total_runs,
+                wandb_project=args.wandb_project,
+                wandb_group=wandb_group,
+                num_epochs=task_hp.get("num_epochs", 3),
+                warmup_ratio=task_hp.get("warmup_ratio", 0.1),
+                early_stopping_patience=task_hp.get(
+                    "early_stopping_patience", 5
+                ),
+                metric_for_best_model=task_hp.get(
+                    "metric_for_best_model", "eval_loss"
+                ),
+                greater_is_better=task_hp.get("greater_is_better", False),
+                init_from_mnli=task_hp.get("init_from_mnli", False),
+                no_early_stopping=True,
+                target_skip_rate=cell["target_skip_rate"],
+                max_consecutive_skips=cell["max_consecutive_skips"],
+                probe_interval=cell["probe_interval"],
+                policy=args.policy,
+                rho_veto_threshold=cell["rho_veto_threshold"],
+                risk_gamma=cell["risk_gamma"],
+                guard_mode=args.guard_mode,
+                skip_update_mode="freeze",
+                scheduler_step_policy=(
+                    SchedulerStepPolicy.SKIP_ON_BACKWARD_SKIP
+                ),
+                allow_early_stopping_with_skipping=False,
+                rvd_veto_mode=args.rvd_veto_mode,
+                rvd_margin_rank_floor=args.rvd_margin_rank_floor,
+                rvd_spike_factor=args.rvd_spike_factor,
+                rvd_spike_ema_window=args.rvd_spike_ema_window,
+                rvd_repay_mode=args.rvd_repay_mode,
+                rvd_repay_protect_dangerous=args.rvd_repay_protect_dangerous,
+                rvd_policy_seed=None,
             provenance_classification=cell_classification,
             online_ler_mode=ONLINE_LER_MODE_AUTO,
             online_ler_parameter_sample_size=cell["online_ler_parameter_sample_size"],
@@ -3144,6 +3145,9 @@ def _main_phase1_3(args, parser):
             planned_cell=cell,
             model_revision=cell["model_revision"],
         )
+        except BaseException as exc:
+            print(f"  Cell {run_idx}/{total_runs} failed: {type(exc).__name__}: {exc}")
+            continue
 
     report = _validate_and_freeze_strict_matrix(bundle)
     print(
