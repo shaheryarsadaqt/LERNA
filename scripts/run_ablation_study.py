@@ -931,6 +931,9 @@ def plan_phase1_3_cell(
     online_ler_mode,
     online_ler_parameter_sample_size,
     online_ler_update_interval,
+    hw_cfg,
+    lr,
+    warmup_ratio,
     use_rho_vg=True,
     use_safety_horizon=True,
     provenance_classification=None,
@@ -1175,6 +1178,9 @@ def build_phase1_3_matrix_plan(
                             data_facts=data_facts,
                             git_sha=git_sha,
                             base_output_dir=base_output_dir,
+                            hw_cfg=cell_kwargs.get("hw_cfg"),
+                            lr=cell_kwargs.get("lr"),
+                            warmup_ratio=cell_kwargs.get("warmup_ratio"),
                             **cell_kwargs,
                         )
                     )
@@ -2968,6 +2974,9 @@ def _main_phase1_3(args, parser):
                 if matrix_kind == "pilot"
                 else CLASSIFICATION_MATCHED_CLAIM
             ),
+            hw_cfg=hw_config,
+            lr=2e-5,
+            warmup_ratio=0.06,
         )
         validate_phase1_3_matrix_plan(
             matrix_plan,
