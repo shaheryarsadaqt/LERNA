@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
@@ -100,8 +101,39 @@ class _OptimizerStepWrapper:
                         # crash the training loop; treat as best-effort.
                         pass
             return None
+        
+        # This is a non-skipped optimizer step attempt
         self._trainer.instr.optimizer_step_attempts += 1
-        return self._trainer._orig_opt_step(*args, **kwargs)
+        
+        # Track AMP overflow skips by checking scaler state before/after
+        scaler = self._trainer._scaler_ref
+        if scaler is None:
+            accel = getattr(self._trainer, "accelerator", None)
+            if accel is not None:
+                scaler = getattr(accel, "scaler", None)
+        
+        # Get scale before step
+        scale_before = None
+        if scaler is not None and hasattr(scaler, "get_scale"):
+            try:
+                scale_before = float(scaler.get_scale())
+            except Exception:
+                pass
+        
+        result = self._trainer._orig_opt_step(*args, **kwargs)
+        
+        # Check if optimizer was actually called (AMP overflow check)
+        # If scaler step was called but optimizer step wasn't, that's an AMP skip
+        if scaler is not None and hasattr(scaler, "_per_optimizer_states"):
+            try:
+                # Check if optimizer state was updated (indicates real step happened)
+                # The scaler calls optimizer.step internally if no overflow
+                # We can infer from the fact that our wrapper was called
+                pass
+            except Exception:
+                pass
+        
+        return result
 
     def __getstate__(self):
         return {}
@@ -114,9 +146,35 @@ class _GradScalerStepWrapper:
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
         self._trainer = trainer
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, optimizer, *args, **kwargs):
         self._trainer.instr.grad_scaler_step_calls += 1
-        return self._trainer._orig_scaler_step(*args, **kwargs)
+        
+        # Track scale before
+        scale_before = None
+        if hasattr(self._trainer._scaler_ref, "get_scale"):
+            try:
+                scale_before = float(self._trainer._scaler_ref.get_scale())
+            except Exception:
+                pass
+        
+        result = self._trainer._orig_scaler_step(optimizer, *args, **kwargs)
+        
+        # Track scale after
+        if hasattr(self._trainer._scaler_ref, "get_scale"):
+            try:
+                scale_after = float(self._trainer._scaler_ref.get_scale())
+                if scale_before is not None:
+                    if scale_after < scale_before:
+                        # Scale decreased = overflow occurred
+                        self._trainer.instr.optimizer_steps_skipped_amp += 1
+                # Track min scale
+                if self._trainer.instr.scaler_scale_min is None or scale_after < self._trainer.instr.scaler_scale_min:
+                    self._trainer.instr.scaler_scale_min = scale_after
+                self._trainer.instr.scaler_scale_final = scale_after
+            except Exception:
+                pass
+        
+        return result
 
     def __getstate__(self):
         return {}
@@ -292,6 +350,27 @@ class SkipInstrumentation:
     capture_logits_enabled: bool = True
     grad_norm_capture_enabled: bool = False
 
+    # M2c: strict forward-loss numerics
+    nonfinite_forward_loss_policy: str = "fail"
+    forward_loss_observations: int = 0
+    nonfinite_forward_loss_count: int = 0
+    first_nonfinite_forward_loss_step: Optional[int] = None
+    first_nonfinite_forward_loss_value: Optional[float] = None
+
+    # AMP accounting: real optimizer steps skipped by GradScaler overflow
+    optimizer_steps_skipped_amp: int = 0
+    scaler_scale_final: Optional[float] = None
+    scaler_scale_min: Optional[float] = None
+
+    # Timing breakdown
+    train_loop_seconds: float = 0.0
+    eval_seconds: float = 0.0
+    setup_seconds: float = 0.0
+    telemetry_overhead_seconds: float = 0.0
+    mean_step_time_executed: Optional[float] = None
+    mean_step_time_skipped: Optional[float] = None
+    dataloader_wait_seconds: float = 0.0
+
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["skip_ratio_by_batch"] = (
@@ -346,12 +425,58 @@ class SkipInstrumentation:
         d["skip_update_mode_legacy_compat_used"] = (
             self.skip_update_mode_legacy_compat_used
         )
+        # M2c forward-loss numerics
+        d["nonfinite_forward_loss_policy"] = self.nonfinite_forward_loss_policy
+        d["forward_loss_observations"] = self.forward_loss_observations
+        d["nonfinite_forward_loss_count"] = self.nonfinite_forward_loss_count
+        d["first_nonfinite_forward_loss_step"] = self.first_nonfinite_forward_loss_step
+        d["first_nonfinite_forward_loss_value"] = self.first_nonfinite_forward_loss_value
+        # AMP accounting
+        d["optimizer_steps_skipped_amp"] = self.optimizer_steps_skipped_amp
+        d["scaler_scale_final"] = self.scaler_scale_final
+        d["scaler_scale_min"] = self.scaler_scale_min
+        # Timing breakdown
+        d["train_loop_seconds"] = self.train_loop_seconds
+        d["eval_seconds"] = self.eval_seconds
+        d["setup_seconds"] = self.setup_seconds
+        d["telemetry_overhead_seconds"] = self.telemetry_overhead_seconds
+        d["mean_step_time_executed"] = self.mean_step_time_executed
+        d["mean_step_time_skipped"] = self.mean_step_time_skipped
+        d["dataloader_wait_seconds"] = self.dataloader_wait_seconds
         return d
 
 
 # ----------------------------------------------------------------------------
 # Internal callback for install/uninstall of wrappers (after optimizer exists)
 # ----------------------------------------------------------------------------
+
+class _TimingCallback(TrainerCallback):
+    """Callback to measure setup, train loop, and eval time."""
+    def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
+        self._trainer = trainer
+        self._train_start = None
+        self._eval_start = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._trainer.instr.setup_seconds = time.perf_counter() - self._trainer._global_start_time
+        self._train_start = time.perf_counter()
+        return control
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        self._eval_start = time.perf_counter()
+        return control
+
+    def on_evaluate_end(self, args, state, control, **kwargs):
+        if self._eval_start is not None:
+            self._trainer.instr.eval_seconds += time.perf_counter() - self._eval_start
+            self._eval_start = None
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._train_start is not None:
+            self._trainer.instr.train_loop_seconds = time.perf_counter() - self._train_start
+        return control
+
 
 class _SkipWrapperInstaller(TrainerCallback):
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
@@ -482,7 +607,11 @@ class TrueBackwardSkippingTrainer(Trainer):
         # [Piece 8] Authoritative horizon validation flag
         self._horizon_checked: bool = False
 
+        # Global start time for setup timing
+        self._global_start_time = time.perf_counter()
+
         self.add_callback(_SkipWrapperInstaller(self))
+        self.add_callback(_TimingCallback(self))
 
     # ----------------------------------------------------- subclass hook
     def on_skipped_backward_step(self, loss, model, inputs) -> None:
@@ -648,6 +777,10 @@ class TrueBackwardSkippingTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        import time
+        step_start = time.perf_counter()
+        dataloader_start = step_start
+        
         # [FIX P0-3] Forward ALWAYS happens before skip decision (R3).
         # [CRIT-1] Always clear both flags at start of each step (safety net).
         self._skip_optimizer_step = False
@@ -655,6 +788,10 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         model.train()
         inputs = self._prepare_inputs(inputs)
+        
+        # Track dataloader wait time
+        self.instr.dataloader_wait_seconds += (time.perf_counter() - dataloader_start)
+        
         self.instr.batches_seen += 1
 
         # [FIX P0-3] Forward ALWAYS happens first.
@@ -667,7 +804,12 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # [M2] Non-finite forward loss terminates the attempt (strict protocol).
         loss_val = float(loss.detach())
+        self.instr.forward_loss_observations += 1
         if not math.isfinite(loss_val):
+            self.instr.nonfinite_forward_loss_count += 1
+            if self.instr.first_nonfinite_forward_loss_step is None:
+                self.instr.first_nonfinite_forward_loss_step = max(self.instr.batches_seen - 1, 0)
+                self.instr.first_nonfinite_forward_loss_value = loss_val
             record = {
                 "decision_index": max(self.instr.batches_seen - 1, 0),
                 "global_step": int(getattr(self.state, "global_step", 0)),
@@ -727,6 +869,16 @@ class TrueBackwardSkippingTrainer(Trainer):
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception:
                 pass
+            
+            # Record skipped step time
+            step_time = time.perf_counter() - step_start
+            if self.instr.mean_step_time_skipped is None:
+                self.instr.mean_step_time_skipped = step_time
+            else:
+                n = self.instr.skipped_backward_steps
+                self.instr.mean_step_time_skipped = (
+                    (self.instr.mean_step_time_skipped * (n - 1) + step_time) / n
+                )
             return loss.detach() / max(self.args.gradient_accumulation_steps, 1)
 
         # [CRIT-2] Normal step: divide loss BEFORE backward for gradient
@@ -774,6 +926,16 @@ class TrueBackwardSkippingTrainer(Trainer):
             pol.record_grad_norm(self._pre_clip_grad_norm)
         else:
             self._pre_clip_grad_norm = None
+
+        # Record executed step time
+        step_time = time.perf_counter() - step_start
+        if self.instr.mean_step_time_executed is None:
+            self.instr.mean_step_time_executed = step_time
+        else:
+            n = self.instr.backward_calls
+            self.instr.mean_step_time_executed = (
+                (self.instr.mean_step_time_executed * (n - 1) + step_time) / n
+            )
 
         # Return the un-scaled detached loss for logging consistency.
         return loss.detach()

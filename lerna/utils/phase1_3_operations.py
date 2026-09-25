@@ -1066,6 +1066,8 @@ def freeze_matrix_validation(
         results = _load_json(attempt_dir / "results.json")
         manifest = _load_json(attempt_dir / "run_manifest.json")
         validate_power_evidence(results)
+        # M2c: strict forward-loss numerics validation
+        check_forward_loss_numerics(results)
         matrix_kind = bundle["envelope"]["matrix_kind"]
         if matrix_kind not in ("pilot", "production"):
             raise Phase13OperationalError(
@@ -1122,3 +1124,59 @@ def freeze_matrix_validation(
         )
     _write_immutable_json(root / VALIDATION_FILENAME, report)
     return report
+
+
+def check_forward_loss_numerics(results: dict[str, Any]) -> None:
+    """Validate M2c forward-loss numerics fields are present and consistent.
+
+    Required fields in true_skip_instrumentation:
+    - nonfinite_forward_loss_policy (str)
+    - forward_loss_observations (int, must equal total forward calls = 575)
+    - nonfinite_forward_loss_count (int, must be 0 for valid runs)
+    - first_nonfinite_forward_loss_step (int or null)
+    - first_nonfinite_forward_loss_value (float or null)
+    """
+    instr = results.get("true_skip_instrumentation", {})
+    required_fields = [
+        "nonfinite_forward_loss_policy",
+        "forward_loss_observations",
+        "nonfinite_forward_loss_count",
+        "first_nonfinite_forward_loss_step",
+        "first_nonfinite_forward_loss_value",
+    ]
+    for field in required_fields:
+        if field not in instr:
+            raise Phase13OperationalError(
+                f"M2c validation failed: missing required field '{field}' "
+                f"in true_skip_instrumentation"
+            )
+    # Verify forward_loss_observations == 575 (total training steps)
+    if instr["forward_loss_observations"] != 575:
+        raise Phase13OperationalError(
+            f"M2c validation failed: forward_loss_observations = "
+            f"{instr['forward_loss_observations']}, expected 575"
+        )
+    # Verify nonfinite_forward_loss_count == 0 (strict protocol: run would be invalidated)
+    if instr["nonfinite_forward_loss_count"] != 0:
+        raise Phase13OperationalError(
+            f"M2c validation failed: nonfinite_forward_loss_count = "
+            f"{instr['nonfinite_forward_loss_count']}, expected 0 for valid run"
+        )
+    # If count > 0, first_nonfinite fields must be populated
+    if instr["nonfinite_forward_loss_count"] > 0:
+        if instr["first_nonfinite_forward_loss_step"] is None:
+            raise Phase13OperationalError(
+                "M2c validation failed: nonfinite_forward_loss_count > 0 but "
+                "first_nonfinite_forward_loss_step is None"
+            )
+        if instr["first_nonfinite_forward_loss_value"] is None:
+            raise Phase13OperationalError(
+                "M2c validation failed: nonfinite_forward_loss_count > 0 but "
+                "first_nonfinite_forward_loss_value is None"
+            )
+    # Verify policy is 'fail' (strict protocol)
+    if instr["nonfinite_forward_loss_policy"] != "fail":
+        raise Phase13OperationalError(
+            f"M2c validation failed: nonfinite_forward_loss_policy = "
+            f"{instr['nonfinite_forward_loss_policy']!r}, expected 'fail'"
+        )

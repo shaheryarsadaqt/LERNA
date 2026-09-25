@@ -1024,6 +1024,13 @@ def plan_phase1_3_cell(
         no_early_stopping=True,
         total_steps=total_steps,
         git_sha=git_sha,
+        attn_implementation="eager",
+        fp16=hw_cfg["fp16"],
+        torch_dtype="float16" if hw_cfg["fp16"] else "float32",
+        max_grad_norm=1.0,
+        learning_rate=lr,
+        warmup_ratio=warmup_ratio,
+        weight_decay=0.01,
     )
     identity_inputs = add_online_ler_to_identity(
         identity_inputs,
@@ -1849,6 +1856,13 @@ def run_ablation_single(
         no_early_stopping=no_early_stopping,
         total_steps=total_steps,
         git_sha=git_sha,
+        attn_implementation="eager",
+        fp16=training_args.fp16,
+        torch_dtype="float16" if training_args.fp16 else "float32",
+        max_grad_norm=training_args.max_grad_norm,
+        learning_rate=training_args.learning_rate,
+        warmup_ratio=training_args.warmup_ratio,
+        weight_decay=training_args.weight_decay,
     )
     identity_inputs = add_online_ler_to_identity(
         identity_inputs,

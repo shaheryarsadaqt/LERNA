@@ -276,6 +276,13 @@ def build_identity_inputs(
     total_steps: int,
     git_sha: str,
     scheduler_step_policy: str = "skip_on_backward_skip",
+    attn_implementation: Optional[str] = None,
+    fp16: bool = False,
+    torch_dtype: Optional[str] = None,
+    max_grad_norm: Optional[float] = None,
+    learning_rate: Optional[float] = None,
+    warmup_ratio: Optional[float] = None,
+    weight_decay: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build the canonical identity dictionary for a scientific run.
 
@@ -306,6 +313,13 @@ def build_identity_inputs(
         "no_early_stopping": bool(no_early_stopping),
         "total_steps": int(total_steps),
         "git_sha": str(git_sha),
+        "attn_implementation": attn_implementation,
+        "fp16": bool(fp16),
+        "torch_dtype": torch_dtype,
+        "max_grad_norm": max_grad_norm,
+        "learning_rate": learning_rate,
+        "warmup_ratio": warmup_ratio,
+        "weight_decay": weight_decay,
     }
     return identity
 
@@ -330,6 +344,13 @@ _BASE_IDENTITY_KEYS = frozenset(
         "no_early_stopping",
         "total_steps",
         "git_sha",
+        "attn_implementation",
+        "fp16",
+        "torch_dtype",
+        "max_grad_norm",
+        "learning_rate",
+        "warmup_ratio",
+        "weight_decay",
     }
 )
 
