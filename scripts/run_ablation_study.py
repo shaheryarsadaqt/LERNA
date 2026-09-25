@@ -1843,37 +1843,8 @@ def run_ablation_single(
     max_samples_requested = (
         None if max_samples_override is None else int(max_samples_override)
     )
-    identity_inputs = build_identity_inputs(
-        task=task_name,
-        training_seed=seed,
-        model_id=model_name,
-        model_revision=model_revision,
-        max_samples_requested=max_samples_requested,
-        train_samples_realized=len(train_ds),
-        eval_samples_realized=len(eval_ds),
-        train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
-        eval_dataset_fingerprint=getattr(eval_ds, "_fingerprint", None),
-        num_epochs=num_epochs,
-        control=effective_control or policy,
-        target_skip_rate=target_skip_rate,
-        policy_seed=controller_cfg["policy_seed"],
-        skip_update_mode=effective_skip_update_mode,
-        scheduler_step_policy=scheduler_step_policy,
-        no_early_stopping=no_early_stopping,
-        total_steps=total_steps,
-        git_sha=git_sha,
-        attn_implementation="eager",
-        fp16=training_args.fp16,
-        torch_dtype="float16" if training_args.fp16 else "float32",
-        max_grad_norm=training_args.max_grad_norm,
-        learning_rate=training_args.learning_rate,
-        warmup_ratio=training_args.warmup_ratio,
-        weight_decay=training_args.weight_decay,
-    )
-    identity_inputs = add_online_ler_to_identity(
-        identity_inputs,
-        online_diagnostics,
-    )
+    # NOTE: identity_inputs will be built AFTER training_args is created below,
+    # to use the actual training_args values for fp16, max_grad_norm, etc.
     # RVD configuration is included only when the effective control is rvd
     # or the legacy policy is random_veto_deferral (which resolves to rvd).
     if effective_control == "rvd" or (
@@ -2310,6 +2281,39 @@ def run_ablation_single(
         dataloader_pin_memory=(profile == "server"),
         gradient_checkpointing=hw_cfg["gradient_checkpointing"],
         remove_unused_columns=True,
+    )
+
+    # Build canonical identity after training_args is available
+    identity_inputs = build_identity_inputs(
+        task=task_name,
+        training_seed=seed,
+        model_id=model_name,
+        model_revision=model_revision,
+        max_samples_requested=max_samples_requested,
+        train_samples_realized=len(train_ds),
+        eval_samples_realized=len(eval_ds),
+        train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
+        eval_dataset_fingerprint=getattr(eval_ds, "_fingerprint", None),
+        num_epochs=num_epochs,
+        control=effective_control or policy,
+        target_skip_rate=target_skip_rate,
+        policy_seed=controller_cfg["policy_seed"],
+        skip_update_mode=effective_skip_update_mode,
+        scheduler_step_policy=scheduler_step_policy,
+        no_early_stopping=no_early_stopping,
+        total_steps=total_steps,
+        git_sha=git_sha,
+        attn_implementation="eager",
+        fp16=training_args.fp16,
+        torch_dtype="float16" if training_args.fp16 else "float32",
+        max_grad_norm=training_args.max_grad_norm,
+        learning_rate=training_args.learning_rate,
+        warmup_ratio=training_args.warmup_ratio,
+        weight_decay=training_args.weight_decay,
+    )
+    identity_inputs = add_online_ler_to_identity(
+        identity_inputs,
+        online_diagnostics,
     )
 
     # Force single-GPU to avoid unstable NCCL/DataParallel on DGX multi-GPU
