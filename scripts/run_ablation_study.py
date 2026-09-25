@@ -1181,7 +1181,7 @@ def build_phase1_3_matrix_plan(
                             hw_cfg=cell_kwargs.get("hw_cfg"),
                             lr=cell_kwargs.get("lr"),
                             warmup_ratio=cell_kwargs.get("warmup_ratio"),
-                            **cell_kwargs,
+                            **{k: v for k, v in cell_kwargs.items() if k not in ("hw_cfg", "lr", "warmup_ratio")},
                         )
                     )
     return plan
