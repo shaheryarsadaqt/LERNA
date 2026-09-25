@@ -485,7 +485,10 @@ class SampledLaggedLERTracker:
         rho = None
         if has_signal:
             denominator = velocity_sq_for_rho ** 0.5 * signal_sq_sum ** 0.5
-            rho = 0.0 if denominator < 1e-12 else dot_sum / denominator
+            if math.isfinite(denominator) and denominator >= 1e-12:
+                rho = dot_sum / denominator
+            else:
+                rho = 0.0
         return velocity, rho, new_samples
 
     @staticmethod
