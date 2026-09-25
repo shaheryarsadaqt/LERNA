@@ -1843,10 +1843,43 @@ def run_ablation_single(
     max_samples_requested = (
         None if max_samples_override is None else int(max_samples_override)
     )
-    # NOTE: identity_inputs will be built AFTER training_args is created below,
-    # to use the actual training_args values for fp16, max_grad_norm, etc.
-    # RVD configuration is included only when the effective control is rvd
-    # or the legacy policy is random_veto_deferral (which resolves to rvd).
+    # Build identity_inputs early for controller config additions (needed for
+    # both phase1_3 and CLI paths). For CLI path, use hw_cfg values; for
+    # phase1_3 path, planned_cell already has identity_inputs so we skip.
+    if planned_cell is not None:
+        identity_inputs = planned_cell.get("identity_inputs", {})
+    else:
+        identity_inputs = build_identity_inputs(
+            task=task_name,
+            training_seed=seed,
+            model_id=model_name,
+            model_revision=model_revision,
+            max_samples_requested=max_samples_requested,
+            train_samples_realized=len(train_ds),
+            eval_samples_realized=len(eval_ds),
+            train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
+            eval_dataset_fingerprint=getattr(eval_ds, "_fingerprint", None),
+            num_epochs=num_epochs,
+            control=effective_control or policy,
+            target_skip_rate=target_skip_rate,
+            policy_seed=controller_cfg["policy_seed"],
+            skip_update_mode=effective_skip_update_mode,
+            scheduler_step_policy=scheduler_step_policy,
+            no_early_stopping=no_early_stopping,
+            total_steps=total_steps,
+            git_sha=git_sha,
+            attn_implementation="eager",
+            fp16=hw_cfg["fp16"],
+            torch_dtype="float16" if hw_cfg["fp16"] else "float32",
+            max_grad_norm=1.0,
+            learning_rate=lr if 'lr' in locals() else 2e-5,
+            warmup_ratio=warmup_ratio,
+            weight_decay=0.01,
+        )
+        identity_inputs = add_online_ler_to_identity(
+            identity_inputs,
+            online_diagnostics,
+        )
     if effective_control == "rvd" or (
         effective_control is None and policy == "random_veto_deferral"
     ):
@@ -2283,42 +2316,20 @@ def run_ablation_single(
         remove_unused_columns=True,
     )
 
-    # Build canonical identity after training_args is available
-    identity_inputs = build_identity_inputs(
-        task=task_name,
-        training_seed=seed,
-        model_id=model_name,
-        model_revision=model_revision,
-        max_samples_requested=max_samples_requested,
-        train_samples_realized=len(train_ds),
-        eval_samples_realized=len(eval_ds),
-        train_dataset_fingerprint=getattr(train_ds, "_fingerprint", None),
-        eval_dataset_fingerprint=getattr(eval_ds, "_fingerprint", None),
-        num_epochs=num_epochs,
-        control=effective_control or policy,
-        target_skip_rate=target_skip_rate,
-        policy_seed=controller_cfg["policy_seed"],
-        skip_update_mode=effective_skip_update_mode,
-        scheduler_step_policy=scheduler_step_policy,
-        no_early_stopping=no_early_stopping,
-        total_steps=total_steps,
-        git_sha=git_sha,
-        attn_implementation="eager",
-        fp16=training_args.fp16,
-        torch_dtype="float16" if training_args.fp16 else "float32",
-        max_grad_norm=training_args.max_grad_norm,
-        learning_rate=training_args.learning_rate,
-        warmup_ratio=training_args.warmup_ratio,
-        weight_decay=training_args.weight_decay,
-    )
-    identity_inputs = add_online_ler_to_identity(
-        identity_inputs,
-        online_diagnostics,
-    )
-
     # Force single-GPU to avoid unstable NCCL/DataParallel on DGX multi-GPU
     if torch.cuda.is_available() and training_args._n_gpu > 1:
         training_args._n_gpu = 1
+
+    # Update identity_inputs with exact training_args values (CLI path only)
+    if planned_cell is None:
+        identity_inputs.update({
+            "fp16": training_args.fp16,
+            "torch_dtype": "float16" if training_args.fp16 else "float32",
+            "max_grad_norm": training_args.max_grad_norm,
+            "learning_rate": training_args.learning_rate,
+            "warmup_ratio": training_args.warmup_ratio,
+            "weight_decay": training_args.weight_decay,
+        })
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
     compute_metrics = build_compute_metrics(task_name)
