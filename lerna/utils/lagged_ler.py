@@ -415,15 +415,18 @@ class SampledLaggedLERTracker:
                 )
         return samples
 
-    def _sampled_signal(self, param, indices, state_lookup) -> Optional[torch.Tensor]:
+    def _sampled_signal(self, param, indices, state_lookup, step_value=None) -> Optional[torch.Tensor]:
         entry = state_lookup.get(id(param))
         if entry is not None:
             group, state = entry
             exp_avg = state.get("exp_avg")
             exp_avg_sq = state.get("exp_avg_sq")
-            step = state.get("step", 0)
-            step_value = float(step.item() if torch.is_tensor(step) else step)
-            if exp_avg is not None and exp_avg_sq is not None and step_value > 0:
+            # Use pre-extracted step_value if provided; otherwise fall back
+            # to per-tensor .item() (legacy path for external callers)
+            if step_value is None:
+                step = state.get("step", 0)
+                step_value = float(step.item() if torch.is_tensor(step) else step)
+            if step_value is not None and step_value > 0 and exp_avg is not None and exp_avg_sq is not None:
                 beta1, beta2 = group.get("betas", (0.9, 0.999))
                 eps = group.get("eps", self._adam_eps_fallback)
                 avg_sample = (
@@ -506,15 +509,34 @@ class SampledLaggedLERTracker:
         in the companion CPU test.
 
         This is tracker revision v2.
+
+        Sync count: O(1) total .item() calls (was O(n_tensors) in v1).
+        Step values are batched into a single .tolist() call to avoid per-tensor
+        optimizer-state .item() syncs inside _sampled_signal.
         """
         state_lookup = {}
+         # Pre-compute step values for all sampled tensors in a single batch
+         # to avoid per-tensor CPU syncs inside _sampled_signal
+        step_values: Dict[int, float] = {}
         if optimizer is not None:
+            step_tensors: List[tuple] = []  # (param_id, step_or_none)
             for group in optimizer.param_groups:
                 for param in group["params"]:
-                    state_lookup[id(param)] = (
-                        group,
-                        optimizer.state.get(param, {}),
-                    )
+                    state = optimizer.state.get(param, {})
+                    state_lookup[id(param)] = (group, state)
+                    step = state.get("step", 0)
+                    if torch.is_tensor(step):
+                        step_tensors.append((id(param), step.detach()))
+                    elif isinstance(step, (int, float)):
+                        step_values[id(param)] = float(step)
+                    else:
+                        step_values[id(param)] = 0.0
+            # Batch-extract all step values in ONE sync
+            if step_tensors:
+                ids, tensors = zip(*step_tensors)
+                batched = torch.stack(tensors).tolist()
+                for pid, sv in zip(ids, batched):
+                    step_values[pid] = float(sv)
 
         new_samples: Dict[str, torch.Tensor] = {}
         # On-device accumulator tensors; single .item() each at the end
@@ -539,7 +561,12 @@ class SampledLaggedLERTracker:
                 delta_sq_tensors.append(delta_sq)
                 scalar_count += int(delta.numel())
 
-                signal = self._sampled_signal(param, indices, state_lookup)
+                # Use pre-computed step_value to avoid CPU syncs per tensor
+                param_id = id(param)
+                step_val = step_values.get(param_id)
+                signal = self._sampled_signal(
+                    param, indices, state_lookup, step_value=step_val
+                )
                 if signal is not None:
                     has_signal = True
                     dot_tensors.append((delta * signal).sum())
