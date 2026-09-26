@@ -635,8 +635,10 @@ class TrueBackwardSkippingTrainer(Trainer):
                 self._cuda_event_start = torch.cuda.Event()
                 self._cuda_event_end = torch.cuda.Event()
 
-        self.add_callback(_SkipWrapperInstaller(self))
-        self.add_callback(_TimingCallback(self))
+        self._timing_cb = _TimingCallback(self)
+        self._skip_installer = _SkipWrapperInstaller(self)
+        self.add_callback(self._skip_installer)
+        self.add_callback(self._timing_cb)
 
     # ----------------------------------------------------- subclass hook
     def on_skipped_backward_step(self, loss, model, inputs) -> None:
@@ -1094,6 +1096,16 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.instrumentation_path = os.path.join(
                 self.args.output_dir, "instrumentation.json"
             )
+        if self.instr.avg_dataloader_wait_ms is None:
+            total_steps = self.instr.batches_seen
+            if total_steps > 0 and self.instr.dataloader_wait_seconds > 0:
+                self.instr.avg_dataloader_wait_ms = (
+                    self.instr.dataloader_wait_seconds / total_steps * 1000.0
+                )
+        if self._timing_cb is not None:
+            timing = self._timing_cb
+            if timing._train_start is not None and self.instr.train_loop_seconds == 0.0:
+                self.instr.train_loop_seconds = time.perf_counter() - timing._train_start
         try:
             os.makedirs(os.path.dirname(self.instrumentation_path), exist_ok=True)
             with open(self.instrumentation_path, "w") as f:

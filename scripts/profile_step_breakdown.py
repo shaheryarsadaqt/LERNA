@@ -19,6 +19,9 @@ import os
 import time
 from pathlib import Path
 
+# Disable torch.compile BEFORE importing torch (match production scripts)
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
 import torch
 import torch.profiler
 import torch.profiler.profiler as profiler_mod
@@ -29,11 +32,21 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HOME", "/raid/hf_cache")
+os.environ.setdefault("HF_HUB_CACHE", "/raid/hf_cache")
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from datasets import load_dataset
 
 from lerna.trainers.policies import RandomSkipPolicy, AlwaysFalsePolicy
+
+
+class MockTrainerState:
+    def __init__(self, global_step=0):
+        self.global_step = global_step
+
+class MockTrainer:
+    def __init__(self):
+        self.state = MockTrainerState()
 
 
 def load_model_and_data(model_name, revision, max_length=512):
@@ -56,22 +69,28 @@ def load_model_and_data(model_name, revision, max_length=512):
     ds = ds.select(range(min(len(ds), total_needed)))
 
     def tokenize(batch):
-        return tokenizer(
+        result = tokenizer(
             batch["sentence1"], batch["sentence2"],
             truncation=True, padding="max_length",
             max_length=128, return_tensors="pt",
         )
+        result["label"] = batch["label"]
+        return result
 
-    ds = ds.map(tokenize, batched=True, remove_columns=ds.column_names)
+    ds = ds.map(tokenize, batched=True, remove_columns=["sentence1", "sentence2"])
     return model, ds, batch_size, device
 
 
 def make_batches(ds, batch_size, device):
     batches = []
     for i in range(0, len(ds), batch_size):
-        batch = {k: torch.stack([ds[j][k] for j in range(i, min(i + batch_size, len(ds)))])
-                 for k in ds[0].keys()}
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch_items = ds[i:i + batch_size]
+        batch = {}
+        for k, v in batch_items.items():
+            t = torch.tensor(v)
+            batch[k] = t.to(device)
+        if "label" in batch:
+            batch["labels"] = batch.pop("label")
         batches.append(batch)
     return batches
 
@@ -79,6 +98,8 @@ def make_batches(ds, batch_size, device):
 def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=True):
     """Run n_steps with optional torch.profiler and report GPU utilization."""
     results = {"gpu_busy_pct": None, "top5_host_ops": [], "step_times_ms": [], "wall_time_s": 0.0}
+    mock_trainer = MockTrainer()
+    step_counter = 0
 
     if not use_profiler or not torch.cuda.is_available():
         # Fallback: measure wall time + CUDA events if available
@@ -89,8 +110,10 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
             t0 = time.perf_counter()
             outputs = model(**batch)
             loss = outputs.loss
+            mock_trainer.state.global_step = step_counter
+            step_counter += 1
             if hasattr(policy, "should_skip"):
-                skip = policy.should_skip(model, batch)  # approximate
+                skip = policy.should_skip(mock_trainer, model, batch)  # approximate
             else:
                 skip = False
             if not skip:
@@ -122,8 +145,10 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
             batch = batches[i % len(batches)]
             outputs = model(**batch)
             loss = outputs.loss
+            mock_trainer.state.global_step = step_counter
+            step_counter += 1
             if hasattr(policy, "should_skip"):
-                skip = policy.should_skip(model, batch)
+                skip = policy.should_skip(mock_trainer, model, batch)
             else:
                 skip = False
             if not skip:
@@ -186,17 +211,19 @@ def main():
     print(f"Profiling {args.steps} steps of full_finetune...")
     full_results = run_profiled_steps(
         model, batches, optimizer_full, full_policy, args.steps,
+        use_profiler=False,
     )
 
     # Profile exact_random (RandomSkipPolicy at 30%)
     optimizer_rand = torch.optim.Adam(
         model.parameters(), lr=2e-5, weight_decay=0.01,
     )
-    rand_policy = RandomSkipPolicy(skip_set_size=int(args.steps * batch_size * 0.30), seed=42)
+    rand_policy = RandomSkipPolicy(target_skip_rate=0.30, min_step=0, seed=42, total_steps=args.steps)
 
     print(f"Profiling {args.steps} steps of exact_random...")
     rand_results = run_profiled_steps(
         model, batches, optimizer_rand, rand_policy, args.steps,
+        use_profiler=False,
     )
 
     output = {

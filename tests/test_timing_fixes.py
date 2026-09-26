@@ -8,6 +8,7 @@ Covers:
   - avg_dataloader_wait_ms is populated
 """
 
+import json
 import os
 import tempfile
 
@@ -142,3 +143,41 @@ def test_avg_dataloader_wait_ms_populated(_trainer):
     """avg_dataloader_wait_ms must be set after training."""
     _trainer.train()
     assert _trainer.instr.avg_dataloader_wait_ms is not None
+
+
+def test_avg_dataloader_wait_ms_in_json_file(_trainer):
+    """avg_dataloader_wait_ms must be in the instrumentation.json file.
+
+    Bug: _SkipWrapperInstaller (registered before _TimingCallback) called
+    _dump_instrumentation() before _TimingCallback.on_train_end could compute
+    avg_dataloader_wait_ms, leaving it None in the JSON output.
+
+    Fix: _dump_instrumentation() now computes the field as a safety net.
+    """
+    _trainer.train()
+    instr_path = os.path.join(_trainer.args.output_dir, "instrumentation.json")
+    assert os.path.exists(instr_path), f"instrumentation.json not found at {instr_path}"
+    with open(instr_path) as f:
+        data = json.load(f)
+    assert data["avg_dataloader_wait_ms"] is not None, (
+        "avg_dataloader_wait_ms must be non-None in instrumentation.json "
+        "(was None due to callback ordering bug)"
+    )
+    assert data["avg_dataloader_wait_ms"] > 0.0
+
+
+def test_train_loop_seconds_in_json_file(_trainer):
+    """train_loop_seconds must be > 0 in instrumentation.json.
+
+    Same callback-ordering bug as avg_dataloader_wait_ms: _TimingCallback.on_train_end
+    was called after _dump_instrumentation, so train_loop_seconds was 0.0 in the file.
+    """
+    _trainer.train()
+    instr_path = os.path.join(_trainer.args.output_dir, "instrumentation.json")
+    assert os.path.exists(instr_path)
+    with open(instr_path) as f:
+        data = json.load(f)
+    assert data["train_loop_seconds"] > 0.0, (
+        "train_loop_seconds must be > 0 in instrumentation.json "
+        f"(got {data['train_loop_seconds']})"
+    )
