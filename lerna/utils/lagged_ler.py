@@ -439,7 +439,13 @@ class SampledLaggedLERTracker:
             return param.grad.detach().reshape(-1).index_select(0, indices).float()
         return None
 
-    def _sampled_dynamics(self, model, optimizer):
+    def _sampled_dynamics_v1(self, model, optimizer):
+        """Original per-tensor .item() reference implementation.
+
+        Kept for regression testing against the vectorized v2.
+        Each tensor triggers a CPU sync; reduction order is Python float
+        left-to-right sequential accumulation.
+        """
         state_lookup = {}
         if optimizer is not None:
             for group in optimizer.param_groups:
@@ -484,6 +490,83 @@ class SampledLaggedLERTracker:
 
         rho = None
         if has_signal:
+            denominator = velocity_sq_for_rho ** 0.5 * signal_sq_sum ** 0.5
+            if math.isfinite(denominator) and denominator >= 1e-12:
+                rho = dot_sum / denominator
+            else:
+                rho = 0.0
+        return velocity, rho, new_samples
+
+    def _sampled_dynamics(self, model, optimizer):
+        """Vectorized version: accumulates per-tensor norms on-device and syncs
+        to CPU once per metric (not per tensor).
+
+        Reduction order differs from v1 (PyTorch pairwise summation vs. Python
+        sequential float accumulation).  Tested to match v1 within atol=1e-6
+        in the companion CPU test.
+
+        This is tracker revision v2.
+        """
+        state_lookup = {}
+        if optimizer is not None:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    state_lookup[id(param)] = (
+                        group,
+                        optimizer.state.get(param, {}),
+                    )
+
+        new_samples: Dict[str, torch.Tensor] = {}
+        # On-device accumulator tensors; single .item() each at the end
+        delta_sq_tensors: List[torch.Tensor] = []
+        scalar_count = 0
+        dot_tensors: List[torch.Tensor] = []
+        signal_sq_tensors: List[torch.Tensor] = []
+        signal_delta_sq_tensors: List[torch.Tensor] = []
+        has_signal = False
+
+        with torch.no_grad():
+            for name, param, indices in self._iter_sampled(model):
+                current = (
+                    param.detach().reshape(-1).index_select(0, indices).float()
+                )
+                new_samples[name] = current
+                previous = self._prev_samples.get(name)
+                if previous is None or previous.numel() != current.numel():
+                    continue
+                delta = current - previous
+                delta_sq = delta.pow(2).sum()
+                delta_sq_tensors.append(delta_sq)
+                scalar_count += int(delta.numel())
+
+                signal = self._sampled_signal(param, indices, state_lookup)
+                if signal is not None:
+                    has_signal = True
+                    dot_tensors.append((delta * signal).sum())
+                    signal_sq_tensors.append(signal.pow(2).sum())
+                    signal_delta_sq_tensors.append(delta_sq)
+
+        # Single sync per metric
+        if delta_sq_tensors:
+            delta_sq_sum = float(
+                torch.stack(delta_sq_tensors).sum().item()
+            )
+        else:
+            delta_sq_sum = 0.0
+
+        velocity = None
+        if scalar_count > 0:
+            velocity = (delta_sq_sum / scalar_count) ** 0.5
+
+        rho = None
+        if has_signal:
+            dot_sum = float(torch.stack(dot_tensors).sum().item())
+            signal_sq_sum = float(
+                torch.stack(signal_sq_tensors).sum().item()
+            )
+            velocity_sq_for_rho = float(
+                torch.stack(signal_delta_sq_tensors).sum().item()
+            )
             denominator = velocity_sq_for_rho ** 0.5 * signal_sq_sum ** 0.5
             if math.isfinite(denominator) and denominator >= 1e-12:
                 rho = dot_sum / denominator

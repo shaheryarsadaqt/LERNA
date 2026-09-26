@@ -371,6 +371,11 @@ class SkipInstrumentation:
     mean_step_time_skipped: Optional[float] = None
     dataloader_wait_seconds: float = 0.0
 
+    # CUDA-event-based per-step timing (ms per step)
+    mean_step_ms_executed: Optional[float] = None
+    mean_step_ms_skipped: Optional[float] = None
+    avg_dataloader_wait_ms: Optional[float] = None
+
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["skip_ratio_by_batch"] = (
@@ -443,6 +448,10 @@ class SkipInstrumentation:
         d["mean_step_time_executed"] = self.mean_step_time_executed
         d["mean_step_time_skipped"] = self.mean_step_time_skipped
         d["dataloader_wait_seconds"] = self.dataloader_wait_seconds
+        # CUDA-event-based per-step timing
+        d["mean_step_ms_executed"] = self.mean_step_ms_executed
+        d["mean_step_ms_skipped"] = self.mean_step_ms_skipped
+        d["avg_dataloader_wait_ms"] = self.avg_dataloader_wait_ms
         return d
 
 
@@ -451,30 +460,33 @@ class SkipInstrumentation:
 # ----------------------------------------------------------------------------
 
 class _TimingCallback(TrainerCallback):
-    """Callback to measure setup, train loop, and eval time."""
+    """Callback to measure setup, train loop, and eval time.
+
+    [FIX] In transformers >= 5.x the callback API was consolidated:
+    on_evaluate_begin / on_evaluate_end no longer exist.  The single
+    on_evaluate event fires AFTER evaluation completes, which makes it
+    useless for timing.  Instead, TrueBackwardSkippingTrainer.evaluate
+    is wrapped to bracket timing with perf_counter, so this callback
+    only handles train-loop start/end.
+    """
     def __init__(self, trainer: "TrueBackwardSkippingTrainer"):
         self._trainer = trainer
         self._train_start = None
-        self._eval_start = None
 
     def on_train_begin(self, args, state, control, **kwargs):
         self._trainer.instr.setup_seconds = time.perf_counter() - self._trainer._global_start_time
         self._train_start = time.perf_counter()
         return control
 
-    def on_evaluate(self, args, state, control, **kwargs):
-        self._eval_start = time.perf_counter()
-        return control
-
-    def on_evaluate_end(self, args, state, control, **kwargs):
-        if self._eval_start is not None:
-            self._trainer.instr.eval_seconds += time.perf_counter() - self._eval_start
-            self._eval_start = None
-        return control
-
     def on_train_end(self, args, state, control, **kwargs):
         if self._train_start is not None:
             self._trainer.instr.train_loop_seconds = time.perf_counter() - self._train_start
+        # Compute avg dataloader wait per step
+        total_steps = self._trainer.instr.batches_seen
+        if total_steps > 0 and self._trainer.instr.avg_dataloader_wait_ms is None:
+            self._trainer.instr.avg_dataloader_wait_ms = (
+                self._trainer.instr.dataloader_wait_seconds / total_steps * 1000.0
+            )
         return control
 
 
@@ -609,6 +621,19 @@ class TrueBackwardSkippingTrainer(Trainer):
 
         # Global start time for setup timing
         self._global_start_time = time.perf_counter()
+
+        # CUDA events for per-step GPU timing
+        self._cuda_event_start: Optional["torch.cuda.Event"] = None
+        self._cuda_event_end: Optional["torch.cuda.Event"] = None
+        self._cuda_step_started = False
+        if torch.cuda.is_available():
+            try:
+                self._cuda_event_start = torch.cuda.Event(enable_timing=True)
+                self._cuda_event_end = torch.cuda.Event(enable_timing=True)
+            except TypeError:
+                # Older torch: no enable_timing kwarg
+                self._cuda_event_start = torch.cuda.Event()
+                self._cuda_event_end = torch.cuda.Event()
 
         self.add_callback(_SkipWrapperInstaller(self))
         self.add_callback(_TimingCallback(self))
@@ -759,6 +784,32 @@ class TrueBackwardSkippingTrainer(Trainer):
                 )
 
     # ----------------------------------------------------- core training
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ):
+        """Override evaluate to measure eval_seconds correctly.
+
+        [FIX] In transformers >= 5.x, on_evaluate fires AFTER evaluation
+        and on_evaluate_end does not exist, so the old _TimingCallback
+        could never accumulate eval_seconds (always 0.0).  This override
+        brackets the parent evaluate() call with perf_counter timing.
+        """
+        eval_start = time.perf_counter()
+        try:
+            result = super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            self.instr.eval_seconds += time.perf_counter() - eval_start
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.args.local_rank)
+        return result
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
@@ -780,11 +831,17 @@ class TrueBackwardSkippingTrainer(Trainer):
         import time
         step_start = time.perf_counter()
         dataloader_start = step_start
-        
+
         # [FIX P0-3] Forward ALWAYS happens before skip decision (R3).
         # [CRIT-1] Always clear both flags at start of each step (safety net).
         self._skip_optimizer_step = False
         self._skip_scheduler_step = False
+
+        # CUDA event pair for GPU-side step timing
+        if self._cuda_event_start is not None:
+            if not self._cuda_step_started:
+                self._cuda_event_start.record()
+                self._cuda_step_started = True
 
         model.train()
         inputs = self._prepare_inputs(inputs)
@@ -870,7 +927,7 @@ class TrueBackwardSkippingTrainer(Trainer):
             except Exception:
                 pass
             
-            # Record skipped step time
+             # Record skipped step time (wall-clock + CUDA event)
             step_time = time.perf_counter() - step_start
             if self.instr.mean_step_time_skipped is None:
                 self.instr.mean_step_time_skipped = step_time
@@ -879,6 +936,19 @@ class TrueBackwardSkippingTrainer(Trainer):
                 self.instr.mean_step_time_skipped = (
                     (self.instr.mean_step_time_skipped * (n - 1) + step_time) / n
                 )
+            # CUDA event timing
+            if self._cuda_event_start is not None:
+                self._cuda_event_end.record()
+                torch.cuda.synchronize(self.args.local_rank)
+                cuda_elapsed_ms = self._cuda_event_start.elapsed_time(self._cuda_event_end)
+                if self.instr.mean_step_ms_skipped is None:
+                    self.instr.mean_step_ms_skipped = cuda_elapsed_ms
+                else:
+                    n = self.instr.skipped_backward_steps
+                    self.instr.mean_step_ms_skipped = (
+                        (self.instr.mean_step_ms_skipped * (n - 1) + cuda_elapsed_ms) / n
+                    )
+                self._cuda_step_started = False
             return loss.detach() / max(self.args.gradient_accumulation_steps, 1)
 
         # [CRIT-2] Normal step: divide loss BEFORE backward for gradient
@@ -927,7 +997,7 @@ class TrueBackwardSkippingTrainer(Trainer):
         else:
             self._pre_clip_grad_norm = None
 
-        # Record executed step time
+        # Record executed step time (wall-clock + CUDA event)
         step_time = time.perf_counter() - step_start
         if self.instr.mean_step_time_executed is None:
             self.instr.mean_step_time_executed = step_time
@@ -936,6 +1006,19 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.instr.mean_step_time_executed = (
                 (self.instr.mean_step_time_executed * (n - 1) + step_time) / n
             )
+        # CUDA event timing for executed steps
+        if self._cuda_event_start is not None:
+            self._cuda_event_end.record()
+            torch.cuda.synchronize(self.args.local_rank)
+            cuda_elapsed_ms = self._cuda_event_start.elapsed_time(self._cuda_event_end)
+            if self.instr.mean_step_ms_executed is None:
+                self.instr.mean_step_ms_executed = cuda_elapsed_ms
+            else:
+                n = self.instr.backward_calls
+                self.instr.mean_step_ms_executed = (
+                    (self.instr.mean_step_ms_executed * (n - 1) + cuda_elapsed_ms) / n
+                )
+            self._cuda_step_started = False
 
         # Return the un-scaled detached loss for logging consistency.
         return loss.detach()

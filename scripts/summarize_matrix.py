@@ -90,9 +90,13 @@ def extract_cell_summary(data: Dict[str, Any]) -> Dict[str, Any]:
         "eval_seconds": instr.get("eval_seconds", 0.0),
         "setup_seconds": instr.get("setup_seconds", 0.0),
         "telemetry_overhead_seconds": instr.get("telemetry_overhead_seconds", 0.0),
-        "mean_step_time_executed": instr.get("mean_step_time_executed"),
+         "mean_step_time_executed": instr.get("mean_step_time_executed"),
         "mean_step_time_skipped": instr.get("mean_step_time_skipped"),
         "dataloader_wait_seconds": instr.get("dataloader_wait_seconds", 0.0),
+        # CUDA-event-based timing (new in tracker v2)
+        "mean_step_ms_executed": instr.get("mean_step_ms_executed"),
+        "mean_step_ms_skipped": instr.get("mean_step_ms_skipped"),
+        "avg_dataloader_wait_ms": instr.get("avg_dataloader_wait_ms"),
     }
 
 
@@ -120,6 +124,10 @@ def build_timing_table(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "mean_step_executed_ms": round(s["mean_step_time_executed"] * 1000, 1) if s["mean_step_time_executed"] else None,
             "mean_step_skipped_ms": round(s["mean_step_time_skipped"] * 1000, 1) if s["mean_step_time_skipped"] else None,
             "dataloader_wait_s": round(s["dataloader_wait_seconds"], 1),
+            # CUDA-event-based (tracker v2)
+            "cuda_mean_step_executed_ms": s["mean_step_ms_executed"],
+            "cuda_mean_step_skipped_ms": s["mean_step_ms_skipped"],
+            "cuda_avg_dataloader_wait_ms": s["avg_dataloader_wait_ms"],
         })
     return sorted(rows, key=lambda x: x["total_runtime_s"])
 
@@ -267,13 +275,32 @@ def main():
     for c in cells_raw:
         c["summary"] = extract_cell_summary(c["data"])
 
-    # Build all tables
+     # Build all tables
     metrics_table = build_metrics_table(cells_raw)
     skip_table = build_skip_accounting_table(cells_raw)
     timing_table = build_timing_table(cells_raw)
     m2c_table = build_m2c_table(cells_raw)
     amp_table = build_amp_table(cells_raw)
     validation_table = build_validation_table(exp_dir)
+
+    # Aggregate run counts: attempted / failed / completed / validated / energy-valid
+    val_path = exp_dir / "matrix_validation.json"
+    run_counts = {
+        "attempted": len(cells_raw),
+        "failed": 0,
+        "completed": 0,
+        "validated": 0,
+        "energy_valid": 0,
+    }
+    if val_path.exists():
+        with open(val_path) as f:
+            val_data = json.load(f)
+        val_runs = val_data.get("runs", [])
+        run_counts["attempted"] = len(val_runs)
+        run_counts["failed"] = sum(1 for r in val_runs if not r.get("completed", r.get("valid", False)))
+        run_counts["completed"] = sum(1 for r in val_runs if r.get("completed", False))
+        run_counts["validated"] = sum(1 for r in val_runs if r.get("run_validated", False) is False and r.get("valid", False))
+        run_counts["energy_valid"] = sum(1 for r in val_runs if r.get("energy_valid", False))
 
     # Print to console
     print("\n=== METRICS TABLE ===")
@@ -326,6 +353,7 @@ def main():
         "m2c_numerics": m2c_table,
         "amp_accounting": amp_table,
         "validation": validation_table,
+        "run_counts": run_counts,
     }
 
     if args.output:
@@ -336,6 +364,14 @@ def main():
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nWritten JSON tables to: {out_path}")
+
+    # Print aggregate run counts
+    print(f"\n=== RUN COUNTS ===")
+    print(f"  Attempted:    {run_counts['attempted']}")
+    print(f"  Failed:       {run_counts['failed']}")
+    print(f"  Completed:    {run_counts['completed']}")
+    print(f"  Validated:    {run_counts['validated']}")
+    print(f"  Energy-valid: {run_counts['energy_valid']}")
 
 
 if __name__ == "__main__":
