@@ -149,17 +149,34 @@ def build_plan(base_output_dir, git_sha, profile):
     return plan, qnli_facts, hw_config
 
 
+def find_completed_attempt(base_output_dir, arm, fingerprint):
+    """Return (attempt_name, results_path) for the first completed attempt, or None."""
+    arm_dir = Path(base_output_dir) / arm / fingerprint
+    if not arm_dir.exists():
+        return None
+    for attempt_dir in sorted(arm_dir.iterdir()):
+        if not attempt_dir.is_dir() or not attempt_dir.name.startswith("attempt-"):
+            continue
+        rpath = attempt_dir / "results.json"
+        ipath = attempt_dir / "instrumentation.json"
+        if rpath.exists() and ipath.exists():
+            return attempt_dir.name, rpath
+    return None
+
+
 def validate_cell(cell, base_output_dir):
     arm = cell["arm"]
     fingerprint = cell["fingerprint"]
-    results_path = Path(base_output_dir) / arm / fingerprint / "attempt-001" / "results.json"
-    if not results_path.exists():
-        return False, f"results.json not found"
+    completed = find_completed_attempt(base_output_dir, arm, fingerprint)
+    if completed is None:
+        return False, f"results.json not found in any attempt"
+    _, results_path = completed
     with open(results_path) as f:
         results = json.load(f)
     errors = []
     try:
-        check_forward_loss_numerics(results)
+        total_steps = results.get("controller_config", {}).get("configured_total_steps", 6548)
+        check_forward_loss_numerics(results, expected_observations=total_steps)
     except Exception as exc:
         errors.append(f"forward_loss_numerics: {exc}")
     instr = results.get("true_skip_instrumentation", {})
@@ -178,13 +195,16 @@ def validate_cell(cell, base_output_dir):
 def collect_cell_metrics(base_output_dir, seed, arm):
     f = Path(base_output_dir) / arm
     for fp_dir in sorted(f.iterdir()):
-        if fp_dir.is_dir() and len(fp_dir.name) == 16:
-            rpath = fp_dir / "attempt-001" / "results.json"
-            if rpath.exists():
-                d = json.load(open(rpath))
-                instr = d.get("true_skip_instrumentation", {})
-                return {
-                    "acc": d["eval_metrics"]["eval_accuracy"],
+        if not fp_dir.is_dir() or len(fp_dir.name) != 16:
+            continue
+        completed = find_completed_attempt(base_output_dir, arm, fp_dir.name)
+        if completed is None:
+            continue
+        _, rpath = completed
+        d = json.load(open(rpath))
+        instr = d.get("true_skip_instrumentation", {})
+        return {
+            "acc": d["eval_metrics"]["eval_accuracy"],
                     "f1": d["eval_metrics"].get("eval_f1", None),
                     "mean_step_ms_executed": instr.get("mean_step_ms_executed"),
                     "mean_step_ms_skipped": instr.get("mean_step_ms_skipped"),
@@ -244,7 +264,24 @@ def main():
 
         for cell in seed_cells:
             arm = cell["arm"]
+            fingerprint = cell["fingerprint"]
             t0 = time.perf_counter()
+            completed = find_completed_attempt(base_output_dir, arm, fingerprint)
+            if completed is not None:
+                attempt_name, _ = completed
+                print(f"\n  [{arm}] seed={seed} SKIP (already complete: {attempt_name})", flush=True)
+                t1 = time.perf_counter()
+                valid, msg = validate_cell(cell, base_output_dir)
+                metrics = collect_cell_metrics(base_output_dir, seed, arm)
+                all_cell_metrics[(seed, arm)] = metrics
+                if valid:
+                    seed_results.append((arm, True, ""))
+                    print(f"  [{arm}] PASS (cached) | acc={metrics['acc']:.4f} | step={metrics['mean_step_ms_executed']:.1f}ms | eval_s={metrics['eval_seconds']:.1f}", flush=True)
+                else:
+                    seed_all_valid = False
+                    seed_results.append((arm, False, msg))
+                    print(f"  [{arm}] FAIL (cached): {msg}", flush=True)
+                continue
             print(f"\n  [{arm}] seed={seed} starting...", flush=True)
             try:
                 run_ablation_single(

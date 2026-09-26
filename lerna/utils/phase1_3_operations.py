@@ -1067,7 +1067,8 @@ def freeze_matrix_validation(
         manifest = _load_json(attempt_dir / "run_manifest.json")
         validate_power_evidence(results)
         # M2c: strict forward-loss numerics validation
-        check_forward_loss_numerics(results)
+        total_steps = results.get("controller_config", {}).get("configured_total_steps", 575)
+        check_forward_loss_numerics(results, expected_observations=total_steps)
         matrix_kind = bundle["envelope"]["matrix_kind"]
         if matrix_kind not in ("pilot", "production"):
             raise Phase13OperationalError(
@@ -1126,12 +1127,14 @@ def freeze_matrix_validation(
     return report
 
 
-def check_forward_loss_numerics(results: dict[str, Any]) -> None:
+def check_forward_loss_numerics(
+    results: dict[str, Any], expected_observations: int = 575
+) -> None:
     """Validate M2c forward-loss numerics fields are present and consistent.
 
     Required fields in true_skip_instrumentation:
     - nonfinite_forward_loss_policy (str)
-    - forward_loss_observations (int, must equal total forward calls = 575)
+    - forward_loss_observations (int, must equal expected_observations)
     - nonfinite_forward_loss_count (int, must be 0 for valid runs)
     - first_nonfinite_forward_loss_step (int or null)
     - first_nonfinite_forward_loss_value (float or null)
@@ -1150,11 +1153,11 @@ def check_forward_loss_numerics(results: dict[str, Any]) -> None:
                 f"M2c validation failed: missing required field '{field}' "
                 f"in true_skip_instrumentation"
             )
-    # Verify forward_loss_observations == 575 (total training steps)
-    if instr["forward_loss_observations"] != 575:
+    # Verify forward_loss_observations == expected_observations
+    if instr["forward_loss_observations"] != expected_observations:
         raise Phase13OperationalError(
             f"M2c validation failed: forward_loss_observations = "
-            f"{instr['forward_loss_observations']}, expected 575"
+            f"{instr['forward_loss_observations']}, expected {expected_observations}"
         )
     # Verify nonfinite_forward_loss_count == 0 (strict protocol: run would be invalidated)
     if instr["nonfinite_forward_loss_count"] != 0:
