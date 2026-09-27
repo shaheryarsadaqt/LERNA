@@ -470,6 +470,24 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
         "skipped_backward_steps": quota if skipping else 0,
         "provenance_classification": cell.get("provenance_classification", "matched_claim"),
     }
+    if not data.get("power_evidence"):
+        total_steps = cell["total_steps"]
+        data["power_evidence"] = {
+            "authoritative_copy": "results.json",
+            "measurement_source": "nvidia-smi",
+            "energy_valid": True,
+            "energy_invalid_reason": "ok",
+            "gpu_name": "V100",
+            "gpu_index": 0,
+            "gpu_selector": "0",
+            "sample_interval_s": 1.0,
+            "nvidia_smi_query_count": total_steps,
+            "nvidia_smi_success_count": total_steps,
+            "total_energy_kwh": 0.001,
+            "coverage": 1.0,
+            "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}, {"timestamp": 2.0, "power_w": 200.0}],
+            "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+        }
 
     if tamper:
         tamper(data)
@@ -587,7 +605,7 @@ def _create_cell_fixture(
                 "n_decisions": 50,
                 "last_update_decision": 45,
                 "observation_age_decisions": 5,
-                "ler": 0.012,
+                "ler": 0.011,
                 "ler_raw": 0.0125,
                 "rho_vg": 0.01,
                 "rho_vg_raw": 0.01,

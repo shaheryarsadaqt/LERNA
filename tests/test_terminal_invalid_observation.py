@@ -111,10 +111,10 @@ def test_trainer_terminal_failure_path():
             args=args,
             train_dataset=DummyDataset(),
             optimizers=(optimizer, None),
+            online_ler_mode=ONLINE_LER_MODE_SAMPLED_LAGGED,
+            online_ler_update_interval=1,
+            capture_logits=True,
         )
-        trainer.online_ler_mode = ONLINE_LER_MODE_SAMPLED_LAGGED
-        trainer.online_ler_update_interval = 1
-        trainer.capture_logits = True
 
         # Attach tracker
         tracker = SampledLaggedLERTracker(
@@ -331,10 +331,10 @@ def test_no_pending_action_after_terminal():
             args=args,
             train_dataset=DummyDataset(),
             optimizers=(optimizer, None),
+            online_ler_mode=ONLINE_LER_MODE_SAMPLED_LAGGED,
+            online_ler_update_interval=1,
+            capture_logits=True,
         )
-        trainer.online_ler_mode = ONLINE_LER_MODE_SAMPLED_LAGGED
-        trainer.online_ler_update_interval = 1
-        trainer.capture_logits = True
 
         tracker = SampledLaggedLERTracker(task='test', window_size=5, parameter_sample_size=100, sample_seed=42)
         tracker.set_optimizer(optimizer)
@@ -530,7 +530,7 @@ def test_validator_accepts_valid_diagnostics():
             'n_decisions': 50,
             'last_update_decision': 45,
             'observation_age_decisions': 5,
-            'ler': 0.012,
+            'ler': 0.011,
             'ler_raw': 0.0125,
             'rho_vg': 0.01,
             'rho_vg_raw': 0.01,

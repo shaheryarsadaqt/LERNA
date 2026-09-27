@@ -548,6 +548,7 @@ class PowerTelemetryCallback(TrainerCallback):
         self.energy_measurement_source = "invalid"
         self._nvidia_smi_success_count = 0
         self._nvidia_smi_query_count = 0
+        self._coverage_ratio = 0.0
 
     # --- GPU detection ---
 
@@ -757,6 +758,7 @@ class PowerTelemetryCallback(TrainerCallback):
                 and coverage_ratio >= 0.90
             )
             self.energy_valid = energy_valid
+            self._coverage_ratio = coverage_ratio
             self.energy_invalid_reason = (
                 "ok" if energy_valid else
                 f"insufficient_coverage:{coverage_ratio:.2f}"

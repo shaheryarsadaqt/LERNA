@@ -295,12 +295,14 @@ def test_power_evidence_embeds_raw_authoritative_copy():
             }
         ],
         step_energies=[{"step": 1, "step_kwh": 0.001}],
+        _coverage_ratio=1.0,
     )
 
     evidence = runner.build_power_evidence(callback)
 
     assert evidence["authoritative_copy"] == "results.json"
     assert evidence["energy_valid"] is True
+    assert evidence["coverage"] == 1.0
     assert evidence["raw_samples"] == callback._power_samples
     assert evidence["raw_samples"] is not callback._power_samples
     assert evidence["per_step_energy"] is not callback.step_energies

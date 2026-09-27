@@ -49,6 +49,16 @@ class CountingTracker:
         self.calls = 0
         self.fail = fail
 
+    def get_diagnostics(self):
+        return {
+            "mode": "sampled_lagged",
+            "timing": "post_decision_after_backward",
+            "n_updates": self.calls,
+        }
+
+    def note_decision(self, decision_index):
+        pass
+
     def update(self, **kwargs):
         self.calls += 1
         if self.fail:

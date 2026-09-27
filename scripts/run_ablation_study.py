@@ -64,7 +64,8 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 import evaluate
 import numpy as np
-
+import lerna
+lerna_version = getattr(lerna, "__version__", "unknown")
 from lerna.callbacks.efficiency_callback import PowerTelemetryCallback
 from lerna.callbacks.ler_feed import LERFeedCallback
 from lerna.utils.lagged_ler import SampledLaggedLERTracker
@@ -395,6 +396,7 @@ def build_ler_guided_controller_config(
         "probe_interval": probe_interval,
         "min_ler_observations": 3,
         "ler_guidance_strength": 1.0,
+        "ler_guidance_enabled": True,
         "required_tracker_mode": "sampled_lagged",
         "required_tracker_timing": "post_decision_after_backward",
         "safety_enabled": safety_enabled,
@@ -695,6 +697,7 @@ def build_online_ler_tracker(
     task_name,
     use_hysteresis,
     sample_seed,
+    tracker_revision: str = "v2",
 ):
     """Construct the runtime tracker for one resolved online LER config."""
     mode = online_diagnostics["mode"]
@@ -712,6 +715,7 @@ def build_online_ler_tracker(
             window_size=5,
             parameter_sample_size=online_diagnostics["parameter_sample_size"],
             sample_seed=sample_seed,
+            tracker_revision=tracker_revision,
         )
     raise ValueError(f"Unknown online LER mode: {mode!r}")
 
@@ -822,6 +826,7 @@ def build_power_evidence(power_callback):
             power_callback._nvidia_smi_success_count
         ),
         "total_energy_kwh": float(power_callback.cumulative_kwh),
+        "coverage": float(power_callback._coverage_ratio),
         "raw_samples": [dict(sample) for sample in power_callback._power_samples],
         "per_step_energy": [
             dict(sample) for sample in power_callback.step_energies
@@ -1956,6 +1961,7 @@ def run_ablation_single(
         task_name=task_name,
         use_hysteresis=use_hysteresis,
         sample_seed=online_diagnostics["sample_seed"],
+        tracker_revision="v3",
     )
 
     # Signal-consuming policies use their task calibration; signal-free arms
@@ -2294,7 +2300,7 @@ def run_ablation_single(
         gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
         learning_rate=lr,
         weight_decay=0.01,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=int(total_steps * warmup_ratio),
         max_grad_norm=1.0,
         fp16=hw_cfg["fp16"],
         bf16=hw_cfg["bf16"],
@@ -2362,6 +2368,7 @@ def run_ablation_single(
         online_ler_enabled=online_diagnostics["enabled"],
         online_ler_update_interval=online_diagnostics["update_interval"],
         callbacks=callbacks,
+        allow_grad_accumulation_with_skipping=True,
     )
     if ler_feed_callback is not None:
         ler_feed_callback.attach(trainer=trainer)
@@ -2405,6 +2412,8 @@ def run_ablation_single(
         identity_inputs=identity_inputs,
         fingerprint=fingerprint,
         attempt=attempt,
+        tracker_revision=lerna_version,
+        nonfinite_forward_loss_policy="fail",
     )
 
     try:

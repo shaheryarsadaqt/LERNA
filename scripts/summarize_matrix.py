@@ -229,6 +229,7 @@ def build_validation_table(exp_dir: Path) -> List[Dict[str, Any]]:
             "arm": cell_id[3] if len(cell_id) > 3 else None,
             "attempt": run.get("attempt"),
             "energy_valid": run.get("energy_valid"),
+            "power_evidence_coverage": round(run.get("power_evidence_coverage") or 0.0, 4),
             "manifest_sha256": run.get("manifest_sha256", "")[:16] + "...",
             "results_sha256": run.get("results_sha256", "")[:16] + "...",
         })
@@ -340,9 +341,9 @@ def main():
 
     print("\n=== VALIDATION STATUS TABLE ===")
     print_table(
-        ["task", "seed", "skip_rate", "arm", "attempt", "energy_valid", "manifest_sha256", "results_sha256"],
+        ["task", "seed", "skip_rate", "arm", "attempt", "energy_valid", "power_evidence_coverage", "manifest_sha256", "results_sha256"],
         validation_table,
-        ["task", "seed", "skip_rate", "arm", "attempt", "energy_valid", "manifest_sha256", "results_sha256"]
+        ["task", "seed", "skip_rate", "arm", "attempt", "energy_valid", "power_evidence_coverage", "manifest_sha256", "results_sha256"]
     )
 
     # Write JSON output

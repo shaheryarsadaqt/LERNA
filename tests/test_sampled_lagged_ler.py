@@ -3,6 +3,7 @@
 import inspect
 import os
 import tempfile
+import textwrap
 
 import pytest
 import torch
@@ -61,6 +62,7 @@ CANONICAL_KEYS = {
     "rho_vg_history",
     "loss_history",
     "entropy_history",
+    "tracker_revision",
 }
 
 
@@ -94,10 +96,21 @@ def test_sampling_is_deterministic_and_uses_one_global_budget():
 
 
 def test_sampled_source_avoids_dense_permutations_and_vector_concatenation():
-    source = inspect.getsource(__import__("lerna.utils.lagged_ler", fromlist=["*"]))
-    assert "randperm" not in source
-    assert "torch.cat" not in source
-    assert "state_dict" not in source
+    """v2 tracker must not use dense concatenation; v3 uses torch.cat by design."""
+    import inspect
+    import lerna.utils.lagged_ler as mod
+
+    v2_src = textwrap.dedent(inspect.getsource(
+        mod.SampledLaggedLERTracker._sampled_dynamics
+    ))
+    assert "randperm" not in v2_src
+    assert "torch.cat" not in v2_src
+    assert "state_dict" not in v2_src
+
+    v3_src = textwrap.dedent(inspect.getsource(
+        mod.SampledLaggedLERTracker._sampled_dynamics_v3
+    ))
+    assert "torch.cat" in v3_src or "_capture_flat_tensor" in v3_src
 
 
 def test_velocity_is_rms_and_independent_of_sample_budget():

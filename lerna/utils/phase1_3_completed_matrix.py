@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-from numbers import Real
 import os
 import re
 import sys
@@ -180,7 +179,9 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         })
         return False
 
-    # Required typed fields (per terminal contract)
+    initial_findings = len(findings)
+    # Required typed fields (per terminal contract). JSON booleans are not
+    # numeric observations or counters even though bool subclasses int.
     required_fields = {
         "mode": str,
         "timing": str,
@@ -202,6 +203,10 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         "rho_vg_history": list,
         "loss_history": list,
         "entropy_history": list,
+        "ler": (int, float, type(None)),
+        "ler_raw": (int, float, type(None)),
+        "rho_vg": (int, float, type(None)),
+        "param_velocity": (int, float, type(None)),
     }
 
     for field, expected_type in required_fields.items():
@@ -212,7 +217,7 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
                 "cell": cell_id,
                 "message": f"{attempt_name}: missing required field {field!r}",
             })
-        elif not isinstance(diag[field], expected_type):
+        elif isinstance(diag[field], bool) or not isinstance(diag[field], expected_type):
             findings.append({
                 "severity": "error",
                 "field": f"ler_diagnostics.json.{field}",
@@ -220,8 +225,11 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
                 "message": f"{attempt_name}: field {field!r} has wrong type {type(diag[field]).__name__}, expected {expected_type if isinstance(expected_type, tuple) else expected_type.__name__}",
             })
 
-    if findings:
+    if len(findings) != initial_findings:
         return False
+
+    def finite_number(value):
+        return type(value) is int or (type(value) is float and math.isfinite(value))
 
     # Finite accepted raw/smoothed histories and final values
     history_fields = ["ler_raw_history", "ler_history", "velocity_history", "rho_vg_history", "loss_history", "entropy_history"]
@@ -229,12 +237,12 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         history = diag.get(hf, [])
         if isinstance(history, list):
             for i, val in enumerate(history):
-                if isinstance(val, bool) or not isinstance(val, Real) or not math.isfinite(float(val)):
+                if not finite_number(val):
                     findings.append({
                         "severity": "error",
                         "field": f"ler_diagnostics.json.{hf}[{i}]",
                         "cell": cell_id,
-                        "message": f"{attempt_name}: history value in {hf}[{i}] must be a finite real number, got {val!r}",
+                        "message": f"{attempt_name}: expected finite number in accepted {hf}[{i}], got {val!r}",
                     })
                     return False
 
@@ -246,12 +254,12 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
         "param_velocity": diag.get("param_velocity"),
     }
     for fv_name, fv in final_value_fields.items():
-        if fv is not None and (isinstance(fv, bool) or not isinstance(fv, Real) or not math.isfinite(float(fv))):
+        if fv is not None and not finite_number(fv):
             findings.append({
                 "severity": "error",
                 "field": f"ler_diagnostics.json.{fv_name}",
                 "cell": cell_id,
-                "message": f"{attempt_name}: final value {fv_name} must be a finite real number or null, got {fv!r}",
+                "message": f"{attempt_name}: non-finite final value {fv_name} = {fv!r}",
             })
             return False
 
@@ -263,6 +271,13 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
             "field": "ler_diagnostics.json.invalid_emission_events",
             "cell": cell_id,
             "message": f"{attempt_name}: invalid_emission_events = {invalid_count} > 0 (terminal contract violation)",
+        })
+        return False
+
+    if diag["terminal_invalid_event"] is not None:
+        findings.append({
+            "severity": "error", "field": "ler_diagnostics.json.terminal_invalid_event",
+            "cell": cell_id, "message": f"{attempt_name}: terminal observations cannot be accepted",
         })
         return False
 
@@ -300,6 +315,29 @@ def _validate_ler_diagnostics_schema(attempt_path: str, cell_id: Any, attempt_na
             "message": f"{attempt_name}: observation_attempts ({obs_attempts}) != warmup_updates ({warmup_updates}) + valid_emissions ({valid_emissions}) + invalid_emission_events ({invalid_count})",
         })
         return False
+
+    for field, expected in (
+        ("n_updates", obs_attempts),
+        ("loss_history", n_updates),
+        ("entropy_history", n_updates),
+    ):
+        actual = len(diag[field]) if isinstance(diag[field], list) else diag[field]
+        if actual != expected:
+            findings.append({
+                "severity": "error", "field": f"ler_diagnostics.json.{field}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: {field} count {actual} != {expected}",
+            })
+            return False
+    for final, history in (("ler", "ler_history"), ("ler_raw", "ler_raw_history")):
+        expected = diag[history][-1] if diag[history] else None
+        if diag[final] != expected:
+            findings.append({
+                "severity": "error", "field": f"ler_diagnostics.json.{final}",
+                "cell": cell_id,
+                "message": f"{attempt_name}: {final} does not match its accepted history",
+            })
+            return False
 
     # History lengths should match counters
     if len(diag.get("ler_raw_history", [])) != valid_emissions:

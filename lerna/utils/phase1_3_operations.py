@@ -242,6 +242,13 @@ def validate_power_evidence(results: dict[str, Any]) -> None:
     total_energy = power.get("total_energy_kwh")
     if not isinstance(total_energy, (int, float)) or isinstance(total_energy, bool) or total_energy < 0:
         raise Phase13OperationalError("power evidence total_energy_kwh is not non-negative number")
+    coverage = power.get("coverage")
+    if not isinstance(coverage, (int, float)) or isinstance(coverage, bool):
+        raise Phase13OperationalError("power evidence coverage is not a number")
+    if power.get("energy_valid") and coverage < 0.9:
+        raise Phase13OperationalError(
+            f"power evidence energy_valid but coverage {coverage:.4f} < 0.9"
+        )
     raw_samples = power.get("raw_samples")
     if not isinstance(raw_samples, list) or not raw_samples:
         raise Phase13OperationalError("power evidence raw_samples is not a non-empty list")
@@ -1067,7 +1074,11 @@ def freeze_matrix_validation(
         manifest = _load_json(attempt_dir / "run_manifest.json")
         validate_power_evidence(results)
         # M2c: strict forward-loss numerics validation
-        total_steps = results.get("controller_config", {}).get("configured_total_steps", 575)
+        total_steps = results.get("controller_config", {}).get("configured_total_steps")
+        if total_steps is None:
+            raise Phase13OperationalError(
+                "completed results lack configured_total_steps for M2c validation"
+            )
         check_forward_loss_numerics(results, expected_observations=total_steps)
         matrix_kind = bundle["envelope"]["matrix_kind"]
         if matrix_kind not in ("pilot", "production"):
@@ -1102,9 +1113,10 @@ def freeze_matrix_validation(
                     attempt_dir / "run_manifest.json"
                 ),
                 "results_sha256": file_sha256(attempt_dir / "results.json"),
-                "power_evidence_sha256": _power_evidence_sha(results),
-                "energy_valid": results["power_evidence"].get("energy_valid"),
-            }
+                 "power_evidence_sha256": _power_evidence_sha(results),
+                 "energy_valid": results["power_evidence"].get("energy_valid"),
+                 "power_evidence_coverage": results["power_evidence"].get("coverage"),
+             }
         )
     report = {
         "schema_version": VALIDATION_SCHEMA_VERSION,

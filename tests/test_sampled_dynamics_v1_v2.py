@@ -166,3 +166,113 @@ def test_v2_reduction_order_documented():
     assert "torch.stack" in src, "v2 must use torch.stack for on-device accumulation"
     assert "delta_sq_tensors" in src
     assert "signal_delta_sq_tensors" in src
+
+
+def test_v1_vs_v3_outputs_match_atol():
+    """v3 (flat-tensor gather) must match v1 (per-tensor .item()) within atol=1e-6."""
+    tracker_v1, tracker_v3 = _run_observation_sequence_v3(
+        steps=200, parameter_sample_size=4096, seed=0
+    )
+
+    assert len(tracker_v1.velocity_history) == len(tracker_v3.velocity_history)
+    assert len(tracker_v1.rho_vg_history) == len(tracker_v3.rho_vg_history)
+    assert len(tracker_v1.ler_history) == len(tracker_v3.ler_history)
+    assert tracker_v1.valid_emissions == tracker_v3.valid_emissions
+    assert tracker_v1.terminal_invalid_event == tracker_v3.terminal_invalid_event
+
+    for v1, v3 in zip(tracker_v1.velocity_history, tracker_v3.velocity_history):
+        assert v3 == pytest.approx(v1, abs=1e-6)
+
+    for v1, v3 in zip(tracker_v1.rho_vg_history, tracker_v3.rho_vg_history):
+        if v1 is not None and v3 is not None:
+            assert v3 == pytest.approx(v1, abs=1e-6)
+        else:
+            assert v1 is None and v3 is None
+
+    for v1, v3 in zip(tracker_v1.ler_history, tracker_v3.ler_history):
+        assert v3 == pytest.approx(v1, abs=1e-6)
+
+
+def _run_observation_sequence_v3(steps=200, parameter_sample_size=4096, seed=0):
+    """Run a 200-step synthetic optimizer trajectory, comparing v1 vs v3."""
+    torch.manual_seed(123)
+    model_v1 = _rand_model()
+    model_v3 = _rand_model()
+    model_v3.load_state_dict(model_v1.state_dict())
+
+    optimizer_v1 = torch.optim.Adam(model_v1.parameters(), lr=1e-3)
+    optimizer_v3 = torch.optim.Adam(model_v3.parameters(), lr=1e-3)
+
+    tracker_v1 = SampledLaggedLERTracker(
+        parameter_sample_size=parameter_sample_size,
+        sample_seed=seed,
+    )
+    tracker_v3 = SampledLaggedLERTracker(
+        parameter_sample_size=parameter_sample_size,
+        sample_seed=seed,
+        tracker_revision="v3",
+    )
+    tracker_v1.set_optimizer(optimizer_v1)
+    tracker_v3.set_optimizer(optimizer_v3)
+
+    logits = torch.randn(4, 2)
+    for step in range(steps):
+        with torch.no_grad():
+            for p1, p3 in zip(model_v1.parameters(), model_v3.parameters()):
+                noise = torch.randn_like(p1) * 0.01
+                p1.add_(noise)
+                p3.add_(noise)
+
+        optimizer_v1.zero_grad(set_to_none=True)
+        optimizer_v3.zero_grad(set_to_none=True)
+
+        for p1, p3 in zip(model_v1.parameters(), model_v3.parameters()):
+            p1.grad = torch.randn_like(p1) * 0.001
+            p3.grad = p1.grad.clone()
+
+        optimizer_v1.step()
+        optimizer_v3.step()
+
+        loss_val = 1.0 - step * 0.001
+
+        tracker_v1.update(
+            loss=loss_val,
+            logits=logits,
+            model=model_v1,
+            optimizer=optimizer_v1,
+            decision_index=step,
+        )
+        tracker_v3.update(
+            loss=loss_val,
+            logits=logits,
+            model=model_v3,
+            optimizer=optimizer_v3,
+            decision_index=step,
+        )
+
+    return tracker_v1, tracker_v3
+
+
+def test_v3_uses_single_index_select_for_samples():
+    """v3 must use _global_sample_index and _capture_flat_tensor."""
+    import inspect
+    import textwrap
+    import lerna.utils.lagged_ler as mod
+
+    src = textwrap.dedent(inspect.getsource(
+        mod.SampledLaggedLERTracker._sampled_dynamics_v3
+    ))
+    assert "global_idx" in src, "v3 must use global index for flat gather"
+    assert "_capture_flat_tensor" in src, "v3 must use flat tensor capture"
+
+
+def test_v3_compute_entropy_batches_item_calls():
+    """v3 _compute_entropy must batch .item() into single .tolist()."""
+    import inspect
+    import textwrap
+    import lerna.utils.lagged_ler as mod
+
+    src = textwrap.dedent(inspect.getsource(
+        mod.SampledLaggedLERTracker._compute_entropy_v3
+    ))
+    assert ".tolist()" in src, "v3 entropy must use .tolist() for batched sync"

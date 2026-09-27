@@ -362,6 +362,7 @@ def test_validation_freeze_hashes_results_and_power_evidence_immutably(tmp_path)
         "nvidia_smi_query_count": 1,
         "nvidia_smi_success_count": 1,
         "total_energy_kwh": 0.001,
+        "coverage": 1.0,
         "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
         "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
     }
@@ -370,6 +371,14 @@ def test_validation_freeze_hashes_results_and_power_evidence_immutably(tmp_path)
         {
             "power_evidence": power,
             "provenance_classification": "pilot_non_claim",
+            "controller_config": {"configured_total_steps": 575},
+            "true_skip_instrumentation": {
+                "nonfinite_forward_loss_policy": "fail",
+                "forward_loss_observations": 575,
+                "nonfinite_forward_loss_count": 0,
+                "first_nonfinite_forward_loss_step": None,
+                "first_nonfinite_forward_loss_value": None,
+            },
         },
     )
     _write_json(
@@ -453,7 +462,8 @@ def test_power_evidence_validation_rejects_malformed_power(tmp_path):
         "sample_interval_s": 1.0,
         "nvidia_smi_query_count": 1,
         "nvidia_smi_success_count": 1,
-        "total_energy_kwh": 0.0,
+         "total_energy_kwh": 0.0,
+        "coverage": 1.0,
         "raw_samples": [],
         "per_step_energy": [],
     })
@@ -463,6 +473,54 @@ def test_power_evidence_validation_rejects_malformed_power(tmp_path):
     bogus_power["raw_samples"] = [{"timestamp": "not_a_number", "power_w": 200.0}]
     with pytest.raises(operations.Phase13OperationalError, match="numeric timestamp"):
         operations.validate_power_evidence({"power_evidence": bogus_power})
+
+
+def test_validate_power_evidence_rejects_low_coverage(tmp_path):
+    power = {
+        "authoritative_copy": "results.json",
+        "measurement_source": "nvidia-smi",
+        "energy_valid": True,
+        "energy_invalid_reason": "ok",
+        "gpu_name": "V100",
+        "gpu_index": 0,
+        "gpu_selector": "0",
+        "sample_interval_s": 1.0,
+        "nvidia_smi_query_count": 100,
+        "nvidia_smi_success_count": 99,
+        "total_energy_kwh": 0.001,
+        "coverage": 0.50,
+        "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}, {"timestamp": 2.0, "power_w": 200.0}],
+        "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+    }
+    with pytest.raises(operations.Phase13OperationalError, match="coverage"):
+        operations.validate_power_evidence({"power_evidence": power})
+
+
+def test_check_forward_loss_numerics_qnli_6548():
+    instr = {
+        "nonfinite_forward_loss_policy": "fail",
+        "forward_loss_observations": 6548,
+        "nonfinite_forward_loss_count": 0,
+        "first_nonfinite_forward_loss_step": None,
+        "first_nonfinite_forward_loss_value": None,
+    }
+    operations.check_forward_loss_numerics(
+        {"true_skip_instrumentation": instr}, expected_observations=6548
+    )
+
+
+def test_check_forward_loss_numerics_rejects_observation_mismatch():
+    instr = {
+        "nonfinite_forward_loss_policy": "fail",
+        "forward_loss_observations": 6547,
+        "nonfinite_forward_loss_count": 0,
+        "first_nonfinite_forward_loss_step": None,
+        "first_nonfinite_forward_loss_value": None,
+    }
+    with pytest.raises(operations.Phase13OperationalError, match="forward_loss_observations"):
+        operations.check_forward_loss_numerics(
+            {"true_skip_instrumentation": instr}, expected_observations=6548
+        )
 
 
 def test_freeze_rejects_malformed_power_evidence(tmp_path):
@@ -681,8 +739,17 @@ def test_pilot_non_claim_classification_in_evidence(tmp_path):
                 "nvidia_smi_query_count": 1,
                 "nvidia_smi_success_count": 1,
                 "total_energy_kwh": 0.001,
-                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+                "coverage": 1.0,
+                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}, {"timestamp": 2.0, "power_w": 200.0}],
                 "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+            },
+            "controller_config": {"configured_total_steps": 575},
+            "true_skip_instrumentation": {
+                "nonfinite_forward_loss_policy": "fail",
+                "forward_loss_observations": 575,
+                "nonfinite_forward_loss_count": 0,
+                "first_nonfinite_forward_loss_step": None,
+                "first_nonfinite_forward_loss_value": None,
             },
         },
     )
@@ -722,11 +789,21 @@ def test_freeze_rejects_matched_claim_evidence_for_pilot(tmp_path):
                 "nvidia_smi_query_count": 1,
                 "nvidia_smi_success_count": 1,
                 "total_energy_kwh": 0.001,
-                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+                "coverage": 1.0,
+                "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}, {"timestamp": 2.0, "power_w": 200.0}],
                 "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
+            },
+            "controller_config": {"configured_total_steps": 575},
+            "true_skip_instrumentation": {
+                "nonfinite_forward_loss_policy": "fail",
+                "forward_loss_observations": 575,
+                "nonfinite_forward_loss_count": 0,
+                "first_nonfinite_forward_loss_step": None,
+                "first_nonfinite_forward_loss_value": None,
             },
         },
     )
+
     _write_json(
         attempt / "run_manifest.json",
         {
@@ -772,7 +849,8 @@ def test_freeze_rejects_missing_or_arbitrary_provenance(tmp_path, matrix_kind, t
         "nvidia_smi_query_count": 1,
         "nvidia_smi_success_count": 1,
         "total_energy_kwh": 0.001,
-        "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}],
+        "coverage": 1.0,
+        "raw_samples": [{"timestamp": 1.0, "power_w": 200.0}, {"timestamp": 2.0, "power_w": 200.0}],
         "per_step_energy": [{"step": 1, "step_kwh": 0.001}],
     }
     results_data = {
@@ -785,6 +863,14 @@ def test_freeze_rejects_missing_or_arbitrary_provenance(tmp_path, matrix_kind, t
         "identity_inputs": cell["identity_inputs"],
         "attempt": 1,
         "power_evidence": power_evidence,
+        "controller_config": {"configured_total_steps": 575},
+        "true_skip_instrumentation": {
+            "nonfinite_forward_loss_policy": "fail",
+            "forward_loss_observations": 575,
+            "nonfinite_forward_loss_count": 0,
+            "first_nonfinite_forward_loss_step": None,
+            "first_nonfinite_forward_loss_value": None,
+        },
     }
     manifest_data = {
         "status": "completed",

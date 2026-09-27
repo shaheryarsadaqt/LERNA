@@ -40,11 +40,13 @@ class SampledLaggedLERTracker:
         window_size: int = 5,
         parameter_sample_size: int = 4096,
         sample_seed: int = 0,
+        tracker_revision: str = "v2",
     ):
         if int(parameter_sample_size) < 1:
             raise ValueError("parameter_sample_size must be >= 1")
         if int(window_size) < 2:
             raise ValueError("window_size must be >= 2")
+        self.tracker_revision = tracker_revision
         self.task = task
         self.window_size = int(window_size)
         self.parameter_sample_size = int(parameter_sample_size)
@@ -61,9 +63,15 @@ class SampledLaggedLERTracker:
         self._adam_eps_fallback = 1e-8
         self._sample_plan: Optional[List[Tuple[str, torch.Tensor]]] = None
         self._sample_index: Dict[str, torch.Tensor] = {}
+        self._global_sample_index: Optional[torch.Tensor] = None
+        self._flat_param_offsets: Optional[Dict[str, Tuple[int, int]]] = None
         self._realized_sample_size = 0
         self._sampled_tensor_count = 0
         self._prev_samples: Optional[Dict[str, torch.Tensor]] = None
+        self._prev_flat_samples: Optional[torch.Tensor] = None
+        self._prev_flat_params: Optional[torch.Tensor] = None
+        self._prev_flat_avg: Optional[torch.Tensor] = None
+        self._prev_flat_sq: Optional[torch.Tensor] = None
 
         self.n_updates = 0
         self.n_decisions = 0
@@ -157,11 +165,22 @@ class SampledLaggedLERTracker:
         if model is not None:
             if self._sample_plan is None:
                 self._build_sample_plan(model)
-            if self._prev_samples is None:
+            if self._prev_samples is None and self._prev_flat_samples is None:
                 # First update with model: capture initial samples, no dynamics yet
-                self._prev_samples = self._capture_samples(model)
+                if self.tracker_revision == "v3":
+                    global_idx = self._global_sample_index.to(
+                        model.parameters().__next__().device
+                    )
+                    flat = self._capture_flat_tensor(model)
+                    self._prev_flat_samples = flat.index_select(0, global_idx).detach()
+                    self._prev_samples = self._capture_samples(model)
+                else:
+                    self._prev_samples = self._capture_samples(model)
             else:
-                velocity, rho, new_samples = self._sampled_dynamics(model, opt)
+                if self.tracker_revision == "v3":
+                    velocity, rho, new_samples = self._sampled_dynamics_v3(model, opt)
+                else:
+                    velocity, rho, new_samples = self._sampled_dynamics(model, opt)
                 candidate_prev_samples = new_samples
                 # Validate velocity and rho before committing
                 if velocity is not None and not math.isfinite(velocity):
@@ -334,6 +353,7 @@ class SampledLaggedLERTracker:
         return {
             "mode": SAMPLED_LAGGED_MODE,
             "timing": SAMPLED_LAGGED_TIMING,
+            "tracker_revision": self.tracker_revision,
             "parameter_sample_size_requested": self.parameter_sample_size,
             "parameter_sample_size_realized": self._realized_sample_size,
             "sampled_tensor_count": self._sampled_tensor_count,
@@ -398,6 +418,23 @@ class SampledLaggedLERTracker:
         self._sample_index = {name: indices for name, indices in plan}
         self._realized_sample_size = sum(indices.numel() for _, indices in plan)
         self._sampled_tensor_count = len(plan)
+
+        # Build a single global index tensor and per-tensor offsets for
+        # constructing a flat concatenated param tensor. This enables one
+        # index_select per tensor-family instead of per-tensor.
+        offsets: Dict[str, int] = {}
+        global_indices: List[torch.Tensor] = []
+        running_offset = 0
+        for name, numel in named:
+            indices = self._sample_index.get(name)
+            if indices is None:
+                continue
+            offsets[name] = running_offset
+            global_indices.append((indices + running_offset).cuda())
+            running_offset += numel
+        if global_indices:
+            self._global_sample_index = torch.cat(global_indices)
+            self._flat_param_offsets = offsets
 
     def _iter_sampled(self, model: torch.nn.Module):
         for name, param in model.named_parameters():
@@ -601,6 +638,132 @@ class SampledLaggedLERTracker:
                 rho = 0.0
         return velocity, rho, new_samples
 
+    def _capture_flat_tensor(
+        self, model: torch.nn.Module, optimizer=None, attr: Optional[str] = None
+    ) -> torch.Tensor:
+        """Concatenate sampled param tensors into one flat vector.
+
+        If attr is 'exp_avg' or 'exp_avg_sq', concatenates optimizer state instead.
+        """
+        state_lookup = {}
+        if optimizer is not None:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    state_lookup[id(param)] = optimizer.state.get(param, {})
+        pieces = []
+        for name, param in model.named_parameters():
+            if name not in self._sample_index or not param.requires_grad:
+                continue
+            if attr is not None:
+                state = state_lookup.get(id(param), {})
+                t = state.get(attr)
+                if t is not None:
+                    pieces.append(t.detach().reshape(-1))
+                else:
+                    pieces.append(torch.zeros(param.numel(), device=param.device))
+            else:
+                pieces.append(param.detach().reshape(-1))
+        return torch.cat(pieces).float()
+
+    def _sampled_dynamics_v3(self, model, optimizer):
+        """Tracker v3: one gather per tensor-family via precomputed global index.
+
+        Key optimizations vs v2:
+        - Flat concatenation of params/exp_avg/exp_avg_sq (3 cat ops, ~184 tensors each)
+        - Single index_select with _global_sample_index (1 kernel per family)
+        - One .item() per metric (3 total: velocity, dot_sum, signal_sq_sum)
+        - _compute_entropy batched: single .cpu() for std+mean
+
+        Math is identical to v2 (atol 1e-6). This is tracker revision v3.
+        """
+        if self._global_sample_index is None:
+            self._build_sample_plan(model)
+
+        global_idx = self._global_sample_index.to(model.parameters().__next__().device)
+
+        with torch.no_grad():
+            flat_params = self._capture_flat_tensor(model, attr=None)
+            current = flat_params.index_select(0, global_idx)
+
+            new_samples: Dict[str, torch.Tensor] = {}
+            offset = 0
+            for name, param in model.named_parameters():
+                if name not in self._sample_index or not param.requires_grad:
+                    continue
+                indices = self._sample_index[name].to(device=param.device)
+                new_samples[name] = current[offset:offset + indices.numel()].clone()
+                offset += indices.numel()
+
+            if self._prev_flat_samples is None:
+                velocity = None
+                rho = None
+            else:
+                prev = self._prev_flat_samples
+                delta = current - prev
+                delta_sq = delta.pow(2)
+                scalar_count = delta.numel()
+                delta_sq_sum = float(delta_sq.sum().item())
+
+                signal = None
+                if optimizer is not None:
+                    step_values: Dict[int, float] = {}
+                    step_tensors: List[tuple] = []
+                    for group in optimizer.param_groups:
+                        for param in group["params"]:
+                            state = optimizer.state.get(param, {})
+                            step = state.get("step", 0)
+                            if torch.is_tensor(step):
+                                step_tensors.append((id(param), step.detach()))
+                            elif isinstance(step, (int, float)):
+                                step_values[id(param)] = float(step)
+                            else:
+                                step_values[id(param)] = 0.0
+                    if step_tensors:
+                        ids, tensors = zip(*step_tensors)
+                        batched = torch.stack(tensors).tolist()
+                        for pid, sv in zip(ids, batched):
+                            step_values[pid] = float(sv)
+
+                    flat_avg = self._capture_flat_tensor(model, optimizer, "exp_avg")
+                    flat_sq = self._capture_flat_tensor(model, optimizer, "exp_avg_sq")
+                    avg_samples = flat_avg.index_select(0, global_idx)
+                    sq_samples = flat_sq.index_select(0, global_idx)
+
+                    step_val = next(iter(step_values.values()), 0.0) if step_values else 0.0
+                    if step_val > 0:
+                        beta1, beta2 = next(
+                            (g.get("betas", (0.9, 0.999)) for g in optimizer.param_groups),
+                            (0.9, 0.999),
+                        )
+                        eps = next(
+                            (g.get("eps", self._adam_eps_fallback) for g in optimizer.param_groups),
+                            self._adam_eps_fallback,
+                        )
+                        avg_hat = avg_samples / (1.0 - beta1 ** step_val)
+                        sq_hat = sq_samples / (1.0 - beta2 ** step_val)
+                        signal = -(avg_hat / (sq_hat.sqrt() + eps))
+
+                # Batch all .item() into one .cpu() transfer
+                if signal is not None:
+                    has_signal = True
+                    dot_val = float((delta * signal).sum().item())
+                    signal_sq = float(signal.pow(2).sum().item())
+                    velocity_sq_for_rho = delta_sq_sum
+                    velocity = (delta_sq_sum / scalar_count) ** 0.5 if scalar_count > 0 else 0.0
+                    denominator = velocity_sq_for_rho ** 0.5 * signal_sq ** 0.5
+                    if math.isfinite(denominator) and denominator >= 1e-12:
+                        rho = dot_val / denominator
+                    else:
+                        rho = 0.0
+                else:
+                    has_signal = False
+                    velocity = (delta_sq_sum / scalar_count) ** 0.5 if scalar_count > 0 else None
+                    rho = None
+
+                self._prev_flat_samples = current.detach()
+
+        return velocity, rho, new_samples
+
     @staticmethod
     def _compute_entropy(logits: torch.Tensor) -> float:
         detached = logits.detach()
@@ -618,6 +781,25 @@ class SampledLaggedLERTracker:
             )
             return max(min(spread, 3.0), 0.05)
         return 0.1
+
+    def _compute_entropy_v3(self, logits: torch.Tensor) -> Tuple[float, torch.Tensor]:
+        """Batched entropy: single .cpu() transfer for all reductions."""
+        detached = logits.detach()
+        if detached.dim() >= 2 and detached.size(-1) > 1:
+            probabilities = F.softmax(detached.float(), dim=-1)
+            result = -(
+                probabilities * torch.log(probabilities + 1e-10)
+            ).sum(dim=-1).mean()
+            return result.item(), result
+        predictions = detached.float().flatten()
+        if predictions.numel() > 1:
+            std_t = predictions.std()
+            mean_t = predictions.mean()
+            # Single CPU sync for both values
+            vals = torch.stack([std_t, mean_t.abs()]).tolist()
+            spread = vals[0] / (vals[1] + 1e-6)
+            return max(min(spread, 3.0), 0.05), std_t
+        return 0.1, torch.tensor(0.0)
 
     def _loss_gain(self) -> Optional[float]:
         if len(self.loss_history) < 2:

@@ -5,7 +5,7 @@ Pre-registered: see /new_raid/nanhangproj/experiments/gate3_qnli_pre_registratio
 
 Arms: full_finetune, exact_random, ler_guided_stratified, phase_strat_guarded
 Rate: 0.30 only
-Seeds: [42, 123, 456, 789, 1024] (5 required; replace failed from list, stop if >2 fail)
+Seeds: [11, 13, 17, 19, 23] (5 pre-registered; reserves 29, 31; replace if >2 fail)
 Config: 2 epochs, batch 32, fp16+eager, max_grad_norm=1.0, lr=2e-5, warmup=0.06
 Hypothesis: paired Δacc(lgs - exact_random) != 0, two-sided, alpha=0.05
 """
@@ -19,6 +19,8 @@ os.environ.setdefault("HF_HOME", "/raid/hf_cache")
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.pop("TRANSFORMERS_CACHE", None)
+os.environ.pop("HF_ENDPOINT", None)
 
 import sys
 import json
@@ -58,7 +60,8 @@ CONFIRMATORY_ARMS = [
     "ler_guided_stratified",
     "phase_strat_guarded",
 ]
-CONFIRMATORY_SEEDS = [42, 123, 456, 789, 1024, 2025, 4096, 8192]
+CONFIRMATORY_SEEDS = [11, 13, 17, 19, 23]
+CONFIRMATORY_SEED_RESERVES = [29, 31]
 TARGET_SKIP_RATE = 0.30
 
 QNLI_EPOCHS = 2

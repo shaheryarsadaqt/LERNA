@@ -560,6 +560,8 @@ def write_manifest_running(
     identity_inputs: Optional[Dict[str, Any]] = None,
     fingerprint: Optional[str] = None,
     attempt: Optional[int] = None,
+    tracker_revision: Optional[str] = None,
+    nonfinite_forward_loss_policy: str = "fail",
 ) -> Dict[str, Any]:
     """Create the unique initial running manifest atomically."""
     os.makedirs(run_dir, exist_ok=True)
@@ -620,6 +622,10 @@ def write_manifest_running(
         manifest["fingerprint"] = fingerprint
     if attempt is not None:
         manifest["attempt"] = attempt
+    manifest["tracker_revision"] = tracker_revision
+    manifest["nonfinite_forward_loss_policy"] = nonfinite_forward_loss_policy
+    if git_state.get("commit_sha"):
+        manifest["git_sha"] = git_state["commit_sha"]
     _atomic_write_json(target, manifest)
     return manifest
 
@@ -706,6 +712,10 @@ _COMPLETED_REQUIRED_FIELDS = (
     "artifacts",
     "realized",
     "validation",
+    "git",
+    "git_sha",
+    "tracker_revision",
+    "nonfinite_forward_loss_policy",
 )
 _ARTIFACT_METADATA_KEYS = ("path", "exists", "size_bytes", "sha256")
 _SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
