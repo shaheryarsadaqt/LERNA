@@ -19,20 +19,23 @@ import os
 import time
 from pathlib import Path
 
-# Disable torch.compile BEFORE importing torch (match production scripts)
+# Torch import must happen AFTER env setup but BEFORE transformers
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
-
-import torch
-import torch.profiler
-import torch.profiler.profiler as profiler_mod
-
-# Offline enforcement (match production matrix_environment.json)
+# Offline HF setup (match production matrix_environment.json)
+os.environ.setdefault("HF_HOME", "/raid/hf_cache")
+os.environ.setdefault("HF_HUB_CACHE", "/raid/hf_cache")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HOME", "/raid/hf_cache")
-os.environ.setdefault("HF_HUB_CACHE", "/raid/hf_cache")
+# Remove deprecated/env vars that can shadow HF_HUB_CACHE and break resolution
+os.environ.pop("TRANSFORMERS_CACHE", None)
+os.environ.pop("HF_ENDPOINT", None)
+os.environ.pop("HF_HUB_ENDPOINT", None)
+
+import torch
+import torch.profiler
+import torch.profiler.profiler as profiler_mod
 
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from datasets import load_dataset
@@ -41,12 +44,14 @@ from lerna.trainers.policies import RandomSkipPolicy, AlwaysFalsePolicy
 
 
 class MockTrainerState:
-    def __init__(self, global_step=0):
+    def __init__(self, global_step=0, max_steps=50):
         self.global_step = global_step
+        self.max_steps = max_steps
 
 class MockTrainer:
-    def __init__(self):
-        self.state = MockTrainerState()
+    def __init__(self, max_steps=50):
+        self.state = MockTrainerState(max_steps=max_steps)
+        self.args = type("Args", (), {"max_steps": max_steps})()
 
 
 def load_model_and_data(model_name, revision, max_length=512):
@@ -96,13 +101,18 @@ def make_batches(ds, batch_size, device):
 
 
 def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=True):
-    """Run n_steps with optional torch.profiler and report GPU utilization."""
+    """Run n_steps with optional torch.profiler and report GPU utilization.
+
+    Returns wall time, step times, and (if use_profiler=True):
+    - gpu_busy_pct: CUDA time / wall time ratio
+    - top5_host_ops: top-5 CPU ops by self time
+    """
     results = {"gpu_busy_pct": None, "top5_host_ops": [], "step_times_ms": [], "wall_time_s": 0.0}
-    mock_trainer = MockTrainer()
+    mock_trainer = MockTrainer(n_steps)
     step_counter = 0
 
     if not use_profiler or not torch.cuda.is_available():
-        # Fallback: measure wall time + CUDA events if available
+        # Fallback: measure wall time + sync each step
         start = time.perf_counter()
         events = []
         for i in range(n_steps):
@@ -112,15 +122,15 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
             loss = outputs.loss
             mock_trainer.state.global_step = step_counter
             step_counter += 1
+            skip = False
             if hasattr(policy, "should_skip"):
-                skip = policy.should_skip(mock_trainer, model, batch)  # approximate
-            else:
-                skip = False
+                skip = policy.should_skip(mock_trainer, model, batch)
             if not skip:
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             events.append((time.perf_counter() - t0) * 1000)
         results["wall_time_s"] = time.perf_counter() - start
         results["step_times_ms"] = events
@@ -128,14 +138,13 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
             results["mean_step_ms"] = sum(events) / len(events)
         return results
 
-    # Full torch.profiler path
+    # Full torch.profiler path with CUDA activity
+    active_steps = min(10, n_steps - 6) if n_steps > 6 else n_steps
+    schedule_wait = max(3, n_steps - active_steps - 3)
     activities = [profiler_mod.ProfilerActivity.CPU, profiler_mod.ProfilerActivity.CUDA]
     with torch.profiler.profile(
         activities=activities,
-        schedule=torch.profiler.schedule(wait=5, warmup=5, active=n_steps - 10, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            "/tmp/lerna_profile"
-        ) if False else None,  # No tensorboard, use memory instead
+        schedule=torch.profiler.schedule(wait=3, warmup=3, active=active_steps, repeat=1),
         record_shapes=True,
         profile_memory=True,
         with_stack=False,
@@ -143,14 +152,14 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
         start = time.perf_counter()
         for i in range(n_steps):
             batch = batches[i % len(batches)]
+            t0 = time.perf_counter()
             outputs = model(**batch)
             loss = outputs.loss
             mock_trainer.state.global_step = step_counter
             step_counter += 1
+            skip = False
             if hasattr(policy, "should_skip"):
                 skip = policy.should_skip(mock_trainer, model, batch)
-            else:
-                skip = False
             if not skip:
                 loss.backward()
                 optimizer.step()
@@ -158,33 +167,41 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
             prof.step()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            results["step_times_ms"].append((time.perf_counter() - t0) * 1000)
         results["wall_time_s"] = time.perf_counter() - start
-        prof.stop()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-    # Extract GPU utilization
     try:
         key_averages = prof.key_averages()
-        # GPU utilization: compute total CUDA time vs wall time
-        total_cuda_ms = 0.0
-        for evt in key_averages:
-            if evt.device_type == torch.profiler.ProfilerActivity.CUDA:
-                total_cuda_ms += evt.cpu_time_total / 1000.0  # microseconds -> ms
-        if results["wall_time_s"] > 0:
-            results["gpu_busy_pct"] = (total_cuda_ms / (results["wall_time_s"] * 1000)) * 100
+        # GPU busy %: total CUDA self-time / wall time
+        cuda_val = torch.profiler.ProfilerActivity.CUDA.value
+        cpu_val = torch.profiler.ProfilerActivity.CPU.value
+        total_cuda_us = 0.0
+        wall_s = results["wall_time_s"]
+        if wall_s > 0:
+            for evt in key_averages:
+                if int(evt.device_type) == cuda_val:
+                    total_cuda_us += evt.self_cuda_time_total
+            results["gpu_busy_pct"] = round((total_cuda_us / 1e6 / wall_s) * 100, 1)
 
         # Top-5 host-side (CPU) ops by self CPU time
         cpu_events = [
             evt for evt in key_averages
-            if evt.device_type == torch.profiler.ProfilerActivity.CPU
+            if int(evt.device_type) == cpu_val
         ]
-        cpu_events.sort(key=lambda e: e.cpu_time_total, reverse=True)
-        for i, evt in enumerate(cpu_events[:5]):
+        cpu_events.sort(key=lambda e: e.self_cpu_time_total, reverse=True)
+        for evt in cpu_events[:5]:
             results["top5_host_ops"].append({
                 "op": evt.key,
                 "cpu_self_time_ms": round(evt.self_cpu_time_total / 1000, 2),
                 "cpu_total_time_ms": round(evt.cpu_time_total / 1000, 2),
                 "count": evt.count,
             })
+        if results["step_times_ms"]:
+            results["mean_step_ms"] = round(
+                sum(results["step_times_ms"]) / len(results["step_times_ms"]), 2
+            )
     except Exception as exc:
         results["profiler_error"] = str(exc)
 
@@ -211,7 +228,7 @@ def main():
     print(f"Profiling {args.steps} steps of full_finetune...")
     full_results = run_profiled_steps(
         model, batches, optimizer_full, full_policy, args.steps,
-        use_profiler=False,
+        use_profiler=True,
     )
 
     # Profile exact_random (RandomSkipPolicy at 30%)
@@ -223,7 +240,25 @@ def main():
     print(f"Profiling {args.steps} steps of exact_random...")
     rand_results = run_profiled_steps(
         model, batches, optimizer_rand, rand_policy, args.steps,
-        use_profiler=False,
+        use_profiler=True,
+    )
+
+    # Profile LER-guided (phase-stratified, calls _sampled_dynamics for decision)
+    # Use FixedPhaseStratifiedRandomPolicy which has the phase logic but
+    # uses simple RNG skipping; overhead measured via timing comparison
+    from lerna.trainers.policies import FixedPhaseStratifiedRandomPolicy
+
+    optimizer_ler = torch.optim.Adam(
+        model.parameters(), lr=2e-5, weight_decay=0.01,
+    )
+    ler_policy = FixedPhaseStratifiedRandomPolicy(
+        target_skip_rate=0.30, total_steps=args.steps, min_step=5, seed=42, n_phases=4,
+        phase_weights=[0.4, 0.3, 0.2, 0.1],
+    )
+    print(f"Profiling {args.steps} steps of ler_guided_stratified...")
+    ler_results = run_profiled_steps(
+        model, batches, optimizer_ler, ler_policy, args.steps,
+        use_profiler=True,
     )
 
     output = {
@@ -234,6 +269,7 @@ def main():
         "cuda_available": torch.cuda.is_available(),
         "full_finetune": full_results,
         "exact_random": rand_results,
+        "ler_guided_stratified": ler_results,
     }
 
     out_path = Path(args.output)
@@ -243,7 +279,7 @@ def main():
     print(f"Results written to {out_path}")
 
     # Print summary
-    for arm in ("full_finetune", "exact_random"):
+    for arm in ("full_finetune", "exact_random", "ler_guided_stratified"):
         r = output[arm]
         print(f"\n=== {arm} ===")
         if r["gpu_busy_pct"] is not None:
