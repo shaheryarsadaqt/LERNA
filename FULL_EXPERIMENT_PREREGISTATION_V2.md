@@ -3,7 +3,7 @@
 **Status**: Amended pre-registration for QNLI confirmatory run
 **Date**: 2026-09-27
 **Previous version**: v1 (2026-09-25, SHA 64f16f0cb90a73a28ce396ed7623c362efef4e07)
-**Frozen SHA**: 87e114bb9ec62dabe6cec8f49acb7524af91b09b (Phase 2 smoke validated)
+**Frozen SHA**: d5663f3df68be8c83ebf007439d6bbdf47a9b99f (Phase 2 smoke validated, 6/6 cells pass)
 
 This amendment replaces Section 3–5 of v1 for the QNLI confirmatory component.
 The MRPC 120-cell production matrix (Section 2 of v1) remains unchanged.
