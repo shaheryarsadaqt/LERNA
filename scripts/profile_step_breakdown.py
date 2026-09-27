@@ -185,10 +185,17 @@ def run_profiled_steps(model, batches, optimizer, policy, n_steps, use_profiler=
                     total_cuda_us += evt.self_cuda_time_total
             results["gpu_busy_pct"] = round((total_cuda_us / 1e6 / wall_s) * 100, 1)
 
-        # Top-5 host-side (CPU) ops by self CPU time
+        # Top-5 real host-side (CPU) ops by self CPU time
+        # Filter out profiler artifacts and host-wait-on-GPU markers
+        _noise_prefixes = (
+            "ProfilerStep", "cudaStreamSynchronize", "cudaDeviceSynchronize",
+            "cudaIpcGetMemHandle", "cudaEventRecord", "cudaEventSynchronize",
+            "cudaEventElapsedTime",
+        )
         cpu_events = [
             evt for evt in key_averages
             if int(evt.device_type) == cpu_val
+            and not evt.key.startswith(_noise_prefixes)
         ]
         cpu_events.sort(key=lambda e: e.self_cpu_time_total, reverse=True)
         for evt in cpu_events[:5]:
