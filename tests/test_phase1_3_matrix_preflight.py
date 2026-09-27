@@ -126,6 +126,9 @@ def _plan_cell(
         data_facts=_data_facts(task) if facts is None else facts,
         git_sha="abc123",
         base_output_dir=base_output_dir,
+        hw_cfg=_hardware_config(max_samples=2000),
+        lr=2e-5,
+        warmup_ratio=0.06,
         provenance_classification="matched_claim",
         **kwargs,
     )
@@ -420,9 +423,11 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
         data_facts_provider=provider,
         git_sha="abc123",
         provenance_classification="matched_claim",
-        **CELL_KWARGS,
+        hw_cfg=_hardware_config(max_samples=2000),
+        lr=2e-5,
+        warmup_ratio=0.06,
+         **CELL_KWARGS,
     )
-
     expected_order = [
         (task, seed, rate, arm)
         for task in tasks

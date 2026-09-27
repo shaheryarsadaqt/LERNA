@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate 2: MRPC smoke test on tracker v2 (6 arms x rate 0.30 x seed 42).
+"""Gate 2: MRPC smoke test on tracker v3 (6 arms x rate 0.30 x seed 42).
 
 Builds a 6-cell plan using build_phase1_3_matrix_plan with a single skip
 rate (0.30) and single seed (42), persists it as a fresh plan, runs all
@@ -194,12 +194,15 @@ def validate_cell(cell, base_output_dir):
 
     # Scan for results.json (fingerprint dir is computed at runtime by run_ablation_single)
     results_path = None
+    manifest_path = None
     if arm_dir.exists():
         for fp_dir in sorted(arm_dir.iterdir()):
             if fp_dir.is_dir() and len(fp_dir.name) == 16:
                 candidate = fp_dir / "attempt-001" / "results.json"
+                cand_manifest = fp_dir / "attempt-001" / "run_manifest.json"
                 if candidate.exists():
                     results_path = candidate
+                    manifest_path = cand_manifest
                     break
 
     if results_path is None:
@@ -210,9 +213,10 @@ def validate_cell(cell, base_output_dir):
 
     errors = []
 
-    # M2c: forward-loss numerics
+    # M2c: forward-loss numerics (use cell's total_steps, not hard-coded 575)
+    total_steps = cell.get("total_steps", 575)
     try:
-        check_forward_loss_numerics(results)
+        check_forward_loss_numerics(results, expected_observations=total_steps)
     except Exception as exc:
         errors.append(f"forward_loss_numerics: {exc}")
 
@@ -229,6 +233,28 @@ def validate_cell(cell, base_output_dir):
         print(f"  CUDA mean_step_ms_executed: {ms_exec:.1f} ms")
     else:
         errors.append("mean_step_ms_executed is None")
+
+    # Power evidence coverage >= 0.9
+    pe = results.get("power_evidence", {})
+    coverage = pe.get("coverage")
+    if coverage is None or coverage < 0.9:
+        errors.append(f"power_evidence.coverage={coverage} (must be >= 0.9)")
+
+    # git_sha in manifest
+    if manifest_path and manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if not manifest.get("git_sha"):
+            errors.append("manifest missing git_sha")
+        if not manifest.get("tracker_revision"):
+            errors.append("manifest missing tracker_revision")
+        if manifest.get("nonfinite_forward_loss_policy") != "fail":
+            errors.append(
+                f"manifest nonfinite_forward_loss_policy="
+                f"{manifest.get('nonfinite_forward_loss_policy')} (expected 'fail')"
+            )
+    else:
+        errors.append("run_manifest.json not found")
 
     # LER overhead check: backward_calls > 0 implies executed steps
     backward_calls = instr.get("backward_calls", 0)
@@ -257,7 +283,7 @@ def main():
     base_output_dir = args.output_dir
     git_sha = resolve_git_sha()
     profile = detect_device_profile()
-    print(f"Gate 2: MRPC smoke test on tracker v2")
+    print(f"Gate 2: MRPC smoke test on tracker v3")
     print(f"  Git SHA: {git_sha}")
     print(f"  Profile: {profile}")
     print(f"  Output: {base_output_dir}")

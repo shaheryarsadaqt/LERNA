@@ -2412,7 +2412,7 @@ def run_ablation_single(
         identity_inputs=identity_inputs,
         fingerprint=fingerprint,
         attempt=attempt,
-        tracker_revision=lerna_version,
+        tracker_revision="v3",
         nonfinite_forward_loss_policy="fail",
     )
 

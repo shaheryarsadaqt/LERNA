@@ -430,7 +430,7 @@ class SampledLaggedLERTracker:
             if indices is None:
                 continue
             offsets[name] = running_offset
-            global_indices.append((indices + running_offset).cuda())
+            global_indices.append(indices + running_offset)
             running_offset += numel
         if global_indices:
             self._global_sample_index = torch.cat(global_indices)

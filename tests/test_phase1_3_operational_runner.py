@@ -53,6 +53,18 @@ def _bundle(root: Path):
         use_rho_vg=True,
         use_safety_horizon=True,
         provenance_classification=runner.CLASSIFICATION_PILOT_NON_CLAIM,
+        hw_cfg={
+            "per_device_train_batch_size": 32,
+            "per_device_eval_batch_size": 64,
+            "gradient_accumulation_steps": 1,
+            "fp16": True,
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "dataloader_num_workers": 0,
+            "max_samples": 25000,
+        },
+        lr=2e-5,
+        warmup_ratio=0.06,
     )
     environment = {
         "hardware_config": {"max_samples": 25000},

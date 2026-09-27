@@ -1,434 +1,341 @@
+"""Source-verified AMP contract checks; synthetic fault injection, not a benchmark.
+
+CUDA: python amp_harness.py --repo . --output-dir ../amp-check --device cuda
+CPU:  same with --device cpu (requires torch.amp.GradScaler CPU support).
+Every output directory must be new. CPU checks never certify CUDA execution.
+"""
 from __future__ import annotations
 
-import copy
+import argparse
 import hashlib
 import inspect
 import json
-import os
+import math
+import platform
 import subprocess
 import sys
-import traceback
 from pathlib import Path
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', type=Path, required=True)
+    parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--device', choices=('cuda', 'cpu'), default='cuda')
+    parser.add_argument('--expected-trainer-sha256')
+    return parser.parse_args()
+
+
+CLI = parse_args() if __name__ == '__main__' else None
+if CLI is not None:
+    sys.path.insert(0, str(CLI.repo.resolve()))
+
 import torch
+import transformers
+import accelerate
 from torch.utils.data import Dataset
-from transformers import TrainerCallback, TrainingArguments
+from transformers import TrainerCallback, TrainingArguments, set_seed
+from lerna.trainers.policies import AlwaysFalsePolicy, LERGuidedStratifiedPolicy
+from lerna.trainers.true_skip_trainer import ObservationFailureError, TrueBackwardSkippingTrainer
+from lerna.utils.lagged_ler import SampledLaggedLERTracker
 
-ROOT = Path(os.environ.get('LERNA_ROOT', Path(__file__).resolve().parent)).resolve()
-OUT = Path(os.environ.get('LERNA_AMP_OUT', Path(__file__).resolve().parent / 'amp_evidence')).resolve()
-EXPECTED_BRANCH = os.environ.get(
-    'LERNA_EXPECTED_BRANCH', 'candidate/terminal-invalid-observation-0f55d012'
-)
-EXPECTED_HEAD = os.environ.get(
-    'LERNA_EXPECTED_HEAD', 'a048dc99645a2ff228e60aa4d3917bb6acf3dbc9'
-)
-sys.path.insert(0, str(ROOT))
-
-from lerna.trainers.policies import AlwaysFalsePolicy  # noqa: E402
-from lerna.trainers.true_skip_trainer import (  # noqa: E402
-    ObservationFailureError,
-    SkipPolicy,
-    TrueBackwardSkippingTrainer,
-)
-from lerna.utils.lagged_ler import SampledLaggedLERTracker  # noqa: E402
+CASES = ('finite', 'sampled', 'backward_skip', 'overflow_recovery', 'terminal_rejection', 'tracker_error')
 
 
-def source_identity():
-    trainer_source = Path(inspect.getfile(TrueBackwardSkippingTrainer)).resolve()
-    if trainer_source.parent.parent.parent != ROOT:
-        raise AssertionError(
-            f'imported trainer is outside active checkout: {trainer_source}'
-        )
-    branch = subprocess.check_output(
-        ['git', '-C', str(ROOT), 'symbolic-ref', '--short', 'HEAD'],
-        text=True,
-    ).strip()
-    head = subprocess.check_output(
-        ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
-        text=True,
-    ).strip()
-    if branch != EXPECTED_BRANCH:
-        raise AssertionError(f'branch mismatch: expected {EXPECTED_BRANCH}, got {branch}')
-    if head != EXPECTED_HEAD:
-        raise AssertionError(f'HEAD mismatch: expected {EXPECTED_HEAD}, got {head}')
-    source_hash = hashlib.sha256(trainer_source.read_bytes()).hexdigest()
+def strict_value(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return {'kind': 'nonfinite', 'value': 'NaN' if math.isnan(value) else ('+Infinity' if value > 0 else '-Infinity')}
+    if isinstance(value, dict):
+        return {str(k): strict_value(v) for k, v in value.items() if not callable(v)}
+    if isinstance(value, (tuple, list)):
+        return [strict_value(v) for v in value]
+    return value
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(strict_value(value), indent=2, allow_nan=False) + '\n')
+
+
+def fingerprint(value):
+    if torch.is_tensor(value):
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        return {'sha256': hashlib.sha256(raw).hexdigest(), 'shape': list(value.shape), 'dtype': str(value.dtype)}
+    if isinstance(value, dict):
+        return {str(k): fingerprint(v) for k, v in value.items() if not callable(v)}
+    if isinstance(value, (list, tuple)):
+        return [fingerprint(v) for v in value]
+    return strict_value(value)
+
+
+def snapshot(trainer):
+    scaler = trainer.accelerator.scaler
     return {
-        'root': str(ROOT),
-        'trainer_source': str(trainer_source),
-        'trainer_source_sha256': source_hash,
-        'branch': branch,
-        'head': head,
-        'output': str(OUT),
+        'model': fingerprint(trainer.model.state_dict()),
+        'optimizer': fingerprint(trainer.optimizer.state_dict()),
+        'scheduler': fingerprint(trainer.lr_scheduler.state_dict()),
+        'scaler': fingerprint(scaler.state_dict()),
     }
 
 
 class TinyDataset(Dataset):
-    def __init__(self, size=4):
-        self.inputs = torch.tensor(
-            [[0.2, -0.1], [0.4, 0.3], [-0.5, 0.2], [0.1, 0.6]],
-            dtype=torch.float32,
-        )[:size]
-        self.labels = torch.tensor([0, 1, 1, 0], dtype=torch.long)[:size]
-
     def __len__(self):
-        return len(self.labels)
+        return 8
 
     def __getitem__(self, index):
-        return {'input_ids': self.inputs[index], 'labels': self.labels[index]}
+        return {'input_ids': torch.tensor([0.1 * (index + 1), -0.2]), 'labels': torch.tensor(index % 2)}
 
 
 class TinyModel(torch.nn.Module):
-    def __init__(self, nan_on_forward=None, overflow_on_forward=None):
+    def __init__(self, injections=None, terminal_decision=None):
         super().__init__()
         self.linear = torch.nn.Linear(2, 2)
-        self.nan_on_forward = nan_on_forward
-        self.overflow_on_forward = overflow_on_forward
-        self.forward_index = 0
-        self.forward_observations = []
+        self.injections = injections or {}
+        self.terminal_decision = terminal_decision
+        self.forward_count = 0
+        self.observations = []
+        self.linear.weight.register_hook(self.inject_gradient)
+
+    def inject_gradient(self, grad):
+        value = self.injections.get(self.forward_count - 1)
+        if value is not None:
+            grad = grad.clone()
+            grad.flatten()[0] = value
+        return grad
 
     def forward(self, input_ids=None, labels=None, **kwargs):
-        index = self.forward_index
-        self.forward_index += 1
+        decision = self.forward_count
+        self.forward_count += 1
         logits = self.linear(input_ids)
         loss = torch.nn.functional.cross_entropy(logits, labels)
-        if self.nan_on_forward is not None and index == self.nan_on_forward:
-            loss = loss * torch.tensor(float('nan'), device=loss.device)
-        if self.overflow_on_forward is not None and index == self.overflow_on_forward:
-            loss = loss * 1e39
-        self.forward_observations.append({
-            'index': index,
-            'input_device': str(input_ids.device),
-            'logits_dtype': str(logits.dtype),
-            'loss_dtype': str(loss.dtype),
-            'autocast_enabled': bool(torch.is_autocast_enabled()),
-            'autocast_gpu_dtype': str(torch.get_autocast_gpu_dtype()),
+        if decision == self.terminal_decision:
+            loss = loss * float('nan')
+        self.observations.append({
+            'decision': decision, 'device': str(input_ids.device),
+            'logits_dtype': str(logits.dtype), 'loss': float(loss.detach()),
+            'cuda_autocast': bool(torch.is_autocast_enabled()),
         })
         return {'loss': loss, 'logits': logits}
 
 
-class ScriptedPolicy(SkipPolicy):
-    name = 'amp_scripted'
+class ScriptedPolicy:
+    name = 'amp_contract_scripted'
 
-    def __init__(self, skip_after_real_steps=None):
-        self.skip_after_real_steps = skip_after_real_steps
-        self.calls = 0
-        self.skipped = []
-        self.snapshot_before_skip = None
-        self.trainer = None
+    def __init__(self, skips):
+        self.skips = set(skips)
 
     def should_skip(self, trainer, model, inputs):
-        self.calls += 1
-        should_skip = (
-            self.skip_after_real_steps is not None
-            and self.calls > self.skip_after_real_steps
-        )
-        if should_skip:
-            self.skipped.append(self.calls - 1)
-            self.snapshot_before_skip = snapshot(trainer)
-        return should_skip
+        return trainer.instr.batches_seen - 1 in self.skips
 
 
-class ActionRecorder(TrainerCallback):
-    def __init__(self, trainer):
-        self.trainer = trainer
-        self.events = []
-        self.scaler = None
-
-    def on_train_begin(self, args, state, control, optimizer=None, lr_scheduler=None, **kwargs):
-        self.scaler = getattr(self.trainer.accelerator, 'scaler', None)
-        if optimizer is not None:
-            original = optimizer.step
-            def optimizer_step(*a, **kw):
-                self.events.append('optimizer.step')
-                return original(*a, **kw)
-            optimizer.step = optimizer_step
-        if lr_scheduler is not None:
-            original_scheduler = lr_scheduler.step
-            def scheduler_step(*a, **kw):
-                self.events.append('scheduler.step')
-                return original_scheduler(*a, **kw)
-            lr_scheduler.step = scheduler_step
-        if self.scaler is not None:
-            original_scaler_step = self.scaler.step
-            original_scaler_update = self.scaler.update
-            def scaler_step(*a, **kw):
-                self.events.append('scaler.step')
-                return original_scaler_step(*a, **kw)
-            def scaler_update(*a, **kw):
-                self.events.append('scaler.update')
-                return original_scaler_update(*a, **kw)
-            self.scaler.step = scaler_step
-            self.scaler.update = scaler_update
-
-    def on_step_end(self, args, state, control, **kwargs):
-        self.events.append('trainer.step_end')
+class BrokenTracker(SampledLaggedLERTracker):
+    def update(self, **kwargs):
+        if self.n_updates == 1:
+            raise RuntimeError('injected required tracker failure')
+        return super().update(**kwargs)
 
 
-def digest_tensor(value):
-    value = value.detach().cpu().contiguous()
-    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
-
-
-def state_summary(trainer):
-    model = {
-        name: {'shape': list(value.shape), 'dtype': str(value.dtype), 'sha256': digest_tensor(value)}
-        for name, value in trainer.model.state_dict().items()
-    }
-    optimizer = {}
-    for parameter, state in trainer.optimizer.state.items():
-        optimizer[str(id(parameter))] = {
-            key: (digest_tensor(value) if torch.is_tensor(value) else value)
-            for key, value in state.items()
-        }
-    scheduler = None
-    if trainer.lr_scheduler is not None:
-        scheduler = {
-            key: value
-            for key, value in trainer.lr_scheduler.state_dict().items()
-            if not callable(value)
-        }
-    scaler = trainer.accelerator.scaler.state_dict() if getattr(trainer.accelerator, 'scaler', None) is not None else None
-    return {'model': model, 'optimizer': optimizer, 'scheduler': scheduler, 'scaler': scaler}
-
-
-def snapshot(trainer):
-    return copy.deepcopy(state_summary(trainer))
-
-
-def same_state(before, after, key):
-    return before[key] == after[key]
-
-
-def make_args(path, max_steps):
-    return TrainingArguments(
-        output_dir=str(path),
-        max_steps=max_steps,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        learning_rate=1e-2,
-        warmup_steps=0,
-        logging_steps=1,
-        save_strategy='no',
-        report_to='none',
-        remove_unused_columns=False,
-        use_cpu=False,
-        fp16=True,
-        bf16=False,
-        dataloader_num_workers=0,
-        disable_tqdm=True,
-        seed=123,
-    )
-
-
-def build(path, model, policy, max_steps, tracker=None):
-    trainer = TrueBackwardSkippingTrainer(
-        model=model,
-        args=make_args(path, max_steps),
-        train_dataset=TinyDataset(),
-        skip_policy=policy,
-        instrumentation_path=str(path / 'instrumentation.json'),
-        online_ler_mode='sampled_lagged' if tracker is not None else 'off',
-        online_ler_update_interval=1,
-        capture_logits=tracker is not None,
-    )
-    if tracker is not None:
-        trainer.ler_tracker = tracker
-    policy.trainer = trainer
-    recorder = ActionRecorder(trainer)
-    trainer.callback_handler.callbacks.insert(0, recorder)
-    return trainer, recorder
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2, default=str, allow_nan=False))
-
-
-def finite_case():
-    path = OUT / 'finite'
-    path.mkdir()
-    model = TinyModel().cuda()
-    trainer, recorder = build(path, model, AlwaysFalsePolicy(), 3)
-    trainer.train()
-    scaler = recorder.scaler
-    result = {
-        'case': 'finite_multi_step_amp',
-        'state': state_summary(trainer),
-        'events': recorder.events,
-        'instrumentation': trainer.get_instrumentation(),
-        'forward_observations': model.forward_observations,
-        'scaler_scale': float(scaler.get_scale()),
-        'scaler_state': scaler.state_dict(),
-    }
-    assert len(model.forward_observations) == 3
-    assert all(item['input_device'].startswith('cuda') for item in model.forward_observations)
-    assert all(item['autocast_enabled'] for item in model.forward_observations)
-    assert all(item['logits_dtype'] == 'torch.float16' for item in model.forward_observations)
-    assert recorder.events.count('optimizer.step') == 3
-    assert recorder.events.count('scaler.step') == 3
-    assert recorder.events.count('scaler.update') == 3
-    assert trainer.instr.scheduler_step_calls == 2
-    write_json(path / 'result.json', result)
-
-
-def skip_case():
-    path = OUT / 'backward_skip'
-    path.mkdir()
-    model = TinyModel().cuda()
-    policy = ScriptedPolicy(skip_after_real_steps=1)
-    trainer, recorder = build(path, model, policy, 2)
-    trainer.train()
-    after = snapshot(trainer)
-    before = policy.snapshot_before_skip
-    result = {
-        'case': 'true_backward_skip_amp',
-        'before_skip': before,
-        'after_run': after,
-        'events': recorder.events,
-        'instrumentation': trainer.get_instrumentation(),
-        'forward_observations': model.forward_observations,
-        'scaler_state_after': recorder.scaler.state_dict(),
-        'scaler_scale_after': float(recorder.scaler.get_scale()),
-        'comparisons': {key: same_state(before, after, key) for key in ('model', 'optimizer', 'scheduler', 'scaler')},
-    }
-    assert before is not None
-    assert result['comparisons']['model']
-    assert result['comparisons']['optimizer']
-    assert result['comparisons']['scheduler'], (
-        f"scheduler changed: before={before['scheduler']}, after={after['scheduler']}"
-    )
-    assert trainer.instr.optimizer_step_attempts == 1
-    assert recorder.events.count('scaler.step') == 1
-    assert recorder.events.count('scaler.update') == 1
-    assert trainer.instr.scheduler_step_calls == 0
-    assert trainer.instr.skipped_backward_steps == 1
-    write_json(path / 'result.json', result)
-
-
-def overflow_recovery_case():
-    path = OUT / 'overflow_recovery'
-    path.mkdir()
-    model = TinyModel(overflow_on_forward=0).cuda()
-    initial_model = {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-    }
-    trainer, recorder = build(path, model, AlwaysFalsePolicy(), 2)
-    trainer.train()
-    result = {
-        'case': 'amp_overflow_then_finite_recovery',
-        'events': recorder.events,
-        'instrumentation': trainer.get_instrumentation(),
-        'forward_observations': model.forward_observations,
-        'scaler_scale_after': float(recorder.scaler.get_scale()),
-        'scaler_state_after': recorder.scaler.state_dict(),
-        'optimizer_state_steps': [
-            int(state['step'])
-            for state in trainer.optimizer.state.values()
-            if 'step' in state
-        ],
-        'model_changed_after_recovery': any(
-            not torch.equal(initial_model[name], value)
-            for name, value in model.state_dict().items()
-        ),
-    }
-    assert len(model.forward_observations) == 2
-    assert recorder.events.count('scaler.step') == 2
-    assert recorder.events.count('scaler.update') == 2
-    assert trainer.instr.grad_scaler_step_calls == 2
-    assert trainer.instr.optimizer_step_attempts == 2
-    assert result['scaler_scale_after'] < 65536.0
-    assert result['optimizer_state_steps'] == [1, 1]
-    assert result['model_changed_after_recovery']
-    write_json(path / 'result.json', result)
-
-
-class TerminalCaptureTrainer(TrueBackwardSkippingTrainer):
-    def __init__(self, *args, capture_path=None, **kwargs):
-        self.capture_path = capture_path
+class InspectTrainer(TrueBackwardSkippingTrainer):
+    def __init__(self, *args, **kwargs):
+        self.gradient_checks = {}
         self.before_rejection = None
         super().__init__(*args, **kwargs)
 
-    def _dump_ler_diagnostics(self, valid_prefix, terminal_event):
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        result = super().training_step(model, inputs, num_items_in_batch)
+        gradients = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+        scale = float(self.accelerator.scaler.get_scale())
+        finite = all(bool(torch.isfinite(g).all()) for g in gradients) if gradients else None
+        squared = sum(float(g.double().square().sum()) for g in gradients)
+        self.gradient_checks[self.instr.batches_seen - 1] = {
+            'gradients_present': bool(gradients), 'grad_finite': finite,
+            'scaled_grad_norm': math.sqrt(squared) if gradients else None,
+            'unscaled_grad_norm': math.sqrt(squared) / scale if gradients else None,
+            'scale_before_step': scale,
+        }
+        return result
+
+    def _fail_observation(self, exc, tracker, decision_index):
         self.before_rejection = snapshot(self)
-        return super()._dump_ler_diagnostics(valid_prefix, terminal_event)
+        return super()._fail_observation(exc, tracker, decision_index)
 
 
-def terminal_case():
-    path = OUT / 'terminal_rejection'
-    path.mkdir()
-    model = TinyModel(nan_on_forward=1).cuda()
-    policy = AlwaysFalsePolicy()
-    tracker = SampledLaggedLERTracker(parameter_sample_size=2, sample_seed=7)
-    trainer = TerminalCaptureTrainer(
-        model=model,
-        args=make_args(path, 2),
-        train_dataset=TinyDataset(),
-        skip_policy=policy,
-        instrumentation_path=str(path / 'instrumentation.json'),
-        online_ler_mode='sampled_lagged',
-        online_ler_update_interval=1,
-        capture_logits=True,
+class StepTrace(TrainerCallback):
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.rows = []
+        self.before = None
+        self.original_methods = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        t = self.trainer
+        self.original_methods = (t.optimizer.step, t.lr_scheduler.step, t.accelerator.scaler.step)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.before = snapshot(self.trainer)
+        self.before_counters = self.trainer.get_instrumentation()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        t = self.trainer
+        after = snapshot(t)
+        counts = t.get_instrumentation()
+        decision = counts['batches_seen'] - 1
+        delta = {k: counts[k] - self.before_counters[k] for k in (
+            'optimizer_step_attempts', 'optimizer_step_successes',
+            'optimizer_steps_skipped_amp', 'scheduler_step_calls', 'skipped_backward_steps')}
+        self.rows.append({
+            'decision': decision, 'deltas': delta,
+            'gradient': t.gradient_checks[decision], 'before': self.before, 'after': after,
+            'unchanged': {k: self.before[k] == after[k] for k in self.before},
+        })
+
+
+def run_case(root: Path, device: str, case: str):
+    path = root / case
+    path.mkdir(parents=True, exist_ok=False)
+    set_seed(123)  # Before model construction, identically for all cases.
+    terminal = case in ('terminal_rejection', 'tracker_error')
+    injections = {1: float('inf'), 3: float('nan')} if case == 'overflow_recovery' else {}
+    skips = {1, 3} if case == 'backward_skip' else ({4} if injections else set())
+    steps = 6 if injections else (4 if case in ('sampled', 'backward_skip') else 3)
+    tracker = None
+    if case in ('sampled', 'terminal_rejection', 'tracker_error'):
+        cls = BrokenTracker if case == 'tracker_error' else SampledLaggedLERTracker
+        tracker = cls(parameter_sample_size=4, sample_seed=7)
+    policy = ScriptedPolicy(skips) if skips else AlwaysFalsePolicy()
+    if case == 'tracker_error':
+        policy = LERGuidedStratifiedPolicy(tracker, total_steps=steps, target_skip_rate=0.0, min_step=0)
+    model = TinyModel(injections, 1 if case == 'terminal_rejection' else None)
+    args = TrainingArguments(
+        output_dir=str(path), max_steps=steps, per_device_train_batch_size=1,
+        gradient_accumulation_steps=1, learning_rate=1e-2, warmup_steps=0,
+        save_strategy='no', report_to='none', logging_strategy='no',
+        remove_unused_columns=False, use_cpu=device == 'cpu', fp16=device == 'cuda',
+        dataloader_num_workers=0, disable_tqdm=True, seed=123,
     )
-    trainer.ler_tracker = tracker
-    recorder = ActionRecorder(trainer)
-    trainer.callback_handler.callbacks.insert(0, recorder)
+    t = InspectTrainer(
+        model=model, args=args, train_dataset=TinyDataset(), skip_policy=policy,
+        online_ler_mode='sampled_lagged' if tracker is not None else 'off',
+        capture_logits=tracker is not None,
+    )
+    if tracker is not None:
+        t.ler_tracker = tracker
+    # A low starting scale isolates injected overflow from startup calibration.
+    if device == 'cuda':
+        t.accelerator.scaler = torch.cuda.amp.GradScaler(init_scale=128, growth_interval=100)
+    else:
+        t.accelerator.scaler = torch.amp.GradScaler('cpu', init_scale=128, growth_interval=100)
+    trace = StepTrace(t)
+    t.callback_handler.callbacks.insert(0, trace)
     error = None
     try:
-        trainer.train()
-    except ObservationFailureError as exc:
+        t.train()
+    except Exception as exc:
         error = exc
-    if error is None:
-        raise AssertionError('terminal case did not raise ObservationFailureError')
-    after = snapshot(trainer)
+    counts = t.get_instrumentation()
+    failures = []
+
+    def check(condition, message):
+        if not condition:
+            failures.append(message)
+
+    check(not t._wrappers_installed and t._optimizer_success_hook is None, 'wrappers/hooks not restored')
+    check(trace.original_methods == (t.optimizer.step, t.lr_scheduler.step, t.accelerator.scaler.step), 'method bindings not restored')
+    check(counts['optimizer_step_attempts'] == counts['optimizer_step_successes'] + counts['optimizer_steps_skipped_amp'], 'attempt/update/overflow counts disagree')
+    check(counts['scheduler_step_calls'] == counts['optimizer_step_successes'], 'scheduler advanced without a successful optimizer step')
+    if terminal:
+        check(isinstance(error, ObservationFailureError), 'expected terminal observation error')
+        check(counts['run_invalidated'], 'terminal attempt not invalidated')
+        check(counts['backward_calls'] == 2 and counts['optimizer_step_successes'] == 1, 'terminal finite prefix wrong')
+        check(t.before_rejection == snapshot(t), 'pending action changed state after rejection')
+        check(counts['online_ler_update_attempts'] == 2 and counts['online_ler_update_successes'] == 1, 'tracker attempts/successes wrong')
+        check(not getattr(error, 'evidence_write_failures', []), 'terminal evidence not fully exported')
+        forwards = model.forward_count
+        try:
+            t.train()
+        except RuntimeError as exc:
+            check('invalidated' in str(exc), 'invalidated reuse raised wrong error')
+        else:
+            check(False, 'invalidated trainer was reused')
+        check(model.forward_count == forwards, 'reuse performed another forward')
+    else:
+        check(error is None, f'unexpected training exception: {error!r}')
+        check(not counts['run_invalidated'], 'finite/overflow attempt invalidated')
+        check(model.forward_count == steps, 'incorrect forward horizon')
+        check(counts['skipped_backward_steps'] == len(skips), 'intentional skip count wrong')
+        check(counts['optimizer_steps_skipped_amp'] == len(injections), 'AMP suppression count wrong')
+        check(counts['optimizer_step_successes'] == steps - len(skips) - len(injections), 'successful step count wrong')
+    for row in trace.rows:
+        decision = row['decision']
+        if decision in skips:
+            check(all(row['unchanged'].values()), f'D{decision}: intentional skip changed state')
+            check(row['gradient']['grad_finite'] is None, f'D{decision}: empty gradients misreported as finite')
+        elif decision in injections:
+            check(row['gradient']['grad_finite'] is False, f'D{decision}: injected nonfinite gradient missed')
+            check(all(row['unchanged'][k] for k in ('model', 'optimizer', 'scheduler')), f'D{decision}: overflow changed protected state')
+            check(row['after']['scaler']['scale'] < row['before']['scaler']['scale'], f'D{decision}: scaler did not back off')
+        else:
+            check(row['deltas']['optimizer_step_successes'] == 1, f'D{decision}: finite recovery did not update')
+            check(not row['unchanged']['model'], f'D{decision}: expected nonzero parameter update')
+    if case == 'sampled':
+        check(counts['online_ler_update_successes'] == steps == tracker.n_updates, 'sampled observations not committed')
+        check(tracker.valid_emissions > 0, 'no valid sampled emissions')
+    if device == 'cuda':
+        check(all(row['cuda_autocast'] and row['logits_dtype'] == 'torch.float16' for row in model.observations), 'native CUDA fp16 autocast not exercised')
     result = {
-        'case': 'terminal_rejection_after_backward_before_pending_actions',
-        'error_type': type(error).__name__,
-        'cause_type': type(error.__cause__).__name__ if error.__cause__ else None,
-        'before_rejection': trainer.before_rejection,
-        'after_termination': after,
-        'events': recorder.events,
-        'instrumentation': trainer.get_instrumentation(),
-        'forward_observations': model.forward_observations,
-        'scaler_state_after': recorder.scaler.state_dict(),
-        'scaler_scale_after': float(recorder.scaler.get_scale()),
-        'comparisons': {key: same_state(trainer.before_rejection, after, key) for key in ('model', 'optimizer', 'scheduler', 'scaler')},
-        'terminal_event': getattr(error, 'tracker_event', None),
+        'case': case, 'validation_status': 'passed' if not failures else 'failed',
+        'run_status': 'expected_terminal_rejection' if terminal and isinstance(error, ObservationFailureError) else ('failed' if error else 'completed'),
+        'device': device, 'native_cuda_amp_tested': device == 'cuda',
+        'synthetic_fault_injection': strict_value(injections),
+        'error_type': type(error).__name__ if error else None,
+        'cause_type': type(error.__cause__).__name__ if error and error.__cause__ else None,
+        'failures': failures, 'instrumentation': counts, 'steps': trace.rows,
+        'forward_observations': model.observations,
+        'tracker': tracker.get_diagnostics() if tracker is not None else None,
+        'before_rejection': t.before_rejection, 'final_state': snapshot(t),
     }
-    assert result['cause_type'] == 'TerminalInvalidObservation'
-    assert result['comparisons']['model']
-    assert result['comparisons']['optimizer']
-    assert result['comparisons']['scheduler']
-    assert result['comparisons']['scaler']
-    assert recorder.events.count('scaler.step') == 1
-    assert recorder.events.count('scaler.update') == 1
-    assert recorder.events.count('optimizer.step') == 1
-    assert trainer.instr.scheduler_step_calls == 0
-    assert trainer.instr.backward_calls == 2
-    assert trainer.instr.optimizer_step_attempts == 1
-    assert trainer.instr.grad_scaler_step_calls == 1
     write_json(path / 'result.json', result)
+    if failures:
+        raise AssertionError(f'{case}: ' + '; '.join(failures))
+    return result
 
 
-def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    identity = source_identity()
-    write_json(OUT / 'source_identity.json', identity)
-    print(json.dumps(identity, sort_keys=True), flush=True)
-    for name, function in (
-        ('finite', finite_case),
-        ('backward_skip', skip_case),
-        ('terminal_rejection', terminal_case),
-        ('overflow_recovery', overflow_recovery_case),
-    ):
-        print(f'BEGIN {name}', flush=True)
-        function()
-        print(f'PASS {name}', flush=True)
-    print('ALL AMP CASES PASSED', flush=True)
+def main(args):
+    repo = args.repo.resolve()
+    imported = Path(inspect.getfile(TrueBackwardSkippingTrainer)).resolve()
+    if imported != repo / 'lerna/trainers/true_skip_trainer.py':
+        raise RuntimeError(f'Wrong trainer imported: {imported}')
+    source_hash = hashlib.sha256(imported.read_bytes()).hexdigest()
+    if args.expected_trainer_sha256 and source_hash != args.expected_trainer_sha256:
+        raise RuntimeError('Imported trainer SHA-256 differs from expected source')
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA unavailable; no native AMP validation performed')
+    output = args.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    metadata = {
+        'trainer_file': str(imported), 'trainer_sha256': source_hash,
+        'torch': torch.__version__, 'transformers': transformers.__version__,
+        'accelerate': accelerate.__version__, 'python': platform.python_version(),
+        'device': args.device, 'native_cuda_amp_tested': args.device == 'cuda',
+        'gpu_name': torch.cuda.get_device_name(0) if args.device == 'cuda' else None,
+        'cuda_runtime': torch.version.cuda, 'seed': 123,
+        'purpose': 'Synthetic correctness checks with explicit fault injection; not timing or MRPC evidence',
+    }
+    for command, key in ((['git', 'rev-parse', 'HEAD'], 'local_git_head'), (['git', 'status', '--porcelain'], 'git_status')):
+        response = subprocess.run(command, cwd=repo, capture_output=True, text=True)
+        metadata[key] = response.stdout.strip() if response.returncode == 0 else None
+    write_json(output / 'metadata.json', metadata)
+    results = {}
+    for case in CASES:
+        try:
+            run_case(output, args.device, case)
+            results[case] = 'passed'
+        except Exception as exc:
+            results[case] = f'failed: {exc}'
+        print(f'{case}: {results[case]}', flush=True)
+    passed = all(v == 'passed' for v in results.values())
+    write_json(output / 'summary.json', {'passed': passed, 'cases': results, **metadata})
+    return 0 if passed else 1
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
-        raise
+    raise SystemExit(main(CLI))

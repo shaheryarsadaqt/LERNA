@@ -257,6 +257,18 @@ def _plan_matrix(
         use_rho_vg=True,
         use_safety_horizon=True,
         provenance_classification="matched_claim",
+        hw_cfg={
+            "per_device_train_batch_size": 1,
+            "per_device_eval_batch_size": 16,
+            "gradient_accumulation_steps": 1,
+            "fp16": False,
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "dataloader_num_workers": 0,
+            "max_samples": 16,
+        },
+        lr=2e-5,
+        warmup_ratio=0.06,
     )
     findings = validate_phase1_3_matrix_plan(
         plan,
@@ -462,6 +474,18 @@ def _runtime_cell(
         use_rho_vg=True,
         use_safety_horizon=True,
         provenance_classification=planned_cell.get("provenance_classification", "matched_claim"),
+        hw_cfg={
+            "per_device_train_batch_size": 1,
+            "per_device_eval_batch_size": 16,
+            "gradient_accumulation_steps": 1,
+            "fp16": False,
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "dataloader_num_workers": 0,
+            "max_samples": 16,
+        },
+        lr=2e-5,
+        warmup_ratio=0.06,
     )
     runtime["controller_config"] = controller
     return runtime
