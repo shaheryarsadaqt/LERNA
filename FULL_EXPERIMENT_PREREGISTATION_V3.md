@@ -5,7 +5,7 @@
 **Previous version**: v2 (2026-09-27, frozen SHA 8fc60da — INVALIDATED, see diagnosis)
 **Previous-previous version**: v1 (2026-09-25, SHA 64f16f0cb90a73a28ce396ed7623c362efef4e07)
 
-**Frozen SHA**: df70f428fac367a905defc08bd90d462d87262f6
+**Frozen SHA**: d4383a888a6d74f63d021d0f517cf81fdd892801
 ("Phase 5: fix seed propagation bug, validator rule, analyze-only mode, pre-reg v3")
 
 **Why v3**: The v2 confirmatory run (SHA 8fc60da) is invalidated because `collect_cell_metrics`
