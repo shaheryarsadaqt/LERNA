@@ -63,7 +63,7 @@ def load_model_and_tokenizer(
 ) -> Tuple:
     """Load model and tokenizer with architecture-aware defaults.
 
-    ModernBERT/Ettin: reference_compile=False, attn_implementation="sdpa"
+    ModernBERT/Ettin: reference_compile=False, attn_implementation="eager"
     Others: standard AutoModel loading
     """
     is_modernbert = any(model_name.startswith(p) for p in _MODERNBERT_PREFIXES)

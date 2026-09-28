@@ -875,6 +875,30 @@ class TrueBackwardSkippingTrainer(Trainer):
                 "value": loss_val,
             }
             self.instr.run_invalidated = True
+            # Route through tracker so TerminalInvalidObservation is raised and
+            # wrapped as ObservationFailureError (M2 strict semantics preserved).
+            trk = getattr(self, "ler_tracker", None) or getattr(self, "_ler_tracker", None)
+            if trk is not None and hasattr(trk, "update"):
+                try:
+                    trk.update(loss=float(loss_val), logits=self._last_real_logits, model=model, optimizer=getattr(trk, "_optimizer", None) or self.optimizer, decision_index=record["decision_index"])
+                except TerminalInvalidObservation as tio:
+                    self._dump_instrumentation()
+                    terminal_event = tio.__dict__.get("terminal_invalid_event") or {
+                        "event_type": tio.event_type,
+                        "decision_index": tio.decision_index,
+                        "operands": tio.operands,
+                    }
+                    self._dump_ler_diagnostics(
+                        valid_prefix=tio.valid_prefix,
+                        terminal_event=terminal_event,
+                    )
+                    self._uninstall_wrappers()
+                    raise ObservationFailureError(
+                        tracker_event=terminal_event,
+                        valid_prefix=tio.valid_prefix,
+                        original_exception=tio,
+                    ) from tio
+            # Fallback: no tracker attached, raise NonfiniteForwardLossError directly.
             self._dump_instrumentation()
             self._uninstall_wrappers()
             raise NonfiniteForwardLossError(record)

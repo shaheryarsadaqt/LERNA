@@ -101,7 +101,7 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
         _, kwargs = model_from_pretrained.call_args
         self.assertEqual(kwargs["num_labels"], 2)
         self.assertIs(kwargs["reference_compile"], False)
-        self.assertEqual(kwargs["attn_implementation"], "sdpa")
+        self.assertEqual(kwargs["attn_implementation"], "eager")
 
     def test_load_model_and_tokenizer_ettin_kwargs(self):
         with mock.patch.object(
@@ -122,7 +122,7 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
         _, kwargs = model_from_pretrained.call_args
         self.assertEqual(kwargs["num_labels"], 2)
         self.assertIs(kwargs["reference_compile"], False)
-        self.assertEqual(kwargs["attn_implementation"], "sdpa")
+        self.assertEqual(kwargs["attn_implementation"], "eager")
         self.assertEqual(kwargs["revision"], model_loader.ETTIN_REVISION)
         self.assertIs(kwargs["local_files_only"], True)
 

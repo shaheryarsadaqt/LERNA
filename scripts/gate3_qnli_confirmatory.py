@@ -24,8 +24,10 @@ os.environ.pop("HF_ENDPOINT", None)
 
 import sys
 import json
+import glob
 import subprocess
 import time
+import shutil
 import traceback
 from pathlib import Path
 
@@ -73,6 +75,15 @@ def resolve_git_sha():
     return subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
     ).strip()
+
+
+def is_git_dirty():
+    result = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+    )
+    return result.returncode != 0
 
 
 def patch_qnli():
@@ -195,36 +206,80 @@ def validate_cell(cell, base_output_dir):
     return (len(errors) == 0), "; ".join(errors)
 
 
-def collect_cell_metrics(base_output_dir, seed, arm):
-    f = Path(base_output_dir) / arm
-    for fp_dir in sorted(f.iterdir()):
-        if not fp_dir.is_dir() or len(fp_dir.name) != 16:
+def discover_existing_cells(base_output_dir):
+    """Discover all valid cells in the output directory by scanning manifests.
+
+    Used in --analyze-only mode where the current git_sha differs from the
+    frozen SHA the cells were run at.  Returns a list of cell dicts compatible
+    with the plan format.
+    """
+    cells = []
+    for arm in CONFIRMATORY_ARMS:
+        arm_dir = Path(base_output_dir) / arm
+        if not arm_dir.exists():
             continue
-        completed = find_completed_attempt(base_output_dir, arm, fp_dir.name)
-        if completed is None:
-            continue
-        _, rpath = completed
-        d = json.load(open(rpath))
-        instr = d.get("true_skip_instrumentation", {})
-        return {
-            "acc": d["eval_metrics"]["eval_accuracy"],
-                    "f1": d["eval_metrics"].get("eval_f1", None),
-                    "mean_step_ms_executed": instr.get("mean_step_ms_executed"),
-                    "mean_step_ms_skipped": instr.get("mean_step_ms_skipped"),
-                    "train_loop_seconds": instr.get("train_loop_seconds"),
-                    "eval_seconds": instr.get("eval_seconds"),
-                    "avg_dataloader_wait_ms": instr.get("avg_dataloader_wait_ms"),
-                    "forward_calls": instr.get("forward_calls"),
-                    "backward_calls": instr.get("backward_calls"),
-                    "skipped_backward_steps": instr.get("skipped_backward_steps"),
-                    "energy_kwh": d.get("energy_kwh"),
-                    "energy_valid": d.get("power_evidence", {}).get("energy_valid", False),
-                    "skip_ratio_by_batch": d.get("skip_ratio_by_batch"),
+        for fp_dir in sorted(arm_dir.iterdir()):
+            if not fp_dir.is_dir() or len(fp_dir.name) != 16:
+                continue
+            manifest = glob.glob(str(fp_dir / "attempt-001" / "run_manifest.json"))
+            if not manifest:
+                continue
+            with open(manifest[0]) as f:
+                m = json.load(f)
+            seed = m.get("identity_inputs", {}).get("training_seed")
+            if seed is None or seed not in CONFIRMATORY_SEEDS:
+                continue
+            cells.append(
+                {
+                    "arm": arm,
+                    "fingerprint": fp_dir.name,
+                    "training_seed": seed,
+                    "model_id": arm,
+                    "model_revision": "",
                 }
-    return None
+            )
+    return cells
+
+
+def collect_cell_metrics(base_output_dir, arm, fingerprint):
+    """Collect metrics for a specific cell (arm + fingerprint).
+    
+    The fingerprint includes seed, so passing it ensures we read the correct
+    results.json rather than matching any arbitrary attempt for the arm.
+    """
+    completed = find_completed_attempt(base_output_dir, arm, fingerprint)
+    if completed is None:
+        return None
+    _, rpath = completed
+    d = json.load(open(rpath))
+    instr = d.get("true_skip_instrumentation", {})
+    return {
+        "acc": d["eval_metrics"]["eval_accuracy"],
+        "f1": d["eval_metrics"].get("eval_f1", None),
+        "mean_step_ms_executed": instr.get("mean_step_ms_executed"),
+        "mean_step_ms_skipped": instr.get("mean_step_ms_skipped"),
+        "train_loop_seconds": instr.get("train_loop_seconds"),
+        "eval_seconds": instr.get("eval_seconds"),
+        "avg_dataloader_wait_ms": instr.get("avg_dataloader_wait_ms"),
+        "forward_calls": instr.get("forward_calls"),
+        "backward_calls": instr.get("backward_calls"),
+        "skipped_backward_steps": instr.get("skipped_backward_steps"),
+        "energy_kwh": d.get("energy_kwh"),
+        "energy_valid": d.get("power_evidence", {}).get("energy_valid", False),
+        "skip_ratio_by_batch": d.get("skip_ratio_by_batch"),
+    }
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Gate 3: QNLI confirmatory run")
+    parser.add_argument(
+        "--analyze-only",
+        action="store_true",
+        help="Skip preflight checks and just re-analyze cached results (no new runs)",
+    )
+    args = parser.parse_args()
+
     base_output_dir = os.environ.get(
         "GATE3_OUTPUT_DIR",
         "/new_raid/nanhangproj/experiments/gate3_qnli_confirmatory",
@@ -240,16 +295,78 @@ def main():
     print(f"  Arms: {CONFIRMATORY_ARMS}")
     print(f"  Max seeds: {CONFIRMATORY_SEEDS}")
     print(f"  Patches: QNLI epochs={QNLI_EPOCHS} lr={QNLI_LR} warmup={QNLI_WARMUP}")
+    if args.analyze_only:
+        print(f"  Mode: ANALYZE ONLY (no preflight, no new runs)")
     print("=" * 60)
 
     orig = patch_qnli()
     env = build_environment(profile)
     print(f"  Environment: {json.dumps(env, indent=2)}")
 
-    plan, qnli_facts, hw_config = build_plan(base_output_dir, git_sha, profile)
-    print(f"\nPlan: {len(plan)} cells (4 arms x up to {len(CONFIRMATORY_SEEDS)} seeds)")
-    print(f"  QNLI: {qnli_facts['num_epochs']} epochs, {qnli_facts['total_steps']} total_steps, "
-          f"{qnli_facts['train_samples_realized']} train, {qnli_facts['eval_samples_realized']} eval")
+    # Preflight checks
+    preflight_skipped = False
+    if not args.analyze_only:
+        preflight_errors = []
+        # 1. Clean git tree
+        if is_git_dirty():
+            preflight_errors.append("git tree is dirty (commit or stash changes first)")
+        # 2. Disk space check (>=500 GB free)
+        disk = shutil.disk_usage("/new_raid/nanhangproj")
+        if disk.free < 500 * 1024 ** 3:
+            preflight_errors.append(
+                f"insufficient disk: {disk.free / 1024 ** 3:.0f} GB free (need 500 GB)"
+            )
+        # 3. No foreign-SHA cells in output dir
+        for arm_dir in Path(base_output_dir).iterdir():
+            if arm_dir.is_dir():
+                for fp_dir in arm_dir.iterdir():
+                    if fp_dir.is_dir():
+                        for attempt_dir in fp_dir.iterdir():
+                            if attempt_dir.is_dir() and attempt_dir.name.startswith(
+                                "attempt-"
+                            ):
+                                manifest = attempt_dir / "run_manifest.json"
+                                if manifest.exists():
+                                    try:
+                                        m = json.load(open(manifest))
+                                        m_sha = m.get("git_sha", "")
+                                        if m_sha != git_sha:
+                                            preflight_errors.append(
+                                                f"foreign SHA cell: {manifest} has git_sha={m_sha[:12]}, expected={git_sha[:12]}"
+                                            )
+                                    except json.JSONDecodeError:
+                                        preflight_errors.append(
+                                            f"corrupt manifest: {manifest}"
+                                        )
+        if preflight_errors:
+            print("\n  PREFLIGHT CHECKS FAILED:")
+            for err in preflight_errors:
+                print(f"    - {err}", flush=True)
+            sys.exit(2)
+        print("  Preflight: clean git, disk OK, no foreign-SHA cells")
+    else:
+        preflight_skipped = True
+        print("  Preflight: SKIPPED (analyze-only mode)")
+
+    # In analyze-only mode, discover existing cells from manifests rather
+    # than building a plan whose fingerprints depend on the current git_sha.
+    if args.analyze_only:
+        plan = discover_existing_cells(base_output_dir)
+        print(f"\nDiscovered {len(plan)} existing cells (analyze-only)")
+        for cell in plan:
+            print(f"  [{cell['arm']}] seed={cell['training_seed']} fp={cell['fingerprint'][:8]}")
+        qnli_facts = {
+            "num_epochs": QNLI_EPOCHS,
+            "total_steps": 6548,
+            "train_samples_realized": 104743,
+            "eval_samples_realized": 5463,
+        }
+        hw_config = {}
+    else:
+        plan, qnli_facts, hw_config = build_plan(base_output_dir, git_sha, profile)
+        print(f"\nPlan: {len(plan)} cells (4 arms x up to {len(CONFIRMATORY_SEEDS)} seeds)")
+        print(f"  QNLI: {qnli_facts['num_epochs']} epochs, {qnli_facts['total_steps']} total_steps, "
+              f"{qnli_facts['train_samples_realized']} train, {qnli_facts['eval_samples_realized']} eval")
 
     completed_seeds = []
     failed_seeds = []
@@ -275,7 +392,7 @@ def main():
                 print(f"\n  [{arm}] seed={seed} SKIP (already complete: {attempt_name})", flush=True)
                 t1 = time.perf_counter()
                 valid, msg = validate_cell(cell, base_output_dir)
-                metrics = collect_cell_metrics(base_output_dir, seed, arm)
+                metrics = collect_cell_metrics(base_output_dir, arm, fingerprint)
                 all_cell_metrics[(seed, arm)] = metrics
                 if valid:
                     seed_results.append((arm, True, ""))
@@ -286,6 +403,11 @@ def main():
                     print(f"  [{arm}] FAIL (cached): {msg}", flush=True)
                 continue
             print(f"\n  [{arm}] seed={seed} starting...", flush=True)
+            if args.analyze_only:
+                print(f"  [{arm}] SKIP (analyze-only mode: no execution)", flush=True)
+                seed_all_valid = False
+                seed_results.append((arm, False, "analyze-only mode: cell not found for re-execution"))
+                continue
             try:
                 run_ablation_single(
                     task_name="qnli",
@@ -330,7 +452,7 @@ def main():
 
             t1 = time.perf_counter()
             valid, msg = validate_cell(cell, base_output_dir)
-            metrics = collect_cell_metrics(base_output_dir, seed, arm)
+            metrics = collect_cell_metrics(base_output_dir, arm, fingerprint)
             all_cell_metrics[(seed, arm)] = metrics
 
             f1 = metrics["acc"] if metrics else "?"
@@ -377,6 +499,30 @@ def main():
         print(f"  Completed: {completed_seeds}")
     if failed_seeds:
         print(f"  Failed: {failed_seeds}")
+
+    # Validator rule: identical accuracy across >=2 seeds for the same arm => invalid
+    # Triggers if ANY two seeds produce the same accuracy (statistical coincidence
+    # or seed propagation bug). Investigated: ler_guided_stratified seeds 11 & 13
+    # both yield 0.9322716456159619 despite different train_loss/eval_loss.
+    seed_identity_violation = False
+    for arm in CONFIRMATORY_ARMS:
+        accs = []
+        for s in completed_seeds:
+            m = all_cell_metrics.get((s, arm))
+            if m and m.get("acc") is not None:
+                accs.append((s, m["acc"]))
+        if len(accs) >= 2:
+            vals = [a for _, a in accs]
+            if len(set(vals)) < len(vals):
+                seed_identity_violation = True
+                dup_seeds = [str(s) for s, a in accs if vals.count(a) > 1]
+                print(f"\n  VALIDATOR RULE VIOLATION: {arm} has identical acc across seeds [{', '.join(dup_seeds)}]")
+    if seed_identity_violation:
+        print("\n  MATRIX INVALIDATED: identical results across seeds detected")
+        print("  (Likely cause: seed not propagated to trainer, or fingerprint collision)")
+        matrix_invalidated = True
+    else:
+        matrix_invalidated = False
 
     # Paired analysis (only if >= 2 completed seeds)
     if len(completed_seeds) >= 2:
@@ -455,6 +601,7 @@ def main():
         "n_validated_cells": len(completed_seeds) * 4,
         "total_cells_planned": len(plan),
         "fp16_nan_events": fp16_nan_count,
+        "matrix_invalidated": matrix_invalidated,
     }
     os.makedirs(base_output_dir, exist_ok=True)
     summary_path = Path(base_output_dir) / "gate3_summary.json"
