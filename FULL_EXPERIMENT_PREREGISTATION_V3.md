@@ -239,7 +239,46 @@ Every cell manifest records:
 - Manifests complete (git_sha, tracker_revision, nonfinite_forward_loss_policy)
 - M2c strict (forward_loss_observations == total_steps, nonfinite_count == 0)
 
-**Status**: Pre-registration committed; smoke to run before QNLI confirmatory.
+**Status**: Pre-registration committed; MRPC smoke completed (8/8 PASS). QNLI confirmatory completed (20/20 PASS). Results below.
+
+---
+
+## 12. QNLI Confirmatory Results
+
+**Run**: `scripts/gate3_qnli_confirmatory.py`
+**Environment**: ettin-encoder-150m rev 45d0864, fp16+eager, 2 epochs, lr=2e-5, warmup=0.06
+**Duration**: ~6.5 hours serial on 8× V100 (CUDA_VISIBLE_DEVICES=0)
+
+### 12.1 Cell Results (20/20 PASS)
+
+| Seed | full_finetune | exact_random | ler_guided_stratified | phase_strat_guarded |
+|------|--------------|-------------|----------------------|-------------------|
+| 11   | 0.9365       | 0.9314      | 0.9323               | 0.9306            |
+| 13   | 0.9332       | 0.9317      | 0.9323               | 0.9315            |
+| 17   | 0.9308       | 0.9295      | 0.9301               | 0.9303            |
+| 19   | 0.9334       | 0.9325      | 0.9319               | 0.9314            |
+| 23   | 0.9295       | 0.9306      | 0.9262               | 0.9255            |
+
+- **M2c strict**: All 20 cells satisfy `forward_loss_observations == total_steps (6548)`, `nonfinite_forward_loss_count == 0`
+- **Seed difference**: All seeds differ within each arm (no seed propagation bug)
+- **Reproducibility**: All 20 accuracies match Phase 4 baseline exactly (4-decimal precision)
+
+### 12.2 Paired Analysis (ler_guided_stratified vs exact_random)
+
+**Primary hypothesis (paired t-test, two-sided, α=0.05)**:
+- Mean Δacc = −0.000586
+- t(4) = −0.596, p = 0.583
+- **Result: NOT SIGNIFICANT** (fail to reject H0; lgs ≠ er effect not established)
+
+**Secondary TOST non-inferiority (margin = 0.5 pt = 0.005)**:
+- t = −5.68, CI_lower = −0.00456
+- **Result: PASS** (lgs is non-inferior to er within 0.5 pt)
+
+### 12.3 Efficiency
+
+- `ler_guided_stratified`: ~109 ms/step (training with online LER)
+- `exact_random`: ~90 ms/step (training with random skipping)
+- Overhead (lgs − er): +18.8 ms/step (~21% overhead)
 
 ---
 
