@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def load_results_json(results_path: Path) -> Optional[Dict[str, Any]]:
@@ -256,6 +257,194 @@ def print_table(headers: List[str], rows: List[Dict[str, Any]], key_order: List[
         print(line)
 
 
+def extract_seed_map(cells_raw: List[Dict[str, Any]]) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    """Build {arm: {seed: cell_data}} from collected raw cells.
+
+    Uses identity_inputs.training_seed if present, falls back to 'seed' field.
+    """
+    seed_map: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for c in cells_raw:
+        arm = c["arm"]
+        data = c["data"]
+        seed = data.get("identity_inputs", {}).get("training_seed", data.get("seed"))
+        if seed is None:
+            continue
+        seed_map.setdefault(arm, {})[int(seed)] = data
+    return seed_map
+
+
+def paired_ttest(
+    arm_a: str, arm_b: str, seed_map: Dict[str, Dict[int, Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """Paired t-test on Δacc(arm_a − arm_b) across shared seeds.
+
+    Returns mean, se, t_stat, df, t_crit, p_value_approx, significant.
+    """
+    seeds_a = set(seed_map.get(arm_a, {}).keys())
+    seeds_b = set(seed_map.get(arm_b, {}).keys())
+    shared = sorted(seeds_a & seeds_b)
+    if len(shared) < 2:
+        return {
+            "n": len(shared),
+            "deltas": [],
+            "mean_delta": None,
+            "se": None,
+            "t_stat": None,
+            "df": len(shared) - 1 if shared else 0,
+            "t_crit": None,
+            "significant": False,
+            "error": "insufficient shared seeds",
+        }
+
+    deltas = []
+    for s in shared:
+        acc_a = (
+            seed_map[arm_a][s]
+            .get("eval_metrics", {})
+            .get("eval_accuracy")
+        )
+        acc_b = (
+            seed_map[arm_b][s]
+            .get("eval_metrics", {})
+            .get("eval_accuracy")
+        )
+        if acc_a is None or acc_b is None:
+            continue
+        deltas.append(float(acc_a) - float(acc_b))
+
+    n = len(deltas)
+    if n < 2:
+        return {
+            "n": n,
+            "deltas": deltas,
+            "mean_delta": None,
+            "se": None,
+            "t_stat": None,
+            "df": n - 1,
+            "t_crit": None,
+            "significant": False,
+            "error": "insufficient data after filtering",
+        }
+
+    mean_d = sum(deltas) / n
+    var_d = sum(d**2 for d in deltas) / n - mean_d**2
+    if var_d < 0:
+        var_d = 0.0
+    se = math.sqrt(var_d) / math.sqrt(n) if n > 1 else 0.0
+    t_stat = mean_d / se if se > 0 else float("inf")
+
+    # t-critical for two-sided alpha=0.05
+    t_table = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776,
+        5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
+        9: 2.262, 10: 2.228, 15: 2.131, 20: 2.086,
+        30: 1.697,
+    }
+    t_crit = t_table.get(n - 1, 1.96)
+    significant = abs(t_stat) > t_crit if se > 0 else True
+
+    return {
+        "n": n,
+        "deltas": deltas,
+        "mean_delta": mean_d,
+        "se": se,
+        "t_stat": t_stat,
+        "df": n - 1,
+        "t_crit": t_crit,
+        "significant": significant,
+    }
+
+
+def tost_noninferiority(
+    arm_a: str, arm_b: str, seed_map: Dict[str, Dict[int, Dict[str, Any]]],
+    margin: float = 0.005, alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """TOST non-inferiority test: H0: Δ <= -margin vs H1: Δ > -margin.
+
+    Uses the paired t-test results to check if the lower 90% CI
+    (one-sided) exceeds -margin.
+    """
+    pt = paired_ttest(arm_a, arm_b, seed_map)
+    if pt["mean_delta"] is None or pt["se"] is None:
+        return {"pass": False, "error": pt.get("error", "insufficient data")}
+
+    n = pt["n"]
+    mean_d = pt["mean_delta"]
+    se = pt["se"]
+    df = pt["df"]
+
+    # One-sided 95% CI: mean_d - t_one_sided * se
+    # t_one_sided for alpha=0.05 is the same as t_two_sided(0.10, df)
+    t_one_sided_table = {
+        1: 6.314, 2: 2.920, 3: 2.353, 4: 2.132,
+        5: 2.015, 6: 1.943, 7: 1.895, 8: 1.860,
+        9: 1.833, 10: 1.812, 15: 1.753, 20: 1.725,
+        30: 1.697,
+    }
+    t_one_sided = t_one_sided_table.get(df, 1.645)
+
+    ci_lower = mean_d - t_one_sided * se if se < float("inf") else mean_d
+    passes = ci_lower >= -margin
+
+    return {
+        "n": n,
+        "mean_delta": mean_d,
+        "se": se,
+        "ci_lower": ci_lower,
+        "margin": margin,
+        "pass": passes,
+    }
+
+
+def build_paired_analysis(cells_raw: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build paired t-test and TOST non-inferiority tables.
+
+    Uses seed-256 field grouping if available; falls back to fingerprint-based
+    arm grouping with seed extracted from identity_inputs.
+    """
+    seed_map = extract_seed_map(cells_raw)
+
+    result: Dict[str, Any] = {"by_arm_seed": {}, "primary": {}, "secondary": {}, "tost": {}}
+
+    for arm, seed_dict in seed_map.items():
+        result["by_arm_seed"][arm] = {
+            str(s): {
+                "eval_accuracy": (
+                    seed_dict[s].get("eval_metrics", {}).get("eval_accuracy")
+                ),
+                "eval_f1": seed_dict[s].get("eval_metrics", {}).get("eval_f1"),
+                "train_loss": seed_dict[s].get("train_loss"),
+            }
+            for s in sorted(seed_dict.keys())
+        }
+
+    # Primary: paired t-test (ler_guided_stratified - exact_random)
+    if "ler_guided_stratified" in seed_map and "exact_random" in seed_map:
+        result["primary"] = paired_ttest(
+            "ler_guided_stratified", "exact_random", seed_map
+        )
+
+    # Secondary: TOST non-inferiority (ler_guided_stratified - full_finetune)
+    if "ler_guided_stratified" in seed_map and "full_finetune" in seed_map:
+        result["tost"]["ler_vs_fullfinetune"] = tost_noninferiority(
+            "ler_guided_stratified", "full_finetune", seed_map
+        )
+
+    # TOST: ler_guided_stratified vs exact_random
+    if "ler_guided_stratified" in seed_map and "exact_random" in seed_map:
+        result["tost"]["ler_vs_exactrandom"] = tost_noninferiority(
+            "ler_guided_stratified", "exact_random", seed_map
+        )
+
+    # TOST: phase_strat_guarded vs exact_random
+    if "phase_strat_guarded" in seed_map and "exact_random" in seed_map:
+        result["tost"]["phase_vs_exactrandom"] = tost_noninferiority(
+            "phase_strat_guarded", "exact_random", seed_map
+        )
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate summary tables from experiment results")
     parser.add_argument("experiment_dir", help="Path to experiment directory")
@@ -276,7 +465,7 @@ def main():
     for c in cells_raw:
         c["summary"] = extract_cell_summary(c["data"])
 
-     # Build all tables
+    # Build all tables
     metrics_table = build_metrics_table(cells_raw)
     skip_table = build_skip_accounting_table(cells_raw)
     timing_table = build_timing_table(cells_raw)
@@ -346,6 +535,49 @@ def main():
         ["task", "seed", "skip_rate", "arm", "attempt", "energy_valid", "power_evidence_coverage", "manifest_sha256", "results_sha256"]
     )
 
+    # Paired analysis (paired t-test + TOST)
+    paired_analysis = build_paired_analysis(cells_raw)
+
+    # Print paired analysis
+    print("\n=== PAIRED ANALYSIS ===")
+    seed_map = paired_analysis.get("by_arm_seed", {})
+    if seed_map:
+        arms = sorted(seed_map.keys())
+        seeds = sorted(
+            set(s for arm in arms for s in seed_map[arm].keys()),
+            key=lambda x: int(x),
+        )
+        print(f"\n  {'Arm':25s} | " + " | ".join(f"s{s}" for s in seeds))
+        print("  " + "-" * (25 + 7 * len(seeds)))
+        for arm in arms:
+            vals = []
+            for s in seeds:
+                cell = seed_map[arm].get(s, {})
+                acc = cell.get("eval_accuracy")
+                vals.append(f"{acc:.6f}" if acc is not None else "N/A")
+            print(f"  {arm:25s} | " + " | ".join(vals))
+
+    pt = paired_analysis.get("primary", {})
+    if pt and pt.get("mean_delta") is not None:
+        print(f"\n  Primary: Δacc(lgs − exact_random), n={pt['n']}")
+        print(f"    Mean Δ: {pt['mean_delta']:+.10f}")
+        print(f"    SE: {pt['se']:.10f}" if pt.get('se') else "    SE: N/A")
+        print(f"    t({pt['df']}): {pt['t_stat']:.3f}" if pt.get('t_stat') else "    t: N/A")
+        print(f"    t_crit: {pt['t_crit']}")
+        sig = "SIGNIFICANT" if pt.get("significant") else "NOT SIGNIFICANT"
+        print(f"    Result: {sig} at α=0.05 (two-sided)")
+
+    print("\n--- TOST Non-Inferiority ---")
+    for label, tost_key in [
+        ("ler vs full_finetune", "ler_vs_fullfinetune"),
+        ("ler vs exact_random", "ler_vs_exactrandom"),
+        ("phase_strat vs exact_random", "phase_vs_exactrandom"),
+    ]:
+        tr = paired_analysis.get("tost", {}).get(tost_key, {})
+        if tr and tr.get("pass") is not None:
+            print(f"  {label:25s}: mean Δ={tr['mean_delta']:+.6f}, CI_lower={tr['ci_lower']:+.6f}, "
+                  f"margin={tr['margin']}, {'PASS' if tr['pass'] else 'FAIL'}")
+
     # Write JSON output
     output = {
         "metrics": metrics_table,
@@ -355,6 +587,7 @@ def main():
         "amp_accounting": amp_table,
         "validation": validation_table,
         "run_counts": run_counts,
+        "paired_analysis": paired_analysis,
     }
 
     if args.output:

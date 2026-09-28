@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Gate 2: MRPC smoke test on tracker v3 (6 arms x rate 0.30 x seed 42).
+"""Gate 2: MRPC smoke test on tracker v3 (4 arms x rate 0.30 x seeds 42, 43).
 
-Builds a 6-cell plan using build_phase1_3_matrix_plan with a single skip
-rate (0.30) and single seed (42), persists it as a fresh plan, runs all
-6 cells sequentially on a single V100, then validates each cell's
+Builds an 8-cell plan (4 confirmatory arms × 0.30 × 2 seeds), persists it,
+runs all 8 cells sequentially on a single V100, then validates each cell's
 results.json for the M3 checks.
+
+Pass criteria:
+- 8/8 cells complete, 0 non-finite losses
+- Seeds 42 and 43 differ in every arm (no seed propagation bug)
+- ler_guided_stratified F1 within 1.5 pt of seed-42 F1
+- eval_seconds > 0, manifests complete, M2c strict
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 PYTHONDONTWRITEBYTECODE=1 \\
@@ -42,6 +47,7 @@ from lerna.utils.phase1_3_operations import (
     file_sha256,
 )
 from lerna.utils import ettin_constants as ETTIN
+from scripts.gate3_qnli_confirmatory import CONFIRMATORY_ARMS
 from scripts.run_ablation_study import (
     build_phase1_3_matrix_plan,
     run_ablation_single,
@@ -85,7 +91,7 @@ def build_environment(profile):
 
 
 def plan_smoke(base_output_dir, git_sha, profile):
-    """Build 6-arm x 0.30 x seed 42 plan and persist."""
+    """Build 4-arm × 2-seed × 0.30 plan and persist."""
     tokenizer = load_tokenizer(
         ETTIN.ETTIN_MODEL_ID,
         revision=ETTIN.ETTIN_REVISION,
@@ -99,9 +105,10 @@ def plan_smoke(base_output_dir, git_sha, profile):
 
     hw_config = dict(get_training_config(profile))
 
-    plan = build_phase1_3_matrix_plan(
+    # Build full 6-arm plan, then filter to 4 confirmatory arms
+    full_plan = build_phase1_3_matrix_plan(
         tasks=["mrpc"],
-        seeds=[42],
+        seeds=[42, 43],
         target_skip_rates=[0.30],
         model_name=ETTIN.ETTIN_MODEL_ID,
         model_revision=ETTIN.ETTIN_REVISION,
@@ -124,14 +131,19 @@ def plan_smoke(base_output_dir, git_sha, profile):
         warmup_ratio=0.06,
     )
 
-    # Validate all 6 arms present
-    arms_in_plan = [c["arm"] for c in plan]
-    assert set(arms_in_plan) == set(PHASE1_3_CANONICAL_ARMS), (
-        f"Expected all 6 canonical arms, got {arms_in_plan}"
+    # Filter to 4 confirmatory arms
+    plan = [c for c in full_plan if c["arm"] in CONFIRMATORY_ARMS]
+
+    # Validate plan
+    arms_in_plan = set(c["arm"] for c in plan)
+    assert arms_in_plan == set(CONFIRMATORY_ARMS), (
+        f"Expected 4 confirmatory arms, got {arms_in_plan}"
     )
-    assert len(plan) == 6, f"Expected 6 cells, got {len(plan)}"
+    assert len(plan) == 8, f"Expected 8 cells (4 arms x 2 seeds), got {len(plan)}"
     assert all(c["target_skip_rate"] == 0.30 for c in plan), "All cells must have rate 0.30"
-    assert all(c["training_seed"] == 42 for c in plan), "All cells must have seed 42"
+    assert set(c["training_seed"] for c in plan) == {42, 43}, (
+        f"Expected seeds {{42, 43}}, got {set(c['training_seed'] for c in plan)}"
+    )
 
     return plan, resolved_facts["mrpc"], hw_config
 
@@ -294,12 +306,14 @@ def main():
     plan, mrpc_facts, hw_config = plan_smoke(
         base_output_dir, git_sha, profile
     )
-    print(f"\nPlan: {len(plan)} cells (6 arms x rate 0.30 x seed 42)")
+    print(f"\nPlan: {len(plan)} cells (4 arms x rate 0.30 x seeds 42, 43)")
 
     # Run each cell
     results = []
+    cell_data = {}  # (arm, seed) -> results dict for cross-seed validation
     for cell in plan:
         arm = cell["arm"]
+        seed = cell["training_seed"]
         success, err = run_cell(
             cell, base_output_dir, profile,
             num_epochs=mrpc_facts["num_epochs"],
@@ -309,23 +323,80 @@ def main():
         msg = err if not success else ""
         if success:
             valid, msg = validate_cell(cell, base_output_dir)
-        results.append((arm, success, valid, msg))
+            # Collect results for cross-seed validation
+            try:
+                from pathlib import Path as _Path
+                arm_dir = _Path(base_output_dir) / arm
+                for fp_dir in sorted(arm_dir.iterdir()):
+                    if fp_dir.is_dir() and len(fp_dir.name) == 16:
+                        rpath = fp_dir / "attempt-001" / "results.json"
+                        if rpath.exists():
+                            with open(rpath) as f:
+                                cell_data[(arm, seed)] = json.load(f)
+                            break
+            except Exception:
+                pass
+        results.append((arm, seed, success, valid, msg))
+
+    # Cross-seed validation: seeds 42 and 43 must differ in every arm
+    print("\n=== CROSS-SEED VALIDATION ===")
+    seed_diff_ok = True
+    for arm in CONFIRMATORY_ARMS:
+        r42 = cell_data.get((arm, 42), {})
+        r43 = cell_data.get((arm, 43), {})
+        acc42 = r42.get("eval_metrics", {}).get("eval_accuracy")
+        acc43 = r43.get("eval_metrics", {}).get("eval_accuracy")
+        train_loss42 = r42.get("train_loss")
+        train_loss43 = r43.get("train_loss")
+        if acc42 is not None and acc43 is not None:
+            same_acc = abs(acc42 - acc43) < 1e-12
+            same_loss = (
+                abs(train_loss42 - train_loss43) < 1e-6
+                if train_loss42 is not None and train_loss43 is not None
+                else False
+            )
+            status = "IDENTICAL" if same_acc else "DIFFERENT"
+            if same_acc:
+                seed_diff_ok = False
+            print(f"  {arm:25s} s42_acc={acc42:.6f} s43_acc={acc43:.6f} → {status}")
+            if same_acc and not same_loss:
+                print(f"    (acc identical but train_loss differs: {train_loss42:.6f} vs {train_loss43:.6f} — coincidence)")
+        else:
+            seed_diff_ok = False
+            print(f"  {arm:25s} MISSING data")
+
+    # F1-within-1.5-pt check for ler_guided_stratified
+    print("\n=== F1 CONVERGENCE CHECK ===")
+    f1_ok = True
+    r42 = cell_data.get(("ler_guided_stratified", 42), {}).get("eval_metrics", {})
+    r43 = cell_data.get(("ler_guided_stratified", 43), {}).get("eval_metrics", {})
+    f1_42 = r42.get("eval_f1")
+    f1_43 = r43.get("eval_f1")
+    if f1_42 is not None and f1_43 is not None:
+        f1_diff = abs(f1_42 - f1_43)
+        f1_ok = f1_diff <= 1.5
+        print(f"  ler_guided_stratified: s42 F1={f1_42:.4f}, s43 F1={f1_43:.4f}, diff={f1_diff:.4f} (≤1.5 required: {'PASS' if f1_ok else 'FAIL'})")
+    else:
+        f1_ok = False
+        print(f"  ler_guided_stratified: F1 data missing")
 
     # Summary
     print("\n=== SMOKE TEST RESULTS ===")
     all_pass = True
-    for arm, ran, valid, msg in results:
+    for arm, seed, ran, valid, msg in results:
         status = "PASS" if (ran and valid) else "FAIL"
         if not (ran and valid):
             all_pass = False
-        print(f"  {arm:30s} {status}  {msg}")
+        print(f"  {arm:25s} s{seed:<3d} {status}  {msg}")
 
-    n_completed = sum(1 for _, ran, _, _ in results if ran)
-    n_validated = sum(1 for _, ran, valid, _ in results if ran and valid)
+    n_completed = sum(1 for _, _, ran, _, _ in results if ran)
+    n_validated = sum(1 for _, _, ran, valid, _ in results if ran and valid)
     print(f"\n  Completed: {n_completed}/{len(results)}")
     print(f"  Validated: {n_validated}/{len(results)}")
+    print(f"  Seeds differ in every arm: {'PASS' if seed_diff_ok else 'FAIL'}")
+    print(f"  F1 within 1.5pt: {'PASS' if f1_ok else 'FAIL'}")
 
-    if all_pass:
+    if all_pass and seed_diff_ok and f1_ok:
         print("\nGate 2: ALL CHECKS PASSED")
     else:
         print("\nGate 2: FAILURES DETECTED")
