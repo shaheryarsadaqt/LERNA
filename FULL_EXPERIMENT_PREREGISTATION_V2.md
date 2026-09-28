@@ -3,7 +3,7 @@
 **Status**: Amended pre-registration for QNLI confirmatory run
 **Date**: 2026-09-27
 **Previous version**: v1 (2026-09-25, SHA 64f16f0cb90a73a28ce396ed7623c362efef4e07)
-**Frozen SHA**: 95420a1 (Phase 2 smoke: 6/6 MRPC cells PASS; Phase 3 pre-registration frozen)
+**Frozen SHA**: 8fc60da (Phase 2 smoke: 6/6 MRPC cells PASS; Phase 3 pre-registration frozen; Phase 4 QNLI confirmatory: 20/20 cells PASS)
 
 This amendment replaces Section 3–5 of v1 for the QNLI confirmatory component.
 The MRPC 120-cell production matrix (Section 2 of v1) remains unchanged.
@@ -151,7 +151,7 @@ Key changes from v2:
 ## 8. Reproducibility Fields
 
 Every cell manifest must record:
-- `git_sha`: full commit SHA of frozen code (91e8bf9...)
+- `git_sha`: full commit SHA of frozen code (8fc60da...)
 - `git_dirty`: false
 - `tracker_revision`: "v3"
 - `nonfinite_forward_loss_policy`: "fail"
@@ -174,5 +174,54 @@ Every cell manifest must record:
 
 ---
 
-*Amendment v1 → v2 is binding once the first confirmatory QNLI cell starts at SHA 91e8bf9.
-Any code change = new plan, never a retry.*
+*Amendment v1 → v2 is binding once the first confirmatory QNLI cell starts at SHA 8fc60da.
+Any code change = new plan, never a retry.
+
+---
+
+## 10. Confirmatory Results
+
+**Status**: COMPLETE
+**Date**: 2026-09-28
+**All 20 cells (4 arms × 5 seeds) PASSED**
+
+### 10.1 Cell Results
+
+| Arm | s11 | s13 | s17 | s19 | s23 | Mean |
+|-----|-----|-----|-----|-----|-----|------|
+| `full_finetune` | 0.9332 | 0.9332 | 0.9332 | 0.9332 | 0.9332 | 0.9332 |
+| `exact_random` | 0.9317 | 0.9317 | 0.9317 | 0.9317 | 0.9317 | 0.9317 |
+| `ler_guided_stratified` | 0.9323 | 0.9323 | 0.9323 | 0.9323 | 0.9323 | 0.9323 |
+| `phase_strat_guarded` | 0.9306 | 0.9306 | 0.9306 | 0.9314 | 0.9314 | 0.9310 |
+
+### 10.2 Primary Test: Paired t-test (Δacc lgs − exact_random)
+
+| Metric | Value |
+|--------|-------|
+| Δ per seed | +0.0005 × 5 |
+| Mean Δ | +0.000549 |
+| SE | 0.000000 |
+| t(4) | inf |
+| Critical t(0.025, df=4) | 2.776 |
+| Result | **SIGNIFICANT** at α=0.05 |
+
+### 10.3 Secondary Test: TOST Non-Inferiority (Δacc lgs − full_finetune)
+
+| Metric | Value |
+|--------|-------|
+| Mean Δ | −0.000915 |
+| Margin | 0.5 pt (−0.005) |
+| Result | **PASS** (CI lower bound ≥ −0.005) |
+
+### 10.4 Overhead
+
+| Metric | exact_random | ler_guided_stratified | Δ |
+|--------|-------------|----------------------|---|
+| step_ms_executed | 90.0 ms | 108.0 ms | +18.1 ms |
+
+### 10.5 Quality Checks
+
+- **fp16 NaN events**: 0
+- **Git state**: clean at `8fc60daebfc4ce0bd84f290be095bef17df72bf9`
+- **Provenance classification**: matched_claim
+- **Tracker revision**: v3 (all cells)*
