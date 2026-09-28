@@ -310,11 +310,11 @@ def main():
         # 1. Clean git tree
         if is_git_dirty():
             preflight_errors.append("git tree is dirty (commit or stash changes first)")
-        # 2. Disk space check (>=100 GB free)
+        # 2. Disk space check (>=500 GB free)
         disk = shutil.disk_usage("/new_raid/nanhangproj")
-        if disk.free < 100 * 1024 ** 3:
+        if disk.free < 500 * 1024 ** 3:
             preflight_errors.append(
-                f"insufficient disk: {disk.free / 1024 ** 3:.0f} GB free (need 100 GB)"
+                f"insufficient disk: {disk.free / 1024 ** 3:.0f} GB free (need 500 GB)"
             )
         # 3. No foreign-SHA cells in output dir
         for arm_dir in Path(base_output_dir).iterdir():
