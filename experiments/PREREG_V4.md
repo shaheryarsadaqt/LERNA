@@ -110,7 +110,7 @@ only via the MRFC smoke (mechanics check) and the Stage-2 confirmatory cells.
 - LR curves identical: `max|diff| = 0.00e+00`
 - Phase 0 quota 0 (min_step-gated; share transferred to windows 1-3)
 
-**Overhead**: gate +53.7 ms/step over control (forward_gain_score cost, expected).
+**Overhead**: gate +51.2 ms/step over control (forward_gain_score cost, expected).
 
 **Output**: `/raid/smoke_forward_gate_mrpc/` (smoke_summary.json with provenance).
 
