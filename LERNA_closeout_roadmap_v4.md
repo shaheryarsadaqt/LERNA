@@ -120,7 +120,9 @@ is run. The retrospective, with both confounds stated, is written in `docs/chapt
 
 > **Branch A — if the Stage 0 oracle gate PASSES.** The forward gain proxy predicts per-step
 > contribution above a within-seed permutation + step-index/loss-stratified partial correlation:
-> local ρ > 0 with a bootstrap CI excluding 0 on both seed 11 and seed 13.
+> local ρ ≥ 0.20 with a bootstrap CI excluding 0 on both seed 11 and seed 13.
+> (ρ > 0 is too weak: over ~800 points it passes at ρ≈0.07, statistically significant but
+> explaining <1% variance — unable to move accuracy.)
 >
 > **Branch B — if the oracle gate FAILS.** Reported as "undetectable at n = 5" (not "no signal
 > exists"), consistent with Kaddour. No further attempt is made to make LER win.

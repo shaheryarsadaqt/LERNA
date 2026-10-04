@@ -78,8 +78,10 @@ v4 tests the signal *on its own terms* rather than via budget vs full fine-tunin
   trailing 64-step windows, moving-block bootstrap (block 64, 10k resamples), with old LER logged in
   shadow mode using the *same* statistic. The oracle gate asks whether the forward score predicts
   contribution above a within-seed permutation and a step-index/loss-stratified partial correlation.
-- Only if that local ρ > 0 with a bootstrap CI excluding 0 on both seed 11 and seed 13 does the
-  signal claim hold. Otherwise Path B.
+- Only if that local ρ ≥ 0.20 with a bootstrap CI excluding 0 on both seed 11 and seed 13
+  does the signal claim hold. (ρ > 0 is too weak: over ~800 points it passes at ρ≈0.07,
+  which is statistically significant but explains <1% of variance and cannot move accuracy.)
+  Otherwise Path B.
 
 ## 5. Headline (until Stage 0 decides)
 
