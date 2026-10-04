@@ -1956,10 +1956,44 @@ def _check_phase1_3_fixed_budget(report: ValidationReport, data: dict,
                        "instrumentation")
 
 
+def _check_provenance_sha(report: ValidationReport, data: dict,
+                          expected_sha: Optional[str]) -> None:
+    """Enforce pre-registration code SHA: reject runs built against a mismatched
+    code revision.
+    """
+    if expected_sha is None:
+        return
+    provenance = data.get("provenance")
+    if not isinstance(provenance, dict):
+        report.add(SEVERITY_ERROR, "provenance", "JSON object", None,
+                   "provenance section missing from results manifest")
+        return
+    tree_dirty = provenance.get("tree_dirty")
+    if tree_dirty is True:
+        report.add(SEVERITY_ERROR, "provenance.tree_dirty", False, True,
+                   "results produced from a dirty tree; stamp from a clean "
+                   "checkout of the frozen SHA")
+    matched_any = False
+    for sha_field in ("v3_retrospective_sha", "v4_prereg_sha",
+                      "frozen_confirmatory_sha"):
+        actual = provenance.get(sha_field)
+        if actual is not None and actual == expected_sha:
+            matched_any = True
+            break
+    if not matched_any:
+        report.add(SEVERITY_ERROR, "provenance.sha_matching", expected_sha,
+                   {k: provenance.get(k) for k in
+                    ("v3_retrospective_sha", "v4_prereg_sha",
+                     "frozen_confirmatory_sha")},
+                   "run's provenance SHA does not match expected pre-registration "
+                   "SHA in any recognized field")
+
+
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
                      count_tolerance: int = 0,
                      allow_historical_momentum: bool = False,
-                     required_artifacts: Optional[List[str]] = None
+                     required_artifacts: Optional[List[str]] = None,
+                     expected_sha: Optional[str] = None,
                      ) -> ValidationReport:
     path = Path(path)
     report = ValidationReport(path=str(path))
@@ -2015,6 +2049,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
     _check_phase1_3_ler_controller(report, data, run_config)
     _check_phase1_3_online_diagnostics(report, data, run_config)
     _check_phase1_3_fixed_budget(report, data, run_config, diag, instr)
+    _check_provenance_sha(report, data, expected_sha)
 
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
@@ -2100,6 +2135,10 @@ def main() -> None:
     parser.add_argument("--require-artifact", action="append", default=[],
                         help="Sibling artifact filename that must exist "
                              "(repeatable)")
+    parser.add_argument("--expected-sha", dest="expected_sha", default=None,
+                        help="Frozen SHA from the pre-registration; the run's "
+                             "provenance.frozen_confirmatory_sha must match "
+                             "exactly and tree must be clean.")
     args = parser.parse_args()
 
     report = validate_results(
@@ -2108,6 +2147,7 @@ def main() -> None:
         count_tolerance=args.count_tolerance,
         allow_historical_momentum=args.allow_historical_momentum,
         required_artifacts=args.require_artifact,
+        expected_sha=args.expected_sha,
     )
     print(json.dumps(report.to_dict(), indent=2, default=str))
     if not report.ok:
