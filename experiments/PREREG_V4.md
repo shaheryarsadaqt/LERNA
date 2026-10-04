@@ -33,12 +33,13 @@ Both gates are answered in `docs/supervisor_signoff_v4.md`:
    method. The contribution is a pre-registered comparison under identical
    strict M2c protocol. Answer: **same line**.
 
-2. **Two-sided null acceptable?** → Yes, with pre-registration fidelity + paired
-   TOST reporting. Two-sided α = 0.05 paired t-test as primary, with TOST
-   equivalence bound reported alongside. A null is a publishable non-trivial
-   outcome (Kaddour et al., NeurIPS 2023), provided the upper bound on effect
-   at n seeds is reported (Path B wording mandatory). Answer: **yes with
-   conditions**.
+2. **Two-sided null acceptable?** → Yes, with pre-registration fidelity.
+   The primary test is a two-sided α = 0.05 paired t-test (df = n−1). Separately,
+   a pre-registered TOST equivalence bound (two one-sided tests, α = 0.05 each) is
+   reported as a secondary analysis to bound the effect size in the event of a null.
+   A null is a publishable non-trivial outcome (Kaddour et al., NeurIPS 2023),
+   provided the upper bound on effect at n seeds is reported (Path B wording
+   mandatory). Answer: **yes with conditions**.
 
 **Physical supervisor signature required** before any Stage-2 GPU cell runs.
 The stand-in answers bind procedure only.
