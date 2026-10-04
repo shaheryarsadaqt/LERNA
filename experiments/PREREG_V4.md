@@ -123,6 +123,11 @@ only via the MRFC smoke (mechanics check) and the Stage-2 confirmatory cells.
 | Stage 1 | Pending supervisor countersignature | Q1 + Q2 answered (stand-in) |
 | Stage 2 | Pending supervisor countersignature | same-line + two-sided TOST |
 
+Stage 2 selects between **rate 0.45** (reachable under the v4 schedule with cap=4)
+and **rate 0.60** (may be unreachable under the cap constraint — deferred if so).
+The MRFC smoke already validates mechanics at rate 0.45. Stage 2 confirmatory
+cells run at the Stage 1-selected rate, not the V3 QNLI 0.30 rate.
+
 No Stage-2 GPU cell shall begin until `docs/supervisor_signoff_v4.md` bears the
 real supervisor's signature.
 
