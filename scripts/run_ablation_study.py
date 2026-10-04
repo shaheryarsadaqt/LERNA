@@ -1672,7 +1672,7 @@ def run_ablation_single(
     metric_for_best_model: str = "eval_loss",
     greater_is_better: bool = False,
     init_from_mnli: bool = False,
-    no_early_stopping: bool = False,
+    no_early_stopping: bool = True,
     target_skip_rate: float = 0.20,
     max_consecutive_skips: int = 4,
     probe_interval: int = 8,

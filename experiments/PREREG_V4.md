@@ -155,7 +155,31 @@ gain. The chosen score carries into Stage 2. Stage 0 never cancels Stage 2.
 
 ---
 
-## 5. Phase 3 Forward Gate Design
+## 5. Accuracy measurement protocol
+
+**Final checkpoint only — no dev-set selection.**
+
+- `no_early_stopping=True` is enforced for every Phase 1.3 cell (asserted in
+  `_validate_cell_contract`).
+- `load_best_model_at_end=False` is derived from `not no_early_stopping`;
+  this is guaranteed, not optional.
+- Accuracy on the dev/test set is taken from the **final** checkpoint after the
+  full `total_steps` schedule. No early-stopping selection, no best-model
+  selection, no checkpoint averaging.
+- `eval_strategy="steps"` with `eval_steps = max(total_steps // 20, 10)` is used
+  only for monitoring/logging, never for model selection.
+- `metric_for_best_model` is recorded in metadata but never acted upon.
+
+This is a deliberate **deviation from `run_baseline_glue_modernbert.py`** (which
+uses `load_best_model_at_end=True` with patience-based early stopping). The Phase 1.3
+protocol forbids it because dev-set selection would inflate the gate's apparent
+benefit: a gate that skips "lucky" steps could be rewarded by selecting a
+checkpoint that happened to have good dev accuracy by chance, rather than having
+genuinely learned more from the skipped backward passes.
+
+---
+
+## 6. Phase 3 Forward Gate Design
 
 ### 5.1 Module
 `lerna/utils/forward_gate.py` — pure, CPU-testable. Three exported components:
@@ -217,7 +241,7 @@ of the eligible region.
 
 ---
 
-## 6. MRFC Smoke Test (Phase 3 mechanics validation)
+## 7. MRFC Smoke Test (Phase 3 mechanics validation)
 
 **Script**: `scripts/smoke_forward_gate_mrpc.py`
 **Status**: PASS (expected after bug fixes)
@@ -255,7 +279,7 @@ identical; only the warmup window differs.
 
 ---
 
-## 7. Stage 2: Confirmatory Test (rate 0.60, pending supervisor signature)
+## 8. Stage 2: Confirmatory Test (rate 0.60, pending supervisor signature)
 
 **Arms (4)** at rate 0.60, paired over seeds:
 1. `gate` — `ScoreQuantileGatePolicy` with the chosen score from Stage 0
@@ -347,7 +371,7 @@ The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ---
 
-## 8. Stage 2 Failure Policy
+## 9. Stage 2 Failure Policy
 
 - Strict forward-loss check ON (`nonfinite_forward_loss_policy="fail"`)
 - `forward_loss_observations == total_steps` (6548 for QNLI)
@@ -358,7 +382,7 @@ The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ---
 
-## 9. Probe Exclusion Assertion
+## 10. Probe Exclusion Assertion
 
 Both `P_s` (256 examples) and `P_e` (256 examples) are removed from the training
 sampler in every arm. The runner asserts:
@@ -373,7 +397,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ---
 
-## 10. Execution Protocol
+## 11. Execution Protocol
 
 1. **Stage 0 first**: Run oracle probe (seeds 101, 103) in shadow mode.
 2. **Decision recorded**: `docs/gate_a_decision.md` must be dated and committed
@@ -387,7 +411,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ---
 
-## 11. Checklist Before Pre-Reg Commit
+## 12. Checklist Before Pre-Reg Commit
 
 1. **Cap revert + exact feasibility check**: Tests on adversarial score sequences
    (monotone up, monotone down, constant, alternating) at 0.45 and 0.60 over 6548
@@ -416,7 +440,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ---
 
-## 12. Addendum: Changes from V3
+## 13. Addendum: Changes from V3
 
 | Section | V3 | V4 (this amendment) |
 |---------|-----|---------------------|
