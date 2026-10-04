@@ -1,9 +1,9 @@
 # Gate A Decision — LER informativeness oracle test
 
-Date:            YYYY-MM-DD
-Runner SHA:      <commit>
+Date:            2026-10-04
+Runner SHA:      a55fc20f5085a6667031663abbe99196f8bfe99f
 Score source:    S1 (||p-y||) / S2 (alignment) — selected by Stage 0
-Selected score:  
+Selected score:  Pending Stage 0 GPU run (shadow mode, seeds 101/103)
 
 ## Stage 0 oracle probe (seeds 101, 103 — disjoint from Stage 2)
 
