@@ -15,9 +15,11 @@ Covers:
   12. policy reads trainer logits with no trainer coupling in the scorer
   13. S2 alignment_score matches autograd gradient (G_B) within 1e-5
   14. max_skips_possible formula
-  15. adversarial score sequences: monotone up, monotone down, constant, alternating
-  16. no leftover quota crosses a window boundary
-  17. phase_skip_positions diagnostic populated correctly
+   15. adversarial score sequences: monotone up, monotone down, constant, alternating
+   16. no leftover quota crosses a window boundary
+   17. phase_skip_positions diagnostic populated correctly
+   18. max_skips_possible_with_consec accounts for mid-stride consecutive count
+   19. window-boundary carry: skip run crossing phase boundary doesn't break quota
 """
 
 import math
@@ -31,6 +33,7 @@ from lerna.utils.forward_gate import (
     alignment_score,
     AlignmentProbe,
     max_skips_possible,
+    max_skips_possible_with_consec,
     _classifier_grad_from_logits,
     TerminalInvalidScoreError,
     InfeasibleBudgetError,
@@ -507,3 +510,59 @@ def test_alignment_score_finite_with_mock():
         probe_fn=probe_fn, adam_state_key="classifier.weight",
     )
     assert math.isfinite(s)
+
+
+def test_max_skips_possible_with_consec_formula():
+    """max_skips_possible_with_consec must be <= max_skips_possible (c=0)
+    and must match closed-form for known streak states."""
+    K = 4
+    # c=0: should match max_skips_possible exactly
+    for r in range(1, 30):
+        assert max_skips_possible_with_consec(r, K, 0) == max_skips_possible(r, K)
+    # c>=K: cap forces backward on next step, then unconstrained from 0
+    for r in range(1, 10):
+        assert max_skips_possible_with_consec(r, K, K) == max_skips_possible(r - 1, K)
+        assert max_skips_possible_with_consec(r, K, K + 1) == max_skips_possible(r - 1, K)
+    # Starting mid-stride with 3 consecutive (K=4): 1 free skip fills to cap,
+    # backward, then 3 more = 4 total (same as from 0, but pattern differs)
+    assert max_skips_possible_with_consec(5, K, 3) == 4
+    # Starting mid-stride: always <= from 0
+    for r in range(1, 30):
+        for c in range(K + 1):
+            assert max_skips_possible_with_consec(r, K, c) <= max_skips_possible(r, K)
+    # Starting mid-stride c=3, K=4, 5 steps: 1 skip (cap), backward, then 3 = 4
+    assert max_skips_possible_with_consec(5, K, 3) == 4
+    # Starting mid-stride c=3, K=4, 4 steps: 1 + backward + 2 = 3
+    assert max_skips_possible_with_consec(4, K, 3) == 3
+    # Starting mid-stride c=2, K=4, 6 steps: 2 skips (to cap), backward, then 3 = 5
+    assert max_skips_possible_with_consec(6, K, 2) == 5
+
+
+def test_window_boundary_carry_respects_quota():
+    """When a skip run crosses a phase boundary, the per-step feasibility
+    check must account for the carry-over consecutive count so that quota
+    is still met exactly."""
+    K = 4
+    n_phases = 2
+    total = 100
+    min_step = 5
+    rate = 0.8  # high pressure: quota=80, F(95)=76... infeasible. Use 0.70: quota=70, F(95)=76, feasible
+    rate = 0.70
+    # Use decreasing scores to push skipping behavior; the feasibility forcing
+    # must kick in at boundary crossings.
+    scores = [0.0] * total
+    g = ScoreQuantileGate(
+        rate=rate, total_steps=total, min_step=min_step, n_phases=n_phases,
+        max_consecutive_skips=K, seed=1, score_source=_list_score_source(scores),
+    )
+    skips = [g.decide(i, None, None) for i in range(total)]
+    # Longest consecutive run never exceeds K
+    longest = cur = 0
+    for s in skips:
+        cur = cur + 1 if s else 0
+        longest = max(longest, cur)
+    assert longest <= K
+    # Quota met exactly in every phase
+    d = g.diagnostics()
+    for used, quota in zip(d["phase_used"], d["phase_quota"]):
+        assert used == quota

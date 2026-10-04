@@ -121,7 +121,7 @@ def make_trainer(arm):
         dataloader_num_workers=0, remove_unused_columns=False,
         disable_tqdm=True,
     )
-pol = ScoreQuantileGatePolicy(
+    pol = ScoreQuantileGatePolicy(
         target_skip_rate=RATE, total_steps=TOTAL_STEPS, min_step=50,
         n_phases=4, max_consecutive_skips=4, policy_seed=SEED,
         score_source="s1" if arm == "gate" else "uniform",

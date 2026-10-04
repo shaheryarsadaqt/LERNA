@@ -145,6 +145,35 @@ def max_skips_possible(r: int, k: int) -> int:
     return k * (r // (k + 1)) + min(r % (k + 1), k)
 
 
+def max_skips_possible_with_consec(r: int, k: int, c: int) -> int:
+    """Exact maximum skips in r decisions under cap K, starting with c consecutive.
+
+    Unlike max_skips_possible (which assumes c=0), this accounts for a skip run
+    already in progress. When c > 0, the first `k - c` skips fill the run to the
+    cap, then a forced backward resets to 0. Starting from 0, the standard
+    K-skip + 1-backward pattern applies.
+
+    Args:
+        r: remaining decision steps (excluding the current step).
+        k: cap (max consecutive skips).
+        c: current consecutive skip count (0 <= c <= k). When c == k the cap
+           fires on the next decision (forcing a backward), so the remaining
+           r-1 steps start fresh from 0.
+    """
+    if r <= 0:
+        return 0
+    if c >= k:
+        # Cap fires on the first of the r remaining steps: forced backward,
+        # then r-1 steps unconstrained from 0 consecutive.
+        return max_skips_possible(r - 1, k)
+    free = k - c  # skips before hitting the cap from the current streak
+    first_skips = min(free, r)
+    if r <= free:
+        return r
+    # After first_skips, a forced backward consumes 1 step, then repeat from 0.
+    return first_skips + max_skips_possible(r - first_skips - 1, k)
+
+
 def _nanquantile(values: Sequence[float], q: float) -> float:
     """Deterministic quantile with the same semantics the tracker uses."""
     vals = sorted(float(v) for v in values)
@@ -315,19 +344,26 @@ class ScoreQuantileGate:
             return False
 
         # Exact feasibility check:
-        # - If we skip, can the remaining (remaining_quota - 1) skips still be
-        #   achieved in the remaining (remaining_steps - 1) decisions?
-        # - If we skip, the remaining_quota decreases by 1 and remaining_steps
-        #   decreases by 1.
+        # - If we skip, the remaining (remaining_quota - 1) skips must be
+        #   achievable in the remaining (remaining_steps - 1) decisions,
+        #   starting from the new consecutive count (c+1).
         # - If we do NOT skip, remaining_quota stays and remaining_steps
-        #   decreases by 1.
-        # F(r) = K * floor(r / (K+1)) + min(r % (K+1), K) is the max skips in r.
+        #   decreases by 1, starting from 0 consecutive (reset by the backward).
+        # - F(r, K) = K * floor(r/(K+1)) + min(r%(K+1), K) is the max skips in
+        #   r steps starting from 0 consecutive;
+        #   F_with_consec(r, K, c) accounts for a mid-stride run of c skips.
         #
         # skip_possible: can we still hit quota if we skip now?
-        #   remaining_quota - 1 skips in remaining_steps - 1 steps
-        skip_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota - 1
+        #   remaining_quota - 1 skips in remaining_steps - 1 steps, starting
+        #   from c+1 consecutive (c = self._consecutive_skips)
+        skip_possible = (
+            max_skips_possible_with_consec(
+                remaining_steps - 1, K, self._consecutive_skips + 1
+            )
+            >= remaining_quota - 1
+        )
         # real_possible: can we still hit quota if we run a real backward now?
-        #   remaining_quota skips in remaining_steps - 1 steps
+        #   remaining_quota skips in remaining_steps - 1 steps, starting from 0
         real_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota
 
         if not skip_possible and not real_possible:
