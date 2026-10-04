@@ -280,8 +280,8 @@ def _plan_matrix(
     )
     if findings:
         raise RuntimeError(f"unexpected synthetic plan findings: {findings}")
-    if len(plan) != 12:
-        raise RuntimeError(f"synthetic matrix must contain 12 cells, got {len(plan)}")
+    if len(plan) != 14:
+        raise RuntimeError(f"synthetic matrix must contain 14 cells, got {len(plan)}")
     return plan
 
 
@@ -294,6 +294,8 @@ def _build_policy(cell: dict[str, Any], tracker):
         "seed": cell["policy_seed"],
     }
     if arm == "full_finetune":
+        return AlwaysFalsePolicy()
+    if arm == "reduced_steps":
         return AlwaysFalsePolicy()
     if arm == "exact_random":
         return RandomSkipPolicy(**common)
@@ -362,16 +364,24 @@ def _runtime_controller(cell: dict[str, Any], policy) -> dict[str, Any]:
     total_steps = int(getattr(policy, "total_steps", cell["total_steps"]) or cell["total_steps"])
     min_step = int(getattr(policy, "min_step", cell["min_step"]))
     requested_quota = round(target_skip_rate * total_steps) if skipping else None
+    if arm == "reduced_steps":
+        reduced_total_steps = round(total_steps * (1.0 - target_skip_rate))
+        reduced_min_step = round(min_step * (1.0 - target_skip_rate))
+        compute_saving = ComputeSavingMechanism.REDUCED_TOTAL_STEPS
+    else:
+        reduced_total_steps = None
+        reduced_min_step = None
+        compute_saving = (
+            ComputeSavingMechanism.BACKWARD_SKIPPING
+            if skipping
+            else ComputeSavingMechanism.NONE
+        )
     controller = {
         "arm": arm,
         "arm_alias_of": None,
         "control": arm,
         "policy_class": type(policy).__name__,
-        "compute_saving_mechanism": (
-            ComputeSavingMechanism.BACKWARD_SKIPPING
-            if skipping
-            else ComputeSavingMechanism.NONE
-        ),
+        "compute_saving_mechanism": compute_saving,
         "policy_seed": int(cell["policy_seed"]),
         "target_skip_rate": target_skip_rate,
         "min_step": min_step,
@@ -382,6 +392,8 @@ def _runtime_controller(cell: dict[str, Any], policy) -> dict[str, Any]:
         "allow_early_stopping_with_skipping": False,
         "early_stopping_active": False,
         "num_epochs": int(cell["num_epochs"]),
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "online_diagnostics": dict(cell["online_diagnostics"]),
         "policy_effective_config": (
             dict(policy.effective_config())

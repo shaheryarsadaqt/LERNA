@@ -144,7 +144,7 @@ def test_run_consumes_persisted_plan_in_exact_order(monkeypatch, tmp_path):
     fresh = mock.Mock()
     run_cell = mock.Mock(return_value={"ok": True})
     freeze = mock.Mock(
-        return_value={"n_valid_runs": 12, "completed_matrix_valid": True}
+        return_value={"n_valid_runs": 14, "completed_matrix_valid": True}
     )
     progress = [
         {
@@ -166,7 +166,7 @@ def test_run_consumes_persisted_plan_in_exact_order(monkeypatch, tmp_path):
     fresh.assert_called_once_with(
         bundle["plan"], base_output_dir=str(bundle["root"])
     )
-    assert run_cell.call_count == 12
+    assert run_cell.call_count == 14
     assert [
         (
             call.kwargs["task_name"],
@@ -213,7 +213,7 @@ def test_resume_recovers_then_skips_only_verified_completion(
     recover = mock.Mock(return_value=["attempt-001"])
     run_cell = mock.Mock(return_value={"ok": True})
     freeze = mock.Mock(
-        return_value={"n_valid_runs": 12, "completed_matrix_valid": True}
+        return_value={"n_valid_runs": 14, "completed_matrix_valid": True}
     )
     progress = [
         {
@@ -246,7 +246,7 @@ def test_resume_recovers_then_skips_only_verified_completion(
         base_output_dir=str(bundle["root"]),
         stale_after_hours=12.0,
     )
-    assert run_cell.call_count == 11
+    assert run_cell.call_count == 13
     assert run_cell.call_args_list[0].kwargs["planned_cell"] is bundle["plan"][1]
     freeze.assert_called_once_with(bundle)
 
@@ -259,7 +259,7 @@ def test_validate_action_has_no_training_or_planning_side_effects(
     run_cell = mock.Mock(side_effect=AssertionError("validate must not train"))
     scan = mock.Mock(side_effect=AssertionError("validate uses completed validator"))
     freeze = mock.Mock(
-        return_value={"n_valid_runs": 12, "completed_matrix_valid": True}
+        return_value={"n_valid_runs": 14, "completed_matrix_valid": True}
     )
     monkeypatch.setattr(runner, "run_ablation_single", run_cell)
     monkeypatch.setattr(runner, "scan_phase1_3_progress", scan)

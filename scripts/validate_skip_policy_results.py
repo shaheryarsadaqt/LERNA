@@ -2054,7 +2054,8 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
     policy_name = diag.get("policy_name") or data.get("policy_name")
     control = run_config.get("control")
     is_full_finetune = control == "full_finetune" or policy_name == "always_false"
-    if not diag and not is_full_finetune:
+    is_reduced_steps = control == "reduced_steps"
+    if not diag and not (is_full_finetune or is_reduced_steps):
         report.add(SEVERITY_ERROR, "policy_diagnostics", "present and non-empty",
                    raw_diag, "policy_diagnostics missing from skip-policy result")
         return report
@@ -2113,7 +2114,7 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
         _check_matched_budget(
             report, data, run_config, diag, instr, completed, interrupted,
             rate_tolerance, count_tolerance,
-            require_policy_diagnostics=not is_full_finetune,
+            require_policy_diagnostics=not (is_full_finetune or is_reduced_steps),
         )
 
     return report

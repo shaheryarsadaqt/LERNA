@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-LERNA Phase 1.3 ablation runner.
+LERNA     Phase 1.3 ablation runner.
 
-PHASE1_3_MATRIX is the authoritative six-arm matched-budget matrix. The six
+PHASE1_3_MATRIX is the authoritative seven-arm matched-budget matrix. The seven
 canonical arm names are:
 
     full_finetune
@@ -11,6 +11,7 @@ canonical arm names are:
     phase_strat_guarded
     ler_guided_stratified
     ler_guided_stratified_safe
+    reduced_steps
 
 random_skip is a compatibility alias for exact_random and is excluded from
 the default matrices.
@@ -235,6 +236,7 @@ ABLATIONS = {
     "ler_guided_stratified_safe": {"control": "ler_guided_stratified_safe"},
     "fixed_phase_strat": {"control": "fixed_phase_strat"},
     "phase_strat_guarded": {"control": "phase_strat_guarded"},
+    "reduced_steps": {"control": "reduced_steps"},
     # Compatibility alias for old invocations; excluded from default matrices.
     "random_skip":      {"control": "exact_random", "alias_of": "exact_random"},
 }
@@ -246,6 +248,7 @@ PHASE1_3_MATRIX = [
     "phase_strat_guarded",
     "ler_guided_stratified",
     "ler_guided_stratified_safe",
+    "reduced_steps",
 ]
 
 POLICY_MIN_STEP = 50
@@ -259,7 +262,7 @@ SKIPPING_CONTROLS = (
 )
 ONLINE_LER_MODE_AUTO = "auto"
 ONLINE_LER_SIGNAL_FREE_CONTROLS = (
-    "full_finetune", "exact_random", "fixed_phase_strat"
+    "full_finetune", "exact_random", "fixed_phase_strat", "reduced_steps"
 )
 ONLINE_LER_SIGNAL_FREE_POLICY = "fixed_phase_strat"
 DEFAULT_ABLATIONS = list(PHASE1_3_MATRIX)
@@ -974,7 +977,7 @@ def plan_phase1_3_cell(
             f"{POLICY_MIN_STEP}; got {total_steps}"
         )
 
-    is_skipping_arm = ablation_name != "full_finetune"
+    is_skipping_arm = ablation_name not in ("full_finetune", "reduced_steps")
     if is_skipping_arm:
         requested_quota = round(target_skip_rate * total_steps)
         eligible_count = total_steps - POLICY_MIN_STEP
@@ -986,6 +989,10 @@ def plan_phase1_3_cell(
             )
         planned_skips = requested_quota
         compute_saving_mechanism = "backward_skipping"
+    elif ablation_name == "reduced_steps":
+        requested_quota = None
+        planned_skips = 0
+        compute_saving_mechanism = "reduced_total_steps"
     else:
         requested_quota = None
         planned_skips = 0
@@ -1045,6 +1052,13 @@ def plan_phase1_3_cell(
         online_diagnostics,
     )
 
+    if ablation_name == "reduced_steps":
+        reduced_total_steps = round(total_steps * (1.0 - target_skip_rate))
+        reduced_min_step = round(POLICY_MIN_STEP * (1.0 - target_skip_rate))
+    else:
+        reduced_total_steps = None
+        reduced_min_step = None
+
     controller_config = {
         "arm": ablation_name,
         "arm_alias_of": None,
@@ -1061,6 +1075,8 @@ def plan_phase1_3_cell(
         "allow_early_stopping_with_skipping": False,
         "early_stopping_active": False,
         "num_epochs": num_epochs,
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "online_diagnostics": dict(online_diagnostics),
     }
 
@@ -1130,6 +1146,8 @@ def plan_phase1_3_cell(
         "no_early_stopping": True,
         "skip_update_mode": "freeze",
         "scheduler_step_policy": "skip_on_backward_skip",
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "online_diagnostics": dict(online_diagnostics),
         "controller_config": controller_config,
         "identity_inputs": identity_inputs,
@@ -1347,6 +1365,8 @@ def build_skip_policy(
     """Construct one explicit baseline/RVD/LER-guided control arm."""
     control = "exact_random" if control == "random_skip" else control
     if control == "full_finetune":
+        return AlwaysFalsePolicy()
+    if control == "reduced_steps":
         return AlwaysFalsePolicy()
     if control in LER_GUIDED_CONTROLS:
         if ler_guided_controller_config is None:
@@ -2093,9 +2113,17 @@ def run_ablation_single(
         if hasattr(skip_policy, "effective_config")
         else {}
     )
+    if ablation_name == "reduced_steps":
+        reduced_total_steps = round(total_steps * (1.0 - target_skip_rate))
+        reduced_min_step = round(POLICY_MIN_STEP * (1.0 - target_skip_rate))
+    else:
+        reduced_total_steps = None
+        reduced_min_step = None
     compute_saving_mechanism = (
         ComputeSavingMechanism.NONE
         if effective_control == "full_finetune"
+        else ComputeSavingMechanism.REDUCED_TOTAL_STEPS
+        if effective_control == "reduced_steps"
         else ComputeSavingMechanism.BACKWARD_SKIPPING
     )
     controller_config_effective = {
@@ -2116,6 +2144,8 @@ def run_ablation_single(
         ),
         "early_stopping_active": budget_state["early_stopping_active"],
         "num_epochs": num_epochs,
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "policy_effective_config": policy_effective_config,
         "online_diagnostics": online_diagnostics,
     }
@@ -2172,8 +2202,10 @@ def run_ablation_single(
             "is_skipping_arm": budget_state["is_skipping_arm"],
             "matched_budget": budget_state["matched_budget"],
             "no_early_stopping": bool(no_early_stopping),
-            "skip_update_mode": effective_skip_update_mode,
+             "skip_update_mode": effective_skip_update_mode,
             "scheduler_step_policy": scheduler_step_policy,
+            "reduced_total_steps": reduced_total_steps,
+            "reduced_min_step": reduced_min_step,
             "online_diagnostics": dict(online_diagnostics),
             "controller_config": controller_config_effective,
             "identity_inputs": identity_inputs,

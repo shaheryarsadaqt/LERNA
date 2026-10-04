@@ -22,6 +22,7 @@ ARMS = (
     "phase_strat_guarded",
     "ler_guided_stratified",
     "ler_guided_stratified_safe",
+    "reduced_steps",
 )
 ONLINE_ARMS = {
     "phase_strat_guarded",
@@ -175,7 +176,7 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
     assert report["status"] == "completed"
     assert report["plan_valid"] is True
     assert report["completed_matrix_valid"] is True
-    assert report["n_cells"] == report["n_valid_runs"] == 12
+    assert report["n_cells"] == report["n_valid_runs"] == 14
     assert tuple(report["arms"]) == ARMS
     assert tuple(report["target_skip_rates"]) == RATES
 
@@ -183,7 +184,7 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
     for index, run in enumerate(report["runs"]):
         rate = RATES[index // len(ARMS)]
         arm = ARMS[index % len(ARMS)]
-        expected_skips = 0 if arm == "full_finetune" else round(rate * 100)
+        expected_skips = 0 if arm in ("full_finetune", "reduced_steps") else round(rate * 100)
         expected_backward = 100 - expected_skips
         assert run["cell_id"] == [synthetic.SYNTHETIC_TASK, 7, rate, arm]
         assert run["attempt"] == 1
@@ -226,7 +227,7 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
     assert online_count == 6
     plan = _load(root / "matrix_plan.json")
     completed = _validate_matrix(plan, root)
-    assert len(completed["valid_runs"]) == 12
+    assert len(completed["valid_runs"]) == 14
 
 
 def test_real_matrix_is_semantically_deterministic(completed_matrices):

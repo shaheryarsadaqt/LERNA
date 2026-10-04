@@ -56,6 +56,7 @@ PHASE1_3_CANONICAL_ARMS: tuple[str, ...] = (
     "phase_strat_guarded",
     "ler_guided_stratified",
     "ler_guided_stratified_safe",
+    "reduced_steps",
 )
 STRICT_TARGET_SKIP_RATES: tuple[float, float] = (0.30, 0.40)
 POLICY_MIN_STEP: int = 50
@@ -67,10 +68,11 @@ PHASE1_3_POLICY_CLASSES = {
     "phase_strat_guarded": "PhaseStratifiedGuardedRandomPolicy",
     "ler_guided_stratified": "LERGuidedStratifiedPolicy",
     "ler_guided_stratified_safe": "LERGuidedStratifiedSafetyPolicy",
+    "reduced_steps": "AlwaysFalsePolicy",
 }
 
 _OFFLINE_DIAGNOSTIC_ARMS = frozenset(
-    {"full_finetune", "exact_random", "fixed_phase_strat"}
+    {"full_finetune", "exact_random", "fixed_phase_strat", "reduced_steps"}
 )
 _PHASE_ARMS = frozenset({"fixed_phase_strat", "phase_strat_guarded"})
 _LER_ARMS = frozenset(
@@ -111,6 +113,8 @@ PLANNED_CELL_REQUIRED_FIELDS = frozenset(
         "online_ler_update_interval",
         "use_rho_vg",
         "use_safety_horizon",
+        "reduced_total_steps",
+        "reduced_min_step",
         "provenance_classification",
     }
 )
@@ -156,6 +160,8 @@ _CONTROLLER_REQUIRED_FIELDS = frozenset(
         "allow_early_stopping_with_skipping",
         "early_stopping_active",
         "num_epochs",
+        "reduced_total_steps",
+        "reduced_min_step",
         "online_diagnostics",
     }
 )
@@ -1403,13 +1409,17 @@ def _validate_controller(
         "controller_config.",
     )
     arm = cell.get("arm")
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     expected_values = {
         "arm": arm,
         "arm_alias_of": None,
         "control": arm,
         "policy_class": PHASE1_3_POLICY_CLASSES.get(arm),
-        "compute_saving_mechanism": "backward_skipping" if skipping else "none",
+        "compute_saving_mechanism": (
+            "backward_skipping" if skipping
+            else "reduced_total_steps" if arm == "reduced_steps"
+            else "none"
+        ),
         "policy_seed": cell.get("policy_seed"),
         "target_skip_rate": cell.get("target_skip_rate"),
         "min_step": cell.get("min_step"),
@@ -1420,6 +1430,8 @@ def _validate_controller(
         "allow_early_stopping_with_skipping": False,
         "early_stopping_active": False,
         "num_epochs": cell.get("num_epochs"),
+        "reduced_total_steps": cell.get("reduced_total_steps"),
+        "reduced_min_step": cell.get("reduced_min_step"),
     }
     for key, expected in expected_values.items():
         _expect(controller, key, expected, findings, cell_id, "controller_config.")
@@ -1448,7 +1460,7 @@ def _validate_cell_contract(
             findings,
             "arm",
             cell_id,
-            "arm must be one of the six canonical controls; aliases are invalid",
+            "arm must be one of the seven canonical controls; aliases are invalid",
         )
     if control != arm or type(control) is not type(arm):
         _add_error(findings, "control", cell_id, "control must exactly equal arm")
@@ -1482,8 +1494,31 @@ def _validate_cell_contract(
         _expect(cell, "requested_quota", None, findings, cell_id)
         _expect(cell, "planned_skips", 0, findings, cell_id)
         _expect(cell, "is_skipping_arm", False, findings, cell_id)
+        _expect(cell, "reduced_total_steps", None, findings, cell_id)
+        _expect(cell, "reduced_min_step", None, findings, cell_id)
+    elif arm == "reduced_steps":
+        # Kaddour / 2312.05021 baseline: no backward skipping, just train for
+        # fewer steps with proportionally faster LR decay.
+        _require_fields(
+            cell,
+            frozenset({"reduced_total_steps", "reduced_min_step"}),
+            findings,
+            cell_id,
+        )
+        _expect(cell, "is_skipping_arm", False, findings, cell_id)
+        _expect(cell, "requested_quota", None, findings, cell_id)
+        _expect(cell, "planned_skips", 0, findings, cell_id)
+        rate = cell.get("target_skip_rate")
+        if _is_float(rate) and _is_int(total_steps):
+            expected_reduced = round(total_steps * (1.0 - rate))
+            _expect(cell, "reduced_total_steps", expected_reduced, findings, cell_id)
+            if _is_int(min_step):
+                expected_min_step = round(min_step * (1.0 - rate))
+                _expect(cell, "reduced_min_step", expected_min_step, findings, cell_id)
     elif arm in PHASE1_3_CANONICAL_ARMS:
         _expect(cell, "is_skipping_arm", True, findings, cell_id)
+        _expect(cell, "reduced_total_steps", None, findings, cell_id)
+        _expect(cell, "reduced_min_step", None, findings, cell_id)
         rate = cell.get("target_skip_rate")
         if _is_float(rate) and _is_int(total_steps):
             exact_quota = round(rate * total_steps)

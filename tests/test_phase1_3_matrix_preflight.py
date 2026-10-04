@@ -41,6 +41,8 @@ COMMON_CONTROLLER_FIELDS = {
     "allow_early_stopping_with_skipping",
     "early_stopping_active",
     "num_epochs",
+    "reduced_total_steps",
+    "reduced_min_step",
     "online_diagnostics",
 }
 LER_SAFETY_FIELDS = {
@@ -289,15 +291,30 @@ def test_plan_phase1_3_cell_complete_canonical_projection(
     assert identity["online_diagnostics"] == cell["online_diagnostics"]
     assert controller["online_diagnostics"] == cell["online_diagnostics"]
 
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     expected_quota = round(rate * TOTAL_STEPS) if skipping else None
     assert cell["is_skipping_arm"] is skipping
     assert cell["requested_quota"] == expected_quota
     assert cell["planned_skips"] == (expected_quota if skipping else 0)
     assert controller["requested_quota"] == expected_quota
     assert controller["compute_saving_mechanism"] == (
-        "backward_skipping" if skipping else "none"
+        "backward_skipping" if skipping
+        else "reduced_total_steps" if arm == "reduced_steps"
+        else "none"
     )
+
+    if arm == "reduced_steps":
+        expected_reduced = round(TOTAL_STEPS * (1.0 - rate))
+        expected_reduced_min = round(runner.POLICY_MIN_STEP * (1.0 - rate))
+        assert cell["reduced_total_steps"] == expected_reduced
+        assert cell["reduced_min_step"] == expected_reduced_min
+        assert controller["reduced_total_steps"] == expected_reduced
+        assert controller["reduced_min_step"] == expected_reduced_min
+    else:
+        assert cell["reduced_total_steps"] is None
+        assert cell["reduced_min_step"] is None
+        assert controller["reduced_total_steps"] is None
+        assert controller["reduced_min_step"] is None
 
     online = cell["online_diagnostics"]
     offline = arm in runner.ONLINE_LER_SIGNAL_FREE_CONTROLS
@@ -437,7 +454,7 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
     ]
     assert provider_calls == tasks
     assert facts_by_task == facts_before
-    assert len(plan) == len(expected_order) == 48
+    assert len(plan) == len(expected_order) == 56
     assert [
         (
             cell["task"],
@@ -449,8 +466,9 @@ def test_build_phase1_3_matrix_plan_complete_valid_no_write(tmp_path):
     ] == expected_order
     assert all(cell["policy_seed"] == cell["training_seed"] for cell in plan)
     assert sum(cell["arm"] == "full_finetune" for cell in plan) == 8
-    assert len({cell["fingerprint"] for cell in plan}) == 48
-    assert len({cell["planned_arm_dir"] for cell in plan}) == 48
+    assert sum(cell["arm"] == "reduced_steps" for cell in plan) == 8
+    assert len({cell["fingerprint"] for cell in plan}) == 56
+    assert len({cell["planned_arm_dir"] for cell in plan}) == 56
     assert validate_phase1_3_matrix_plan(
         plan,
         tasks=tasks,
@@ -754,7 +772,7 @@ def test_strict_plan_persists_before_any_run(monkeypatch, tmp_path):
         output_dir.joinpath("matrix_plan.json").read_text(encoding="utf-8")
     )
     assert envelope["matrix_kind"] == "pilot"
-    assert len(envelope["plan"]) == 12
+    assert len(envelope["plan"]) == 14
     assert output_dir.joinpath("matrix_environment.json").is_file()
     assert not output_dir.joinpath("ablation_summary.json").exists()
     assert all(

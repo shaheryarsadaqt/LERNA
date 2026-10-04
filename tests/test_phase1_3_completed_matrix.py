@@ -89,12 +89,13 @@ POLICY_CLASSES = {
     "phase_strat_guarded": "PhaseStratifiedGuardedRandomPolicy",
     "ler_guided_stratified": "LERGuidedStratifiedPolicy",
     "ler_guided_stratified_safe": "LERGuidedStratifiedSafetyPolicy",
+    "reduced_steps": "AlwaysFalsePolicy",
 }
-OFFLINE_ARMS = ("full_finetune", "exact_random", "fixed_phase_strat")
+OFFLINE_ARMS = ("full_finetune", "exact_random", "fixed_phase_strat", "reduced_steps")
 PHASE_ARMS = ("fixed_phase_strat", "phase_strat_guarded")
 LER_ARMS = ("ler_guided_stratified", "ler_guided_stratified_safe")
 
-FULL, RANDOM, FIXED, GUARDED, LER, LER_SAFE = range(6)
+FULL, RANDOM, FIXED, GUARDED, LER, LER_SAFE, REDUCED = range(7)
 
 BOUND_MANIFEST_RUN_FIELDS = (
     "task",
@@ -243,15 +244,23 @@ def _build_cell(
     task=TASK,
     seed=SEED,
 ):
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     quota = round(rate * total_steps) if skipping else None
     online = _online_diag(arm, seed)
+    if arm == "reduced_steps":
+        reduced_total_steps = round(total_steps * (1.0 - rate))
+        reduced_min_step = round(POLICY_MIN_STEP * (1.0 - rate))
+        compute_saving = "reduced_total_steps"
+    else:
+        reduced_total_steps = None
+        reduced_min_step = None
+        compute_saving = "backward_skipping" if skipping else "none"
     controller = {
         "arm": arm,
         "arm_alias_of": None,
         "control": arm,
         "policy_class": POLICY_CLASSES[arm],
-        "compute_saving_mechanism": "backward_skipping" if skipping else "none",
+        "compute_saving_mechanism": compute_saving,
         "policy_seed": seed,
         "target_skip_rate": rate,
         "min_step": POLICY_MIN_STEP,
@@ -262,6 +271,8 @@ def _build_cell(
         "allow_early_stopping_with_skipping": False,
         "early_stopping_active": False,
         "num_epochs": EPOCHS,
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "online_diagnostics": copy.deepcopy(online),
     }
     identity = {
@@ -313,6 +324,8 @@ def _build_cell(
         "no_early_stopping": True,
         "skip_update_mode": "freeze",
         "scheduler_step_policy": "skip_on_backward_skip",
+        "reduced_total_steps": reduced_total_steps,
+        "reduced_min_step": reduced_min_step,
         "online_diagnostics": online,
         "controller_config": controller,
         "identity_inputs": identity,
@@ -349,7 +362,7 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
     rate = cell["target_skip_rate"]
     total_steps = cell["total_steps"]
     quota = round(rate * total_steps)
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     online = cell["online_diagnostics"]
     is_online = arm not in OFFLINE_ARMS
     training_seed = cell["training_seed"]
@@ -527,7 +540,7 @@ def _create_cell_fixture(
     attempt_dir = os.path.join(cell_dir, f"attempt-{attempt_num:03d}")
     os.makedirs(attempt_dir, exist_ok=True)
 
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     rate = cell["target_skip_rate"]
     total_steps = cell["total_steps"]
     quota = round(rate * total_steps)
@@ -751,9 +764,9 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertIn("GUARDED_LOAD_OK", proc.stdout)
 
-    # ── 1. Valid 12-cell end-to-end ────────────────────────────────────────
+    # ── 1. Valid 14-cell end-to-end ──────────────────────────────────────────
 
-    def test_valid_12_cell_matrix_returns_runs_in_plan_order(self):
+    def test_valid_14_cell_matrix_returns_runs_in_plan_order(self):
         with tempfile.TemporaryDirectory(prefix="lerna-completed-") as tmp:
             base = os.path.join(tmp, "output")
             plan = _build_plan(base_output_dir=base)
@@ -768,7 +781,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 base_output_dir=base,
             )
 
-            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(len(result["valid_runs"]), 14)
             self.assertEqual(result["findings"], [])
 
             # Verify runs are in exact plan order
@@ -838,7 +851,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
             except CompletedMatrixError as exc:
                 self.assertIsInstance(exc, ValueError)
                 self.assertIsInstance(exc.findings, list)
-                self.assertGreaterEqual(len(exc.findings), 12)
+                self.assertGreaterEqual(len(exc.findings), 14)
                 for finding in exc.findings:
                     self.assertEqual(
                         set(finding), {"severity", "field", "cell", "message"}
@@ -865,7 +878,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 base_output_dir=base,
             )
 
-            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(len(result["valid_runs"]), 14)
             self.assertEqual(result["findings"], [])
             for run in result["valid_runs"]:
                 self.assertEqual(run["attempt"], "attempt-002")
@@ -1202,7 +1215,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 minimum_seed_count=1,
                 base_output_dir=base,
             )
-            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(len(result["valid_runs"]), 14)
 
     # ── 17. Matched-budget tampering is rejected by Piece 5 ────────────────
 
@@ -1675,7 +1688,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 minimum_seed_count=1,
                 base_output_dir=base,
             )
-            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(len(result["valid_runs"]), 14)
             self.assertEqual(result["findings"], [])
 
     def test_every_planned_controller_field_requires_presence(self):
@@ -1977,7 +1990,7 @@ class Phase13CompletedMatrixValidatorTests(unittest.TestCase):
                 minimum_seed_count=1,
                 base_output_dir=base,
             )
-            self.assertEqual(len(result["valid_runs"]), 12)
+            self.assertEqual(len(result["valid_runs"]), 14)
             for run in result["valid_runs"]:
                 manifest = run["manifest"]
                 self.assertEqual(manifest["run"]["model_revision"], revision)

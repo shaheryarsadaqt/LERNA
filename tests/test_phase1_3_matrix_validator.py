@@ -44,8 +44,9 @@ POLICY_CLASSES = {
     "phase_strat_guarded": "PhaseStratifiedGuardedRandomPolicy",
     "ler_guided_stratified": "LERGuidedStratifiedPolicy",
     "ler_guided_stratified_safe": "LERGuidedStratifiedSafetyPolicy",
+    "reduced_steps": "AlwaysFalsePolicy",
 }
-OFFLINE_ARMS = ("full_finetune", "exact_random", "fixed_phase_strat")
+OFFLINE_ARMS = ("full_finetune", "exact_random", "fixed_phase_strat", "reduced_steps")
 PHASE_ARMS = ("fixed_phase_strat", "phase_strat_guarded")
 LER_ARMS = ("ler_guided_stratified", "ler_guided_stratified_safe")
 LER_SAFETY_VALUES = {
@@ -92,6 +93,8 @@ CONTROLLER_FIELDS = (
     "allow_early_stopping_with_skipping",
     "early_stopping_active",
     "num_epochs",
+    "reduced_total_steps",
+    "reduced_min_step",
     "online_diagnostics",
 )
 ONLINE_DIAG_FIELDS = (
@@ -105,8 +108,8 @@ ONLINE_DIAG_FIELDS = (
     "sample_seed",
 )
 
-# Arm index offsets inside one (task, seed, rate) six-arm group.
-FULL, RANDOM, FIXED, GUARDED, LER, LER_SAFE = range(6)
+# Arm index offsets inside one (task, seed, rate) seven-arm group.
+FULL, RANDOM, FIXED, GUARDED, LER, LER_SAFE, REDUCED = range(7)
 
 _IMPORT_GUARD_SCRIPT = """
 import importlib.util
@@ -231,15 +234,22 @@ def _build_cell(
     task=TASK,
     seed=SEED,
 ):
-    skipping = arm != "full_finetune"
+    skipping = arm not in ("full_finetune", "reduced_steps")
     quota = round(rate * total_steps) if skipping else None
+    is_reduced = arm == "reduced_steps"
+    reduced_total = round(total_steps * (1.0 - rate)) if is_reduced else None
+    reduced_min = round(POLICY_MIN_STEP * (1.0 - rate)) if is_reduced else None
     online = _online_diag(arm, seed)
     controller = {
         "arm": arm,
         "arm_alias_of": None,
         "control": arm,
         "policy_class": POLICY_CLASSES[arm],
-        "compute_saving_mechanism": "backward_skipping" if skipping else "none",
+        "compute_saving_mechanism": (
+            "backward_skipping" if skipping
+            else "reduced_total_steps" if is_reduced
+            else "none"
+        ),
         "policy_seed": seed,
         "target_skip_rate": rate,
         "min_step": POLICY_MIN_STEP,
@@ -250,6 +260,8 @@ def _build_cell(
         "allow_early_stopping_with_skipping": False,
         "early_stopping_active": False,
         "num_epochs": EPOCHS,
+        "reduced_total_steps": reduced_total,
+        "reduced_min_step": reduced_min,
         "online_diagnostics": copy.deepcopy(online),
     }
     identity = {
@@ -315,6 +327,8 @@ def _build_cell(
         "use_rho_vg": True,
         "use_safety_horizon": True,
         "provenance_classification": "matched_claim",
+        "reduced_total_steps": reduced_total,
+        "reduced_min_step": reduced_min,
     }
 
 
@@ -408,23 +422,24 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
     def test_public_constants_literal_values(self):
         self.assertEqual(
             PHASE1_3_CANONICAL_ARMS,
-            (
-                "full_finetune",
-                "exact_random",
-                "fixed_phase_strat",
-                "phase_strat_guarded",
-                "ler_guided_stratified",
-                "ler_guided_stratified_safe",
-            ),
+             (
+                 "full_finetune",
+                 "exact_random",
+                 "fixed_phase_strat",
+                 "phase_strat_guarded",
+                 "ler_guided_stratified",
+                 "ler_guided_stratified_safe",
+                 "reduced_steps",
+             ),
         )
         self.assertEqual(STRICT_TARGET_SKIP_RATES, (0.30, 0.40))
         self.assertEqual(POLICY_MIN_STEP, 50)
 
-    # 1. Complete valid 12-cell plan.
+    # 1. Complete valid 14-cell plan.
     def test_valid_plan_returns_empty_findings(self):
         self.assertEqual(tuple(RATES), STRICT_TARGET_SKIP_RATES)
         plan = _build_plan()
-        self.assertEqual(len(plan), 12)
+        self.assertEqual(len(plan), 14)
         self.assertEqual(_validate(plan), [])
 
     # 2. Validation performs no filesystem writes.
@@ -533,7 +548,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
     def test_requested_quota_none_rejected_on_skipping_arm(self):
         quota = round(RATES[0] * TOTAL_STEPS)
         for offset, arm in zip(
-            (RANDOM, FIXED, GUARDED, LER, LER_SAFE), PHASE1_3_CANONICAL_ARMS[1:]
+            (RANDOM, FIXED, GUARDED, LER, LER_SAFE), PHASE1_3_CANONICAL_ARMS[1:-1]
         ):
             with self.subTest(arm=arm):
                 plan = _build_plan()
@@ -674,8 +689,8 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             "required planned cell is missing", _messages(findings, "plan.cells")
         )
 
-    # 10. Paired fields across each six-arm group.
-    def test_enforce_paired_fields_across_six_arm_group(self):
+    # 10. Paired fields across each seven-arm group.
+    def test_enforce_paired_fields_across_seven_arm_group(self):
         paired_cases = [
             ("model_id", "other-model"),
             ("total_steps", TOTAL_STEPS + 100),
@@ -740,7 +755,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
     # 13. Exact quotas for the five skipping arms and infeasibility.
     def test_exact_quota_for_all_skipping_arms(self):
         for offset, arm in zip(
-            (RANDOM, FIXED, GUARDED, LER, LER_SAFE), PHASE1_3_CANONICAL_ARMS[1:]
+            (RANDOM, FIXED, GUARDED, LER, LER_SAFE), PHASE1_3_CANONICAL_ARMS[1:-1]
         ):
             expected = round(RATES[0] * TOTAL_STEPS)
             with self.subTest(arm=arm, field="requested_quota"):
@@ -936,7 +951,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
         big_quota = round(RATES[1] * TOTAL_STEPS)
         plan = _build_plan()
         _set_sub(
-            plan[6 + FIXED],
+            plan[7 + FIXED],
             "phase_strat_controller",
             "phase_quota",
             [big_quota - 4, 4],
