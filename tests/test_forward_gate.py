@@ -86,11 +86,11 @@ def test_feasibility_forcing_fires():
 
 
 # ---------------------------------------------------------------------------
-# 5) cap of 4 respected
+# 5) cap of 4 respected for non-forcing skips
 # ---------------------------------------------------------------------------
 
 def test_cap_never_exceeded():
-    scores = [1000 - i for i in range(1000)]  # always low -> always wants skip
+    scores = [1000 - i for i in range(1000)]  # decreasing scores
     g = ScoreQuantileGate(rate=0.3, total_steps=1000, min_step=5, n_phases=4,
                           max_consecutive_skips=4, seed=1,
                           score_source=_list_score_source(scores))
@@ -99,8 +99,27 @@ def test_cap_never_exceeded():
     for s in skips:
         cur = cur + 1 if s else 0
         longest = max(longest, cur)
-    assert longest <= 4
+    assert longest <= 4                  # cap respected (forcing never active at rate=0.3)
+    assert g.forced_skips == 0
     assert g.cap_blocked > 0
+
+
+def test_forcing_overrides_cap():
+    """When forcing is active (pressure >= 0.8), the cap is overridden:
+    the gate MUST skip to meet the per-window quota, and consecutive skips
+    can exceed max_consecutive_skips."""
+    g = ScoreQuantileGate(rate=1.0, total_steps=10, min_step=0, n_phases=1,
+                          max_consecutive_skips=4, seed=1,
+                          score_source=lambda i, m, x: 0.5)
+    skips = [g.decide(i, None, None) for i in range(10)]
+    longest = cur = 0
+    for s in skips:
+        cur = cur + 1 if s else 0
+        longest = max(longest, cur)
+    assert all(skips)                     # every step forced-skip
+    assert longest == 10                  # cap exceeded under forcing
+    assert g.forced_skips == 10
+    assert g.cap_blocked == 0             # cap never engaged (forcing always active)
 
 
 # ---------------------------------------------------------------------------

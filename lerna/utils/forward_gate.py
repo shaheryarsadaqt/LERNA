@@ -8,21 +8,33 @@ intentionally a *pure*, CPU-testable scorer: the policy wrapper
 Design (single rule, zero tuned knobs):
 
 * 4 phase windows of equal length over `total_steps`.
-* Exact per-window quota = round(rate * window_length).
+* Exact per-window quota = round(rate * window_length) allocated via largest-remainder
+  over ELIGIBLE steps (decision_index >= min_step), so sum(phase_quota) ==
+  round(rate * total_steps) exactly.
 * Deficit-aware skip probability: q = remaining_window_quota /
   remaining_window_steps. A step is skipped when its score is below the q-quantile
   of the last `score_history_window` (default 64) observed scores.
-* Feasibility forcing: when remaining_quota / remaining_steps >= 4/5, skip is
-  forced (this is the maximum sustainable skip fraction under cap=4). Forced
-  decisions are counted in diagnostics.
-* Annealing: after `anneal_step`, the score is replaced by i.i.d. Uniform[0,1],
-  so selection becomes random while the budget is preserved.
-* cap: never exceed `max_consecutive_skips` consecutive skips; if the run is at
-  the cap a backward step is forced even under forcing pressure.
-* min_step: never skip before `min_step` decisions.
-* Ties against the quantile threshold are broken by the policy RNG.
+* Feasibility forcing: when remaining_quota / remaining_steps >= forcing_fraction
+  (default 0.8), skip is FORCED. Forcing overrides the consecutive-skip cap
+  (cap only applies to non-forcing quantile/Bernoulli decisions), so the per-window
+  quota is always fully realized and no leftover is dropped at window boundaries.
+* Annealing: after `anneal_step`, selection uses Bernoulli(q) directly (not the
+  score). The original score is still recorded in history; no Uniform[0,1] values
+  are fed into the gain-score history, avoiding threshold skew.
+* cap: never exceed `max_consecutive_skips` consecutive skips for non-forcing
+  decisions; if the run is at the cap a backward step is forced.
+* min_step: never skip before `min_step` decisions. NOTE: loss typically decreases
+  over training, so gain scores decrease within a window. This causes the gate to
+  skip more in the second half of each window, concentrating skips at lower-loss
+  steps. The uniform control has no such correlation. This is a known confound
+  about WHEN steps are skipped (not which batches); a matched-budget variant that
+  shuffles skip decisions within each window should be used for final inference.
 * Non-finite score: raises `TerminalInvalidScoreError`, which absorbs all
   subsequent decisions (terminal).
+* min_step vs warmup: training loss typically decreases over training, so gain
+  scores decrease within a window. min_step should be >= warmup_steps to avoid
+  skipping during the LR warmup phase, where skip effects differ. The smoke test
+  uses min_step=50 with warmup_steps=12 (warmup ends before min_step).
 
 Score source is pluggable so the gate (forward predicted gain) and the control
 (uniform random) share identical budget mechanics. Only the score differs.
@@ -242,13 +254,10 @@ class ScoreQuantileGate:
             raise TerminalInvalidScoreError(decision_index, score)
 
         annealed = decision_index >= self.anneal_step
-        if annealed:
-            # annealing: score blinded by uniform; budget preserved, selection random
-            score = self._rng.random()
 
         if decision_index < self.min_step:
             self.warmup_blocked += 1
-            self._scores.append(float(score))
+            self.note_score(score)
             return False
 
         # feasibility forcing: under cap-ceiling pressure, skip is forced
@@ -266,13 +275,23 @@ class ScoreQuantileGate:
             forcing_active = pressure >= self.forcing_fraction
 
         skip = False
-        if forcing_active and self._consecutive_skips < self.max_consecutive_skips:
+        if forcing_active:
+            # (a) Forcing overrides the cap: the quota must be met to avoid
+            # window-boundary drop-off. The cap only constrains non-forcing skips.
             skip = True
             self.forced_skips += 1
         elif self._consecutive_skips >= self.max_consecutive_skips:
-            # cap binds: must run a real backward to refresh
+            # cap binds (non-forcing only): must run a real backward to refresh
             self.cap_blocked += 1
             skip = False
+        elif annealed:
+            # (b) Annealing: use Bernoulli(q) directly. Do NOT feed Uniform[0,1]
+            # into the score history (which holds gain scores in [0, sqrt2]);
+            # that would skew the quantile threshold for ~window steps.
+            q = remaining_quota / remaining_steps if remaining_steps > 0 else 0.0
+            skip = self._rng.random() < q
+            if skip:
+                self.anneal_skips += 1
         else:
             q = remaining_quota / remaining_steps if remaining_steps > 0 else 0.0
             if self._scores:
@@ -289,12 +308,10 @@ class ScoreQuantileGate:
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
-            if annealed:
-                self.anneal_skips += 1
         else:
             self._consecutive_skips = 0
 
-        self.note_score(score)
+        self.note_score(score)  # always append the original score, not uniform
         return skip
 
     def terminate_on_score(self, decision_index: int, value: float) -> None:
@@ -419,6 +436,9 @@ class ScoreQuantileGatePolicy:
                 inputs.get("labels") if isinstance(inputs, dict) else None,
             )
 
+        # (c) Gate RNG must differ from the policy RNG (used by the uniform
+        # score source). Using policy_seed + 1 keeps the streams independent
+        # while remaining deterministic and reproducible.
         self._gate = ScoreQuantileGate(
             rate=float(target_skip_rate),
             total_steps=int(total_steps),
@@ -428,7 +448,7 @@ class ScoreQuantileGatePolicy:
             score_history_window=int(score_history_window),
             anneal_fraction=float(anneal_fraction),
             forcing_fraction=float(forcing_fraction),
-            seed=int(policy_seed),
+            seed=int(policy_seed) + 1,
             score_source=_source,
         )
 
