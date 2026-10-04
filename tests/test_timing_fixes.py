@@ -72,7 +72,7 @@ def _trainer(_tmpdir):
         logging_steps=4,
         dataloader_num_workers=0,
         report_to="none",
-        no_cuda=not torch.cuda.is_available(),
+        use_cpu=not torch.cuda.is_available(),
         seed=42,
     )
     trainer = TrueBackwardSkippingTrainer(

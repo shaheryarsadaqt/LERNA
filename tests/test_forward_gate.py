@@ -1,24 +1,44 @@
-"""CPU tests for lerna.utils.forward_gate.
+"""Tests for lerna.utils.forward_gate — ScoreQuantileGate and score sources.
 
-Pure-Python, no trainer, no GPU. Run: pytest tests/test_forward_gate.py
+Covers:
+  1. exact per-window quota
+  2. no skips before min_step
+  3) per-window quota never exceeded, met exactly
+  4. feasibility forcing fires under pressure and still meets quota
+  5. cap of 4 respected (always, including under forcing)
+  6. annealing ignores the score
+  7. non-finite score is terminal and stays terminal
+  8. uniform control realizes the target rate in aggregate
+  9. determinism: same seed + same scores => identical skip vector
+  10. gate vs uniform-control: identical quota machinery, different selection
+  11. forward_gain_score bounds and shape (S1)
+  12. policy reads trainer logits with no trainer coupling in the scorer
+  13. S2 alignment_score matches autograd gradient (G_B) within 1e-5
+  14. max_skips_possible formula
+  15. adversarial score sequences: monotone up, monotone down, constant, alternating
+  16. no leftover quota crosses a window boundary
+  17. phase_skip_positions diagnostic populated correctly
 """
 
 import math
 import random
-import pytest
+from collections import deque
 
 from lerna.utils.forward_gate import (
-    InfeasibleBudgetError,
     ScoreQuantileGate,
     ScoreQuantileGatePolicy,
-    TerminalInvalidScoreError,
-    _eligible_phase_quota,
     forward_gain_score,
+    alignment_score,
+    AlignmentProbe,
+    max_skips_possible,
+    _classifier_grad_from_logits,
+    TerminalInvalidScoreError,
+    InfeasibleBudgetError,
 )
 
 
 def _list_score_source(scores):
-    return lambda decision_index, model, inputs: float(scores[decision_index])
+    return lambda idx, m, x: scores[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +46,7 @@ def _list_score_source(scores):
 # ---------------------------------------------------------------------------
 
 def test_quotas_computed_exactly():
-    g = ScoreQuantileGate(rate=0.3, total_steps=1000, n_phases=4, seed=7,
+    g = ScoreQuantileGate(rate=0.3, total_steps=1000, min_step=50, n_phases=4, seed=7,
                           score_source=lambda i, m, x: 0.5)
     d = g.diagnostics()
     # requested_total = round(0.3 * 1000) = 300, allocated over eligible steps
@@ -36,6 +56,26 @@ def test_quotas_computed_exactly():
     assert d["requested_total"] == 300
     assert d["total_eligible"] == 950
     assert d["eligible_per_window"] == [200, 250, 250, 250]
+
+
+def test_min_step_392_default():
+    """The v4 protocol uses min_step=392 in every arm (no warmup skipping)."""
+    g = ScoreQuantileGate(rate=0.6, total_steps=6548, n_phases=4, seed=7,
+                          score_source=lambda i, m, x: 0.5)
+    d = g.diagnostics()
+    assert d["min_step"] == 392
+    assert d["warmup_blocked"] == 0  # not yet decided, but min_step is set
+
+
+def test_quota_impossible_under_cap_rejected():
+    """rate=1.0 with total_steps=10, cap=4 is infeasible: F(10)=8 < 10."""
+    import pytest
+    with pytest.raises(InfeasibleBudgetError):
+        ScoreQuantileGate(
+            rate=1.0, total_steps=10, min_step=0, n_phases=1,
+            max_consecutive_skips=4, seed=1,
+            score_source=lambda i, m, x: 0.5,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +104,7 @@ def test_per_window_quota_never_exceeded_and_met():
     d = g.diagnostics()
     for used, quota in zip(d["phase_used"], d["phase_quota"]):
         assert used <= quota            # never overspend
-        assert used == quota            # met exactly (cap/forcing catch up)
+        assert used == quota            # met exactly (forcing catches up)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +122,28 @@ def test_feasibility_forcing_fires():
     assert g.forced_skips > 0                  # forcing engaged
     for used, quota in zip(d["phase_used"], d["phase_quota"]):
         assert used <= quota
-        assert used == quota
+        assert used == quota                   # quota still met exactly
+
+
+def test_forcing_respects_cap():
+    """Under high pressure, forcing fires but the cap of 4 consecutive is
+    always respected (no override)."""
+    # rate=0.8 with total_steps=1000, cap=4: quota=800, F(995)=796... that's
+    # infeasible. Use rate=0.75: quota=750, F(995)=796, feasible.
+    scores = [0.0] * 1000  # all want to skip
+    g = ScoreQuantileGate(rate=0.75, total_steps=1000, min_step=5, n_phases=4,
+                          max_consecutive_skips=4, seed=1,
+                          score_source=_list_score_source(scores))
+    skips = [g.decide(i, None, None) for i in range(1000)]
+    longest = cur = 0
+    for s in skips:
+        cur = cur + 1 if s else 0
+        longest = max(longest, cur)
+    assert longest <= 4                         # cap always respected
+    d = g.diagnostics()
+    for used, quota in zip(d["phase_used"], d["phase_quota"]):
+        assert used == quota                    # quota still met via forcing
+    assert d["phase_quota"] == [185, 189, 188, 188]  # round(0.75*250) each, largest-remainder
 
 
 # ---------------------------------------------------------------------------
@@ -99,27 +160,9 @@ def test_cap_never_exceeded():
     for s in skips:
         cur = cur + 1 if s else 0
         longest = max(longest, cur)
-    assert longest <= 4                  # cap respected (forcing never active at rate=0.3)
+    assert longest <= 4                         # cap respected (forcing never active at rate=0.3)
     assert g.forced_skips == 0
     assert g.cap_blocked > 0
-
-
-def test_forcing_overrides_cap():
-    """When forcing is active (pressure >= 0.8), the cap is overridden:
-    the gate MUST skip to meet the per-window quota, and consecutive skips
-    can exceed max_consecutive_skips."""
-    g = ScoreQuantileGate(rate=1.0, total_steps=10, min_step=0, n_phases=1,
-                          max_consecutive_skips=4, seed=1,
-                          score_source=lambda i, m, x: 0.5)
-    skips = [g.decide(i, None, None) for i in range(10)]
-    longest = cur = 0
-    for s in skips:
-        cur = cur + 1 if s else 0
-        longest = max(longest, cur)
-    assert all(skips)                     # every step forced-skip
-    assert longest == 10                  # cap exceeded under forcing
-    assert g.forced_skips == 10
-    assert g.cap_blocked == 0             # cap never engaged (forcing always active)
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +276,7 @@ def test_different_score_source_differs_only_in_selection():
 
 
 # ---------------------------------------------------------------------------
-# 11) forward_gain_score bounds and shape
+# 11) forward_gain_score bounds and shape (S1)
 # ---------------------------------------------------------------------------
 
 def test_forward_gain_score_bounds():
@@ -272,11 +315,195 @@ def test_policy_should_skip_reads_trainer_logits():
     tr = _FakeTrainer(logits, labels)
     pol = ScoreQuantileGatePolicy(
         target_skip_rate=0.3, total_steps=200, min_step=0,
-        n_phases=4, policy_seed=5, score_source="gain",
+        n_phases=4, policy_seed=5, score_source="s1",
     )
     # should not crash; produces a bool
     out = pol.should_skip(tr, None, {"labels": labels})
     assert isinstance(out, bool)
     diag = pol.get_diagnostics()
-    assert diag["score_source"] == "gain"
+    assert diag["score_source"] == "s1"
     assert diag["phase_quota"] == [15, 15, 15, 15]  # round(0.3*50)
+
+
+# ---------------------------------------------------------------------------
+# 13) S2 alignment_score: G_B matches autograd gradient within 1e-5
+# ---------------------------------------------------------------------------
+
+def test_alignment_score_matches_autograd():
+    import torch
+    torch.manual_seed(42)
+    B, C, H = 4, 2, 8
+    hidden = torch.randn(B, H)
+    W = torch.randn(C, H).requires_grad_(True)
+    labels = torch.tensor([0, 1, 0, 1])
+    logits = hidden @ W.t()
+    loss = torch.nn.functional.cross_entropy(logits, labels)
+    loss.backward()
+    G_autograd = W.grad.clone()  # [C, H]
+
+    # Compute G_B via the helper
+    logits_detached = logits.detach()
+    G_B = _classifier_grad_from_logits(logits_detached, labels, hidden.detach())
+    assert G_B.shape == (C, H)
+    assert torch.allclose(G_B, G_autograd, atol=1e-5, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 14) max_skips_possible formula
+# ---------------------------------------------------------------------------
+
+def test_max_skips_possible_formula():
+    # F(r) = K * floor(r / (K+1)) + min(r % (K+1), K)
+    # With K=4: pattern is SSSS N (4 skips, 1 real), repeat every 5.
+    assert max_skips_possible(0, 4) == 0
+    assert max_skips_possible(1, 4) == 1
+    assert max_skips_possible(5, 4) == 4
+    assert max_skips_possible(10, 4) == 8
+    assert max_skips_possible(6, 4) == 5
+    assert max_skips_possible(4, 4) == 4
+    assert max_skips_possible(3, 4) == 3
+    # K=1: pattern S N S N S N... F(5)=1*2+min(1,1)=3
+    assert max_skips_possible(5, 1) == 3
+    assert max_skips_possible(4, 1) == 2
+    assert max_skips_possible(3, 1) == 2
+
+
+# ---------------------------------------------------------------------------
+# 15) adversarial score sequences: monotone up, monotone down, constant, alternating
+# ---------------------------------------------------------------------------
+
+def _run_adv_sequence(scores, rate=0.6, total_steps=6548, min_step=392, **kw):
+    g = ScoreQuantileGate(rate=rate, total_steps=total_steps, min_step=min_step,
+                          n_phases=4, max_consecutive_skips=4, seed=1, **kw,
+                          score_source=_list_score_source(scores))
+    skips = [g.decide(i, None, None) for i in range(total_steps)]
+    d = g.diagnostics()
+    return skips, d
+
+def test_adversarial_monotone_up():
+    # scores increase → quantile threshold rises → fewer skips later
+    scores = [float(i) for i in range(6548)]
+    skips, d = _run_adv_sequence(scores)
+    assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
+    assert d["skipped"] == d["requested_total"]
+
+def test_adversarial_monotone_down():
+    # scores decrease → quantile threshold drops → more skips later
+    scores = [10000.0 - i for i in range(6548)]
+    skips, d = _run_adv_sequence(scores)
+    assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
+    assert d["skipped"] == d["requested_total"]
+
+def test_adversarial_constant():
+    scores = [0.5] * 6548
+    skips, d = _run_adv_sequence(scores)
+    assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
+    assert d["skipped"] == d["requested_total"]
+
+def test_adversarial_alternating():
+    scores = [0.0 if i % 2 == 0 else 1.0 for i in range(6548)]
+    skips, d = _run_adv_sequence(scores)
+    assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
+    assert d["skipped"] == d["requested_total"]
+
+
+# ---------------------------------------------------------------------------
+# 16) no leftover quota crosses a window boundary
+# ---------------------------------------------------------------------------
+
+def test_no_leftover_quota_crosses_window_boundary():
+    scores = [0.0] * 6548  # all want to skip
+    g = ScoreQuantileGate(rate=0.6, total_steps=6548, min_step=392, n_phases=4,
+                          max_consecutive_skips=4, seed=1,
+                          score_source=_list_score_source(scores))
+    for i in range(6548):
+        g.decide(i, None, None)
+    d = g.diagnostics()
+    for used, quota in zip(d["phase_used"], d["phase_quota"]):
+        assert used <= quota            # never overspend
+        assert used == quota            # met exactly — no leftover crossed boundary
+
+
+# ---------------------------------------------------------------------------
+# 17) phase_skip_positions diagnostic populated correctly
+# ---------------------------------------------------------------------------
+
+def test_phase_skip_positions_diagnostic():
+    scores = [0.0] * 100  # all want to skip
+    g = ScoreQuantileGate(rate=0.5, total_steps=100, min_step=5, n_phases=4,
+                          max_consecutive_skips=4, seed=1,
+                          score_source=_list_score_source(scores))
+    for i in range(100):
+        g.decide(i, None, None)
+    d = g.diagnostics()
+    assert len(d["phase_skip_positions"]) == 4
+    for window_info in d["phase_skip_positions"]:
+        assert "skip_count" in window_info
+        assert "median_rel_position" in window_info
+
+
+# ---------------------------------------------------------------------------
+# 18) alignment_score returns finite value when all components present
+# ---------------------------------------------------------------------------
+
+def test_alignment_score_finite_with_mock():
+    import torch
+    torch.manual_seed(0)
+    B, C, H = 4, 2, 8
+
+    class _FakeParam:
+        shape = (C, H)
+
+    class _FakeOptimizer:
+        def __init__(self, param):
+            self.state = {param: {"exp_avg_sq": torch.ones(C, H) * 0.5}}
+
+    class _FakeModel:
+        def __init__(self):
+            self._fake_param = torch.nn.Parameter(torch.randn(C, H))
+
+        def named_parameters(self):
+            yield "classifier.weight", self._fake_param
+
+    class _FakeTrainer:
+        def __init__(self, logits, labels, hidden):
+            self._last_real_logits = logits
+            self._alignment_probe = type("P", (), {"last_hidden": hidden})()
+            self.optimizer = _FakeOptimizer(self._fake_param if hasattr(self, '_fake_param') else torch.nn.Parameter(torch.randn(C, H)))
+
+    hidden = torch.randn(B, H)
+    logits = torch.randn(B, C)
+    labels = torch.tensor([0, 1, 0, 1])
+
+    # Build a proper fake optimizer with the param
+    param = torch.nn.Parameter(torch.randn(C, H))
+    state = {"exp_avg_sq": torch.ones(C, H) * 0.5}
+
+    class _FakeOpt2:
+        def __init__(self, param, state):
+            self._param = param
+            self.state = {param: state}
+
+    model = _FakeModel()
+    # Override named_parameters to yield our param
+    class _FakeModel2:
+        pass
+    model2 = _FakeModel2()
+    model2._fake_param = param
+
+    def _yield_params():
+        yield "classifier.weight", param
+
+    model2.named_parameters = _yield_params
+
+    trainer = _FakeTrainer(logits, labels, hidden)
+    trainer.optimizer = _FakeOpt2(param, state)
+
+    def probe_fn():
+        return torch.randn(C, H)
+
+    s = alignment_score(
+        trainer=trainer, model=model2, inputs={"labels": labels},
+        probe_fn=probe_fn, adam_state_key="classifier.weight",
+    )
+    assert math.isfinite(s)

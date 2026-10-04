@@ -78,7 +78,7 @@ SEED = 7
 RATES = [0.30, 0.40]
 MODEL_ID = "synthetic-model"
 EPOCHS = 3
-TOTAL_STEPS = 200
+TOTAL_STEPS = 6548
 GIT_SHA = "0123abcd4567ef890123abcd4567ef8901234567"
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}\Z")
 
@@ -397,7 +397,7 @@ def _results_data(cell, attempt_num=1, *, tamper=None):
             "quota_size": quota,
             "decisions_seen": total_steps,
             "skip_decisions": quota,
-            "realized_skip_rate": rate,
+            "realized_skip_rate": quota / total_steps,
             "requested_quota": quota,
             "seed": training_seed if arm == "exact_random" else None,
         }

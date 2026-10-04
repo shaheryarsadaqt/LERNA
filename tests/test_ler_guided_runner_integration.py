@@ -20,12 +20,12 @@ from scripts.run_ablation_study import (
     LER_GUIDED_CONTROL,
     LER_GUIDED_CONTROLS,
     LER_GUIDED_SAFE_CONTROL,
-    POLICY_MIN_STEP,
     build_ler_guided_controller_config,
     build_ler_guided_skip_policy,
     build_skip_policy,
     copy_ler_guided_config,
 )
+from lerna.utils.phase1_3_matrix import POLICY_MIN_STEP
 
 
 class FakeState:
@@ -79,7 +79,7 @@ class FakeLagTracker:
         }
 
 
-TOTAL_STEPS = 100
+TOTAL_STEPS = 6548
 RATE = 0.20
 
 
@@ -259,7 +259,7 @@ def test_ler_guided_policy_reaches_exact_quota_through_build_skip_policy():
         tracker.tick()
     diag = policy.get_diagnostics()
     assert diag["decisions_seen"] == TOTAL_STEPS
-    assert diag["skip_decisions"] == diag["quota_size"] == int(RATE * TOTAL_STEPS)
+    assert diag["skip_decisions"] == diag["quota_size"] == round(RATE * TOTAL_STEPS)
     assert diag["quota_exact"] is True
     assert tracker.update_calls == 0
     assert tracker.note_calls == 0

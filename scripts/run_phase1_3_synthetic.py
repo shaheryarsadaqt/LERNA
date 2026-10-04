@@ -47,7 +47,6 @@ from lerna.utils.phase1_3_completed_matrix import (
 )
 from lerna.utils.phase1_3_matrix import (
     PHASE1_3_CANONICAL_ARMS,
-    POLICY_MIN_STEP,
     STRICT_TARGET_SKIP_RATES,
     validate_phase1_3_matrix_plan,
 )
@@ -74,7 +73,7 @@ from scripts.validate_skip_policy_results import validate_results
 SYNTHETIC_TASK = "phase1_3_synthetic"
 SYNTHETIC_MODEL_ID = "tiny-linear-cpu"
 SYNTHETIC_MODEL_REVISION = "synthetic-cpu-local-v1"
-SYNTHETIC_TOTAL_STEPS = 100
+SYNTHETIC_TOTAL_STEPS = 700
 SYNTHETIC_NUM_EPOCHS = 1
 SYNTHETIC_TRAIN_SIZE = 100
 SYNTHETIC_EVAL_SIZE = 32
@@ -931,8 +930,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=SYNTHETIC_DATA_SEED + 1,
     )
     facts = _data_facts(train_dataset, eval_dataset)
-    if facts["total_steps"] <= POLICY_MIN_STEP:
-        raise RuntimeError("synthetic horizon must exceed POLICY_MIN_STEP")
+    if facts["total_steps"] <= int(facts["total_steps"] * 0.06):
+        raise RuntimeError("synthetic horizon must exceed min_step (6% of total_steps)")
 
     plan = _plan_matrix(
         base_output_dir=str(base_output_dir),

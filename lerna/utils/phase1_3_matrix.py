@@ -59,7 +59,7 @@ PHASE1_3_CANONICAL_ARMS: tuple[str, ...] = (
     "reduced_steps",
 )
 STRICT_TARGET_SKIP_RATES: tuple[float, float] = (0.30, 0.40)
-POLICY_MIN_STEP: int = 50
+POLICY_MIN_STEP: int = 392
 
 PHASE1_3_POLICY_CLASSES = {
     "full_finetune": "AlwaysFalsePolicy",
@@ -1475,13 +1475,14 @@ def _validate_cell_contract(
     )
     _expect(cell, "matched_budget", True, findings, cell_id)
     _expect(cell, "no_early_stopping", True, findings, cell_id)
-    _expect(cell, "min_step", POLICY_MIN_STEP, findings, cell_id)
 
     num_epochs = cell.get("num_epochs")
-    if _is_int(num_epochs) and num_epochs < 1:
-        _add_error(findings, "num_epochs", cell_id, "num_epochs must be >= 1")
     total_steps = cell.get("total_steps")
     min_step = cell.get("min_step")
+    if not _is_int(min_step) or min_step < 1:
+        _add_error(findings, "min_step", cell_id, "min_step must be a positive integer")
+    if _is_int(num_epochs) and num_epochs < 1:
+        _add_error(findings, "num_epochs", cell_id, "num_epochs must be >= 1")
     if _is_int(total_steps) and _is_int(min_step) and total_steps <= min_step:
         _add_error(
             findings,

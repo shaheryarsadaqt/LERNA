@@ -2,8 +2,8 @@
 
 **Status:** draft, outcome undecided. This is a retrospective reading of the frozen v3 confirmatory
 block (QNLI `@0.30`, code SHA `93ec6e4`, 20/20 cells PASS M2c); it is **not** a locked thesis verdict.
-Path B is the framing that will be adopted *if* Stage 0 confirms the forward gate is uninformative,
-but Stage 0 has not been run yet (see open items). RHO-loss / UDS are out of scope for v4 and are
+The forward gate's informativeness is to be resolved by Stage 0 (oracle probe), the outcome of which
+is not yet known (see open items). RHO-loss / UDS are out of scope for v4 and are
 not introduced here. The numbers below are the frozen v3 outcomes, reinterpreted with their
 confounds stated rather than presented as v4 evidence.
 

@@ -14,27 +14,25 @@ Design (single rule, zero tuned knobs):
 * Deficit-aware skip probability: q = remaining_window_quota /
   remaining_window_steps. A step is skipped when its score is below the q-quantile
   of the last `score_history_window` (default 64) observed scores.
-* Feasibility forcing: when remaining_quota / remaining_steps >= forcing_fraction
-  (default 0.8), skip is FORCED. Forcing overrides the consecutive-skip cap
-  (cap only applies to non-forcing quantile/Bernoulli decisions), so the per-window
-  quota is always fully realized and no leftover is dropped at window boundaries.
+* Feasibility forcing: at each step, check whether skipping and whether a
+  backward step each still leave the per-window quota reachable. If only one
+  does, force that one. Otherwise the score decides. The cap (K=4 consecutive
+  skips) always applies — including to forced decisions — so the quota is met
+  without ever exceeding K consecutive skips, which means no leftover is
+  dropped at window boundaries.
 * Annealing: after `anneal_step`, selection uses Bernoulli(q) directly (not the
   score). The original score is still recorded in history; no Uniform[0,1] values
   are fed into the gain-score history, avoiding threshold skew.
-* cap: never exceed `max_consecutive_skips` consecutive skips for non-forcing
-  decisions; if the run is at the cap a backward step is forced.
-* min_step: never skip before `min_step` decisions. NOTE: loss typically decreases
-  over training, so gain scores decrease within a window. This causes the gate to
-  skip more in the second half of each window, concentrating skips at lower-loss
-  steps. The uniform control has no such correlation. This is a known confound
-  about WHEN steps are skipped (not which batches); a matched-budget variant that
-  shuffles skip decisions within each window should be used for final inference.
+* cap: never exceed `max_consecutive_skips` consecutive skips for any decision,
+  forcing or not; if the run is at the cap a backward step is forced.
+* min_step: never skip before `min_step` decisions. Loss rises during warmup
+  and the model is far from convergence, so gain scores are high but noisy and
+  not representative of the steady-state distribution. min_step should be
+  >= warmup_steps to avoid skipping during the LR warmup phase, where skip
+  effects differ. The smoke test uses min_step=50 with warmup_steps=12
+  (warmup ends before min_step).
 * Non-finite score: raises `TerminalInvalidScoreError`, which absorbs all
   subsequent decisions (terminal).
-* min_step vs warmup: training loss typically decreases over training, so gain
-  scores decrease within a window. min_step should be >= warmup_steps to avoid
-  skipping during the LR warmup phase, where skip effects differ. The smoke test
-  uses min_step=50 with warmup_steps=12 (warmup ends before min_step).
 
 Score source is pluggable so the gate (forward predicted gain) and the control
 (uniform random) share identical budget mechanics. Only the score differs.
@@ -47,6 +45,8 @@ import random
 from typing import Deque, Optional, Sequence
 
 from collections import deque
+
+import torch
 
 
 class TerminalInvalidScoreError(RuntimeError):
@@ -133,6 +133,18 @@ def _eligible_phase_quota(
     return quota, requested_total, total_eligible, eligible
 
 
+def max_skips_possible(r: int, k: int) -> int:
+    """Exact maximum skips in r decisions under cap K (max K consecutive).
+
+    With cap K, the densest skip pattern is K skips followed by 1 forced
+    backward step, repeating every K+1 decisions. So:
+        F(r) = K * floor(r / (K+1)) + min(r mod (K+1), K)
+    """
+    if r <= 0:
+        return 0
+    return k * (r // (k + 1)) + min(r % (k + 1), k)
+
+
 def _nanquantile(values: Sequence[float], q: float) -> float:
     """Deterministic quantile with the same semantics the tracker uses."""
     vals = sorted(float(v) for v in values)
@@ -163,12 +175,11 @@ class ScoreQuantileGate:
         *,
         rate: float,
         total_steps: int,
-        min_step: int = 50,
+        min_step: int = 392,
         max_consecutive_skips: int = 4,
         n_phases: int = 4,
         score_history_window: int = 64,
         anneal_fraction: float = 0.88,
-        forcing_fraction: float = 0.8,
         seed: int = 0,
         score_source,
     ):
@@ -183,7 +194,6 @@ class ScoreQuantileGate:
         self.n_phases = int(n_phases)
         self.score_history_window = int(score_history_window)
         self.anneal_step = int(round(self.total_steps * anneal_fraction))
-        self.forcing_fraction = float(forcing_fraction)
         self.seed = int(seed)
         self._rng = random.Random(self.seed)
         self._score_source = score_source
@@ -197,6 +207,20 @@ class ScoreQuantileGate:
         self._phase_quota, self._requested_total, self._total_eligible, self._eligible_per_window = (
             _eligible_phase_quota(self.rate, self.total_steps, self.min_step, self.n_phases)
         )
+        # Hard feasibility: the requested quota must be achievable under the cap.
+        # With cap K, max_skips_possible(n_elig, K) is the most skips possible
+        # across all eligible steps. If the quota exceeds this, the run would
+        # dead-lock (forced skips hit the cap and can never catch up). Reject
+        # loudly rather than silently under-spend.
+        max_achievable = max_skips_possible(self._total_eligible, self.max_consecutive_skips)
+        if self._requested_total > max_achievable:
+            raise InfeasibleBudgetError(
+                f"Infeasible skip quota under cap: requested {self._requested_total} skips "
+                f"({self.rate:.3f} of {self.total_steps}), but max achievable under "
+                f"max_consecutive_skips={self.max_consecutive_skips} is {max_achievable} "
+                f"over {self._total_eligible} eligible steps. Lower the skip rate, "
+                f"raise the cap, or increase total_steps."
+            )
         self._phase_used = [0] * self.n_phases
         self._consecutive_skips = 0
         self._terminal = False
@@ -211,6 +235,19 @@ class ScoreQuantileGate:
         self.anneal_skips = 0
 
         self._scores: Deque[float] = deque(maxlen=self.score_history_window)
+
+        # per-window skip-position diagnostics (bug d): track where skips land
+        # within each phase window to detect front-loading or back-loading bias.
+        self._phase_skip_positions: list[list[int]] = [[] for _ in range(self.n_phases)]
+
+    def _record_skip_position(self, decision_index: int, skip: bool) -> None:
+        """Record the phase-relative position of skips for parity diagnostics."""
+        if not skip:
+            return
+        phase = self.phase_for(decision_index)
+        start, _ = self._phase_windows[phase]
+        rel = decision_index - start
+        self._phase_skip_positions[phase].append(rel)
 
     # ------------------------------------------------------------------ api
     def phase_for(self, decision_index: int) -> int:
@@ -260,7 +297,6 @@ class ScoreQuantileGate:
             self.note_score(score)
             return False
 
-        # feasibility forcing: under cap-ceiling pressure, skip is forced
         remaining_quota, remaining_steps = self._remaining_in_phase(decision_index)
 
         # Hard invariant: never skip beyond the per-window quota. Once a phase's
@@ -269,22 +305,54 @@ class ScoreQuantileGate:
             self.note_score(score)
             return False
 
-        forcing_active = False
-        if remaining_steps > 0:
-            pressure = remaining_quota / remaining_steps
-            forcing_active = pressure >= self.forcing_fraction
+        K = self.max_consecutive_skips
 
-        skip = False
-        if forcing_active:
-            # (a) Forcing overrides the cap: the quota must be met to avoid
-            # window-boundary drop-off. The cap only constrains non-forcing skips.
-            skip = True
-            self.forced_skips += 1
-        elif self._consecutive_skips >= self.max_consecutive_skips:
-            # cap binds (non-forcing only): must run a real backward to refresh
+        # At the cap: must run a real backward step to avoid exceeding K.
+        if self._consecutive_skips >= K:
             self.cap_blocked += 1
-            skip = False
-        elif annealed:
+            self._consecutive_skips = 0
+            self.note_score(score)
+            return False
+
+        # Exact feasibility check:
+        # - If we skip, can the remaining (remaining_quota - 1) skips still be
+        #   achieved in the remaining (remaining_steps - 1) decisions?
+        # - If we skip, the remaining_quota decreases by 1 and remaining_steps
+        #   decreases by 1.
+        # - If we do NOT skip, remaining_quota stays and remaining_steps
+        #   decreases by 1.
+        # F(r) = K * floor(r / (K+1)) + min(r % (K+1), K) is the max skips in r.
+        #
+        # skip_possible: can we still hit quota if we skip now?
+        #   remaining_quota - 1 skips in remaining_steps - 1 steps
+        skip_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota - 1
+        # real_possible: can we still hit quota if we run a real backward now?
+        #   remaining_quota skips in remaining_steps - 1 steps
+        real_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota
+
+        if not skip_possible and not real_possible:
+            # Infeasible: cannot meet quota either way. This should not happen
+            # because the quota was validated at init, but guard loudly.
+            self.note_score(score)
+            return False
+        elif not skip_possible:
+            # Skipping would make quota unreachable; a real backward is forced.
+            self.forced_skips += 1
+            self.note_score(score)
+            return False
+        elif not real_possible:
+            # Not skipping would make quota unreachable; skip is forced.
+            self.forced_skips += 1
+            phase = self.phase_for(decision_index)
+            self._phase_used[phase] += 1
+            self.skipped += 1
+            self._consecutive_skips += 1
+            self.note_score(score)
+            return True
+
+        # Both are feasible: the score decides.
+        skip = False
+        if annealed:
             # (b) Annealing: use Bernoulli(q) directly. Do NOT feed Uniform[0,1]
             # into the score history (which holds gain scores in [0, sqrt2]);
             # that would skew the quantile threshold for ~window steps.
@@ -308,6 +376,7 @@ class ScoreQuantileGate:
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
+            self._record_skip_position(decision_index, True)
         else:
             self._consecutive_skips = 0
 
@@ -327,6 +396,24 @@ class ScoreQuantileGate:
         ]
 
     def diagnostics(self) -> dict:
+        # per-window skip-position diagnostics (bug d): median and spread of
+        # phase-relative positions where skips land, for parity comparison.
+        window_positions = []
+        for positions in self._phase_skip_positions:
+            if positions:
+                sorted_pos = sorted(positions)
+                n = len(sorted_pos)
+                median_pos = sorted_pos[n // 2] if n % 2 == 1 else (
+                    sorted_pos[n // 2 - 1] + sorted_pos[n // 2]
+                ) / 2
+                window_positions.append({
+                    "skip_count": n,
+                    "median_rel_position": median_pos,
+                    "min_rel_position": sorted_pos[0],
+                    "max_rel_position": sorted_pos[-1],
+                })
+            else:
+                window_positions.append({"skip_count": 0, "median_rel_position": None})
         return {
             "rate": self.rate,
             "total_steps": self.total_steps,
@@ -346,9 +433,10 @@ class ScoreQuantileGate:
             "warmup_blocked": self.warmup_blocked,
             "anneal_skips": self.anneal_skips,
             "decisions_seen": self.decisions_seen,
-        "terminal": self._terminal,
-        "terminal_at": self._terminal_at,
-    }
+            "phase_skip_positions": window_positions,
+            "terminal": self._terminal,
+            "terminal_at": self._terminal_at,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +445,7 @@ class ScoreQuantileGate:
 
 # Upper bound from Katharopoulos & Fleuret (2018): for softmax cross-entropy,
 # ||grad_w.r.t. logits|| = ||p - y||, bounded by sqrt(2) for two classes.
-# mean_i ||p_i - y_i|| is exactly the proposed LER v4 score. It is bounded,
+# mean_i ||p_i - y_i|| is exactly the proposed LER v4 score (S1). It is bounded,
 # label-noise-robust, and costs ~0 ms because the logits are already cached in
 # trainer._last_real_logits (capture_logits=True).
 
@@ -394,13 +482,184 @@ def forward_gain_score(logits, labels) -> float:
     return score
 
 
+# ---------------------------------------------------------------------------
+# S2: last-layer alignment score
+# ---------------------------------------------------------------------------
+#
+# Formula:  s_B = <G_B, G_P ⊘ (sqrt(v) + eps)>
+#
+# - G_B = (1/B) * sum_i (p_i - y_i) h_i^T   (per-batch gradient w.r.t. classifier.weight)
+#   where h_i is the hidden state entering the classifier (captured via a
+#   forward-pre-hook on the classifier module), p_i = softmax(logits_i),
+#   y_i = one-hot label.  Shape: [num_labels, hidden_dim].
+#
+# - G_P is the same gradient computed on a 256-example score probe P_s, run in
+#   eval mode every 64 steps in fp32.
+#
+# - v is AdamW's exp_avg_sq for classifier.weight, shape [num_labels, hidden_dim].
+#
+# The score is a first-order prediction of how much the probe loss drops if
+# this batch's update is applied: it is the dot product of the batch gradient
+# with the probe gradient, each coordinate normalized by sqrt(v)+eps, which is
+# exactly the sign/direction of the AdamW update step on classifier.weight.
+#
+# Note (recorded in pre-reg): loss rescaling (the magnitude of the gradient)
+# is NOT used — only direction. Under AdamW the update is approximately
+# scale-invariant, so the alignment of directions is what matters.
+
+
+class AlignmentProbe:
+    """Capture the hidden state entering the classifier and compute S2 scores.
+
+    Attaches a forward-pre-hook to ``model.classifier`` (the Linear layer that
+    maps pooled hidden state -> logits in ModernBertForSequenceClassification).
+    The hook stores the most recent input tensor so that S2 scores can be
+    computed from cached logits + labels without an extra forward pass.
+    """
+
+    def __init__(self, model, hook_module_name: str = "classifier"):
+        self.model = model
+        self.hook_module_name = hook_module_name
+        self._last_hidden: Optional[torch.Tensor] = None
+        self._hook_handle = None
+        self._attach()
+
+    def _attach(self) -> None:
+        module = getattr(self.model, self.hook_module_name, None)
+        if module is None:
+            raise AttributeError(
+                f"Model has no attribute '{self.hook_module_name}'; cannot attach "
+                f"forward-pre-hook for alignment score."
+            )
+
+        def _pre_hook(_module, args):
+            # args[0] is the input tensor entering the Linear layer (pooled_output).
+            self._last_hidden = args[0].detach().clone()
+
+        self._hook_handle = module.register_forward_pre_hook(_pre_hook)
+
+    def remove(self) -> None:
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
+
+    @property
+    def last_hidden(self) -> Optional[torch.Tensor]:
+        return self._last_hidden
+
+
+def _classifier_grad_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    """Compute G = (1/B) * sum_i (p_i - y_i) h_i^T, the gradient of
+    softmax cross-entropy loss w.r.t. the classifier weight.
+
+    Args:
+        logits: [B, C] detached logits tensor.
+        labels: [B] integer class ids.
+        hidden: [B, H] hidden state entering the classifier.
+
+    Returns:
+        [C, H] tensor — the mean per-example gradient w.r.t. classifier.weight.
+    """
+    with torch.no_grad():
+        p = logits.float().softmax(dim=-1)
+        onehot = torch.zeros_like(p).scatter_(1, labels.view(-1, 1), 1.0)
+        diff = p - onehot  # [B, C]
+        # G = (1/B) * sum_i diff_i * h_i^T  =>  [C, H]
+        G = (diff.t() @ hidden.float()) / labels.shape[0]
+        return G
+
+
+def alignment_score(
+    trainer,
+    model,
+    inputs,
+    probe_fn,
+    adam_state_key: str = "classifier.weight",
+    eps: float = 1e-8,
+) -> float:
+    """Compute S2: the last-layer alignment score.
+
+    s_B = <G_B, G_P ⊘ (sqrt(v) + eps)>
+
+    where G_B is the current batch's gradient w.r.t. classifier.weight (derived
+    from cached logits + hidden state), G_P is the probe gradient (recomputed by
+    ``probe_fn``), and v is AdamW's exp_avg_sq for classifier.weight.
+
+    Returns NaN if any component is unavailable (gate treats as terminal).
+    """
+    import torch
+
+    logits = getattr(trainer, "_last_real_logits", None)
+    if logits is None:
+        logits = getattr(trainer, "_last_logits", None)
+    if logits is None:
+        return float("nan")
+
+    labels = inputs.get("labels") if isinstance(inputs, dict) else None
+    if labels is None:
+        return float("nan")
+
+    # Retrieve the hidden state captured by AlignmentProbe's forward-pre-hook.
+    probe = getattr(trainer, "_alignment_probe", None)
+    if probe is None:
+        return float("nan")
+    hidden = probe.last_hidden
+    if hidden is None:
+        return float("nan")
+
+    with torch.no_grad():
+        logits_f = logits.float().detach()
+        if logits_f.shape[0] != labels.shape[0] or logits_f.shape[0] != hidden.shape[0]:
+            return float("nan")
+
+        G_B = _classifier_grad_from_logits(logits_f, labels, hidden)
+
+        # G_P from the probe (refreshed every 64 steps by probe_fn)
+        G_P = probe_fn()
+        if G_P is None:
+            return float("nan")
+        G_P = G_P.float()
+
+        # v: AdamW exp_avg_sq for classifier.weight
+        optimizer = getattr(trainer, "optimizer", None) or getattr(trainer, "_optimizer", None)
+        if optimizer is None:
+            return float("nan")
+        # Resolve the parameter by name from the model
+        param = None
+        for name, p in model.named_parameters():
+            if name == adam_state_key:
+                param = p
+                break
+        if param is None:
+            return float("nan")
+        state = optimizer.state.get(param, {})
+        v = state.get("exp_avg_sq")
+        if v is None:
+            return float("nan")
+        v = v.float()
+
+        if G_B.shape != G_P.shape or G_B.shape != v.shape:
+            return float("nan")
+
+        normalized = G_P / (v.sqrt() + eps)
+        s = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
+        if not math.isfinite(s):
+            return float("nan")
+        return s
+
+
 class ScoreQuantileGatePolicy:
     """SkipPolicy plugging ScoreQuantileGate into TrueBackwardSkippingTrainer.
 
-    `score_source` is either "gain" (forward predicted-gain bound) or "uniform"
-    (i.i.d. Uniform[0,1] from `policy_seed`). Everything else — quota, phases,
-    cap, forcing, annealing — is shared, so switching the source turns the
-    contender into its own control.
+    `score_source` is "s1" (forward predicted-gain bound, ||p-y||),
+    "s2" (last-layer alignment score), or "uniform" (i.i.d. Uniform[0,1] from
+    `policy_seed`). Everything else — quota, phases, cap, feasibility forcing,
+    annealing — is shared, so switching the source turns the contender into
+    its own control.
 
     Reads logits from `trainer._last_real_logits` (captured when
     `online_ler_mode != "off"`, e.g. "legacy_dense" with no ler_tracker).
@@ -413,32 +672,46 @@ class ScoreQuantileGatePolicy:
         *,
         target_skip_rate: float,
         total_steps: int,
-        min_step: int = 50,
+        min_step: int = 392,
         max_consecutive_skips: int = 4,
         n_phases: int = 4,
         score_history_window: int = 64,
         anneal_fraction: float = 0.88,
-        forcing_fraction: float = 0.8,
         policy_seed: int = 0,
-        score_source: str = "gain",
+        score_source: str = "s1",
+        alignment_probe_fn=None,
+        alignment_adam_state_key: str = "classifier.weight",
+        alignment_eps: float = 1e-8,
     ):
-        if score_source not in ("gain", "uniform"):
-            raise ValueError(f"score_source must be 'gain' or 'uniform', got {score_source!r}")
+        if score_source not in ("s1", "s2", "uniform"):
+            raise ValueError(
+                f"score_source must be 's1', 's2', or 'uniform', got {score_source!r}"
+            )
         self.score_source_kind = score_source
         self._rng = random.Random(int(policy_seed))
         self._trainer_ref = None
+        self.alignment_probe_fn = alignment_probe_fn
+        self.alignment_adam_state_key = alignment_adam_state_key
+        self.alignment_eps = float(alignment_eps)
 
         def _source(decision_index, model, inputs):
             if score_source == "uniform":
                 return self._rng.random()
-            return forward_gain_score(
-                getattr(self._trainer_ref, "_last_real_logits", None),
-                inputs.get("labels") if isinstance(inputs, dict) else None,
-            )
+            elif score_source == "s1":
+                return forward_gain_score(
+                    getattr(self._trainer_ref, "_last_real_logits", None),
+                    inputs.get("labels") if isinstance(inputs, dict) else None,
+                )
+            else:  # s2
+                return alignment_score(
+                    trainer=self._trainer_ref,
+                    model=model,
+                    inputs=inputs,
+                    probe_fn=self.alignment_probe_fn,
+                    adam_state_key=self.alignment_adam_state_key,
+                    eps=self.alignment_eps,
+                )
 
-        # (c) Gate RNG must differ from the policy RNG (used by the uniform
-        # score source). Using policy_seed + 1 keeps the streams independent
-        # while remaining deterministic and reproducible.
         self._gate = ScoreQuantileGate(
             rate=float(target_skip_rate),
             total_steps=int(total_steps),
@@ -447,13 +720,15 @@ class ScoreQuantileGatePolicy:
             n_phases=int(n_phases),
             score_history_window=int(score_history_window),
             anneal_fraction=float(anneal_fraction),
-            forcing_fraction=float(forcing_fraction),
             seed=int(policy_seed) + 1,
             score_source=_source,
         )
 
     def should_skip(self, trainer, model, inputs) -> bool:
         self._trainer_ref = trainer
+        if self.score_source_kind == "s2":
+            if not hasattr(trainer, "_alignment_probe"):
+                trainer._alignment_probe = AlignmentProbe(model)
         instr = getattr(trainer, "instr", None)
         idx = (getattr(instr, "batches_seen", 0) - 1) if instr is not None else self._gate.decisions_seen
         if idx < 0:
@@ -463,9 +738,18 @@ class ScoreQuantileGatePolicy:
     def get_diagnostics(self) -> dict:
         d = self._gate.diagnostics()
         d["score_source"] = self.score_source_kind
+        d["alignment_eps"] = self.alignment_eps
+        d["alignment_adam_state_key"] = self.alignment_adam_state_key
         return d
 
 
 # Re-exported so the matrix / harness can resolve the name string.
-__all__ = ["ScoreQuantileGate", "ScoreQuantileGatePolicy", "forward_gain_score",
-           "TerminalInvalidScoreError"]
+__all__ = [
+    "ScoreQuantileGate",
+    "ScoreQuantileGatePolicy",
+    "forward_gain_score",
+    "alignment_score",
+    "AlignmentProbe",
+    "TerminalInvalidScoreError",
+    "InfeasibleBudgetError",
+]

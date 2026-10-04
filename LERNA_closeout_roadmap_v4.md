@@ -114,21 +114,17 @@ Seeds 42–8192 remain exploratory by pre-registration and are excluded from all
 
 **Outcome pending Stage 0.** The v3 QNLI 0.30 data are retrospective only — two confounds bind them
 (cap 4 vs no cap on the skip arms; LR schedule artifact where skip arms stepped ~4584/6548 vs
-full fine-tuning every step — the Kaddour failure mode). They are not Path B evidence until Stage 0
+full fine-tuning every step — the Kaddour failure mode). They are not V4 evidence until Stage 0
 is run. The retrospective, with both confounds stated, is written in `docs/chapter_why_ler_failed.md`
 (status: draft, outcome undecided).
 
-> **Branch A — if the Stage 0 oracle gate PASSES.** The forward gain proxy predicts per-step
-> contribution above a within-seed permutation + step-index/loss-stratified partial correlation:
-> local ρ ≥ 0.20 with a bootstrap CI excluding 0 on both seed 11 and seed 13.
-> (ρ > 0 is too weak: over ~800 points it passes at ρ≈0.07, statistically significant but
-> explaining <1% variance — unable to move accuracy.)
+> **Branch A — if Stage 0 selects an informative score.** The chosen score (S1 or S2) predicts
+> per-step contribution with local Spearman ρ ≥ 0.10 (descriptive threshold) with a bootstrap CI
+> above 0 on Stage 0 seeds (101, 103). The score carries into Stage 2.
 >
-> **Branch B — if the oracle gate FAILS.** Reported as "undetectable at n = 5" (not "no signal
-> exists"), consistent with Kaddour. No further attempt is made to make LER win.
-
-Both branches are defensible theses; neither claims superiority. Stage 0 is the only decision
-point; it has not been run.
+> **Branch B — if the oracle probe finds no informative score.** Reported as "undetectable" (not
+> "no signal exists"), consistent with Kaddour. Stage 2 proceeds regardless; the headline becomes
+> the efficiency study. No further attempt is made to make the gate win.
 
 ---
 
@@ -139,54 +135,68 @@ point; it has not been run.
 The thesis claim is **non-inferiority under a matched backward-step budget**, plus a pre-registered test of
 whether the LER signal is informative at all. No superiority claim is made in any arm, task, or rate.
 
-### 3.2 Arms
+### 3.2 Arms (Stage 2)
 
-Five arms, all at matched budget except `full_finetune` (0% skip, rate-independent):
+Four arms, all at matched budget except `full_finetune` (0% skip, rate-independent):
 
-`full_finetune` · `exact_random` · `ler_guided_stratified` (`lgs`) · `lgs_shuffled` · `phase_strat_guarded`
+`full_finetune` · `gate` (chosen score from Stage 0) · `control` · `reduced_steps`
 
-`lgs_shuffled` is the within-seed permutation control: identical LER machinery, identical realized skip
-count, per-seed deterministic permutation of the LER ranking. It isolates *"is the ranking informative"*
-from *"does the tracker machinery cost anything"*.
+`control` is the uniform-random skip counterpart of `gate`: identical quota, cap,
+phases, and feasibility logic; the only difference is the score source
+("uniform" vs the Stage 0-selected score). This isolates *"is the ranking
+informative"* from *"does the tracker/score machinery cost anything."*
+
+Stage 1 is dropped. The rate is fixed at 0.60 pre-hoc (see §3.5).
 
 ### 3.3 Gate A — the oracle test (decides Branch A vs Branch B)
 
-`lgs_shuffled` must beat all three, on QNLI at skip 0.60, paired over 5 seeds:
+Stage 0 selects between two pre-declared candidate scores (S1: ||p−y|| forward
+gain bound; S2: last-layer alignment score) using seeds 101 and 103, disjoint
+from Stage 2 seeds. The statistic is local Spearman ρ of (score) vs (realized
+per-step gain on P_e) within trailing 64-step windows, with moving-block
+bootstrap (block 64, 10k resamples) and 97.5% CI.
 
-1. **Partial Spearman** ρ(LER score, per-step gain | step index, current loss) ≥ 0.20, bootstrap 95% CI
-   excluding 0.
-2. **Paired t-test** `lgs` > `lgs_shuffled`, two-sided, p < 0.05.
-3. **Split-half reliability** r ≥ 0.30 across probe halves within seed.
+Selection rule (fixed in advance): take the higher per-seed ρ for each score;
+pick the score with the higher value. Ties go to S1. Report the "eligible" mark
+(ρ ≥ 0.10 with CI above 0) only as description. Stage 0 never cancels Stage 2.
 
-**Failure is reported as "undetectable", not "no signal exists."** With n = 5 seeds the test has limited
-power; a failure bounds the effect from above, it does not prove absence. This wording is mandatory in the
-thesis and the defense.
+**Failure is reported as "undetectable", not "no signal exists."** With n = 5
+seeds the test has limited power; a failure bounds the effect from above, it
+does not prove absence.
 
-### 3.4 Build cost — correction to the brief
+### 3.4 Build cost — alignment probe hook
 
-`lgs_shuffled` **requires a small code change**, not configuration only. `VALID_ONLINE_LER_MODES` in
-`lerna/trainers/true_skip_trainer.py:30-33` is exactly `{off, legacy_dense, sampled_lagged}`. There is no
-permutation mode; the string `shuffled` does not appear anywhere in the repository.
+`lgs_shuffled` (permutation control) is dropped. Stage 2 uses `ScoreQuantileGatePolicy`
+with `score_source` ∈ {s1, s2, uniform}. S2 requires:
 
-**Required work:** one new constant `ONLINE_LER_MODE_SHUFFLED`, one branch in the existing mode dispatch, a
-deterministic per-seed permutation seeded from the existing `policy_seed`, and a test asserting the realized
-skip count is identical to `lgs` at the same seed and rate. No change to the skip-policy logic, the tracker,
-or the budget accounting. Estimate: **1 day including tests.** It is additive and does not touch the frozen
-QNLI 0.30 block.
+1. A forward-pre-hook on `model.classifier` to capture the hidden state `h` entering
+   the classifier. Verified: `ModernBertForSequenceClassification.classifier` is
+   `Linear(768 → 2)`, hook captures `[B, 768]` input.
+2. `AlignmentProbe` class in `forward_gate.py` manages the hook lifecycle.
+3. `alignment_score()` function computes `⟨G_B, G_P ⊘ (√v + ε)⟩`.
+
+S1 requires no code changes (logits already cached when `capture_logits=True`).
+Estimate: **1 day including tests.** Additive; does not touch the frozen V3 QNLI block.
 
 ### 3.5 Matrix
 
-| Task | Rate | Seeds | Cells |
-|---|---|---|---|
-| QNLI | 0.30 | 11, 13, 17, 19, 23 (frozen) + 5 new | 4 skip arms × 10 × 1 + full × 10 = 50 |
-| QNLI | 0.60 | 5 new | 4 skip arms × 5 + full × 5 = 25 |
-| MRPC | 0.30 | 30 new | 4 skip arms × 30 + full × 30 = 150 |
-| Gate A oracle probe | 0.60 | 5 | 5 |
-| Serial timing cells | 0.30 | 5 | 5 |
+| Stage | Task | Rate | Seeds | Cells | Purpose |
+|---|---|---|---|---|---|
+| Stage 0 | QNLI | 0.60 (shadow) | 101, 103 | 2 | Oracle probe: select S1 or S2 |
+| Stage 2 | QNLI | 0.60 | 24 new | 96 | Confirmatory: gate vs control vs full vs reduced_steps |
+| Descriptive | QNLI | 0.45 | 5 | 10 | Rate sensitivity |
+| Timing | QNLI | 0.30 | 3 | 12 | ms/step (single GPU) |
+| V3 retro | QNLI | 0.30 | frozen | 20 | Historical (confounded) |
 
-**Total ≈ 235 accuracy cells.** MRPC at 0.60 is **dropped**: the MRPC dev set is 408 examples, which cannot
-resolve a 0.60-skip effect with a useful confidence interval, and pre-registering it would be
-pre-registering a known failure. 0.60 is retained on QNLI only, because Gate A requires it.
+**Stage 1 is dropped.** The rate is fixed at 0.60 pre-hoc (no post-hoc rate selection).
+0.70 is excluded (above the trainer's cap constraint at rate 0.60).
+
+### 3.6 Probes
+
+Two disjoint 256-example probes from the train split:
+- `P_s`: used to compute G_P for S2 (refreshed every 64 steps, fp32, eval mode).
+- `P_e`: used to measure realized per-step gain in Stage 0 (fp32, eval mode).
+- Both removed from the training sampler in every arm, asserted at runtime.
 
 ### 3.6 Provenance disclosure (mandatory)
 

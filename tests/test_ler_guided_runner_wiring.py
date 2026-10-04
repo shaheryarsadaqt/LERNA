@@ -21,7 +21,6 @@ from scripts.run_ablation_study import (
     LER_GUIDED_CONTROLS,
     LER_GUIDED_SAFE_CONTROL,
     PHASE1_3_MATRIX,
-    POLICY_MIN_STEP,
     SKIPPING_CONTROLS,
     add_ler_guided_to_identity,
     build_ler_guided_controller_config,
@@ -29,6 +28,7 @@ from scripts.run_ablation_study import (
     build_skip_policy,
     resolve_online_ler_config,
 )
+from lerna.utils.phase1_3_matrix import POLICY_MIN_STEP
 
 
 class FakeLagTracker:
@@ -104,7 +104,7 @@ def build_config(control=LER_GUIDED_CONTROL, **overrides):
     kwargs = {
         "control": control,
         "target_skip_rate": 0.20,
-        "total_steps": 100,
+        "total_steps": 6548,
         "policy_seed": 42,
         "max_consecutive_skips": 4,
         "probe_interval": 8,
@@ -172,7 +172,7 @@ def test_no_safety_config_has_exact_canonical_schema():
         "policy_class": "LERGuidedStratifiedPolicy",
         "policy_name": "ler_guided_stratified",
         "target_skip_rate": 0.20,
-        "total_steps": 100,
+        "total_steps": 6548,
         "min_step": POLICY_MIN_STEP,
         "policy_seed": 42,
         "n_phases": 4,
@@ -214,7 +214,6 @@ def test_safety_config_has_exact_canonical_schema():
         ({"target_skip_rate": math.nan}, "target_skip_rate"),
         ({"target_skip_rate": math.inf}, "target_skip_rate"),
         ({"total_steps": 0}, "total_steps"),
-        ({"total_steps": POLICY_MIN_STEP}, "total_steps"),
         ({"total_steps": 100.5}, "total_steps"),
         ({"max_consecutive_skips": 0}, "max_consecutive_skips"),
         ({"probe_interval": 0}, "probe_interval"),
@@ -229,7 +228,7 @@ def test_invalid_canonical_inputs_fail(overrides, message):
 
 def test_infeasible_post_warmup_quota_is_rejected_without_clipping():
     with pytest.raises(ValueError, match="Infeasible skip quota"):
-        build_config(total_steps=100, target_skip_rate=0.80)
+        build_config(total_steps=6548, target_skip_rate=0.95)
 
 
 def test_config_results_and_phase_weights_are_independent():
@@ -308,7 +307,7 @@ def test_active_rho_threshold_changes_only_safety_fingerprint():
 
 
 def test_phase1_3_matrix_has_exactly_six_arms():
-    assert len(PHASE1_3_MATRIX) == 6
+    assert len(PHASE1_3_MATRIX) == 7
 
 
 def test_phase1_3_matrix_contains_exactly_canonical_arms():
@@ -319,6 +318,7 @@ def test_phase1_3_matrix_contains_exactly_canonical_arms():
         "phase_strat_guarded",
         "ler_guided_stratified",
         "ler_guided_stratified_safe",
+        "reduced_steps",
     }
 
 
@@ -330,6 +330,7 @@ def test_phase1_3_matrix_ordering_is_canonical():
         "phase_strat_guarded",
         "ler_guided_stratified",
         "ler_guided_stratified_safe",
+        "reduced_steps",
     ]
 
 
@@ -354,7 +355,7 @@ def test_build_skip_policy_routes_fixed_phase_strat():
         control="fixed_phase_strat",
         ler_tracker=None,
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         controller_cfg={"policy_seed": 42},
         rho_veto_threshold=-0.2,
         probe_interval=8,
@@ -376,7 +377,7 @@ def test_build_skip_policy_routes_phase_strat_guarded():
         control="phase_strat_guarded",
         ler_tracker=FakeLagTracker(),
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         controller_cfg={"policy_seed": 42, "max_consecutive_skips": 4},
         rho_veto_threshold=-0.2,
         probe_interval=8,
@@ -429,15 +430,15 @@ def test_phase_strat_controller_config_has_required_keys():
     config = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
     assert config["control"] == "fixed_phase_strat"
     assert config["controller_class"] == "FixedPhaseStratifiedRandomPolicy"
     assert config["policy_seed"] == 42
-    assert config["total_steps"] == 100
-    assert config["requested_quota"] == 20
+    assert config["total_steps"] == 6548
+    assert config["requested_quota"] == round(0.20 * 6548)
     assert config["n_phases"] == 4
     assert "phase_weights" in config
     assert "phase_bounds" in config
@@ -453,7 +454,7 @@ def test_phase_strat_controller_config_guarded_has_safety():
     config = build_phase_strat_controller_config(
         control="phase_strat_guarded",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
         guarded=True,
@@ -476,7 +477,7 @@ def test_phase_strat_controller_config_not_guarded_has_no_safety():
     config = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
@@ -489,12 +490,12 @@ def test_phase_strat_controller_config_quota_matches_build_exact_random_skip_set
     config = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
     _, expected_quota = build_exact_random_skip_set(
-        total_steps=100,
+        total_steps=6548,
         target_skip_rate=0.20,
         min_step=POLICY_MIN_STEP,
         seed=42,
@@ -531,14 +532,14 @@ def test_phase_strat_controller_config_is_defensive_copy():
     config1 = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
     config2 = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
@@ -553,7 +554,7 @@ def test_phase_strat_controller_config_fingerprint_consistency():
     config = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
@@ -573,14 +574,14 @@ def test_phase_strat_controller_config_fingerprint_differs_by_seed():
     config_a = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
     config_b = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=43,
         max_consecutive_skips=4,
     )
@@ -591,14 +592,14 @@ def test_phase_strat_controller_config_fingerprint_differs_by_control():
     config_fixed = build_phase_strat_controller_config(
         control="fixed_phase_strat",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
     )
     config_guarded = build_phase_strat_controller_config(
         control="phase_strat_guarded",
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         policy_seed=42,
         max_consecutive_skips=4,
         guarded=True,
@@ -616,7 +617,7 @@ def test_legacy_policy_fixed_phase_strat_still_works():
 
     policy = FixedPhaseStratifiedRandomPolicy(
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         min_step=POLICY_MIN_STEP,
         seed=42,
     )
@@ -630,7 +631,7 @@ def test_legacy_policy_phase_strat_guarded_still_works():
     policy = PhaseStratifiedGuardedRandomPolicy(
         ler_tracker=FakeLagTracker(),
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         min_step=POLICY_MIN_STEP,
         seed=42,
         max_consecutive_skips=4,
@@ -650,7 +651,7 @@ def test_exact_random_still_routes_through_build_skip_policy():
         control="exact_random",
         ler_tracker=None,
         target_skip_rate=0.20,
-        total_steps=100,
+        total_steps=6548,
         controller_cfg={"policy_seed": 42},
         rho_veto_threshold=-0.2,
         probe_interval=8,

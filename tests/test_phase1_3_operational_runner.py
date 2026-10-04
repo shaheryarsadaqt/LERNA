@@ -25,7 +25,7 @@ def _facts():
         "eval_samples_realized": 408,
         "train_dataset_fingerprint": "mrpc-train",
         "eval_dataset_fingerprint": "mrpc-eval",
-        "total_steps": 575,
+        "total_steps": 6548,
         "per_device_train_batch_size": 8,
         "gradient_accumulation_steps": 1,
         "effective_n_gpu": 1,

@@ -118,6 +118,9 @@ from lerna.utils.phase1_3_operations import (
     require_clean_git_state,
     require_frozen_mrpc_facts,
     scan_phase1_3_progress,
+    MRPC_TRAIN_SAMPLES,
+    MRPC_VALIDATION_SAMPLES,
+    MRPC_TOTAL_STEPS,
 )
 
 
@@ -251,7 +254,6 @@ PHASE1_3_MATRIX = [
     "reduced_steps",
 ]
 
-POLICY_MIN_STEP = 50
 LER_GUIDED_CONTROL = "ler_guided_stratified"
 LER_GUIDED_SAFE_CONTROL = "ler_guided_stratified_safe"
 LER_GUIDED_CONTROLS = {LER_GUIDED_CONTROL, LER_GUIDED_SAFE_CONTROL}
@@ -342,6 +344,7 @@ def build_ler_guided_controller_config(
     max_consecutive_skips: int,
     probe_interval: int,
     rho_veto_threshold: float,
+    warmup_ratio: float = 0.06,
 ) -> dict:
     """Build canonical scientific configuration for a LER-guided arm."""
     if control not in LER_GUIDED_CONTROLS:
@@ -355,10 +358,11 @@ def build_ler_guided_controller_config(
         raise ValueError("target_skip_rate must be finite and in [0, 1]")
 
     total_steps_int = int(total_steps)
-    if total_steps_int <= POLICY_MIN_STEP or total_steps_int != total_steps:
+    min_step = int(total_steps_int * warmup_ratio)
+    if total_steps_int <= min_step or total_steps_int != total_steps:
         raise ValueError(
-            f"total_steps must be an integer greater than POLICY_MIN_STEP="
-            f"{POLICY_MIN_STEP}; got {total_steps!r}"
+            f"total_steps must be an integer greater than min_step={min_step} "
+            f"(= int({total_steps} * {warmup_ratio})); got {total_steps!r}"
         )
 
     max_consecutive_skips = int(max_consecutive_skips)
@@ -372,11 +376,11 @@ def build_ler_guided_controller_config(
         raise ValueError("rho_veto_threshold must be finite")
 
     requested_quota = int(round(target_skip_rate * total_steps_int))
-    eligible_count = total_steps_int - POLICY_MIN_STEP
+    eligible_count = total_steps_int - min_step
     if requested_quota > eligible_count:
         raise ValueError(
             f"Infeasible skip quota: requested {requested_quota} skips after "
-            f"min_step={POLICY_MIN_STEP}, but only {eligible_count} decisions "
+            f"min_step={min_step}, but only {eligible_count} decisions "
             "are eligible; quotas are never clipped"
         )
 
@@ -391,7 +395,7 @@ def build_ler_guided_controller_config(
         "policy_name": control,
         "target_skip_rate": target_skip_rate,
         "total_steps": total_steps_int,
-        "min_step": POLICY_MIN_STEP,
+        "min_step": min_step,
         "policy_seed": int(policy_seed),
         "n_phases": 4,
         "phase_weights": [0.22, 0.24, 0.26, 0.28],
@@ -424,6 +428,7 @@ def build_phase_strat_controller_config(
     total_steps: int,
     policy_seed: int,
     max_consecutive_skips: int,
+    warmup_ratio: float = 0.06,
     n_phases: int = 4,
     phase_weights: Optional[List[float]] = None,
     rho_veto_threshold: float = -0.2,
@@ -445,10 +450,11 @@ def build_phase_strat_controller_config(
         raise ValueError("target_skip_rate must be finite and in [0, 1]")
 
     total_steps_int = int(total_steps)
-    if total_steps_int <= POLICY_MIN_STEP or total_steps_int != total_steps:
+    min_step = int(total_steps_int * warmup_ratio)
+    if total_steps_int <= min_step or total_steps_int != total_steps:
         raise ValueError(
-            f"total_steps must be an integer greater than POLICY_MIN_STEP="
-            f"{POLICY_MIN_STEP}; got {total_steps!r}"
+            f"total_steps must be an integer greater than min_step={min_step} "
+            f"(= int({total_steps} * {warmup_ratio})); got {total_steps!r}"
         )
 
     max_consecutive_skips = int(max_consecutive_skips)
@@ -461,18 +467,18 @@ def build_phase_strat_controller_config(
     normalized_weights = [w / s for w in phase_weights]
 
     requested_quota = int(round(target_skip_rate * total_steps_int))
-    eligible_count = total_steps_int - POLICY_MIN_STEP
+    eligible_count = total_steps_int - min_step
     if requested_quota > eligible_count:
         raise ValueError(
             f"Infeasible skip quota: requested {requested_quota} skips after "
-            f"min_step={POLICY_MIN_STEP}, but only {eligible_count} decisions "
+            f"min_step={min_step}, but only {eligible_count} decisions "
             "are eligible; quotas are never clipped"
         )
 
-    eligible = list(range(POLICY_MIN_STEP, total_steps_int))
+    eligible = list(range(min_step, total_steps_int))
     n_elig = len(eligible)
     edges = [
-        POLICY_MIN_STEP + int(round(n_elig * i / n_phases))
+         min_step + int(round(n_elig * i / n_phases))
         for i in range(n_phases + 1)
     ]
     phase_bounds = edges
@@ -504,7 +510,7 @@ def build_phase_strat_controller_config(
         "policy_name": control,
         "target_skip_rate": target_skip_rate,
         "total_steps": total_steps_int,
-        "min_step": POLICY_MIN_STEP,
+        "min_step": min_step,
         "policy_seed": int(policy_seed),
         "n_phases": n_phases,
         "phase_weights": normalized_weights,
@@ -971,20 +977,21 @@ def plan_phase1_3_cell(
     policy_seed = int(policy_seed)
     num_epochs = int(data_facts["num_epochs"])
     total_steps = int(data_facts["total_steps"])
-    if total_steps <= POLICY_MIN_STEP:
+    min_step = int(total_steps * warmup_ratio)
+    if total_steps <= min_step:
         raise ValueError(
-            f"total_steps must be greater than POLICY_MIN_STEP="
-            f"{POLICY_MIN_STEP}; got {total_steps}"
+            f"total_steps must be greater than min_step={min_step} "
+            f"(= int({total_steps} * {warmup_ratio})); got {total_steps}"
         )
 
     is_skipping_arm = ablation_name not in ("full_finetune", "reduced_steps")
     if is_skipping_arm:
         requested_quota = round(target_skip_rate * total_steps)
-        eligible_count = total_steps - POLICY_MIN_STEP
+        eligible_count = total_steps - min_step
         if requested_quota > eligible_count:
             raise ValueError(
                 f"Infeasible skip quota: requested {requested_quota} skips "
-                f"after min_step={POLICY_MIN_STEP}, but only {eligible_count} "
+                f"after min_step={min_step}, but only {eligible_count} "
                 "decisions are eligible; quotas are never clipped"
             )
         planned_skips = requested_quota
@@ -1054,7 +1061,7 @@ def plan_phase1_3_cell(
 
     if ablation_name == "reduced_steps":
         reduced_total_steps = round(total_steps * (1.0 - target_skip_rate))
-        reduced_min_step = round(POLICY_MIN_STEP * (1.0 - target_skip_rate))
+        reduced_min_step = round(min_step * (1.0 - target_skip_rate))
     else:
         reduced_total_steps = None
         reduced_min_step = None
@@ -1067,7 +1074,7 @@ def plan_phase1_3_cell(
         "compute_saving_mechanism": compute_saving_mechanism,
         "policy_seed": policy_seed,
         "target_skip_rate": target_skip_rate,
-        "min_step": POLICY_MIN_STEP,
+        "min_step": min_step,
         "configured_total_steps": total_steps,
         "requested_quota": requested_quota,
         "matched_budget": True,
@@ -1087,6 +1094,7 @@ def plan_phase1_3_cell(
             "total_steps": total_steps,
             "policy_seed": policy_seed,
             "max_consecutive_skips": max_consecutive_skips,
+            "warmup_ratio": warmup_ratio,
         }
         if ablation_name == "phase_strat_guarded":
             phase_kwargs.update(
@@ -1112,6 +1120,7 @@ def plan_phase1_3_cell(
             max_consecutive_skips=max_consecutive_skips,
             probe_interval=probe_interval,
             rho_veto_threshold=rho_veto_threshold,
+            warmup_ratio=warmup_ratio,
         )
         identity_inputs = add_ler_guided_to_identity(
             identity_inputs,
@@ -1138,7 +1147,7 @@ def plan_phase1_3_cell(
         "target_skip_rate": target_skip_rate,
         "num_epochs": num_epochs,
         "total_steps": total_steps,
-        "min_step": POLICY_MIN_STEP,
+        "min_step": min_step,
         "requested_quota": requested_quota,
         "planned_skips": planned_skips,
         "is_skipping_arm": is_skipping_arm,
@@ -1360,9 +1369,12 @@ def build_skip_policy(
     use_safety_horizon: bool,
     fallback_threshold: float,
     risk_gamma: float,
+    min_step: int | None = None,
     ler_guided_controller_config=None,
 ):
     """Construct one explicit baseline/RVD/LER-guided control arm."""
+    if min_step is None:
+        min_step = int(total_steps * 0.06)
     control = "exact_random" if control == "random_skip" else control
     if control == "full_finetune":
         return AlwaysFalsePolicy()
@@ -1386,7 +1398,7 @@ def build_skip_policy(
     if control == "exact_random":
         return RandomSkipPolicy(
             target_skip_rate=target_skip_rate,
-            min_step=POLICY_MIN_STEP,
+            min_step=min_step,
             seed=controller_cfg["policy_seed"],
             total_steps=total_steps,
         )
@@ -1394,7 +1406,7 @@ def build_skip_policy(
         return FixedPhaseStratifiedRandomPolicy(
             target_skip_rate=target_skip_rate,
             total_steps=total_steps,
-            min_step=POLICY_MIN_STEP,
+            min_step=min_step,
             seed=controller_cfg["policy_seed"],
             n_phases=controller_cfg.get("n_phases", 4),
             phase_weights=controller_cfg.get(
@@ -1410,7 +1422,7 @@ def build_skip_policy(
             ler_tracker=ler_tracker,
             target_skip_rate=target_skip_rate,
             total_steps=total_steps,
-            min_step=POLICY_MIN_STEP,
+            min_step=min_step,
             seed=controller_cfg["policy_seed"],
             max_consecutive_skips=controller_cfg["max_consecutive_skips"],
             rho_veto_threshold=rho_veto_threshold,
@@ -1421,7 +1433,7 @@ def build_skip_policy(
     if control == "grad_norm":
         return GradNormSkipPolicy(
             target_skip_rate=target_skip_rate,
-            min_step=POLICY_MIN_STEP,
+            min_step=min_step,
             calibration_steps=60,
             recalibrate_every=200,
             max_consecutive_skips=controller_cfg["max_consecutive_skips"],
@@ -1431,7 +1443,7 @@ def build_skip_policy(
             ler_tracker=ler_tracker,
             target_skip_rate=target_skip_rate,
             total_steps=total_steps,
-            min_step=POLICY_MIN_STEP,
+            min_step=min_step,
             seed=controller_cfg["policy_seed"],
             use_loss_spike_veto=controller_cfg["use_loss_spike_veto"],
             spike_factor=controller_cfg["spike_factor"],
@@ -1838,6 +1850,7 @@ def run_ablation_single(
         gradient_accumulation_steps=hw_cfg["gradient_accumulation_steps"],
         n_gpu=effective_n_gpu,
     )
+    min_step = int(total_steps * warmup_ratio)
     eval_steps = max(total_steps // 20, 10)
 
     quota_control = effective_control
@@ -1851,7 +1864,7 @@ def run_ablation_single(
             _, requested_quota = build_exact_random_skip_set(
                 total_steps=total_steps,
                 target_skip_rate=target_skip_rate,
-                min_step=POLICY_MIN_STEP,
+                min_step=min_step,
                 seed=controller_cfg["policy_seed"],
             )
         except ValueError as exc:
@@ -1928,6 +1941,7 @@ def run_ablation_single(
             max_consecutive_skips=max_consecutive_skips,
             probe_interval=probe_interval,
             rho_veto_threshold=rho_veto_threshold,
+            warmup_ratio=warmup_ratio,
         )
         identity_inputs = add_ler_guided_to_identity(
             identity_inputs,
@@ -1943,6 +1957,7 @@ def run_ablation_single(
                 total_steps=total_steps,
                 policy_seed=controller_cfg["policy_seed"],
                 max_consecutive_skips=max_consecutive_skips,
+                warmup_ratio=warmup_ratio,
             )
         )
         identity_inputs["phase_strat_controller"] = (
@@ -1956,6 +1971,7 @@ def run_ablation_single(
                 total_steps=total_steps,
                 policy_seed=controller_cfg["policy_seed"],
                 max_consecutive_skips=max_consecutive_skips,
+                warmup_ratio=warmup_ratio,
                 guarded=True,
                 rho_veto_threshold=rho_veto_threshold,
                 spike_factor=1.0,
@@ -2007,6 +2023,7 @@ def run_ablation_single(
             use_safety_horizon=use_safety_horizon,
             fallback_threshold=base_thr,
             risk_gamma=risk_gamma,
+            min_step=min_step,
             ler_guided_controller_config=ler_guided_controller_config,
         )
     else:
@@ -2015,7 +2032,7 @@ def run_ablation_single(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 total_steps=total_steps,
-                min_step=50,
+                min_step=min_step,
                 seed=seed,
                 max_consecutive_skips=max_consecutive_skips,
                 probe_interval=probe_interval,
@@ -2031,7 +2048,7 @@ def run_ablation_single(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 fallback_threshold=base_thr,
-                min_step=50,
+                min_step=min_step,
                 calibration_steps=60,
                 recalibrate_every=200,
                 use_ler=use_ler,
@@ -2047,7 +2064,7 @@ def run_ablation_single(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 total_steps=total_steps,
-                min_step=50,
+                min_step=min_step,
                 seed=seed,
                 max_consecutive_skips=max_consecutive_skips,
                 rho_veto_threshold=rho_veto_threshold,
@@ -2061,7 +2078,7 @@ def run_ablation_single(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 total_steps=total_steps,
-                min_step=50,
+                min_step=min_step,
                 seed=seed,
                 max_consecutive_skips=max_consecutive_skips,
                 rho_veto_threshold=rho_veto_threshold,
@@ -2074,7 +2091,7 @@ def run_ablation_single(
             skip_policy = FixedPhaseStratifiedRandomPolicy(
                 target_skip_rate=target_skip_rate,
                 total_steps=total_steps,
-                min_step=50,
+                min_step=min_step,
                 seed=seed,
             )
         elif policy == "random_veto_deferral":
@@ -2098,7 +2115,7 @@ def run_ablation_single(
                 ler_tracker=ler_tracker,
                 target_skip_rate=target_skip_rate,
                 fallback_threshold=base_thr,
-                min_step=50,
+                min_step=min_step,
                 calibration_steps=60,
                 recalibrate_every=200,
                 use_ler=use_ler,
@@ -2115,7 +2132,7 @@ def run_ablation_single(
     )
     if ablation_name == "reduced_steps":
         reduced_total_steps = round(total_steps * (1.0 - target_skip_rate))
-        reduced_min_step = round(POLICY_MIN_STEP * (1.0 - target_skip_rate))
+        reduced_min_step = round(min_step * (1.0 - target_skip_rate))
     else:
         reduced_total_steps = None
         reduced_min_step = None
@@ -2134,7 +2151,7 @@ def run_ablation_single(
         "compute_saving_mechanism": compute_saving_mechanism,
         "policy_seed": controller_cfg["policy_seed"],
         "target_skip_rate": target_skip_rate,
-        "min_step": POLICY_MIN_STEP,
+        "min_step": min_step,
         "configured_total_steps": total_steps,
         "requested_quota": requested_quota,
         "matched_budget": budget_state["matched_budget"],
@@ -2163,6 +2180,7 @@ def run_ablation_single(
                 total_steps=total_steps,
                 policy_seed=controller_cfg["policy_seed"],
                 max_consecutive_skips=max_consecutive_skips,
+                warmup_ratio=warmup_ratio,
             )
         )
     if effective_control == "phase_strat_guarded":
@@ -2173,6 +2191,7 @@ def run_ablation_single(
                 total_steps=total_steps,
                 policy_seed=controller_cfg["policy_seed"],
                 max_consecutive_skips=max_consecutive_skips,
+                warmup_ratio=warmup_ratio,
                 guarded=True,
                 rho_veto_threshold=rho_veto_threshold,
                 spike_factor=1.0,
@@ -2194,7 +2213,7 @@ def run_ablation_single(
             "target_skip_rate": float(target_skip_rate),
             "num_epochs": int(num_epochs),
             "total_steps": int(total_steps),
-            "min_step": POLICY_MIN_STEP,
+            "min_step": min_step,
             "requested_quota": requested_quota,
             "planned_skips": (
                 int(requested_quota) if requested_quota is not None else 0
@@ -2590,6 +2609,7 @@ def run_ablation_single(
                     total_steps=total_steps,
                     policy_seed=controller_cfg["policy_seed"],
                     max_consecutive_skips=max_consecutive_skips,
+                    warmup_ratio=warmup_ratio,
                 )
             )
         if effective_control == "phase_strat_guarded":
@@ -2600,6 +2620,7 @@ def run_ablation_single(
                     total_steps=total_steps,
                     policy_seed=controller_cfg["policy_seed"],
                     max_consecutive_skips=max_consecutive_skips,
+                    warmup_ratio=warmup_ratio,
                     guarded=True,
                     rho_veto_threshold=rho_veto_threshold,
                     spike_factor=1.0,

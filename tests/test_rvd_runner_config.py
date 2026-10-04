@@ -63,7 +63,7 @@ def build_control(control, controller_cfg=None):
         control=control,
         ler_tracker=FakeTracker(),
         target_skip_rate=0.20,
-        total_steps=400,
+        total_steps=5000,
         controller_cfg=controller_cfg or make_controller_config(),
         rho_veto_threshold=-0.05,
         probe_interval=8,
@@ -245,7 +245,7 @@ def test_controller_config_is_json_serializable_and_names_inactive_fields():
 
 
 def test_exact_random_and_rvd_none_have_identical_decisions():
-    total_steps = 400
+    total_steps = 5000
     exact = build_control("exact_random")
     rvd = build_control("rvd", make_controller_config(veto_mode="none"))
     trainer = StubTrainer(total_steps)

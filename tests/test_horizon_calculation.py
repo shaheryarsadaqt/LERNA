@@ -165,7 +165,7 @@ def test_exact_random_and_rvd_none_decisions_unchanged():
         def __init__(self, max_steps):
             self.state = type("State", (), {"global_step": 0, "max_steps": max_steps})()
 
-    total_steps = 160
+    total_steps = 6548
     exact = build_skip_policy(
         control="exact_random",
         ler_tracker=FakeTracker(),

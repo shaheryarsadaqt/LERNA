@@ -32,7 +32,7 @@ SEED = 7
 RATES = [0.30, 0.40]
 MODEL_ID = "synthetic-model"
 EPOCHS = 3
-TOTAL_STEPS = 200
+TOTAL_STEPS = 6548
 GIT_SHA = "0123abcd4567ef890123abcd4567ef8901234567"
 BASE_DIR = os.path.join("synthetic-results", "phase1_3")
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}\Z")
@@ -433,7 +433,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
              ),
         )
         self.assertEqual(STRICT_TARGET_SKIP_RATES, (0.30, 0.40))
-        self.assertEqual(POLICY_MIN_STEP, 50)
+        self.assertEqual(POLICY_MIN_STEP, 392)
 
     # 1. Complete valid 14-cell plan.
     def test_valid_plan_returns_empty_findings(self):
@@ -724,7 +724,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             ("matched_budget", False),
             ("no_early_stopping", False),
             ("scheduler_step_policy", "always_step"),
-            ("min_step", POLICY_MIN_STEP + 1),
+            ("min_step", 0),
         ]
         for field, value in cases:
             with self.subTest(field=field):
@@ -772,7 +772,7 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
                 self.assertIn("planned_skips", _fields(_findings(plan)))
 
     def test_infeasible_quota_rejected_without_clipping(self):
-        infeasible_rates = [0.30, 0.90]
+        infeasible_rates = [0.30, 0.95]
         plan = _build_plan(rates=infeasible_rates)
         findings = _findings(plan, target_skip_rates=infeasible_rates)
         self.assertIn(
@@ -948,7 +948,9 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
                 _set_sub(plan[FIXED], "phase_strat_controller", key, value)
                 self.assertIn(prefix + key, _fields(_findings(plan)))
 
-        big_quota = round(RATES[1] * TOTAL_STEPS)
+        mid = (POLICY_MIN_STEP + TOTAL_STEPS) // 2
+        phase_eligible_0 = mid - POLICY_MIN_STEP
+        big_quota = phase_eligible_0 + 10
         plan = _build_plan()
         _set_sub(
             plan[7 + FIXED],
@@ -956,6 +958,9 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
             "phase_quota",
             [big_quota - 4, 4],
         )
+        plan[7 + FIXED]["requested_quota"] = big_quota
+        plan[7 + FIXED]["planned_skips"] = big_quota
+        _refresh(plan[7 + FIXED])
         findings = _findings(plan)
         self.assertIn(
             "phase quota cannot exceed phase eligibility",

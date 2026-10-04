@@ -22,7 +22,7 @@ from scripts import run_ablation_study as runner
 TASK = "mrpc"
 SEED = 7
 MODEL_ID = "synthetic-model"
-TOTAL_STEPS = 200
+TOTAL_STEPS = 6548
 RATES = (0.30, 0.40)
 
 COMMON_CONTROLLER_FIELDS = {
@@ -257,7 +257,7 @@ def test_plan_phase1_3_cell_complete_canonical_projection(
     assert cell["target_skip_rate"] == rate
     assert cell["num_epochs"] == 5
     assert cell["total_steps"] == TOTAL_STEPS
-    assert cell["min_step"] == runner.POLICY_MIN_STEP
+    assert cell["min_step"] == int(TOTAL_STEPS * 0.06)
     assert cell["matched_budget"] is True
     assert cell["no_early_stopping"] is True
     assert cell["skip_update_mode"] == "freeze"
@@ -305,7 +305,7 @@ def test_plan_phase1_3_cell_complete_canonical_projection(
 
     if arm == "reduced_steps":
         expected_reduced = round(TOTAL_STEPS * (1.0 - rate))
-        expected_reduced_min = round(runner.POLICY_MIN_STEP * (1.0 - rate))
+        expected_reduced_min = int(int(TOTAL_STEPS * 0.06) * (1.0 - rate))
         assert cell["reduced_total_steps"] == expected_reduced
         assert cell["reduced_min_step"] == expected_reduced_min
         assert controller["reduced_total_steps"] == expected_reduced
@@ -404,16 +404,16 @@ def test_plan_phase1_3_cell_rejects_mismatches_and_infeasible_budget():
             "exact_random",
             scheduler_step_policy="always_step",
         )
-    with pytest.raises(ValueError, match="greater than POLICY_MIN_STEP"):
+    with pytest.raises(ValueError, match="total_steps must be greater than min_step"):
         _plan_cell(
             "full_finetune",
-            facts=_data_facts(total_steps=runner.POLICY_MIN_STEP),
+            facts=_data_facts(total_steps=0),
         )
-    with pytest.raises(ValueError, match="never clipped"):
+    with pytest.raises(ValueError, match="Infeasible skip quota"):
         _plan_cell(
             "exact_random",
-            0.90,
-            facts=_data_facts(total_steps=60),
+            0.99,
+            facts=_data_facts(total_steps=100),
         )
 
 
@@ -511,7 +511,9 @@ def _strict_plan_argv(*extra, output_dir=None, pilot=False):
 
 
 def _strict_data_facts(task):
-    facts = _data_facts(task=task, total_steps=575, num_epochs=3)
+    facts = _data_facts(
+        task=task, total_steps=runner.MRPC_TOTAL_STEPS, num_epochs=3
+    )
     facts.update(
         max_samples_requested=None,
         max_samples_effective=25000,
@@ -918,11 +920,11 @@ def _runtime_facts(task):
         "num_epochs": 3,
         "max_samples_requested": 2000,
         "max_samples_effective": 2000,
-        "train_samples_realized": 1000,
-        "eval_samples_realized": 1000,
+        "train_samples_realized": 13440,
+        "eval_samples_realized": 13440,
         "train_dataset_fingerprint": "runtime-dataset-fp",
         "eval_dataset_fingerprint": "runtime-dataset-fp",
-        "total_steps": 96,
+        "total_steps": 1260,
         "per_device_train_batch_size": 32,
         "gradient_accumulation_steps": 1,
         "effective_n_gpu": 1,
@@ -932,7 +934,7 @@ def _runtime_facts(task):
 def _install_runtime_gate_fakes(monkeypatch, task):
     hw_config = _hardware_config(max_samples=2000)
     hw_config.update(fp16=False, bf16=False)
-    dataset = FakeDataset(1000, "runtime-dataset-fp")
+    dataset = FakeDataset(13440, "runtime-dataset-fp")
     load_model = mock.Mock(return_value=(_FakeRuntimeModel(), object()))
     mkdir = mock.Mock()
     manifest = mock.Mock()
@@ -1018,6 +1020,7 @@ def test_all_arms_match_runtime_before_any_side_effect(
             skip_update_mode="freeze",
             scheduler_step_policy="skip_on_backward_skip",
             online_ler_mode="auto",
+            warmup_ratio=0.06,
             planned_cell=planned,
         )
 

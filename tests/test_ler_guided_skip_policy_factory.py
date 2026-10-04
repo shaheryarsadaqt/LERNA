@@ -70,8 +70,8 @@ class FakeLagTracker:
         }
 
 
-TOTAL_STEPS = 100
-MIN_STEP = 50
+TOTAL_STEPS = 6548
+MIN_STEP = 392
 RATE = 0.20
 
 
@@ -219,7 +219,7 @@ def test_factory_policy_reaches_exact_quota():
     decisions = run_stream(policy, tracker, commits)
     diag = policy.get_diagnostics()
     assert diag["decisions_seen"] == TOTAL_STEPS
-    assert diag["skip_decisions"] == diag["quota_size"] == int(RATE * TOTAL_STEPS)
+    assert diag["skip_decisions"] == diag["quota_size"] == round(RATE * TOTAL_STEPS)
     assert diag["quota_exact"] is True
     assert sum(decisions) == diag["quota_size"]
     assert not any(decisions[:MIN_STEP])

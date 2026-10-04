@@ -184,8 +184,8 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
     for index, run in enumerate(report["runs"]):
         rate = RATES[index // len(ARMS)]
         arm = ARMS[index % len(ARMS)]
-        expected_skips = 0 if arm in ("full_finetune", "reduced_steps") else round(rate * 100)
-        expected_backward = 100 - expected_skips
+        expected_skips = 0 if arm in ("full_finetune", "reduced_steps") else round(rate * synthetic.SYNTHETIC_TOTAL_STEPS)
+        expected_backward = synthetic.SYNTHETIC_TOTAL_STEPS - expected_skips
         assert run["cell_id"] == [synthetic.SYNTHETIC_TASK, 7, rate, arm]
         assert run["attempt"] == 1
         assert run["backward_calls"] == expected_backward
@@ -209,7 +209,7 @@ def test_real_matrix_has_exact_completed_contract(completed_matrices):
         assert results["model_revision"] == synthetic.SYNTHETIC_MODEL_REVISION
         assert manifest["run"]["model_id"] == synthetic.SYNTHETIC_MODEL_ID
         assert manifest["run"]["model_revision"] == synthetic.SYNTHETIC_MODEL_REVISION
-        assert instrumentation["forward_calls"] == 100
+        assert instrumentation["forward_calls"] == synthetic.SYNTHETIC_TOTAL_STEPS
         assert instrumentation["backward_calls"] == expected_backward
         assert instrumentation["skipped_backward_steps"] == expected_skips
         assert instrumentation["optimizer_step_attempts"] == expected_backward

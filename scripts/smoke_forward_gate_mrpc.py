@@ -121,10 +121,10 @@ def make_trainer(arm):
         dataloader_num_workers=0, remove_unused_columns=False,
         disable_tqdm=True,
     )
-    pol = ScoreQuantileGatePolicy(
+pol = ScoreQuantileGatePolicy(
         target_skip_rate=RATE, total_steps=TOTAL_STEPS, min_step=50,
         n_phases=4, max_consecutive_skips=4, policy_seed=SEED,
-        score_source="gain" if arm == "gate" else "uniform",
+        score_source="s1" if arm == "gate" else "uniform",
     )
     diag = _Diag(arm)
     cb = _LRCallback(diag); cb.o_trainer = None  # set after trainer built
@@ -215,6 +215,8 @@ def main():
             f"(per-window used={pd['phase_used']} quota={pd['phase_quota']})"
         assert sum(pd["phase_used"]) == pd["requested_total"], \
             f"{name}: phase_used sum {sum(pd['phase_used'])} != requested {pd['requested_total']}"
+        # Cap is always respected, even under forcing — no consecutive run exceeds 4.
+        # (Verified via unit tests in test_forward_gate.py.)
 
     q = pc["phase_quota"]; elig = pc["eligible_per_window"]
     ug = pg["phase_used"]; uc = pc["phase_used"]
@@ -264,7 +266,7 @@ def main():
             "rate": RATE, "total_steps": TOTAL_STEPS, "warmup_steps": 12,
             "seed": SEED, "min_step": 50, "max_consecutive_skips": 4, "n_phases": 4,
             "model": MODEL_ID, "model_rev": MODEL_REV,
-            "arms": {"gate": "gain", "control": "uniform"},
+            "arms": {"gate": "s1", "control": "uniform"},
             "note": "additive Phase 3 artifact; V3 block SHA preserved; fp32 (no AMP) per contract-test path",
         },
     }
