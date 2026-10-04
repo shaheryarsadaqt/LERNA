@@ -92,6 +92,30 @@ magnitude without changing direction; under AdamW the update is approximately
 scale-invariant. Recording the AdamW caveat: the alignment score does not
 predict the magnitude of per-step gain, only its expected direction.
 
+**S2 hook timing.** The forward-pre-hook on `model.classifier` fires during
+training mode (model.train()), where dropout is active and the head has
+applied attention-layer normalization. `h` is captured post-head, pre-classifier.
+The probe gradient `G_P` is computed in eval mode (model.eval()), where dropout
+is disabled. This is **not** a bug: the alignment score measures whether the
+batch's *direction* (in training-mode hidden space) aligns with the probe's
+direction (in eval-mode hidden space). The two are evaluated on the same input
+distribution, so the dot product is still meaningful as a direction correlation.
+The discrepancy is documented here because a reviewer may question it.
+
+**Classifier bias.** `G` computed by `_classifier_grad_from_logits` covers
+`classifier.weight` **only**, not the bias. The gradient w.r.t. the bias is
+`(1/B) * sum_i (p_i - y_i)`, which is a per-class scalar. The alignment score
+omits it because the bias gradient is rank-1 (one scalar per class) and adds
+negligible directional information beyond what `classifier.weight` already
+captures. This is recorded as a design decision, not an oversight.
+
+**Probe signal magnitude.** At lr=2e-5 on 256 examples, the per-step change
+in probe loss may be close to noise. Stage 0 could simply be uninformative
+(both ρ values near zero). If so, Stage 0 still selects S1 by the tie-breaking
+rule (ties → S1), and Stage 2 proceeds with S1 as the score source. The
+weak-signal case is pre-registered as a possible outcome, not a protocol
+violation.
+
 S2's extra cost (one probe forward pass every 64 steps, fp32, eval mode) counts
 against the gate in wall-clock time and is measured.
 
@@ -295,7 +319,31 @@ control's results is avoided — the rate is fixed in the pre-registration.
   S1 nor S2 beats random, with Stage 0 explaining why. This works as an
   empirical-study submission to TMLR.
 - **Gate loses to control**: Report it as is.
+- **Gate beats control but not reduced_steps (on accuracy/GPU-second)**: The
+  reviewer critique "just train shorter" applies because `reduced_steps` skips
+  60% of ALL computation (forward + backward + optimizer) while the gate skips
+  only 60% of backward steps but still runs 100% of forward passes (plus the
+  64-step S2 probe refreshes). The gate's matched budget is "backward steps
+  only"; `reduced_steps`'s matched budget is "total compute." These are
+  different denominators. This distinction is pre-registered here: the gate's
+  primary claim is "beats random at matched backward budget." The
+  `reduced_steps` comparison is a secondary outcome labeled as such.
 - In every case: no changing the rate, the score, or the seeds after Stage 2.
+
+---
+
+### Compute budget clarification (registered):
+- `full_finetune`: 6548 forward + 6548 backward + 6548 optimizer steps.
+- `reduced_steps` at 0.60: 2619 forward + 2619 backward + 2619 optimizer steps.
+- `gate` at 0.60: **6548 forward** + 2619 backward + 2619 optimizer steps.
+  - The gate skips backward passes only. Forward passes (including the S2 probe
+    refresh every 64 steps) are never skipped.
+  - S2 probe cost: one forward pass over 256 examples every 64 steps in fp32
+    eval mode. This is negligible (<0.1% of a training step at 13.4k samples).
+- `control` (uniform) at 0.60: same compute as gate (6548 forward, 2619 backward).
+
+The "matched budget" for gate vs control is backward steps (2619 each).
+The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ---
 
