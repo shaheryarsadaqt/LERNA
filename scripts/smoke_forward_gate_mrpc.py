@@ -39,6 +39,7 @@ from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 
 MODEL_ID = "jhu-clsp/ettin-encoder-150m"
 MODEL_REV = "45d08642849e5c5701b162671ac811b7654bfd9f"
+V4_PREREG_SHA = "2d20e935139dc97a0d962e576e0f659e6861ecbc"
 TOTAL_STEPS = 200
 RATE = 0.45
 SEED = 11
@@ -244,18 +245,19 @@ def main():
     print(f"  gate ms/step={r_gate['ms_per_step']:.1f} control={r_ctrl['ms_per_step']:.1f} "
           f"overhead={overhead:+.1f} ms/step")
 
-    # Provenance: the smoke is a new, additive Phase 1 artifact. It does NOT modify
-    # the frozen confirmatory block (commit 93ec6e4) — ScoreQuantileGatePolicy lives
-    # in the untracked lerna/utils/forward_gate.py and is exercised only here. The
-    # manifest records the code SHA it resolved against so any mismatch is rejected
-    # upstream, matching the validator's pre-reg-SHA enforcement.
+    # Provenance: the smoke is a new, additive Phase 3 artifact. It does NOT
+    # modify the frozen V3 QNLI block (SHA 93ec6e4) — the forward gate lives in
+    # the V4 code commit. The manifest records both the V3 retrospective SHA
+    # (for the frozen block) and the V4 code SHA (for the forward gate artifacts),
+    # matching the dual-SHA registry in experiments/PREREG_V4.md. The validator
+    # checks provenance.v3_retrospective_sha or v4_prereg_sha against --expected-sha.
     sha = _git_sha()
     summary = {
         "gate": r_gate, "control": r_ctrl,
         "max_lr_diff": max_diff, "overhead_ms_per_step": overhead,
              "provenance": {
             "v3_retrospective_sha": "93ec6e488a6d74f63d021d0f517cf81fdd892801",
-            "v4_prereg_sha": sha,
+            "v4_prereg_sha": V4_PREREG_SHA,
             "resolved_code_sha": sha,
             "tree_dirty": not _tree_clean(),
             "scheduler_step_policy": "always_step",
@@ -263,7 +265,7 @@ def main():
             "seed": SEED, "min_step": 50, "max_consecutive_skips": 4, "n_phases": 4,
             "model": MODEL_ID, "model_rev": MODEL_REV,
             "arms": {"gate": "gain", "control": "uniform"},
-            "note": "additive Phase 1 artifact; frozen block SHA preserved; fp32 (no AMP) per contract-test path",
+            "note": "additive Phase 3 artifact; V3 block SHA preserved; fp32 (no AMP) per contract-test path",
         },
     }
     json.dump(summary, open(OUT / "smoke_summary.json", "w"), indent=1, default=str)
