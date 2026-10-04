@@ -39,7 +39,7 @@ from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 
 MODEL_ID = "jhu-clsp/ettin-encoder-150m"
 MODEL_REV = "45d08642849e5c5701b162671ac811b7654bfd9f"
-V4_PREREG_SHA = "2d20e935139dc97a0d962e576e0f659e6861ecbc"
+V4_PREREG_SHA = "c618959a8c0e0b689585ffb3a648a5cea261cd1a"
 TOTAL_STEPS = 200
 RATE = 0.45
 SEED = 11

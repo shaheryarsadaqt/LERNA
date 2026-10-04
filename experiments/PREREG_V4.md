@@ -16,7 +16,7 @@ design (4 arms × 5 seeds × rate 0.30) is unchanged from V3 and inherited.
 | Field | Value | Purpose |
 |-------|-------|---------|
 | `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
-| `v4_prereg_sha` | `2d20e935139dc97a0d962e576e0f659e6861ecbc` | SHA of the V4 code commit containing this pre-registration + `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/validate_skip_policy_results.py` (SHA enforcement). |
+| `v4_prereg_sha` | `c618959a8c0e0b689585ffb3a648a5cea261cd1a` | SHA of the V4 code commit containing this pre-registration + `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/validate_skip_policy_results.py` (SHA enforcement). |
 
 The V4 code does **not** exist at `93ec6e4` — it is committed separately and
 additively. No V4 artifact rebases or modifies the V3 frozen block.
