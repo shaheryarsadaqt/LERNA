@@ -471,10 +471,30 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 |---------|-----|---------------------|
 | Gate estimator | backward LER | forward gain (S1) + alignment (S2) |
 | Score formula | ||p−y||² (documented) | ||p−y|| (code-accurate) |
-| min_step | 50 (smoke) | 392 (production; 50 for smoke) |
-| Forcing | forcing_fraction=0.8, cap override | exact feasibility check, cap always applies |
+| min_step | 50 (POLICY_MIN_STEP) | 392 (int(total_steps * 0.06); warmup_ratio=0.06) |
+| warmup_ratio | absent (hardcoded POLICY_MIN_STEP=50) | 0.06 (canonical V4) |
+| Forcing | forcing_fraction=0.8, cap override | exact feasibility check (per-phase + global), cap always applies |
 | Stage 0 | not run | oracle probe (seeds 101, 103) |
 | Rate | 0.30 (confirmatory), 0.60 (Gate A) | 0.60 (Stage 2, pre-registered) |
 | Seeds | 11, 13, 17, 19, 23 | 101, 103 (Stage 0) + 24 Stage 2 seeds |
 | S2 | absent | alignment score with probe |
 | Stage 1 | intermediate | dropped (rate fixed at 0.60) |
+
+**Provenance note (min_step / warmup_ratio change):**
+
+The V4 builders (`build_ler_guided_controller_config`, `build_phase_strat_controller_config`)
+add a `warmup_ratio: float = 0.06` parameter and compute `min_step = int(total_steps * 0.06)`.
+For QNLI (total_steps=6548), this yields `min_step=392`.
+
+V3 (frozen at `93ec6e4`) used `POLICY_MIN_STEP=50` with no `warmup_ratio` parameter.
+**V4 config dicts are NOT byte-for-byte identical to V3**: V3 cells have `min_step=50` in
+the config dict, V4 cells have `min_step=392` (for QNLI).
+
+This is a **deliberate protocol change**, not a bug. The `warmup_ratio` parameter is NOT
+stored in the config dict (only `min_step` is stored, as an integer). V4 cells are validated
+by the V4 validator (which checks `min_step == int(total_steps * 0.06)`). V3 cells remain
+frozen at `93ec6e4` and are validated by the V3 validator (which checks
+`min_step == POLICY_MIN_STEP == 50`).
+
+A V3 cell rebuilt with V4 builders would produce `min_step=392` and would FAIL the V3
+validator. This is by design — V4 is a new protocol revision.
