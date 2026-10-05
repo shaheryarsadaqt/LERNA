@@ -40,12 +40,12 @@ from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 MODEL_ID = "jhu-clsp/ettin-encoder-150m"
 MODEL_REV = "45d08642849e5c5701b162671ac811b7654bfd9f"
 def _v4_prereg_sha() -> str:
-    """Resolve the v4-prereg tag at runtime to avoid self-referential SHA in the
-    commit that creates the tag. The validator checks run_sha == git rev-parse v4-prereg.
+    """Resolve the v4-prereg-r1 tag at runtime. The validator checks
+    run_sha == git rev-parse v4-prereg-r1.
     """
     import subprocess
     try:
-        h = subprocess.run(["git", "rev-parse", "v4-prereg"], capture_output=True, text=True,
+        h = subprocess.run(["git", "rev-parse", "v4-prereg-r1"], capture_output=True, text=True,
                            cwd=str(Path(__file__).resolve().parents[1]))
         sha = h.stdout.strip()
         if sha and len(sha) == 40:

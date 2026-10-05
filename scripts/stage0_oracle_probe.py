@@ -1,10 +1,12 @@
 """Stage 0: oracle probe to select S1 or S2 for Stage 2.
 
 Runs full_finetune in shadow mode on two disjoint seeds (101, 103).
-At every 8th step, logs S1 (forward gain), S2 (alignment), old LER score,
-and realized gain on P_e (fp32, eval mode). Computes local Spearman ρ in
-trailing 64-step windows with moving-block bootstrap (block 64, 10k resamples)
-and selects the score with the higher per-seed ρ.
+At every 8th step, logs S1 (forward gain), S2 (alignment), and realized
+per-step gain on P_e. Computes local Spearman rho in non-overlapping
+windows of 64 logged points (512 actual steps), with cluster bootstrap
+(10k resamples) for descriptive CIs only. Selection uses the mean of
+per-window rho values, pooled over seeds 101 and 103, only in steps
+392-5761. Ties go to S1.
 
 Usage:
     python scripts/stage0_oracle_probe.py \
@@ -14,12 +16,13 @@ Usage:
         --model jhu-clsp/ettin-encoder-150m@45d0864 \
         --probe-size 256 \
         --log-interval 8 \
-        --probe-refresh 64 \
+        --probe-refresh 512 \
         --output-dir /raid/stage0_oracle_probe/
 
 Pre-registered: experiments/PREREG_V4.md §4.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -29,38 +32,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from scipy.stats import spearmanr
-
-
-def _max_skips_possible(r: int, k: int) -> int:
-    if r <= 0:
-        return 0
-    return k * (r // (k + 1)) + min(r % (k + 1), k)
-
-
-def _eligible_phase_quota(
-    rate: float, total_steps: int, min_step: int, n_phases: int
-) -> tuple[list[int], int, int, list[int]]:
-    requested_total = int(round(rate * total_steps))
-    windows = _phase_bounds(total_steps, n_phases)
-    eligible = [_eligible_steps_in_window(s, e, min_step) for (s, e) in windows]
-    total_eligible = sum(eligible)
-    if total_eligible <= 0:
-        return [0] * n_phases, 0, 0, eligible
-    if requested_total > total_eligible:
-        raise ValueError(
-            f"Infeasible: requested {requested_total} > eligible {total_eligible}"
-        )
-    raw = [requested_total * elig / total_eligible for elig in eligible]
-    quota = [int(math.floor(r)) for r in raw]
-    remainder = requested_total - sum(quota)
-    fracs = [raw[i] - quota[i] for i in range(n_phases)]
-    for _ in range(remainder):
-        j = max(range(n_phases), key=lambda i: (fracs[i] if eligible[i] > 0 else -1.0))
-        quota[j] += 1
-        fracs[j] = raw[j] - quota[j]
-    return quota, requested_total, total_eligible, eligible
 
 
 def _phase_bounds(total_steps: int, n_phases: int) -> list[tuple[int, int]]:
@@ -73,59 +45,9 @@ def _phase_bounds(total_steps: int, n_phases: int) -> list[tuple[int, int]]:
     return bounds
 
 
-def moving_block_bootstrap_ci(
-    data_x: list[float],
-    data_y: list[float],
-    block_size: int = 64,
-    n_resamples: int = 10000,
-    alpha: float = 0.05,
-) -> tuple[float, float, float]:
-    """Local Spearman with moving-block bootstrap 95% CI.
-
-    Returns (point_estimate, ci_lower, ci_upper).
-    """
-    n = len(data_x)
-    if n < 4:
-        return float("nan"), float("nan"), float("nan")
-
-    # Point estimate
-    rho, _ = spearmanr(data_x, data_y)
-    if math.isnan(rho):
-        rho = 0.0
-    rho = float(rho)
-
-    if n <= block_size:
-        # Single block — no resampling possible
-        return rho, float("nan"), float("nan")
-
-    # Moving block bootstrap
-    rng = np.random.RandomState(42)
-    n_blocks = math.ceil(n / block_size)
-    boot_rhos = []
-    for _ in range(n_resamples):
-        idx = []
-        for _b in range(n_blocks):
-            start = rng.randint(0, n - block_size) if n > block_size else 0
-            idx.extend(range(start, start + block_size))
-        idx = idx[:n]
-        if len(set(idx)) < n:
-            # Handle potential degenerate cases
-            pass
-        boot_x = [data_x[i] for i in idx]
-        boot_y = [data_y[i] for i in idx]
-        try:
-            b_rho, _ = spearmanr(boot_x, boot_y)
-            if b_rho is not None and not math.isnan(b_rho):
-                boot_rhos.append(b_rho)
-        except Exception:
-            pass
-
-    if not boot_rhos:
-        return rho, float("nan"), float("nan")
-
-    ci_lower = float(np.percentile(boot_rhos, 100 * (alpha / 2)))
-    ci_upper = float(np.percentile(boot_rhos, 100 * (1 - alpha / 2)))
-    return rho, ci_lower, ci_upper
+def _eligible_steps_in_window(start: int, end: int, min_step: int) -> int:
+    elig_start = max(start, min_step)
+    return max(0, end - elig_start)
 
 
 @dataclass
@@ -137,9 +59,101 @@ class Stage0Result:
     s2_spearman: list[float] = field(default_factory=list)
     s2_ci_lower: list[float] = field(default_factory=list)
     s2_ci_upper: list[float] = field(default_factory=list)
-    s1_max_rho: float = float("nan")
-    s2_max_rho: float = float("nan")
-    selected_score: str = "s1"
+    s1_mean_rho: float = float("nan")
+    s2_mean_rho: float = float("nan")
+    s1_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
+    s2_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
+
+
+def load_probe_indices(probe_file: str) -> dict:
+    with open(probe_file) as f:
+        data = json.load(f)
+    return data
+
+
+def compute_probe_loss(model, batch, device):
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=False):
+            out = model(**{k: v.to(device) for k, v in batch.items()})
+            return out.loss.item()
+
+
+def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
+    """Compute G_P = gradient of probe loss w.r.t. classifier.weight.
+
+    Uses _classifier_grad_from_logits on P_s (eval-mode hook), the same
+    function as G_B. Does NOT do a backward pass or zero_grad, so it
+    cannot wipe the training gradient.
+    """
+    from lerna.utils.forward_gate import _classifier_grad_from_logits
+
+    saved = {"training": model.training}
+    model.eval()
+    try:
+        probe_s_batch = {k: v.to(device) for k, v in probe_s_batch.items()}
+        with torch.no_grad():
+            out = model(**probe_s_batch)
+            logits = out.logits.detach()
+            labels = probe_s_batch["labels"]
+
+        hidden = alignment_probe_fn() if alignment_probe_fn else None
+        if hidden is None:
+            return None
+
+        G_P = _classifier_grad_from_logits(logits, labels, hidden)
+        return G_P
+    finally:
+        model.train(saved["training"])
+
+
+def cluster_bootstrap_ci(
+    data_x: list[float],
+    data_y: list[float],
+    n_windows: int,
+    n_resamples: int = 10000,
+    alpha: float = 0.05,
+) -> tuple[float, float, float]:
+    """Cluster bootstrap 95% CI.
+
+    data_x and data_y are per-window Spearman rho values (one per non-overlapping
+    window of 64 logged points = 512 steps). We resample whole windows with
+    replacement (cluster bootstrap), recompute the mean rho, and take the
+    2.5th and 97.5th percentiles.
+
+    Returns (mean_rho, ci_lower, ci_upper). Descriptive only.
+    """
+    n = len(data_x)
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    # Point estimate: mean of the per-window rho values
+    rhos = []
+    for x, y in zip(data_x, data_y):
+        if len(x) >= 4 and len(y) >= 4:
+            min_len = min(len(x), len(y))
+            rho, _ = spearmanr(x[:min_len], y[:min_len])
+            if rho is not None and not math.isnan(rho):
+                rhos.append(float(rho))
+
+    if not rhos:
+        return float("nan"), float("nan"), float("nan")
+
+    mean_rho = float(np.mean(rhos))
+
+    if n < 2:
+        return mean_rho, float("nan"), float("nan")
+
+    # Cluster bootstrap: resample whole windows
+    rng = np.random.RandomState(42)
+    boot_means = []
+    for _ in range(n_resamples):
+        idx = rng.randint(0, n, size=n)
+        boot_rhos = [rhos[i] for i in idx]
+        boot_means.append(float(np.mean(boot_rhos)))
+
+    ci_lower = float(np.percentile(boot_means, 100 * (alpha / 2)))
+    ci_upper = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
+    return mean_rho, ci_lower, ci_upper
 
 
 def run_stage0(
@@ -147,20 +161,22 @@ def run_stage0(
     model_name: str,
     total_steps: int,
     rate: float,
-    probe_size: int,
-    log_interval: int,
-    probe_refresh: int,
-    output_dir: str,
+    probe_indices_file: str,
+    log_interval: int = 8,
+    probe_refresh: int = 512,
+    output_dir: str = "/raid/stage0_oracle_probe/",
 ) -> Stage0Result:
-    """Run Stage 0 oracle probe for a single seed."""
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+    """Run Stage 0 oracle probe for a single seed.
+
+    Shadow mode: full_finetune (no skipping, backward every step).
+    """
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
@@ -168,38 +184,46 @@ def run_stage0(
         torch_dtype=torch.float32,
     )
 
-    # Get training data (QNLI)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
     from datasets import load_dataset
     raw = load_dataset("glue", "qnli", split="train")
     raw = raw.shuffle(seed=seed)
 
-    # Split into P_s, P_e, and train
-    all_ids = list(range(len(raw)))
-    probe_s_ids = set(all_ids[:probe_size])
-    probe_e_ids = set(all_ids[probe_size : 2 * probe_size])
-    train_ids = [i for i in all_ids if i not in probe_s_ids and i not in probe_e_ids]
+    # Use fixed probe indices (PROBE_SEED=0)
+    probe_data = load_probe_indices(probe_indices_file)
+    probe_s_ids = set(probe_data["probe_s_ids"])
+    probe_e_ids = set(probe_data["probe_e_ids"])
+    all_ids = set(range(len(raw)))
+    train_ids = sorted(all_ids - probe_s_ids - probe_e_ids)
 
-    assert len(probe_s_ids & probe_e_ids) == 0, "P_s and P_e overlap"
-    assert len(probe_s_ids & set(train_ids)) == 0, "P_s in train"
-    assert len(probe_e_ids & set(train_ids)) == 0, "P_e in training"
+    assert probe_s_ids.isdisjoint(probe_e_ids), "P_s and P_e overlap"
+    assert probe_s_ids.isdisjoint(train_ids), "P_s in train"
+    assert probe_e_ids.isdisjoint(train_ids), "P_e in train"
 
     probe_s = raw.select(sorted(probe_s_ids))
     probe_e = raw.select(sorted(probe_e_ids))
     train_ds = raw.select(train_ids)
 
-    # Tokenize
     def tokenize(batch):
-        return tokenizer(batch["sentence"], batch["sentence2"], truncation="max_length", padding="max_length", max_length=512)
+        return tokenizer(
+            batch["sentence"], batch["sentence2"],
+            truncation="max_length", padding="max_length", max_length=512
+        )
 
     probe_s = probe_s.map(tokenize, batched=True)
     probe_e = probe_e.map(tokenize, batched=True)
     train_ds = train_ds.map(tokenize, batched=True)
 
-    # Attach alignment probe hook to classifier
+    # Attach alignment probe
     from lerna.utils.forward_gate import AlignmentProbe
     alignment_probe = AlignmentProbe(model, hook_module_name="classifier")
 
-    # Optimizer (need state for S2)
+    def get_last_hidden():
+        return alignment_probe.last_hidden
+
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=2e-5,
@@ -209,56 +233,26 @@ def run_stage0(
     )
 
     # LR schedule (always_step contract)
-    warmup_steps = 392
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: min(1.0, step / warmup_steps) * max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps)) if step < total_steps else 0.0,
-    )
+    warmup_steps = int(total_steps * 0.06)  # 392 for QNLI
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        if step >= total_steps:
+            return 0.0
+        return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Pre-tokenize probe batches
     probe_s_batch = {
-        "input_ids": torch.tensor(probe_s["input_ids"]),
-        "attention_mask": torch.tensor(probe_s["attention_mask"]),
-        "labels": torch.tensor(probe_s["label"]),
+        "input_ids": torch.tensor(probe_s["input_ids"], device=device),
+        "attention_mask": torch.tensor(probe_s["attention_mask"], device=device),
+        "labels": torch.tensor(probe_s["label"], device=device),
     }
     probe_e_batch = {
-        "input_ids": torch.tensor(probe_e["input_ids"]),
-        "attention_mask": torch.tensor(probe_e["attention_mask"]),
-        "labels": torch.tensor(probe_e["label"]),
+        "input_ids": torch.tensor(probe_e["input_ids"], device=device),
+        "attention_mask": torch.tensor(probe_e["attention_mask"], device=device),
+        "labels": torch.tensor(probe_e["label"], device=device),
     }
 
-    def compute_probe_loss(model, batch):
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
-                out = model(**{k: v.to(model.device) for k, v in batch.items()})
-                return out.loss.item()
-
-    def compute_gp(model, probe_s_batch, optimizer):
-        """Compute G_P = gradient of probe loss w.r.t. classifier.weight."""
-        saved = {
-            "training": model.training,
-        }
-        model.eval()
-        try:
-            # Zero gradients, compute forward, get gradient
-            model.zero_grad()
-            with torch.enable_grad():
-                out = model(**{k: v.to(model.device) for k, v in probe_s_batch.items()})
-                loss = out.loss
-            G_P = None
-            for name, p in model.named_parameters():
-                if name == "classifier.weight":
-                    G_P = p.grad.detach().clone() / labels_shape_0(probe_s_batch)
-                    break
-            model.zero_grad()
-            return G_P
-        finally:
-            model.train(saved["training"])
-
-    def labels_shape_0(batch):
-        return batch["labels"].shape[0]
-
-    # Training loop (shadow mode: full_finetune, no skipping)
     dataloader = torch.utils.data.DataLoader(
         train_ds.remove_columns(["sentence", "sentence2", "idx"]),
         batch_size=32,
@@ -270,33 +264,29 @@ def run_stage0(
     # Logging
     step = 0
     s1_values = []
-    s2_values = {}
-    s2_values["gp"] = []    # G_P history for alignment
-    old_ler_values = []
-    pe_loss_history = []    # realized gain on P_e
+    s2_values = []
+    pe_gain_values = []  # F1 fix: per-step, correct sign
+    log_steps = []
 
-    # Track P_e loss at each log step for gain computation
+    # Track P_e loss at each log step
     pe_loss_at_step = {}
 
     print(f"[Stage 0] seed={seed}, total_steps={total_steps}, rate={rate}")
-    print(f"  P_s size={probe_size}, P_e size={probe_size}, log_interval={log_interval}")
+    print(f"  P_s size={len(probe_s_ids)}, P_e size={len(probe_e_ids)}, log_interval={log_interval}")
 
     # Initial P_e loss
-    model.eval()
-    with torch.no_grad():
-        pe_out = model(**{k: v.to(model.device) for k, v in probe_e_batch.items()})
-        pe_loss_initial = pe_out.loss.item()
-    pe_loss_at_step[0] = pe_loss_initial
-    model.train()
+    initial_pe_loss = compute_probe_loss(model, probe_e_batch, device)
+    pe_loss_at_step[0] = initial_pe_loss
 
     # Refresh G_P at step 0
-    gp = compute_gp(model, probe_s_batch, optimizer)
-    v = optimizer.state[dict(model.named_parameters())["classifier.weight"]]
-    v = v.get("exp_avg_sq") if v else None
-
-    last_gp = gp
-    last_v = v
+    last_gp = compute_gp_from_logits(model, probe_s_batch, device, get_last_hidden)
+    v_dict = optimizer.state[dict(model.named_parameters())["classifier.weight"]]
+    last_v = v_dict.get("exp_avg_sq") if v_dict else None
     last_v_step = 0
+
+    # Anneal range: steps 392-5761 only
+    min_step = warmup_steps
+    max_step = int(total_steps * 0.88)  # 5762 for QNLI, so range is 392-5761
 
     while step < total_steps:
         try:
@@ -305,10 +295,11 @@ def run_stage0(
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
 
-        batch = {k: v.to(model.device) for k, v in batch.items() if k in ("input_ids", "attention_mask", "labels")}
+        batch = {k: v.to(device) for k, v in batch.items() if k in ("input_ids", "attention_mask", "labels")}
 
         # Forward
         outputs = model(**batch)
+        logits = outputs.logits.detach()
         loss = outputs.loss
 
         # Backward (shadow mode: always backward)
@@ -319,117 +310,147 @@ def run_stage0(
         if step > 0 and step % log_interval == 0:
             # S1: forward gain score
             from lerna.utils.forward_gate import forward_gain_score
-            logits = outputs.logits.detach()
             s1 = forward_gain_score(logits, batch["labels"])
             s1_values.append(s1)
 
-            # S2: alignment score
-            if last_gp is not None and last_v is not None:
-                from lerna.utils.forward_gate import alignment_score
-                # alignment_score uses trainer._last_real_logits and trainer._alignment_probe
-                # but here we compute directly
-                h = alignment_probe.last_hidden
-                if h is not None:
-                    from lerna.utils.forward_gate import _classifier_grad_from_logits
-                    G_B = _classifier_grad_from_logits(logits, batch["labels"], h)
-                    normalized = last_gp / (last_v.sqrt() + 1e-8)
+            # S2: alignment score (using G_B = _classifier_grad_from_logits on current batch)
+            h = alignment_probe.last_hidden
+            if h is not None and last_gp is not None and last_v is not None:
+                from lerna.utils.forward_gate import _classifier_grad_from_logits
+                G_B = _classifier_grad_from_logits(logits, batch["labels"], h)
+                G_P_f = last_gp.float()
+                v_f = last_v.float()
+                if G_B.shape == G_P_f.shape == v_f.shape:
+                    normalized = G_P_f / (v_f.sqrt() + 1e-8)
                     s2 = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
-                    s2_values["gp"].append(s2)
                 else:
-                    s2_values["gp"].append(float("nan"))
+                    s2 = float("nan")
             else:
-                s2_values["gp"].append(float("nan"))
+                s2 = float("nan")
+            s2_values.append(s2)
 
-            # Old LER score (lagged sampled-LER) — logged but not used for selection
-            old_ler_values.append(0.0)  # placeholder; not implemented in shadow mode
+            # F1 fix: per-step gain, correct sign (before - after)
+            # We compute P_e loss BEFORE optimizer.step(), step, then compute AFTER.
+            pe_loss_before = compute_probe_loss(model, probe_e_batch, device)
 
-            # Realized gain on P_e
-            model.eval()
-            with torch.no_grad():
-                pe_out = model(**{k: v.to(model.device) for k, v in probe_e_batch.items()})
-                pe_loss = pe_out.loss.item()
-            pe_loss_at_step[step] = pe_loss
-            model.train()
+            # Optimizer step
+            optimizer.step()
+            scheduler.step()
 
-            # Refresh G_P every probe_refresh steps
+            pe_loss_after = compute_probe_loss(model, probe_e_batch, device)
+            gain = pe_loss_before - pe_loss_after  # positive = loss decreased = gain
+            pe_gain_values.append(gain)
+            pe_loss_at_step[step] = pe_loss_after
+            log_steps.append(step)
+
+            # Refresh G_P at probe_refresh interval
             if step % probe_refresh == 0 and step > 0:
-                last_gp = compute_gp(model, probe_s_batch, optimizer)
+                last_gp = compute_gp_from_logits(model, probe_s_batch, device, get_last_hidden)
                 v_dict = optimizer.state[dict(model.named_parameters())["classifier.weight"]]
                 last_v = v_dict.get("exp_avg_sq") if v_dict else None
                 last_v_step = step
-
-        # Optimizer step (shadow mode: always step)
-        optimizer.step()
-        scheduler.step()
+        else:
+            # Optimizer step (shadow mode: always step)
+            optimizer.step()
+            scheduler.step()
 
         step += 1
 
     # Remove hook
     alignment_probe.remove()
 
+    # Final P_e loss
+    final_pe_loss = compute_probe_loss(model, probe_e_batch, device)
+    pe_loss_at_step[step] = final_pe_loss
+
     # Compute realized gain
     pe_gains = []
-    log_steps = list(range(log_interval, total_steps, log_interval))
-    pe_loss_final = pe_loss_at_step.get(step, pe_loss_initial)
-    for i, s in enumerate(log_steps):
+    for s in log_steps:
         if s in pe_loss_at_step:
-            gain = pe_loss_at_step[s] - pe_loss_initial  # change in loss
+            gain = pe_loss_at_step[s] - initial_pe_loss
             pe_gains.append(gain)
 
-    # Compute Spearman in windows of 64 log steps
+    # F2/F3: compute rho in non-overlapping windows of 64 logged points
+    # (512 actual steps each), only in steps 392-5761
     result = Stage0Result(seed=seed)
 
-    # Use log_steps as x (step index), pe_gains as y (realized gain)
-    # Compute local Spearman in trailing 64-step windows
-    window_size = 64  # log entries per window = 64 * 8 = 512 actual steps
+    # Filter to logged points in [min_step, max_step]
+    eligible_indices = [
+        i for i, s in enumerate(log_steps) if min_step <= s <= max_step
+    ]
 
-    for score_name, score_values, spearmans, ci_lowers, ci_uppers, attr in [
-        ("s1", s1_values, result.s1_spearman, result.s1_ci_lower, result.s1_ci_upper, "s1_max_rho"),
-        ("s2", s2_values["gp"], result.s2_spearman, result.s2_ci_lower, result.s2_ci_upper, "s2_max_rho"),
+    window_size = 64  # 64 logged points = 512 actual steps
+
+    for score_name, score_values, spearmans, ci_lowers, ci_uppers, attr_mean in [
+        ("s1", s1_values, result.s1_spearman, result.s1_ci_lower, result.s1_ci_upper, "s1_mean_rho"),
+        ("s2", s2_values, result.s2_spearman, result.s2_ci_lower, result.s2_ci_upper, "s2_mean_rho"),
     ]:
-        n = len(score_values)
+        # Filter score values to eligible range
+        eligible_scores = [
+            (score_values[i] if i < len(score_values) else float("nan"))
+            for i in eligible_indices
+        ]
+        eligible_gains = [
+            (pe_gains[i] if i < len(pe_gains) else float("nan"))
+            for i in eligible_indices
+        ]
+
+        n = len(eligible_scores)
         if n < 4:
             continue
 
-        # Trailing windows of 64 entries
+        # Non-overlapping windows of 64 entries
+        window_rhos = []
+        window_ci_los = []
+        window_ci_his = []
         for start_idx in range(0, n, window_size):
             end_idx = min(start_idx + window_size, n)
             if end_idx - start_idx < 4:
                 continue
 
-            x = score_values[start_idx:end_idx]
-            y = pe_gains[start_idx:end_idx] if len(pe_gains) >= end_idx else pe_gains[start_idx:start_idx+len(pe_gains)]
+            x = eligible_scores[start_idx:end_idx]
+            y = eligible_gains[start_idx:end_idx]
 
-            # Align lengths
-            min_len = min(len(x), len(y))
-            if min_len < 4:
+            # Filter NaN
+            valid = [(xi, yi) for xi, yi in zip(x, y)
+                     if not (math.isnan(xi) if isinstance(xi, float) else False)
+                     and not (math.isnan(yi) if isinstance(yi, float) else False)]
+            if len(valid) < 4:
                 continue
-            x = x[:min_len]
-            y = y[:min_len]
 
-            rho, ci_lo, ci_hi = moving_block_bootstrap_ci(
-                x, y, block_size=min(64, min_len), n_resamples=10000
-            )
-            spearmans.append(rho)
-            ci_lowers.append(ci_lo)
-            ci_uppers.append(ci_hi)
+            vx = [v[0] for v in valid]
+            vy = [v[1] for v in valid]
+            min_len = min(len(vx), len(vy))
+            rho, _ = spearmanr(vx[:min_len], vy[:min_len])
+            if rho is not None and not math.isnan(rho):
+                window_rhos.append(float(rho))
+                spearmans.append(float(rho))
 
-        # Max per-seed rho
-        valid_rhos = [r for r in spearmans if not math.isnan(r)]
-        if valid_rhos:
-            setattr(result, attr, max(valid_rhos))
+        if not window_rhos:
+            continue
 
-    # Selection: higher max_rho wins; ties go to S1
-    if not math.isnan(result.s2_max_rho) and result.s2_max_rho > result.s1_max_rho:
-        result.selected_score = "s2"
-    else:
-        result.selected_score = "s1"
+        # F2: mean of per-window rho values
+        mean_rho = float(np.mean(window_rhos))
+        setattr(result, attr_mean, mean_rho)
+
+        # F3: cluster bootstrap CI (descriptive only)
+        if len(window_rhos) >= 2:
+            rng = np.random.RandomState(42)
+            boot_means = []
+            for _ in range(10000):
+                idx = rng.randint(0, len(window_rhos), size=len(window_rhos))
+                boot_means.append(float(np.mean([window_rhos[i] for i in idx])))
+            ci_lo = float(np.percentile(boot_means, 2.5))
+            ci_hi = float(np.percentile(boot_means, 97.5))
+        else:
+            ci_lo, ci_hi = float("nan"), float("nan")
+
+        if score_name == "s1":
+            result.s1_ci_per_seed = (ci_lo, ci_hi)
+        else:
+            result.s2_ci_per_seed = (ci_lo, ci_hi)
 
     return result
-
-
-def labels_shape_0(batch):
-    return batch["labels"].shape[0]
 
 
 def main():
@@ -438,11 +459,23 @@ def main():
     parser.add_argument("--rate", type=float, default=0.60)
     parser.add_argument("--total-steps", type=int, default=6548)
     parser.add_argument("--model", type=str, default="jhu-clsp/ettin-encoder-150m")
-    parser.add_argument("--probe-size", type=int, default=256)
+    parser.add_argument("--probe-file", type=str,
+                        default="experiments/probe_indices_v4.json")
     parser.add_argument("--log-interval", type=int, default=8)
-    parser.add_argument("--probe-refresh", type=int, default=64)
+    parser.add_argument("--probe-refresh", type=int, default=512)
     parser.add_argument("--output-dir", type=str, default="/raid/stage0_oracle_probe/")
     args = parser.parse_args()
+
+    # F6: verify probe file hash matches pre-reg
+    probe_hash = hashlib.sha256(
+        open(args.probe_file, "rb").read()
+    ).hexdigest()
+    with open(args.probe_file) as f:
+        probe_data = json.load(f)
+    expected_hash = probe_data.get("sha256")
+    if expected_hash and probe_hash != expected_hash:
+        print(f"FATAL: probe file hash mismatch. Expected {expected_hash}, got {probe_hash}")
+        sys.exit(1)
 
     results = {}
     for seed in args.seeds:
@@ -452,40 +485,42 @@ def main():
             model_name=args.model,
             total_steps=args.total_steps,
             rate=args.rate,
-            probe_size=args.probe_size,
+            probe_indices_file=args.probe_file,
             log_interval=args.log_interval,
             probe_refresh=args.probe_refresh,
             output_dir=args.output_dir,
         )
         results[seed] = {
             "s1_spearman": result.s1_spearman,
-            "s1_ci_lower": result.s1_ci_lower,
-            "s1_ci_upper": result.s1_ci_upper,
-            "s1_max_rho": result.s1_max_rho,
+            "s1_ci_per_seed": list(result.s1_ci_per_seed),
+            "s1_mean_rho": result.s1_mean_rho,
             "s2_spearman": result.s2_spearman,
-            "s2_ci_lower": result.s2_ci_lower,
-            "s2_ci_upper": result.s2_ci_upper,
-            "s2_max_rho": result.s2_max_rho,
-            "selected_score": result.selected_score,
+            "s2_ci_per_seed": list(result.s2_ci_per_seed),
+            "s2_mean_rho": result.s2_mean_rho,
+            "log_steps": list(range(args.log_interval, args.total_steps, args.log_interval)),
         }
-        print(f"  S1 max ρ: {result.s1_max_rho}")
-        print(f"  S2 max ρ: {result.s2_max_rho}")
-        print(f"  Selected: {result.selected_score}")
+        print(f"  S1 mean ρ: {result.s1_mean_rho}")
+        print(f"  S2 mean ρ: {result.s2_mean_rho}")
 
-    # Overall selection: take the higher of the two per-seed ρ values for each
-    # score, pick the score that is higher. Ties → S1.
-    s1_best = max(r["s1_max_rho"] for r in results.values() if not math.isnan(r["s1_max_rho"]))
-    s2_best = max(r["s2_max_rho"] for r in results.values() if not math.isnan(r["s2_max_rho"]))
-    selected = "s2" if s2_best > s1_best else "s1"
+    # F2: selection = mean of per-window rho, pooled over seeds, only in steps 392-5761
+    # Ties go to S1.
+    s1_mean = np.nanmean([r["s1_mean_rho"] for r in results.values()])
+    s2_mean = np.nanmean([r["s2_mean_rho"] for r in results.values()])
+
+    selected = "s1"  # ties go to S1
+    if not math.isnan(s2_mean) and (math.isnan(s1_mean) or s2_mean > s1_mean):
+        selected = "s2"
 
     output = {
         "stage": "stage0_oracle_probe",
         "seeds": args.seeds,
         "rate": args.rate,
         "total_steps": args.total_steps,
+        "probe_file": args.probe_file,
+        "probe_sha256": probe_hash,
         "selected_score": selected,
-        "s1_best_rho": s1_best,
-        "s2_best_rho": s2_best,
+        "s1_pooled_mean_rho": float(s1_mean) if not math.isnan(s1_mean) else None,
+        "s2_pooled_mean_rho": float(s2_mean) if not math.isnan(s2_mean) else None,
         "results_per_seed": results,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -495,10 +530,10 @@ def main():
         json.dump(output, f, indent=2)
 
     print(f"\n=== Stage 0 complete ===")
-    print(f"  S1 best ρ: {s1_best}")
-    print(f"  S2 best ρ: {s2_best}")
+    print(f"  S1 pooled mean ρ: {s1_mean}")
+    print(f"  S2 pooled mean ρ: {s2_mean}")
     print(f"  Selected score: {selected}")
-    print(f"  Written to: {os.path.join(args.output_dir, 'gate_a_decision.json')}")
+    print(f"  Probe SHA256: {probe_hash}")
 
 
 if __name__ == "__main__":

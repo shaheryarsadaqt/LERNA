@@ -833,6 +833,24 @@ class ScoreQuantileGatePolicy:
         if self.score_source_kind == "s2":
             if not hasattr(trainer, "_alignment_probe"):
                 trainer._alignment_probe = AlignmentProbe(model)
+            # F8: fail hard at min_step if probe not attached or score non-finite
+            instr = getattr(trainer, "instr", None)
+            idx = (getattr(instr, "batches_seen", 0) - 1) if instr is not None else self._gate.decisions_seen
+            if idx >= self._gate.min_step:
+                probe = getattr(trainer, "_alignment_probe", None)
+                assert probe is not None, (
+                    "FATAL: score_source='s2' but _alignment_probe is None at "
+                    f"step {idx}"
+                )
+                assert probe.last_hidden is not None, (
+                    "FATAL: score_source='s2' but AlignmentProbe.last_hidden is None "
+                    f"at step {idx} — hook not firing"
+                )
+                if self.alignment_probe_fn is None:
+                    raise RuntimeError(
+                        "FATAL: score_source='s2' but alignment_probe_fn is not set. "
+                        "S2 alignment score will be NaN."
+                    )
         instr = getattr(trainer, "instr", None)
         idx = (getattr(instr, "batches_seen", 0) - 1) if instr is not None else self._gate.decisions_seen
         if idx < 0:
