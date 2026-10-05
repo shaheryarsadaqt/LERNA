@@ -18,7 +18,7 @@ design (4 arms × 5 seeds × rate 0.30) is unchanged from V3 and inherited.
 | Field | Value | Purpose |
 |-------|-------|---------|
 | `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
-| `v4_prereg_sha` | `v4-prereg` (tag at commit `ce0afc2f77b3`) | Git tag pointing to the V4 pre-registration commit containing `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py`. The validator checks `run_sha == git rev-parse v4-prereg`. |
+| `v4_prereg_sha` | `v4-prereg` (tag at commit `c5a1b21f9873`) | Git tag pointing to the V4 pre-registration commit containing `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py`. The validator checks `run_sha == git rev-parse v4-prereg`. |
 
 The V4 code does **not** exist at `93ec6e4` — it is committed separately and
 additively. No V4 artifact rebases or modifies the V3 frozen block.
@@ -207,20 +207,39 @@ genuinely learned more from the skipped backward passes.
 - **S2** (`alignment_score`): last-layer alignment score. See §3.2.
 
 ### 5.3 Feasibility forcing (bug a fix)
-At each step, compute:
-- `skip_possible`: can quota be met if we skip now?
-  → `max_skips_possible(remaining_steps − 1, K) ≥ remaining_quota − 1`
-- `real_possible`: can quota be met if we run a real backward now?
-  → `max_skips_possible(remaining_steps − 1, K) ≥ remaining_quota`
+At each step (after `min_step`), compute TWO levels of feasibility:
 
-Where `F(r) = K · ⌊r/(K+1)⌋ + min(r mod (K+1), K)` is the exact maximum skips
-in `r` decisions under cap `K`.
+**Level 1 — Per-phase (local):**
+- `per_phase_skip_possible`: can THIS phase's remaining quota be met if we skip now?
+  → `max_skips_possible_with_consec(remaining_in_phase − 1, K, c+1) ≥ remaining_quota − 1`
+- `per_phase_real_possible`: can THIS phase's remaining quota be met if we backward now?
+  → `max_skips_possible(remaining_in_phase − 1, K) ≥ remaining_quota`
 
-Decision:
-- If neither is feasible → abort (should not happen post-init validation).
-- If only `real_possible` → force a real backward (`forced_skips += 1`).
-- If only `skip_possible` → force a skip (`forced_skips += 1`).
-- If both → the score decides (quantile or Bernoulli under annealing).
+Where `c` = current consecutive skip count, and:
+- `F(r) = K · ⌊r/(K+1)⌋ + min(r mod (K+1), K)` — max skips in `r` steps from 0 consecutive.
+- `F_with_consec(r, K, c)` — max skips in `r` steps starting with `c` consecutive (accounts for mid-stride carry-over; see `lerna/utils/forward_gate.py:148`).
+
+**Level 2 — Global (total across all remaining phases):**
+- `global_skip_possible`: can the TOTAL remaining quota be met if we skip now?
+  → `F_with_consec(total_remaining_steps − 1, K, c+1) ≥ total_remaining_quota − 1`
+- `global_real_possible`: can the TOTAL remaining quota be met if we backward now?
+  → `F(total_remaining_steps − 1, K) ≥ total_remaining_quota`
+
+> **Why global?** `sum(F(per_phase_remaining)) ≠ F(total_remaining)`. A phase can
+> be locally infeasible (its quota exceeds its local `F` bound) even when the
+> total is still achievable. The global check catches this and forces the correct
+> decision to ensure `realized_total == requested_total`.
+
+Decision flow (priority order):
+1. If per-phase is infeasible both ways → fall back to global check.
+   - If global infeasible both ways → don't skip (conservative, logged).
+   - If only `global_skip_possible` → force skip, `global_forced_skips += 1`.
+   - If only `global_real_possible` → force backward, `global_forced_skips += 1`.
+2. If only `per_phase_skip_possible` → force real backward, `forced_skips += 1`.
+3. If only `per_phase_real_possible` → force skip, `forced_skips += 1`.
+4. If both per-phase feasible → score decides (quantile or Bernoulli under annealing).
+
+The cap `K=4` (from the Phase 3 config) is ALWAYS respected, including under forcing — verified by unit test `test_forcing_respects_cap`.
 
 The cap (K=4) **always applies**, including to forced skips. No forcing
 overrides the cap. This ensures no leftover quota crosses a window boundary.
@@ -413,10 +432,10 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ## 12. Checklist Before Pre-Reg Commit
 
-1. **Cap revert + exact feasibility check**: Tests on adversarial score sequences
-   (monotone up, monotone down, constant, alternating) at 0.45 and 0.60 over 6548
-   steps: realized == requested, longest skip run ≤ 4, no infeasibility error.
-   → See `tests/test_forward_gate.py` (tests 15–16).
+1. **Per-step global feasibility enforcement**: Tests verify `realized == requested`
+   at 0.45 and 0.60 over 6548 steps, including when a phase is locally infeasible
+   but the global check recovers the total. Longest skip run ≤ 4 (cap respected
+   under forcing). → See `tests/test_forward_gate.py` (tests 15–17).
 
 2. **S2 hook + probe refresh**: On a tiny model, `G_B` (from
    `_classifier_grad_from_logits`) matches the autograd gradient for
@@ -435,7 +454,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    and `scheduler_step_calls == 6548`.
    → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
 
-6. **Clean git tree**: New `v4_prereg_sha` is `ce0afc2f77b3bc45f62638be02b0f37a784fd162` (tag `v4-prereg`). All fixes — including the per-step global feasibility enforcement — are included in this commit.
+6. **Clean git tree**: New `v4_prereg_sha` is `c5a1b21f98730c684294cd6c6fd5d72fc8a25ecf` (tag `v4-prereg`). All fixes — including the per-step global feasibility enforcement — are included in this commit.
    so it cannot be the run SHA.
 
 ---
