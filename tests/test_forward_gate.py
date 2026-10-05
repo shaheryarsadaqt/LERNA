@@ -20,6 +20,8 @@ Covers:
    17. phase_skip_positions diagnostic populated correctly
    18. max_skips_possible_with_consec accounts for mid-stride consecutive count
    19. window-boundary carry: skip run crossing phase boundary doesn't break quota
+   20. global per-step feasibility: total quota met even when a phase is locally infeasible
+   21. global forcing under high-rate adversarial scores — no drift"
 """
 
 import math
@@ -566,3 +568,68 @@ def test_window_boundary_carry_respects_quota():
     d = g.diagnostics()
     for used, quota in zip(d["phase_used"], d["phase_quota"]):
         assert used == quota
+
+
+def test_global_feasibility_forcing_when_per_phase_infeasible():
+    """When a phase becomes locally infeasible (remaining_quota > F(remaining_steps_in_phase, K)),
+    the global per-step feasibility check must still enforce the TOTAL quota.
+
+    We construct a scenario where one phase has an impossibly tight local F
+    bound but the global check can still enforce the total. We verify that
+    realized_total == requested_total despite local infeasibility.
+    """
+    K = 4
+    # 2 phases, total_steps=100, min_step=0 so both phases are fully eligible.
+    # Phase 0: [0,50), Phase 1: [50,100). rate=0.5 → requested_total=50.
+    # Allocate [25, 25] per phase (equal split for simplicity, but the gate
+    # computes via largest-remainder).
+    total = 100
+    min_step = 0
+    rate = 0.5
+    # Use scores that push skipping early in phase 0, creating a deficit that
+    # the global forcing must recover.
+    scores = [0.0] * total  # all scores 0.0 → always skip when not forced
+    g = ScoreQuantileGate(
+        rate=rate, total_steps=total, min_step=min_step, n_phases=2,
+        max_consecutive_skips=K, seed=1, score_source=_list_score_source(scores),
+    )
+    d = g.diagnostics()
+    # requested_total = round(0.5 * 100) = 50; both phases eligible (50 each).
+    assert d["requested_total"] == 50
+    skips = [g.decide(i, None, None) for i in range(total)]
+    # Verify the total quota is met exactly
+    d = g.diagnostics()
+    assert d["realized_total"] == d["requested_total"], (
+        f"Global per-step forcing failed: realized={d['realized_total']} "
+        f"!= requested={d['requested_total']}. phase_used={d['phase_used']} "
+        f"phase_quota={d['phase_quota']} forced={d['forced_skips']} "
+        f"global_forced={d['global_forced_skips']}"
+    )
+
+
+def test_global_feasibility_no_drift_on_high_rate():
+    """A high-rate gate (0.7) over 200 steps with K=4 must still realize exactly
+    round(0.7 * 200) = 140 skips, even under adversarial score sequences that
+    would let naive annealing drift."""
+    K = 4
+    total = 200
+    rate = 0.7
+    # Constant scores push the gate to skip whenever not forced backward by the cap.
+    scores = [0.0] * total
+    g = ScoreQuantileGate(
+        rate=rate, total_steps=total, min_step=0, n_phases=4,
+        max_consecutive_skips=K, seed=1, score_source=_list_score_source(scores),
+    )
+    skips = [g.decide(i, None, None) for i in range(total)]
+    d = g.diagnostics()
+    expected = round(rate * total)
+    assert d["realized_total"] == expected, (
+        f"realized={d['realized_total']} != expected={expected} "
+        f"(per-phase: {d['phase_used']}, quota: {d['phase_quota']})"
+    )
+    # Cap always respected
+    longest = cur = 0
+    for s in skips:
+        cur = cur + 1 if s else 0
+        longest = max(longest, cur)
+    assert longest <= K

@@ -16,7 +16,7 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-os.environ.setdefault("TORCH_LOGS", "+0")
+os.environ.setdefault("TORCH_LOGS", "")
 
 import sys, json, time
 from pathlib import Path
@@ -61,22 +61,24 @@ class _LRCallback(TrainerCallback):
         self.o = outer
     def on_step_end(self, args, state, control, **kwargs):
         try:
-            lr = float(self.o_trainer.optimizer.param_groups[0]["lr"]) if self.o_trainer else None
+            lr = float(self.o._trainer.optimizer.param_groups[0]["lr"]) if self.o._trainer else None
         except Exception:
             lr = None
         if lr is not None:
             self.o.lr.append(lr)
     def on_train_end(self, args, state, control, **kwargs):
         try:
-            instr = getattr(self.o_trainer, "instr", None)
+            instr = getattr(self.o._trainer, "instr", None)
             if instr is not None:
                 self.o.scheduler_step_calls = getattr(instr, "scheduler_step_calls", 0)
                 self.o.batches_seen = getattr(instr, "batches_seen", 0)
                 self.o.optimizer_step_attempts = getattr(instr, "optimizer_step_attempts", 0)
                 self.o.skipped_backward = getattr(instr, "skipped_backward_steps", 0)
-            self.o.policy_diag = self.o_trainer.skip_policy.get_diagnostics()
-            self.o.skipped_batches = getattr(self.o_trainer.instr, "skipped_batches", 0)
-            self.o.forward_calls = getattr(self.o_trainer.instr, "forward_calls", 0)
+            self.o.policy_diag = getattr(self.o._trainer, "skip_policy", None)
+            if self.o.policy_diag is not None:
+                self.o.policy_diag = self.o._trainer.skip_policy.get_diagnostics()
+            self.o.skipped_batches = getattr(instr, "skipped_batches", 0) if instr is not None else 0
+            self.o.forward_calls = getattr(instr, "forward_calls", 0) if instr is not None else 0
         except Exception as e:
             import traceback; traceback.print_exc()
             self.o.policy_diag = None
@@ -127,7 +129,7 @@ def make_trainer(arm):
         score_source="s1" if arm == "gate" else "uniform",
     )
     diag = _Diag(arm)
-    cb = _LRCallback(diag); cb.o_trainer = None  # set after trainer built
+    cb = _LRCallback(diag)
 
     def _acc(p):
         import numpy as np

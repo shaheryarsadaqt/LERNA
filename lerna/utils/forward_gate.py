@@ -262,6 +262,7 @@ class ScoreQuantileGate:
         self.cap_blocked = 0
         self.warmup_blocked = 0
         self.anneal_skips = 0
+        self.global_forced_skips = 0
 
         self._scores: Deque[float] = deque(maxlen=self.score_history_window)
 
@@ -286,12 +287,35 @@ class ScoreQuantileGate:
         return self.n_phases - 1
 
     def _remaining_in_phase(self, decision_index: int) -> tuple[int, int]:
-        """Return (remaining_quota, remaining_steps_decision) in the phase."""
+        """Return (remaining_quota, remaining_steps) in the current phase."""
         phase = self.phase_for(decision_index)
         start, end = self._phase_windows[phase]
         remaining_steps = max(0, end - decision_index)
         remaining_quota = max(0, self._phase_quota[phase] - self._phase_used[phase])
         return remaining_quota, remaining_steps
+
+    def _remaining_global(self, decision_index: int) -> tuple[int, int]:
+        """Return (total_remaining_quota, total_remaining_eligible_steps) across
+        all phases at or after the current decision index.
+
+        This is the GLOBAL feasibility basis for per-step forcing: the sum of
+        per-phase F values is NOT the same as F of the total, so we must check
+        global reachability at each step to guarantee realized == requested.
+        """
+        total_quota = 0
+        total_steps = 0
+        for phase in range(self.phase_for(decision_index), self.n_phases):
+            start, end = self._phase_windows[phase]
+            if end <= decision_index:
+                continue
+            # eligible steps in this phase (from decision_index onward)
+            elig_start = max(start, self.min_step)
+            if end <= elig_start:
+                continue
+            elig_in_phase = max(0, end - max(decision_index, elig_start))
+            total_steps += elig_in_phase
+            total_quota += max(0, self._phase_quota[phase] - self._phase_used[phase])
+        return total_quota, total_steps
 
     def note_score(self, score: float) -> None:
         """Observe a forward-computed score. Non-finite values are terminal.
@@ -344,45 +368,88 @@ class ScoreQuantileGate:
             return False
 
         # Exact feasibility check:
-        # - If we skip, the remaining (remaining_quota - 1) skips must be
-        #   achievable in the remaining (remaining_steps - 1) decisions,
-        #   starting from the new consecutive count (c+1).
-        # - If we do NOT skip, remaining_quota stays and remaining_steps
-        #   decreases by 1, starting from 0 consecutive (reset by the backward).
-        # - F(r, K) = K * floor(r/(K+1)) + min(r%(K+1), K) is the max skips in
-        #   r steps starting from 0 consecutive;
-        #   F_with_consec(r, K, c) accounts for a mid-stride run of c skips.
+        # We check BOTH per-phase and global reachability to guarantee
+        # realized == requested at end-of-run.
         #
-        # skip_possible: can we still hit quota if we skip now?
-        #   remaining_quota - 1 skips in remaining_steps - 1 steps, starting
-        #   from c+1 consecutive (c = self._consecutive_skips)
-        skip_possible = (
+        # Per-phase (local): if skipping now would make this phase's quota
+        # unreachable, or if not skipping would, we force the other choice.
+        #
+        # Global (total): the sum of per-phase F values is NOT the same as
+        # F(total), so we must also check global reachability. If the current
+        # phase is locally infeasible (cannot meet its quota either way), we
+        # fall back to the global check: force a skip if skipping is still
+        # globally feasible, or force a backward if not skipping is still
+        # globally feasible.
+        #
+        # - F(r, K) = K * floor(r/(K+1)) + min(r mod (K+1), K)
+        # - F_with_consec(r, K, c) = max skips in r steps starting with c
+        #   consecutive (c skips already in the current run).
+        #
+        # per_phase_skip_possible: can this phase still be satisfied if we skip now?
+        #   remaining_quota - 1 skips in remaining_steps - 1 steps (from c+1 consec)
+        per_phase_skip_possible = (
             max_skips_possible_with_consec(
                 remaining_steps - 1, K, self._consecutive_skips + 1
             )
             >= remaining_quota - 1
         )
-        # real_possible: can we still hit quota if we run a real backward now?
-        #   remaining_quota skips in remaining_steps - 1 steps, starting from 0
-        real_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota
+        # per_phase_real_possible: can this phase still be satisfied if we backward now?
+        #   remaining_quota skips in remaining_steps - 1 steps, starting from 0 consec
+        per_phase_real_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota
 
-        if not skip_possible and not real_possible:
-            # Infeasible: cannot meet quota either way. This should not happen
-            # because the quota was validated at init, but guard loudly.
-            self.note_score(score)
-            return False
-        elif not skip_possible:
-            # Skipping would make quota unreachable; a real backward is forced.
+        # Global check over ALL remaining phases (for cross-phase compensation).
+        total_quota, total_steps = self._remaining_global(decision_index)
+        # global_skip_possible: can the TOTAL quota still be met if we skip now?
+        global_skip_possible = (
+            max_skips_possible_with_consec(
+                total_steps - 1, K, self._consecutive_skips + 1
+            )
+            >= total_quota - 1
+        ) if total_quota > 0 else False
+        # global_real_possible: can the TOTAL quota still be met if we backward now?
+        global_real_possible = max_skips_possible(total_steps - 1, K) >= total_quota if total_quota > 0 else True
+
+        # Determine if we're forced in either direction.
+        # Priority:
+        # 1. Cap: at the consecutive limit, must backward.
+        # 2. Per-phase forcing: local check dominates when it's decisive.
+        # 3. Global forcing: if per-phase is infeasible both ways, use global.
+        if not per_phase_skip_possible and not per_phase_real_possible:
+            # Phase is locally infeasible (cannot meet its quota either way).
+            # Fall back to global reachability to minimize total deficit.
+            if not global_skip_possible and not global_real_possible:
+                # Globally infeasible too: cannot recover. Don't skip (conservative).
+                self.note_score(score)
+                return False
+            elif not global_real_possible:
+                # Not skipping is globally infeasible; force skip (minimize deficit).
+                self.global_forced_skips += 1
+                phase = self.phase_for(decision_index)
+                self._phase_used[phase] += 1
+                self.skipped += 1
+                self._consecutive_skips += 1
+                self._record_skip_position(decision_index, True)
+                self.note_score(score)
+                return True
+            else:
+                # global_skip_possible is False (skipping globally infeasible):
+                # force backward to preserve global quota.
+                self.global_forced_skips += 1
+                self.note_score(score)
+                return False
+        elif not per_phase_skip_possible:
+            # Skipping would make this phase's quota unreachable; force backward.
             self.forced_skips += 1
             self.note_score(score)
             return False
-        elif not real_possible:
-            # Not skipping would make quota unreachable; skip is forced.
+        elif not per_phase_real_possible:
+            # Not skipping would make this phase's quota unreachable; force skip.
             self.forced_skips += 1
             phase = self.phase_for(decision_index)
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
+            self._record_skip_position(decision_index, True)
             self.note_score(score)
             return True
 
@@ -468,6 +535,7 @@ class ScoreQuantileGate:
             "cap_blocked": self.cap_blocked,
             "warmup_blocked": self.warmup_blocked,
             "anneal_skips": self.anneal_skips,
+            "global_forced_skips": self.global_forced_skips,
             "decisions_seen": self.decisions_seen,
             "phase_skip_positions": window_positions,
             "terminal": self._terminal,

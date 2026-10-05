@@ -1,6 +1,6 @@
 # Gate A Decision — LER informativeness oracle test
 
-Date:            2026-10-04 (prepared; Stage 0 not yet run)
+Date:            2026-10-04 (template prepared; Stage 0 NOT YET RUN — no numbers populated)
 Runner SHA:      v4-prereg (tag at commit 93839a1)
 Score source:    S1 (||p-y||) / S2 (alignment) — selected by Stage 0
 Selected score:  PENDING Stage 0 GPU oracle probe (shadow mode, seeds 101/103)
