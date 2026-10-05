@@ -247,8 +247,10 @@ def run_stage0(
         padded = tokenizer.pad(batch_dict, padding="longest", max_length=512, return_tensors="pt")
         return {k: v.to(device) for k, v in padded.items()}
 
+    _cols_to_remove = [c for c in ("sentence", "sentence2", "idx", "label", "question", "token_type_ids")
+                       if c in train_ds.column_names]
     dataloader = torch.utils.data.DataLoader(
-        train_ds.remove_columns(["sentence", "sentence2", "idx", "label", "question"]),
+        train_ds.remove_columns(_cols_to_remove),
         batch_size=32,
         shuffle=True,
         generator=torch.Generator().manual_seed(seed),
