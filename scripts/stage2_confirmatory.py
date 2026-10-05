@@ -301,7 +301,7 @@ def run_cell(
 
     def tok_fn(x):
         out = tok(x["question"], x["sentence"], truncation=True,
-                   padding="max_length", max_length=512)
+                   max_length=512)
         out["labels"] = x["label"]
         return out
 
@@ -355,13 +355,12 @@ def run_cell(
         return {"accuracy": float((preds == np.asarray(p.label_ids)).mean())}
 
     def _collate(tokenizer):
-        import torch as _T
         def coll(batch):
-            return {
-                "input_ids": _T.tensor([d["input_ids"] for d in batch]),
-                "attention_mask": _T.tensor([d["attention_mask"] for d in batch]),
-                "labels": _T.tensor([d["labels"] for d in batch]),
-            }
+            to_pad = {k: [d[k] for d in batch] for k in ("input_ids", "attention_mask")}
+            labels = torch.tensor([d["labels"] for d in batch])
+            padded = tokenizer.pad(to_pad, padding="longest", max_length=512, return_tensors="pt")
+            padded["labels"] = labels
+            return padded
         return coll
 
     from transformers import TrainerCallback

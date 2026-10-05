@@ -58,6 +58,9 @@ class Stage0Result:
     s1_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
     s2_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
     log_steps: list[int] = field(default_factory=list)
+    # B12: reference predictors (descriptive only)
+    step_index_rho: float = float("nan")
+    batch_loss_rho: float = float("nan")
 
 
 def load_probe_indices(probe_file: str) -> dict:
@@ -67,10 +70,14 @@ def load_probe_indices(probe_file: str) -> dict:
 
 
 def compute_probe_loss(model, batch, device):
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=False):
+    saved = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
             out = model(**{k: v.to(device) for k, v in batch.items()})
             return out.loss.item()
+    finally:
+        model.train(saved)
 
 
 def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
@@ -104,6 +111,7 @@ def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
 def run_stage0(
     seed: int,
     model_name: str,
+    model_rev: str,
     total_steps: int,
     rate: float,
     probe_indices_file: str,
@@ -122,9 +130,10 @@ def run_stage0(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_rev)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
+        revision=model_rev,
         num_labels=2,
         torch_dtype=torch.float32,
     )
@@ -154,9 +163,10 @@ def run_stage0(
     train_ds = train_ds.shuffle(seed=seed)
 
     def tokenize(batch):
+        # B12: dynamic padding — no padding here, handled by DataLoader collate
         return tokenizer(
             batch["question"], batch["sentence"],
-            truncation=True, padding="max_length", max_length=512
+            truncation=True, max_length=512,
         )
 
     probe_s = probe_s.map(tokenize, batched=True)
@@ -194,17 +204,28 @@ def run_stage0(
         "attention_mask": torch.tensor(probe_s["attention_mask"], device=device),
         "labels": torch.tensor(probe_s["labels"], device=device),
     }
+    probe_s_batch = tokenizer.pad(probe_s_batch, padding="longest", max_length=512, return_tensors="pt")
+    probe_s_batch = {k: v.to(device) for k, v in probe_s_batch.items()}
     probe_e_batch = {
         "input_ids": torch.tensor(probe_e["input_ids"], device=device),
         "attention_mask": torch.tensor(probe_e["attention_mask"], device=device),
         "labels": torch.tensor(probe_e["labels"], device=device),
     }
+    probe_e_batch = tokenizer.pad(probe_e_batch, padding="longest", max_length=512, return_tensors="pt")
+    probe_e_batch = {k: v.to(device) for k, v in probe_e_batch.items()}
+
+    def _collate_fn(batch):
+        batch_dict = {k: [d[k] for d in batch] for k in ("input_ids", "attention_mask")}
+        batch_dict["labels"] = torch.tensor([d["labels"] for d in batch])
+        padded = tokenizer.pad(batch_dict, padding="longest", max_length=512, return_tensors="pt")
+        return {k: v.to(device) for k, v in padded.items()}
 
     dataloader = torch.utils.data.DataLoader(
         train_ds.remove_columns(["sentence", "sentence2", "idx"]),
         batch_size=32,
         shuffle=True,
         generator=torch.Generator().manual_seed(seed),
+        collate_fn=_collate_fn,
     )
     dataloader_iter = iter(dataloader)
 
@@ -213,6 +234,8 @@ def run_stage0(
     s1_values = []
     s2_values = []
     pe_gain_values = []  # F1 fix: per-step, correct sign
+    step_index_values = []  # B12: reference predictor
+    batch_loss_values = []  # B12: reference predictor
     log_steps = []
 
     # Track P_e loss at each log step
@@ -270,6 +293,10 @@ def run_stage0(
             else:
                 s2 = float("nan")
             s2_values.append(s2)
+
+            # B12: reference predictors (descriptive only)
+            step_index_values.append(float(step))
+            batch_loss_values.append(float(loss.item()))
 
             # F1 fix: per-step gain, correct sign (before - after)
             # We compute P_e loss BEFORE optimizer.step(), step, then compute AFTER.
@@ -386,6 +413,27 @@ def run_stage0(
         else:
             result.s2_ci_per_seed = (ci_lo, ci_hi)
 
+    # B12: reference predictor rho (step index and batch loss vs realized gain)
+    for ref_name, ref_values, attr in [
+        ("step_index", step_index_values, "step_index_rho"),
+        ("batch_loss", batch_loss_values, "batch_loss_rho"),
+    ]:
+        eligible_ref = [ref_values[i] for i in eligible_indices]
+        eligible_gains_ref = [pe_gain_values[i] for i in eligible_indices]
+        ref_rhos = []
+        for start_idx in range(0, len(eligible_ref), window_size):
+            end_idx = min(start_idx + window_size, len(eligible_ref))
+            if end_idx - start_idx < 4:
+                continue
+            rx = eligible_ref[start_idx:end_idx]
+            ry = eligible_gains_ref[start_idx:end_idx]
+            min_len = min(len(rx), len(ry))
+            rho, _ = spearmanr(rx[:min_len], ry[:min_len])
+            if rho is not None and not math.isnan(rho):
+                ref_rhos.append(float(rho))
+        if ref_rhos:
+            setattr(result, attr, float(np.mean(ref_rhos)))
+
     return result
 
 
@@ -422,6 +470,7 @@ def main():
     parser.add_argument("--rate", type=float, default=0.60)
     parser.add_argument("--total-steps", type=int, default=6548)
     parser.add_argument("--model", type=str, default="jhu-clsp/ettin-encoder-150m")
+    parser.add_argument("--model-rev", type=str, default="45d08642849e5c5701b162671ac811b7654bfd9f")
     parser.add_argument("--probe-file", type=str,
                         default="experiments/probe_indices_v4.json")
     parser.add_argument("--log-interval", type=int, default=8)
@@ -461,6 +510,7 @@ def main():
         result = run_stage0(
             seed=seed,
             model_name=args.model,
+            model_rev=args.model_rev,
             total_steps=args.total_steps,
             rate=args.rate,
             probe_indices_file=args.probe_file,
@@ -476,6 +526,8 @@ def main():
             "s2_ci_per_seed": list(result.s2_ci_per_seed),
             "s2_mean_rho": result.s2_mean_rho,
             "log_steps": result.log_steps,
+            "step_index_rho": result.step_index_rho,
+            "batch_loss_rho": result.batch_loss_rho,
         }
         print(f"  S1 mean ρ: {result.s1_mean_rho}")
         print(f"  S2 mean ρ: {result.s2_mean_rho}")
@@ -494,6 +546,8 @@ def main():
         "seeds": args.seeds,
         "rate": args.rate,
         "total_steps": args.total_steps,
+        "model": args.model,
+        "model_rev": args.model_rev,
         "probe_file": args.probe_file,
         "probe_ids_sha256": ids_sha,
         "run_sha": run_sha,

@@ -2058,13 +2058,64 @@ def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[
                    prov.get("codebase_checkout"),
                    "lerna not imported from repo checkout (may be site-packages)")
 
-    # Eval accuracy must be a finite float
+     # Eval accuracy must be a finite float
     acc = em.get("eval_accuracy")
     acc_float = _as_float(acc)
     if acc_float is None or not (0.0 <= acc_float <= 1.0):
-        report.add(SEVERITY_ERROR, "eval_metrics.eval_accuracy",
-                   "float in [0, 1]", acc,
-                   "eval_accuracy missing or out of range")
+         report.add(SEVERITY_ERROR, "eval_metrics.eval_accuracy",
+                    "float in [0, 1]", acc,
+                    "eval_accuracy missing or out of range")
+
+    # B2: Gate-specific numerical contracts
+    # realized_total == requested_total == round(rate×T)
+    realized = _as_int(diag.get("realized_skips"))
+    requested = _as_int(diag.get("requested_skips"))
+    rate = _as_float(diag.get("skip_rate"))
+    if rate is not None and total_steps is not None:
+        expected_skips = round(rate * total_steps)
+        if realized is not None and realized != expected_skips:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.realized_skips",
+                       expected_skips, realized,
+                       "realized_skips != round(rate×T)")
+        if requested is not None and requested != expected_skips:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.requested_skips",
+                       expected_skips, requested,
+                       "requested_skips != round(rate×T)")
+        if realized is not None and requested is not None and realized != requested:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.skip_parity",
+                       requested, realized,
+                       "realized_skips != requested_skips")
+
+    # longest_skip_run ≤ 4 (K=4 cap, B7)
+    longest_run = _as_int(diag.get("longest_skip_run"))
+    if longest_run is not None and longest_run > 4:
+        report.add(SEVERITY_ERROR, "policy_diagnostics.longest_skip_run",
+                   "≤ 4", longest_run,
+                   "longest consecutive skip run exceeds K=4 cap")
+
+    # global_forced_skips == 0 (no fallback forced skips, B7)
+    forced = _as_int(diag.get("global_forced_skips"))
+    if forced is not None and forced != 0:
+        report.add(SEVERITY_ERROR, "policy_diagnostics.global_forced_skips",
+                   0, forced,
+                   "forced skips must be 0 (cap K=4 never breached)")
+
+    # min_step == int(0.06×T) (B12: 6% of total steps)
+    min_step = _as_int(diag.get("min_step"))
+    if min_step is not None and total_steps is not None:
+        expected_min_step = int(total_steps * 0.06)
+        if min_step != expected_min_step:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.min_step",
+                       expected_min_step, min_step,
+                       "min_step must equal int(0.06×T)")
+
+    # anneal_start: for QNLI (T=6548) this must be 5762 (B12: anneal_start = T - 786)
+    anneal_start = _as_int(diag.get("anneal_start"))
+    if anneal_start is not None and total_steps == 6548:
+        if anneal_start != 5762:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.anneal_start",
+                       5762, anneal_start,
+                       "QNLI gate must have anneal_start == 5762")
 
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
