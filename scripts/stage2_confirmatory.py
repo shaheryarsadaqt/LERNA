@@ -243,7 +243,7 @@ def _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn=N
     from lerna.trainers.policies import AlwaysFalsePolicy
 
     if arm == "full_finetune":
-        return AlwaysFalsePolicy(seed=seed)
+        return AlwaysFalsePolicy()
 
     if arm in ("gate", "control"):
         score_source = score_kind if arm == "gate" else "uniform"
