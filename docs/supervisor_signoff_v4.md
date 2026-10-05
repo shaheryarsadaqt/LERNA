@@ -15,15 +15,15 @@
 LER's objective — minimize forward loss subject to a backward-step budget; i.e. minimize
 (loss ÷ compute) rather than loss alone — is unchanged from v3 / Selective Backprop
 (Jiang et al., 2019) and the gradient-norm bound it uses (Katharopoulos & Fleuret,
-2018). What moves is the **estimator**: v3 looks backward (gradient-based LER), v4 looks
-forward (forward-only gain proxy computed before the backward is spent). No new score is
-introduced — the v4 score is the gradient-norm upper bound already used in Selective
-Backprop — so there is no "new method" to defend on novelty. The contribution v4 registers
-is a **matched, pre-registered comparison** of the backward-looking and forward-looking
-estimators under an identical budget and identical strict (M2c) cell protocol.
-
-The supervisor should treat "forward gate vs backward gate" as a measurement, not an
-innovation claim.
+2018). What moves is the **estimator**: v3 uses a backward-pass gradient-norm (LER),
+v4 uses a forward-only proxy (the gradient-norm upper bound already used in Selective
+Backprop), computed before the backward is spent. No new score or method is introduced.
+The contribution v4 registers is a **matched, pre-registered comparison of a
+forward-predicted-gain gate vs a matched random control**, under an identical budget
+and identical strict (M2c) cell protocol. v3 LER results are retrospective context
+with known confounds (lagged sampling, momentum carryover); they carry no confirmatory
+claim in v4. The supervisor should treat "forward gate vs random control" as a
+measurement, not an innovation claim.
 
 ## Q2 — Is a two-sided null acceptable?
 
@@ -45,7 +45,7 @@ without the power bound; the thesis must still report the upper bound on effect 
 
 | Gate | Answer | Effective? |
 |---|---|---|
-| Same line vs new method | Same line (estimator comparison) | Yes |
+| Same line vs new method | Same line (forward gate vs random control) | Yes |
 | Two-sided null acceptable | Yes, with pre-reg fidelity + paired TOST reporting | Yes |
 
 ---

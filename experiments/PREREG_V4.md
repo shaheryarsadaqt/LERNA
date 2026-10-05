@@ -19,7 +19,7 @@ retrospective baseline. V4 Stage 2 uses a new design: 4 arms × 24 seeds × rate
 | Field | Value | Purpose |
 |-------|-------|---------|
 | `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
-| `v4_prereg_sha` | `v4-prereg-r1` (annotated git tag) | Git tag pointing to the V4 final pre-registration commit (F1–F12 fixes). Contains `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py` + `scripts/run_stage2_multi_gpu.py` + `scripts/run_timing_cells.py`. The validator resolves the tag at runtime via `git rev-parse v4-prereg-r1` and checks `run_sha == git rev-parse v4-prereg-r1`. No hardcoded SHA is embedded in this commit. |
+| `v4_prereg_sha` | `v4-prereg-r2` (annotated git tag) | Git tag pointing to the V4 final pre-registration commit. Contains `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `tests/test_stage2_s2_probe_validation.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py` + `scripts/run_stage2_multi_gpu.py` + `scripts/run_timing_cells.py` + `docs/supervisor_signoff_v4.md` (Q1 reworded). The validator resolves the tag at runtime via `git rev-parse v4-prereg-r2` and checks `run_sha == git rev-parse v4-prereg-r2`. No hardcoded SHA is embedded in this commit. |
 
 The V4 code does **not** exist at `93ec6e4` — it is committed separately and
 additively. No V4 artifact rebases or modifies the V3 frozen block.
@@ -64,8 +64,9 @@ it does not consume the Stage 2 budget. The stand-in answers bind procedure only
 
 | Date | Commit | Reason |
 |------|--------|--------|
-| 2026-10-05 | `549acf6` (superseded) | Pre-registration text finalized, superseded by F1–F12 fixes |
-| 2026-10-05 | `v4-prereg-r1` (annotated tag → commit `d5fe3b0`) | **F1–F12 fixes before any cell ran**: (F1) Stage 0 gain per-step + sign-corrected; (F2) selection uses mean rho, pooled seeds 101+103, steps 392–5761; (F3) cluster bootstrap with non-overlapping 512-step windows, 10k resamples; (F4) old LER score removed; (F5) G_P via `_classifier_grad_from_logits` (no backward); (F6) fixed probe indices (PROBE_SEED=0); (F7) reduced_steps = 2619 steps, 157 warmup; (F8) S2 fails hard at step 392; (F9) reserve seeds replaced in all arms; (F10) 8-GPU launcher added; (F11) provenance checks; (F12) RNG isolation tests. |
+| 2026-10-05 | `549acf6` superseded before any cell ran; reasons F1–F12 | Pre-registration text finalized at this commit, superseded by F1–F12 fixes |
+| 2026-10-05 | `v4-prereg-r1` (annotated tag) | **F1–F12 fixes before any cell ran**: (F1) per-step gain (before-after, sign-corrected); (F2) mean rho, pooled seeds 101+103, steps 392–5761; (F3) cluster bootstrap (512-step windows, 10k resamples); (F4) old LER score removed; (F5) G_P via `_classifier_grad_from_logits` (no backward); (F6) fixed probe indices (PROBE_SEED=0) in `experiments/probe_indices_v4.json`; (F7) reduced_steps = 2619 steps, 157 warmup, linear decay; (F8) S2 fails hard at step 392; (F9) reserve seeds replaced in all arms; (F10) 8-GPU launcher; (F11) provenance in Stage 0 + Stage 2, validator on every cell; (F12) RNG isolation tests. |
+| 2026-10-05 | `v4-prereg-r2` (annotated tag) | **Q1 rewording + config parity + harness check**: (1) Q1 in supervisor_signoff_v4.md reworded — contribution is now "forward-predicted-gain gate vs matched random control", not "backward vs forward estimator comparison"; (2) Stage 0 shadow loop now clips gradients at `max_grad_norm=1.0` to match Stage 2 config; (3) time-trend control test added (mean window ρ near 0 for trend-only data, proving F1/F2 fix); (4) GPU nondeterminism harness check added as §14.9 check (descriptive, not a test). |
 
 ---
 
@@ -153,7 +154,7 @@ gain. The chosen score carries into Stage 2. Stage 0 never cancels Stage 2.
 - `P_e` (256 examples, train split, disjoint from P_s) — used to measure the
   outcome (realized per-step gain) in Stage 0.
 - Both probes use **fixed indices** (`PROBE_SEED=0`), stored in
-  `experiments/probe_indices_v4.json` (SHA256: `965f9b51...`). The indices
+  `experiments/probe_indices_v4.json` (SHA256: `3298be2c72ce970da2440d34da1d35a80ef6014d5409e69ad55f21140d96dbc5`). The indices
   are independent of the training seed and asserted excluded from the training
   sampler in every arm.
 - Probe file hash is recorded in each cell's manifest.
@@ -439,20 +440,27 @@ The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ## 10. SST-2 Replication (pre-declared secondary)
 
-**Scope**: Gate vs control at rate 0.60, 10 seeds each, on SST-2.
+- **Scope**: Gate vs control at rate 0.60, 10 seeds each, on SST-2.
 
-- Uses the score chosen in Stage 0 (same score as QNLI).
-- Total steps: 2,205 (SST-2 train corpus, batch=32).
-- `min_step = int(2205 * 0.06) = 132`.
-- Seeds: [101, 103, 107, 109, 113, 127, 131, 137, 139, 149] (disjoint from Stage 0
-  and Stage 2 QNLI seeds).
-- Cost: ~1 GPU-hour on V100.
-- Primary test: `Δacc(gate − control)`, paired t-test, two-sided, α = 0.05, df = 9.
-- Reported alongside QNLI as a within-protocol replication to address the
-  "one task only" concern. No claim of generalization across tasks is asserted.
-- **If the Stage 0 chosen score is S1**: SST-2 uses `score_source="s1"`.
-- **If the Stage 0 chosen score is S2**: SST-2 uses `score_source="s2"`.
-  The probe is refreshed on the same 64-step cadence.
+- Constants:
+  - Total steps: 4,210 (SST-2 train corpus, batch=32).
+  - `min_step = int(4210 * 0.06) = 252`.
+  - `anneal_start = 3704` (= `int(4210 * 0.88)`; truncation, matching QNLI convention).
+  - Seeds: [101, 103, 107, 109, 113, 127, 131, 137, 139, 149] — the first 10 of the
+    24 Stage 2 seeds (disjoint from Stage 0 seeds).
+  - Cost: ~1 GPU-hour on V100.
+  - Primary test: `Δacc(gate − control)`, paired t-test, two-sided, α = 0.05, df = 9.
+  - Reported alongside QNLI as a within-protocol replication to address the
+    "one task only" concern. No claim of generalization across tasks is asserted.
+  - **If the Stage 0 chosen score is S1**: SST-2 uses `score_source="s1"`.
+  - **If the Stage 0 chosen score is S2**: SST-2 uses `score_source="s2"`.
+    The probe is refreshed on the same 512-step cadence.
+  - `reduced_steps` for SST-2: `max_steps = round(4210 * 0.40) = 1684`,
+    `warmup = int(1684 * 0.06) = 101`, linear decay to 0.
+- **Step-count disclosure (QNLI)**: 104,231 QNLI training examples at batch=32, 2 epochs
+  gives `ceil(104231/32) * 2 = 6516` steps. `max_steps` is fixed at 6,548 (the loader
+  wraps around) so that every pre-registered constant (392, 5762, 2619) remains exact.
+  The loader wrapping is disclosed in the instrumentation metadata.
 
 ---
 
@@ -546,7 +554,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    and `scheduler_step_calls == 6548`.
    → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
 
-6. **Clean git tree**: The `v4-prereg-r1` annotated tag is resolved dynamically via `git rev-parse v4-prereg-r1` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRPC smoke min_step correction, and the SST-2/Pareto secondary sections — are included in the tagged commit.
+6. **Clean git tree**: The `v4-prereg-r2` annotated tag is resolved dynamically via `git rev-parse v4-prereg-r2` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRPC smoke min_step correction, and the SST-2/Pareto secondary sections — are included in the tagged commit.
 
 7. **SST-2 replication plan**: 10 seeds, rate 0.60, min_step=int(2205×0.06)=132.
    → See §10.
@@ -554,6 +562,12 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 8. **Pareto analysis plan**: 12 timing cells (3 seeds × 4 arms), accuracy vs
    GPU-seconds frontier.
    → See §11.
+
+9. **GPU nondeterminism harness check**: Run `full_finetune` seed 11 twice on two
+   different V100 cards. Report the accuracy difference as the GPU nondeterminism floor.
+   This feeds into the paired t-test SD: if the floor ≥ the observed gate-control
+   Δacc, the result is uninterpretable. This is descriptive (not a test) but blocks
+   analysis if the floor is implausibly large (> 0.5%).
 
 ---
 

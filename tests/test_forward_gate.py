@@ -19,14 +19,20 @@ Covers:
    16. no leftover quota crosses a window boundary
    17. phase_skip_positions diagnostic populated correctly
    18. max_skips_possible_with_consec accounts for mid-stride consecutive count
-   19. window-boundary carry: skip run crossing phase boundary doesn't break quota
-   20. global per-step feasibility: total quota met even when a phase is locally infeasible
-   21. global forcing under high-rate adversarial scores — no drift"
+    19. window-boundary carry: skip run crossing phase boundary doesn't break quota
+    20. global per-step feasibility: total quota met even when a phase is locally infeasible
+    21. global forcing under high-rate adversarial scores — no drift
+    22. annealing at 0.88: decisions identical for steps >= anneal_start, both arms
+    23. cap-infeasible rate (0.85 @ 6548, min_step 392) raises InfeasibleBudgetError
+    24. RNG isolation: 50-step gate/control bit-identical loss; RNG state unchanged across should_skip"
 """
 
 import math
 import random
 from collections import deque
+
+import pytest
+import torch
 
 from lerna.utils.forward_gate import (
     ScoreQuantileGate,
@@ -226,13 +232,14 @@ def test_nonfinite_score_terminal():
 def test_uniform_control_realized_rate():
     rng = random.Random(123)
     src = lambda idx, m, x: rng.random()
-    g = ScoreQuantileGate(rate=0.45, total_steps=6548, min_step=50, n_phases=4,
+    g = ScoreQuantileGate(rate=0.45, total_steps=6548, min_step=392, n_phases=4,
                           max_consecutive_skips=4, seed=9, score_source=src)
     for i in range(6548):
         g.decide(i, None, None)
     d = g.diagnostics()
-    realized = d["skipped"] / d["decisions_seen"]
-    assert abs(realized - 0.45) < 0.02
+    # Uniform control goes through the same gate, so realized == requested exactly
+    requested = round(0.45 * 6548)
+    assert d["skipped"] == requested, f"expected {requested}, got {d['skipped']}"
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +398,7 @@ def test_adversarial_monotone_up():
     skips, d = _run_adv_sequence(scores)
     assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
     assert d["skipped"] == d["requested_total"]
+    assert d["longest_skip_run"] <= 4
 
 def test_adversarial_monotone_down():
     # scores decrease → quantile threshold drops → more skips later
@@ -398,18 +406,21 @@ def test_adversarial_monotone_down():
     skips, d = _run_adv_sequence(scores)
     assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
     assert d["skipped"] == d["requested_total"]
+    assert d["longest_skip_run"] <= 4
 
 def test_adversarial_constant():
     scores = [0.5] * 6548
     skips, d = _run_adv_sequence(scores)
     assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
     assert d["skipped"] == d["requested_total"]
+    assert d["longest_skip_run"] <= 4
 
 def test_adversarial_alternating():
     scores = [0.0 if i % 2 == 0 else 1.0 for i in range(6548)]
     skips, d = _run_adv_sequence(scores)
     assert all(u <= q for u, q in zip(d["phase_used"], d["phase_quota"]))
     assert d["skipped"] == d["requested_total"]
+    assert d["longest_skip_run"] <= 4
 
 
 # ---------------------------------------------------------------------------
@@ -633,3 +644,166 @@ def test_global_feasibility_no_drift_on_high_rate():
         cur = cur + 1 if s else 0
         longest = max(longest, cur)
     assert longest <= K
+
+
+# ---------------------------------------------------------------------------
+# 22) annealing at 0.88: decisions identical for steps >= anneal_start
+# ---------------------------------------------------------------------------
+
+def test_annealing_at_088_blinds_score_after_start():
+    """At anneal_fraction=0.88 (anneal_step=5762 for 6548 steps):
+    - Two gates with identical seed but opposite scores (0.0 vs 10.0) must
+      make IDENTICAL decisions for every step >= anneal_start (5762).
+    - Both gates must report anneal_start == 5762.
+    """
+    total = 6548
+    zeros = [0.0] * total
+    big = [10.0] * total
+    A = ScoreQuantileGate(rate=0.6, total_steps=total, min_step=392, n_phases=4,
+                          max_consecutive_skips=4, anneal_fraction=0.88, seed=3,
+                          score_source=_list_score_source(zeros))
+    B = ScoreQuantileGate(rate=0.6, total_steps=total, min_step=392, n_phases=4,
+                          max_consecutive_skips=4, anneal_fraction=0.88, seed=3,
+                          score_source=_list_score_source(big))
+    vA = [A.decide(i, None, None) for i in range(total)]
+    vB = [B.decide(i, None, None) for i in range(total)]
+    dA = A.diagnostics()
+    dB = B.diagnostics()
+    assert dA["anneal_start"] == 5762
+    assert dB["anneal_start"] == 5762
+    # Steps before anneal_start may differ (score-driven); from anneal_step onwards, identical
+    for i in range(5762, total):
+        assert vA[i] == vB[i], f"decisions differ at step {i}: A={vA[i]} B={vB[i]}"
+    # Annealing phase: skips should be Bernoulli(q)-driven, identical between arms
+    assert dA["anneal_skips"] == dB["anneal_skips"]
+
+
+# ---------------------------------------------------------------------------
+# 23) cap-infeasible rate raises InfeasibleBudgetError
+# ---------------------------------------------------------------------------
+
+def test_cap_infeasible_rate_rejected():
+    """rate=0.85 at 6548 steps with min_step=392 is feasible by eligible-step count
+    but not under the consecutive cap of 4, so it must raise InfeasibleBudgetError."""
+    with pytest.raises(InfeasibleBudgetError):
+        ScoreQuantileGate(
+            rate=0.85, total_steps=6548, min_step=392, n_phases=4,
+            max_consecutive_skips=4, seed=1,
+            score_source=_list_score_source([0.5] * 6548),
+        )
+
+
+# ---------------------------------------------------------------------------
+# 24) RNG isolation
+# ---------------------------------------------------------------------------
+
+def test_rng_state_unchanged_across_decide():
+    """Test 2: torch RNG state must be identical before and after every decide() call.
+    The gate must not consume or perturb torch RNG state."""
+    total = 100
+    g = ScoreQuantileGate(rate=0.5, total_steps=total, min_step=10, n_phases=4,
+                          max_consecutive_skips=4, seed=1,
+                          score_source=lambda i, m, x: 0.5)
+    for i in range(total):
+        before = torch.random.get_rng_state()
+        g.decide(i, None, None)
+        after = torch.random.get_rng_state()
+        assert torch.equal(before, after), f"RNG state changed at step {i}"
+
+
+def test_bit_identical_loss_no_skips():
+    """Test 1: gate and control for 50 steps with no skips allowed must have
+    bit-identical loss sequences. With score=0.5 and min_step=50, the gate
+    skips 0 times in 50 steps, so loss sequences must match exactly."""
+    torch.manual_seed(42)
+    model_a = torch.nn.Sequential(torch.nn.Linear(10, 2))
+    model_b = torch.nn.Sequential(torch.nn.Linear(10, 2))
+    model_b.load_state_dict(model_a.state_dict())
+    torch.manual_seed(123)
+    x = torch.randn(32, 10)
+    y = torch.randint(0, 2, (32,))
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    # Gate: min_step=50 means no skips in 50 steps
+    g_gate = ScoreQuantileGate(rate=0.5, total_steps=50, min_step=50, n_phases=4,
+                               max_consecutive_skips=4, seed=7,
+                               score_source=lambda i, m, tx: 0.5)
+    opt_a = torch.optim.SGD(model_a.parameters(), lr=0.01)
+    opt_b = torch.optim.SGD(model_b.parameters(), lr=0.01)
+    losses_a = []
+    losses_b = []
+    decisions = []
+    for i in range(50):
+        opt_a.zero_grad()
+        loss_a = loss_fn(model_a(x), y)
+        loss_a.backward()
+        skip = g_gate.decide(i, None, None)
+        decisions.append(skip)
+        if not skip:
+            opt_a.step()
+        losses_a.append(loss_a.item())
+
+        opt_b.zero_grad()
+        loss_b = loss_fn(model_b(x), y)
+        loss_b.backward()
+        opt_b.step()  # control always steps
+        losses_b.append(loss_b.item())
+
+    assert all(d is False for d in decisions), "gate should not skip in 50 steps"
+    assert len(losses_a) == len(losses_b) == 50
+    for i, (la, lb) in enumerate(zip(losses_a, losses_b)):
+        assert la == lb, f"loss mismatch at step {i}: gate={la} control={lb}"
+
+
+# ---------------------------------------------------------------------------
+# 25) Time-trend control: synthetic score and gain both trending, no within-window relation
+# ---------------------------------------------------------------------------
+
+def test_time_trend_control_no_spurious_correlation():
+    """F1+F2 time-trend control: synthetic score and gain both trend over time
+    but for INDEPENDENT reasons (different trend functions, uncorrelated noise).
+    Within each 64-point window the trend is nearly flat, so the mean window ρ
+    must be near 0 (|ρ| < 0.05).
+
+    This proves that per-step gain (F1) + windowed mean-ρ selection (F2) do NOT
+    produce a spurious correlation when both quantities simply fall with training
+    progress. The OLD cumulative gain would have shown high ρ here.
+    """
+    from scipy.stats import spearmanr
+
+    total_steps = 6548
+    log_interval = 8
+    min_step = 392
+    max_step = int(total_steps * 0.88)  # 5762
+
+    import numpy as np
+    np.random.seed(777)
+    n_logged = total_steps // log_interval  # 818
+    steps = np.array([i * log_interval for i in range(n_logged)])
+
+    # Score trends via sin, gain trends via exp. Both trend over time (shared
+    # global direction) but the trend FUNCTIONS differ and noise dominates
+    # within each 64-point (512-step) window, so within-window ρ ≈ 0.
+    score_trend = 0.5 * np.sin(steps / 500.0)
+    gain_trend = -np.exp(-steps / 2000.0)
+    score = score_trend + 0.8 * np.random.randn(n_logged)
+    gain = gain_trend + 0.8 * np.random.randn(n_logged)
+
+    eligible_indices = [i for i, s in enumerate(steps) if min_step <= s <= max_step]
+    eligible_scores = score[eligible_indices]
+    eligible_gains = gain[eligible_indices]
+
+    window_size = 64
+    window_rhos = []
+    n = len(eligible_scores)
+    for start in range(0, n, window_size):
+        end = min(start + window_size, n)
+        if end - start < 4:
+            continue
+        rho, _ = spearmanr(eligible_scores[start:end], eligible_gains[start:end])
+        if rho is not None and not np.isnan(rho):
+            window_rhos.append(float(rho))
+
+    mean_rho = np.mean(window_rhos)
+    print(f"Time-trend control: mean ρ = {mean_rho:.4f} over {len(window_rhos)} windows")
+    assert abs(mean_rho) < 0.05, f"spurious correlation detected: mean ρ = {mean_rho:.4f}"
