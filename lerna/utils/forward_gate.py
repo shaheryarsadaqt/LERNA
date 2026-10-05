@@ -850,7 +850,7 @@ class ScoreQuantileGatePolicy:
             elif score_source == "s1":
                 return forward_gain_score(
                     getattr(self._trainer_ref, "_last_real_logits", None),
-                    inputs.get("labels") if isinstance(inputs, dict) else None,
+                    inputs.get("labels") if inputs is not None and hasattr(inputs, "get") else None,
                 )
             else:  # s2
                 return alignment_score(
