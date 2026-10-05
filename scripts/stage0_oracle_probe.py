@@ -228,19 +228,15 @@ def run_stage0(
         return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    probe_s_batch = {
-        "input_ids": torch.tensor(probe_s["input_ids"], device=device),
-        "attention_mask": torch.tensor(probe_s["attention_mask"], device=device),
-        "labels": torch.tensor(probe_s["labels"], device=device),
-    }
-    probe_s_batch = tokenizer.pad(probe_s_batch, padding="longest", max_length=512, return_tensors="pt")
+    probe_s_batch = tokenizer.pad(
+        {"input_ids": probe_s["input_ids"], "attention_mask": probe_s["attention_mask"]},
+        padding="longest", max_length=512, return_tensors="pt")
+    probe_s_batch["labels"] = torch.tensor(probe_s["labels"])
     probe_s_batch = {k: v.to(device) for k, v in probe_s_batch.items()}
-    probe_e_batch = {
-        "input_ids": torch.tensor(probe_e["input_ids"], device=device),
-        "attention_mask": torch.tensor(probe_e["attention_mask"], device=device),
-        "labels": torch.tensor(probe_e["labels"], device=device),
-    }
-    probe_e_batch = tokenizer.pad(probe_e_batch, padding="longest", max_length=512, return_tensors="pt")
+    probe_e_batch = tokenizer.pad(
+        {"input_ids": probe_e["input_ids"], "attention_mask": probe_e["attention_mask"]},
+        padding="longest", max_length=512, return_tensors="pt")
+    probe_e_batch["labels"] = torch.tensor(probe_e["labels"])
     probe_e_batch = {k: v.to(device) for k, v in probe_e_batch.items()}
 
     def _collate_fn(batch):
