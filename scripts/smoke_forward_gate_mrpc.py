@@ -54,8 +54,9 @@ def _v4_prereg_sha() -> str:
         pass
     return "unknown"
 TOTAL_STEPS = 200
-RATE = 0.45
+RATE = 0.60
 SEED = 11
+MIN_STEP = int(TOTAL_STEPS * 0.06)  # 12 — V4 canonical warmup_ratio
 OUT = Path("/raid/smoke_forward_gate_mrpc")
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -137,7 +138,7 @@ def make_trainer(arm):
         disable_tqdm=True,
     )
     pol = ScoreQuantileGatePolicy(
-        target_skip_rate=RATE, total_steps=TOTAL_STEPS, min_step=50,
+        target_skip_rate=RATE, total_steps=TOTAL_STEPS, min_step=MIN_STEP,
         n_phases=4, max_consecutive_skips=4, policy_seed=SEED,
         score_source="s1" if arm == "gate" else "uniform",
     )
@@ -249,6 +250,14 @@ def main():
     assert r_ctrl["scheduler_step_calls"] == r_ctrl["batches_seen"], \
         f"always_step contract violated (control): sched={r_ctrl['scheduler_step_calls']} batches={r_ctrl['batches_seen']}"
 
+    # Global-feasibility fallback must never fire when the rate and horizon
+    # make every per-phase quota locally achievable. If it does, the quota
+    # allocation is broken. Assert zero fallbacks for both arms.
+    for name, pd in (("gate", pg), ("control", pc)):
+        assert pd["global_forced_skips"] == 0, \
+            f"{name}: global_forced_skips={pd['global_forced_skips']} != 0 — " \
+            f"per-phase quota allocation is infeasible for this rate/horizon"
+
     lrg = r_gate["lr_curve"]; lrc = r_ctrl["lr_curve"]
     max_diff = max(abs(a - b) for a, b in zip(lrg, lrc)) if lrg and lrc else None
     assert max_diff is not None and max_diff < 1e-9, \
@@ -279,7 +288,7 @@ def main():
             "tree_dirty": not _tree_clean(),
             "scheduler_step_policy": "always_step",
             "rate": RATE, "total_steps": TOTAL_STEPS, "warmup_steps": 12,
-            "seed": SEED, "min_step": 50, "max_consecutive_skips": 4, "n_phases": 4,
+            "seed": SEED,             "min_step": MIN_STEP, "max_consecutive_skips": 4, "n_phases": 4,
             "model": MODEL_ID, "model_rev": MODEL_REV,
             "arms": {"gate": "s1", "control": "uniform"},
             "note": "additive Phase 3 artifact; V3 block SHA preserved; fp32 (no AMP) per contract-test path",

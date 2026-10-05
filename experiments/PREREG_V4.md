@@ -6,8 +6,9 @@ permitted; Stage 2 GPU cells are **blocked** until this page bears the real
 supervisor's or committee member's countersignature
 (see `docs/supervisor_signoff_v4.md`).
 **Date**: 2026-10-04
-**Derived from**: V3 (`FULL_EXPERIMENT_PREREGISTATION_V3.md`); QNLI confirmatory
-design (4 arms × 5 seeds × rate 0.30) is unchanged from V3 and inherited.
+**Derived from**: V3 (`FULL_EXPERIMENT_PREREGISTATION_V3.md`). The V3 QNLI confirmatory
+result (4 arms × 5 seeds × rate 0.30, frozen at SHA `93ec6e4`) serves as the
+retrospective baseline. V4 Stage 2 uses a new design: 4 arms × 24 seeds × rate 0.60.
 
 ---
 
@@ -39,9 +40,19 @@ Both gates are answered in `docs/supervisor_signoff_v4.md`:
    The primary test is a two-sided α = 0.05 paired t-test (df = n−1). Separately,
    a pre-registered TOST equivalence bound (two one-sided tests, α = 0.05 each) is
    reported as a secondary analysis to bound the effect size in the event of a null.
-   A null is a publishable non-trivial outcome (Kaddour et al., NeurIPS 2023),
-   provided the upper bound on effect at n seeds is reported (Path B wording
-   mandatory). Answer: **yes with conditions**.
+   A null is a publishable non-trivial outcome (Kaddour et al., NeurIPS 2023;
+   arXiv 2312.05021), provided the upper bound on effect at n seeds is reported
+   (Path B wording mandatory). Answer: **yes with conditions**.
+
+**Supervisor answers recorded (closing the hard-gate questions):**
+1. "LER v4 = same research line" → **yes** — V4 extends V3's skip-rate-ablation framework
+   with a forward-predicted-gain gate; the QNLI 0.30 block at SHA `93ec6e4` serves as
+   the retrospective baseline.
+2. "Two-sided null acceptable in writing" → **yes** (see above).
+
+These answers close the hard-gate questions. The CLI will not list them as blockers.
+The stale references to "QNLI 0.30 Stage 2" and "v3 Kaddour path" in earlier drafts
+are removed — the V3 block is retrospectively informative, not part of the Stage 2 test.
 
 **Physical supervisor signature required** before any Stage-2 GPU cell runs.
 Stage 0 (oracle probe) runs at the supervisor's discretion but is not blocked;
@@ -355,8 +366,15 @@ giving the gate the most room to beat it. Choosing the rate after seeing
 control's results is avoided — the rate is fixed in the pre-registration.
 
 ### Outcomes, written down before running:
-- **Gate beats control**: "A forward-predicted-gain gate beats random at matched
-  backward budget." Stage 0 ρ values are the mechanism evidence.
+- **Gate beats control**: "A forward-predicted-gain gate beats random at a
+  matched backward-step count" (60% of backward passes skipped in the gate
+  arm, 60% of backward passes run in the control arm). Stage 0 ρ values are
+  the mechanism evidence.
+  > **Note on matched budget:** the gate and control share the same forward
+  > pass budget (100% of forward passes) and the same backward-step budget
+  > (60% of total backward steps). `reduced_steps` is a *different* comparison
+  > — it skips 60% of ALL computation (forward + backward + optimizer). The gate's
+  > claim is scoped to settings where the forward pass cost is already sunk.
 - **Null**: The headline becomes the efficiency study: 60% backward skipping
   compared with full_finetune and reduced_steps, plus the finding that neither
   S1 nor S2 beats random, with Stage 0 explaining why. This works as an
@@ -366,11 +384,11 @@ control's results is avoided — the rate is fixed in the pre-registration.
   reviewer critique "just train shorter" applies because `reduced_steps` skips
   60% of ALL computation (forward + backward + optimizer) while the gate skips
   only 60% of backward steps but still runs 100% of forward passes (plus the
-  64-step S2 probe refreshes). The gate's matched budget is "backward steps
-  only"; `reduced_steps`'s matched budget is "total compute." These are
-  different denominators. This distinction is pre-registered here: the gate's
-  primary claim is "beats random at matched backward budget." The
-  `reduced_steps` comparison is a secondary outcome labeled as such.
+  64-step S2 probe refreshes). The gate's budget is "backward steps only";
+  `reduced_steps`'s budget is "total compute." These are different denominators.
+  This distinction is pre-registered here: the gate's primary claim is
+  "beats random at matched backward-step count." The `reduced_steps`
+  comparison is a secondary outcome labeled as such.
 - In every case: no changing the rate, the score, or the seeds after Stage 2.
 
 ---
