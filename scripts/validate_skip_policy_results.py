@@ -2117,6 +2117,15 @@ def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[
                        5762, anneal_start,
                        "QNLI gate must have anneal_start == 5762")
 
+    # phase_used == phase_quota (B12: each annealing phase must use its full quota)
+    phase_used = diag.get("phase_used")
+    phase_quota = diag.get("phase_quota")
+    if phase_used is not None and phase_quota is not None:
+        if phase_used != phase_quota:
+            report.add(SEVERITY_ERROR, "policy_diagnostics.phase_used_vs_quota",
+                       phase_quota, phase_used,
+                       "phase_used must equal phase_quota")
+
 
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
                      count_tolerance: int = 0,
