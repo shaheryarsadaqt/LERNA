@@ -269,7 +269,7 @@ def _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn=N
         return pol
 
     # reduced_steps handled as a TrainingArguments difference, not a policy
-    return AlwaysFalsePolicy(seed=seed)
+    return AlwaysFalsePolicy()
 
 
 def _build_training_args(
