@@ -39,7 +39,20 @@ from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 
 MODEL_ID = "jhu-clsp/ettin-encoder-150m"
 MODEL_REV = "45d08642849e5c5701b162671ac811b7654bfd9f"
-V4_PREREG_SHA = "fc32f7fd28d378d0776b927fcb2d16d37947c884"
+def _v4_prereg_sha() -> str:
+    """Resolve the v4-prereg tag at runtime to avoid self-referential SHA in the
+    commit that creates the tag. The validator checks run_sha == git rev-parse v4-prereg.
+    """
+    import subprocess
+    try:
+        h = subprocess.run(["git", "rev-parse", "v4-prereg"], capture_output=True, text=True,
+                           cwd=str(Path(__file__).resolve().parents[1]))
+        sha = h.stdout.strip()
+        if sha and len(sha) == 40:
+            return sha
+    except Exception:
+        pass
+    return "unknown"
 TOTAL_STEPS = 200
 RATE = 0.45
 SEED = 11
@@ -261,7 +274,7 @@ def main():
         "max_lr_diff": max_diff, "overhead_ms_per_step": overhead,
              "provenance": {
             "v3_retrospective_sha": "93ec6e488a6d74f63d021d0f517cf81fdd892801",
-            "v4_prereg_sha": V4_PREREG_SHA,
+             "v4_prereg_sha": _v4_prereg_sha(),
             "resolved_code_sha": sha,
             "tree_dirty": not _tree_clean(),
             "scheduler_step_policy": "always_step",
