@@ -18,7 +18,7 @@ design (4 arms × 5 seeds × rate 0.30) is unchanged from V3 and inherited.
 | Field | Value | Purpose |
 |-------|-------|---------|
 | `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
-| `v4_prereg_sha` | `v4-prereg` (tag at commit `c5a1b21f9873`) | Git tag pointing to the V4 pre-registration commit containing `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py`. The validator checks `run_sha == git rev-parse v4-prereg`. |
+| `v4_prereg_sha` | `v4-prereg` (tag at commit `fc32f7fd28d3`) | Git tag pointing to the V4 pre-registration commit containing `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py`. The validator checks `run_sha == git rev-parse v4-prereg`. |
 
 The V4 code does **not** exist at `93ec6e4` — it is committed separately and
 additively. No V4 artifact rebases or modifies the V3 frozen block.
@@ -454,7 +454,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    and `scheduler_step_calls == 6548`.
    → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
 
-6. **Clean git tree**: New `v4_prereg_sha` is `c5a1b21f98730c684294cd6c6fd5d72fc8a25ecf` (tag `v4-prereg`). All fixes — including the per-step global feasibility enforcement — are included in this commit.
+6. **Clean git tree**: New `v4_prereg_sha` is `fc32f7fd28d378d0776b927fcb2d16d37947c884` (tag `v4-prereg`). All fixes — including the per-step global feasibility enforcement and its pre-reg documentation — are included in this commit.
    so it cannot be the run SHA.
 
 ---
