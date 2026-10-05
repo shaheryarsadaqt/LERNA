@@ -60,11 +60,20 @@ it does not consume the Stage 2 budget. The stand-in answers bind procedure only
 
 ---
 
-## 3. The Rule: One Score, Chosen From Two Declared in Advance
+## 3. Amendment Log
+
+| Date | Commit | Reason |
+|------|--------|--------|
+| 2026-10-05 | `549acf6` (superseded by `v4-prereg-r1`) | Final pre-reg before launch |
+| 2026-10-05 | `v4-prereg-r1` (annotated tag, `3a99aa5`) | **v4-prereg superseded before any cell ran; reasons F1–F12**: (F1) Stage 0 gain was cumulative + sign-flipped; (F2) selection used max-rho instead of mean; (F3) bootstrap was degenerate; (F4) old LER score was hard-coded 0.0; (F5) compute_gp did backward+zero_grad wiping training gradient; (F6) probe indices changed with seed; (F7) reduced_steps was a copy of full_finetune; (F8) S2 probe_fn was never attached; (F9) reserve seeds replaced in only one arm; (F10) serial GPU-0; (F11) no provenance checks; (F12) RNG isolation unproven. |
+
+---
+
+## 4. The Rule: One Score, Chosen From Two Declared in Advance
 
 Two candidate scores are declared in this pre-registration. They are evaluated
 on disjoint Stage 0 seeds (101, 103) and the better-performing one is carried
-into Stage 2. The selection rule is fixed in advance (see §4), not data-driven
+into Stage 2. The selection rule is fixed in advance (see §5), not data-driven
 at Stage 2. The Stage 2 false-positive rate is not inflated because:
 
 - Stage 2 tests a **single** hypothesis on a **single** chosen score, fixed before
@@ -132,41 +141,60 @@ against the gate in wall-clock time and is measured.
 
 ---
 
-## 4. Stage 0: Oracle Probe (chooses the score)
+## 5. Stage 0: Oracle Probe (chooses the score)
 
 **Purpose**: Determine which candidate score (S1 or S2) better predicts per-step
 gain. The chosen score carries into Stage 2. Stage 0 never cancels Stage 2.
 
 **Seeds**: 101, 103 (not used in Stage 2; not used in V3 confirmatory or MRPC).
 
-**Probe data**:
+**Probe data** (F6):
 - `P_s` (256 examples, train split) — used to compute G_P for S2.
 - `P_e` (256 examples, train split, disjoint from P_s) — used to measure the
-  outcome (realized gain) in Stage 0.
-- Both probes are **removed from the training sampler** in every arm. This is
-  asserted at runtime via `ProbenRemovedFromSampler` check (see §9).
+  outcome (realized per-step gain) in Stage 0.
+- Both probes use **fixed indices** (`PROBE_SEED=0`), stored in
+  `experiments/probe_indices_v4.json` (SHA256: `965f9b51...`). The indices
+  are independent of the training seed and asserted excluded from the training
+  sampler in every arm.
+- Probe file hash is recorded in each cell's manifest.
 
-**Procedure**:
+**Procedure** (F1, F3, F5):
 1. Run `full_finetune` in **shadow mode** (full backward, no skipping) on each
    seed.
-2. At every 8th step, log: S1, S2, the old LER tracker score (lagged sampled-LER),
-   and the realized gain on `P_e` (fp32, eval mode).
-3. Score: **local Spearman ρ** of (S1 or S2) vs realized per-step gain within
-   trailing 64-step windows, with moving-block bootstrap (block 64, 10,000
-   resamples) and 97.5% CI for each candidate.
+2. At every 8th step (log interval), measure:
+   - **S1**: `forward_gain_score` (forward-only, reads cached logits + labels).
+   - **S2**: `alignment_score` — G_B (current batch gradient) dotted with
+     G_P (probe gradient from P_s), normalized by AdamW `v`.
+   - **G_P** is computed via `_classifier_grad_from_logits` on P_s in eval mode
+     (F5: no backward pass, no zero_grad — uses the same function as G_B).
+     G_P is refreshed every 512 steps (not every 64 — see §6.2).
+   - **Realized per-step gain**: P_e loss BEFORE `optimizer.step()`, then step,
+     then P_e loss AFTER. Gain = `before − after` (positive = loss decreased).
+     (F1 fix: cumulative and sign-flipped were bugs.)
+3. Compute **local Spearman ρ** of (S1 or S2) vs realized per-step gain in
+   **non-overlapping windows of 64 logged points** (= 512 actual steps).
+   (F2 fix: was "trailing 64-step windows, select max ρ". Now: non-overlapping,
+   select mean ρ.)
+   - Only steps 392–5761 are used (the annealing range where the score decides).
+   - Cluster bootstrap (resample whole windows, 10,000 resamples) gives a
+     **95% CI — descriptive only**. (F3 fix: was degenerate block=window.)
 
-**Selection rule** (fixed in advance):
-- Take the higher of the two per-seed ρ values for each score.
-- Pick the score with the higher value. Ties go to S1.
-- Report the "eligible" mark (ρ ≥ 0.10 with CI above 0) only as description.
+**Selection rule** (F2):
+- Compute mean ρ per score, **pooled over seeds 101 and 103** (mean of the two
+  per-seed mean-ρ values).
+- Pick the score with the higher pooled mean ρ. **Ties go to S1.**
+- "Eligible" mark (lower CI > 0) reported descriptively only.
 - **Stage 0 never cancels Stage 2.** Stage 2 costs ~6 GPU-hours, too cheap to let
   a noisy 256-example probe kill it.
 
-**Outcome**: The chosen score is recorded in `docs/gate_a_decision.md`.
+**F4 (old LER score)**: the v3 lagged sampled-LER score is **not run** in Stage 0
+shadow mode. It is removed from the pre-registration. A placeholder value
+was previously written as 0.0; that is deleted. The Stage 0 selection is based
+on S1 vs S2 only.
 
 ---
 
-## 5. Accuracy measurement protocol
+## 6. Accuracy measurement protocol
 
 **Final checkpoint only — no dev-set selection.**
 
@@ -190,16 +218,16 @@ genuinely learned more from the skipped backward passes.
 
 ---
 
-## 6. Phase 3 Forward Gate Design
+## 7. Phase 3 Forward Gate Design
 
-### 5.1 Module
+### 7.1 Module
 `lerna/utils/forward_gate.py` — pure, CPU-testable. Three exported components:
 
 - `ScoreQuantileGate`: deterministic gate scorer. 4 equal phase windows over
   `total_steps`. Per-window quota allocated via largest-remainder (Hare method)
   over **eligible** steps (`decision_index >= min_step`), so `sum(phase_quota) ==
   round(rate * total_steps)` exactly. At each step, an exact feasibility check
-  determines whether skip or backward is forced (see §5.3). Annealing at
+  determines whether skip or backward is forced (see §7.3). Annealing at
   `round(0.88 * total_steps)` replaces score with i.i.d. Uniform[0,1] (budget
   preserved, selection randomized). Non-finite score →
   `TerminalInvalidScoreError` (absorbing).
@@ -212,10 +240,10 @@ genuinely learned more from the skipped backward passes.
 - `AlignmentProbe`: attaches a forward-pre-hook to `model.classifier`,
   capturing `h` (the hidden state entering the classifier). Used by S2.
 
-### 5.2 Score Sources
+### 7.2 Score Sources
 - **S1** (`forward_gain_score`): mean over batch of `||p − y||`, bounded by √2.
-  See §3.1.
-- **S2** (`alignment_score`): last-layer alignment score. See §3.2.
+  See §6.1.
+- **S2** (`alignment_score`): last-layer alignment score. See §6.2.
 
 ### 5.3 Feasibility forcing (bug a fix)
 At each step (after `min_step`), compute TWO levels of feasibility:
@@ -255,23 +283,24 @@ The cap `K=4` (from the Phase 3 config) is ALWAYS respected, including under for
 The cap (K=4) **always applies**, including to forced skips. No forcing
 overrides the cap. This ensures no leftover quota crosses a window boundary.
 
-### 5.4 Per-window skip-position diagnostic (bug d fix)
+### 7.4 Per-window skip-position diagnostic (bug d fix)
 The gate records `phase_skip_positions`: for each phase window, the list of
 phase-relative positions where skips land. The diagnostics report skip count,
 median, min, and max position per window. This enables a parity check between
 gate and control on skip placement, detecting front-loading or back-loading
 bias from the score's temporal structure.
 
-### 5.5 min_step = 392 (bug e fix)
-All arms use `min_step = 392`. This exceeds the warmup phase (warmup_steps = 12
-for the smoke test, 392 for production) so no skips occur during LR warmup,
-where gain scores are inflated and unrepresentative. AdamW's second-moment
-estimate `v` already exists at step 392, so S2 can be computed from the start
+### 7.5 min_step = int(total_steps × warmup_ratio)
+
+All arms use `min_step = int(total_steps × 0.06)`. For QNLI (total_steps=6548),
+this is `int(6548 × 0.06) = 392`. No skips occur during LR warmup, where gain
+scores are inflated and unrepresentative. AdamW's second-moment estimate `v`
+already exists at step 392, so S2 can be computed from the start
 of the eligible region.
 
 ---
 
-## 7. MRFC Smoke Test (Phase 3 mechanics validation)
+## 8. MRFC Smoke Test (Phase 3 mechanics validation)
 
 **Script**: `scripts/smoke_forward_gate_mrpc.py`
 **Status**: PASS (expected after bug fixes)
@@ -309,7 +338,7 @@ identical; only the warmup window differs.
 
 ---
 
-## 8. Stage 2: Confirmatory Test (rate 0.60, pending supervisor signature)
+## 9. Stage 2: Confirmatory Test (rate 0.60, pending supervisor signature)
 
 **Arms (4)** at rate 0.60, paired over seeds:
 1. `gate` — `ScoreQuantileGatePolicy` with the chosen score from Stage 0
