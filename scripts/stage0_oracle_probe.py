@@ -8,24 +8,17 @@ windows of 64 logged points (512 actual steps), with cluster bootstrap
 per-window rho values, pooled over seeds 101 and 103, only in steps
 392-5761. Ties go to S1.
 
-Usage:
-    python scripts/stage0_oracle_probe.py \
-        --seeds 101 103 \
-        --rate 0.60 \
-        --total-steps 6548 \
-        --model jhu-clsp/ettin-encoder-150m@45d0864 \
-        --probe-size 256 \
-        --log-interval 8 \
-        --probe-refresh 512 \
-        --output-dir /raid/stage0_oracle_probe/
+F11 provenance: refuses to run on dirty git tree or unless HEAD == v4-prereg-r2.
+Writes a manifest with run_sha, probe_sha256, and selected_score.
 
-Pre-registered: experiments/PREREG_V4.md §4.
+Pre-registered: experiments/PREREG_V4.md §5.
 """
 import argparse
 import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -305,6 +298,7 @@ def run_stage0(
         # Backward (shadow mode: always backward)
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Log at interval
         if step > 0 and step % log_interval == 0:
@@ -363,13 +357,6 @@ def run_stage0(
     final_pe_loss = compute_probe_loss(model, probe_e_batch, device)
     pe_loss_at_step[step] = final_pe_loss
 
-    # Compute realized gain
-    pe_gains = []
-    for s in log_steps:
-        if s in pe_loss_at_step:
-            gain = pe_loss_at_step[s] - initial_pe_loss
-            pe_gains.append(gain)
-
     # F2/F3: compute rho in non-overlapping windows of 64 logged points
     # (512 actual steps each), only in steps 392-5761
     result = Stage0Result(seed=seed)
@@ -391,7 +378,7 @@ def run_stage0(
             for i in eligible_indices
         ]
         eligible_gains = [
-            (pe_gains[i] if i < len(pe_gains) else float("nan"))
+            (pe_gain_values[i] if i < len(pe_gain_values) else float("nan"))
             for i in eligible_indices
         ]
 
@@ -453,6 +440,32 @@ def run_stage0(
     return result
 
 
+def _check_provenance():
+    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r2."""
+    repo_root = Path(__file__).resolve().parents[1]
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True,
+        cwd=str(repo_root),
+    )
+    if status.stdout.strip():
+        print(f"FATAL: git tree is dirty. Commit or stash first.\n{status.stdout}")
+        sys.exit(1)
+    try:
+        tag_sha = subprocess.check_output(
+            ["git", "rev-parse", "v4-prereg-r2"], text=True, cwd=str(repo_root)
+        ).strip()
+        head_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, cwd=str(repo_root)
+        ).strip()
+    except subprocess.CalledProcessError:
+        print("FATAL: could not resolve v4-prereg-r2 tag.")
+        sys.exit(1)
+    if head_sha != tag_sha:
+        print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r2 ({tag_sha}).")
+        sys.exit(1)
+    return head_sha
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 0: oracle probe")
     parser.add_argument("--seeds", type=int, nargs="+", default=[101, 103])
@@ -465,6 +478,9 @@ def main():
     parser.add_argument("--probe-refresh", type=int, default=512)
     parser.add_argument("--output-dir", type=str, default="/raid/stage0_oracle_probe/")
     args = parser.parse_args()
+
+    # F11: provenance check
+    run_sha = _check_provenance()
 
     # F6: verify probe file hash matches pre-reg
     probe_hash = hashlib.sha256(
@@ -518,6 +534,7 @@ def main():
         "total_steps": args.total_steps,
         "probe_file": args.probe_file,
         "probe_sha256": probe_hash,
+        "run_sha": run_sha,
         "selected_score": selected,
         "s1_pooled_mean_rho": float(s1_mean) if not math.isnan(s1_mean) else None,
         "s2_pooled_mean_rho": float(s2_mean) if not math.isnan(s2_mean) else None,
@@ -528,6 +545,15 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "gate_a_decision.json"), "w") as f:
         json.dump(output, f, indent=2)
+    with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
+        json.dump({
+            "run_sha": run_sha,
+            "probe_sha256": probe_hash,
+            "selected_score": selected,
+            "seeds": args.seeds,
+            "rate": args.rate,
+            "total_steps": args.total_steps,
+        }, f, indent=2)
 
     print(f"\n=== Stage 0 complete ===")
     print(f"  S1 pooled mean ρ: {s1_mean}")

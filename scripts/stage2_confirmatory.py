@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -44,7 +45,7 @@ FULL_WARMUP = int(FULL_STEPS * MIN_STEP_RATIO)  # 392
 
 
 def _check_provenance():
-    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r1."""
+    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r2."""
     import subprocess
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -57,10 +58,10 @@ def _check_provenance():
         print(f"FATAL: git tree is dirty. Commit or stash first.\n{r.stdout}")
         sys.exit(1)
 
-    # Check HEAD == v4-prereg-r1
+    # Check HEAD == v4-prereg-r2
     try:
         tag_sha = subprocess.run(
-            ["git", "rev-parse", "v4-prereg-r1"],
+            ["git", "rev-parse", "v4-prereg-r2"],
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         head_sha = subprocess.run(
@@ -68,10 +69,10 @@ def _check_provenance():
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         if tag_sha != head_sha:
-            print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r1 ({tag_sha}).")
+            print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r2 ({tag_sha}).")
             sys.exit(1)
     except Exception:
-        print("FATAL: could not resolve v4-prereg-r1 tag.")
+        print("FATAL: could not resolve v4-prereg-r2 tag.")
         sys.exit(1)
 
     return head_sha
@@ -288,7 +289,7 @@ def run_cell(
 
     metrics = t.evaluate()
 
-    return {
+    result = {
         "arm": arm,
         "seed": seed,
         "rate": rate,
@@ -303,6 +304,29 @@ def run_cell(
         "batches_seen": batches_seen,
         "min_step": min_step,
     }
+
+    # F11: write results.json and run validate_skip_policy_results.py --expected-sha
+    # The analysis script refuses any cell that fails validation.
+    cell_output = Path(str(output_dir)) / arm / str(seed)
+    results_path = cell_output / "results.json"
+    os.makedirs(str(cell_output), exist_ok=True)
+    with open(results_path, "w") as f:
+        json.dump(result, f, indent=2)
+
+    expected_sha = _check_provenance()
+    repo_root = Path(__file__).resolve().parents[1]
+    validator = str(repo_root / "scripts" / "validate_skip_policy_results.py")
+    val = subprocess.run(
+        [sys.executable, validator, str(results_path), "--expected-sha", expected_sha],
+        capture_output=True, text=True, cwd=str(repo_root),
+    )
+    result["validation_passed"] = (val.returncode == 0)
+    result["validation_stderr"] = val.stderr[:500] if val.returncode != 0 else None
+    if val.returncode != 0:
+        print(f"WARNING: validation failed for arm={arm} seed={seed}:\n{val.stderr[:500]}")
+        print(f"  Cell will be REFUSED in final analysis (validation_passed=False)")
+
+    return result
 
 
 def main():
@@ -406,10 +430,10 @@ def main():
                             "attempts": 2,
                         })
                         # Replace in all arms
-                        for a in arms:
-                            if a in active_seeds:
-                                idx = active_seeds.index(seed)
-                                active_seeds[idx] = new_seed
+                        # F9: replace seed in ALL arms with next reserve
+                        if seed in active_seeds:
+                            idx = active_seeds.index(seed)
+                            active_seeds[idx] = new_seed
                         seed = new_seed
                         print(f"  Replacing seed {seed} with reserve {new_seed} in ALL arms")
                         attempt = 0
@@ -428,9 +452,17 @@ def main():
         key = (r["arm"], r["seed"])
         cells[key] = r
 
-    # Paired analysis: gate vs control (primary)
-    gate_by_seed = {r["seed"]: r["eval_accuracy"] for r in results if r["arm"] == "gate"}
-    ctrl_by_seed = {r["seed"]: r["eval_accuracy"] for r in results if r["arm"] == "control"}
+    # F11: analysis refuses cells that failed validation
+    validated_results = [r for r in results if r.get("validation_passed") is True]
+    failed_validation = [r for r in results if r.get("validation_passed") is not True]
+    if failed_validation:
+        print(f"\nWARNING: {len(failed_validation)} cells failed validation and are REFUSED:")
+        for r in failed_validation:
+            print(f"  arm={r['arm']} seed={r['seed']}: {r.get('validation_stderr', 'unknown')[:200]}")
+
+    # Paired analysis: gate vs control (primary) — only validated cells
+    gate_by_seed = {r["seed"]: r["eval_accuracy"] for r in validated_results if r["arm"] == "gate"}
+    ctrl_by_seed = {r["seed"]: r["eval_accuracy"] for r in validated_results if r["arm"] == "control"}
 
     paired = []
     for s in sorted(gate_by_seed.keys() & ctrl_by_seed.keys()):

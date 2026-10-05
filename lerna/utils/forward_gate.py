@@ -252,6 +252,7 @@ class ScoreQuantileGate:
             )
         self._phase_used = [0] * self.n_phases
         self._consecutive_skips = 0
+        self._longest_skip_run = 0
         self._terminal = False
         self._terminal_at: Optional[int] = None
 
@@ -428,6 +429,7 @@ class ScoreQuantileGate:
                 self._phase_used[phase] += 1
                 self.skipped += 1
                 self._consecutive_skips += 1
+                self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
                 self._record_skip_position(decision_index, True)
                 self.note_score(score)
                 return True
@@ -449,6 +451,7 @@ class ScoreQuantileGate:
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
+            self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
             self._record_skip_position(decision_index, True)
             self.note_score(score)
             return True
@@ -479,6 +482,7 @@ class ScoreQuantileGate:
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
+            self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
             self._record_skip_position(decision_index, True)
         else:
             self._consecutive_skips = 0
@@ -535,7 +539,9 @@ class ScoreQuantileGate:
             "cap_blocked": self.cap_blocked,
             "warmup_blocked": self.warmup_blocked,
             "anneal_skips": self.anneal_skips,
+            "anneal_start": self.anneal_step,
             "global_forced_skips": self.global_forced_skips,
+            "longest_skip_run": self._longest_skip_run,
             "decisions_seen": self.decisions_seen,
             "phase_skip_positions": window_positions,
             "terminal": self._terminal,
