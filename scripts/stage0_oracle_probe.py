@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -56,6 +57,7 @@ class Stage0Result:
     s2_mean_rho: float = float("nan")
     s1_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
     s2_ci_per_seed: tuple[float, float] = (float("nan"), float("nan"))
+    log_steps: list[int] = field(default_factory=list)
 
 
 def load_probe_indices(probe_file: str) -> dict:
@@ -99,56 +101,6 @@ def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
         model.train(saved["training"])
 
 
-def cluster_bootstrap_ci(
-    data_x: list[float],
-    data_y: list[float],
-    n_windows: int,
-    n_resamples: int = 10000,
-    alpha: float = 0.05,
-) -> tuple[float, float, float]:
-    """Cluster bootstrap 95% CI.
-
-    data_x and data_y are per-window Spearman rho values (one per non-overlapping
-    window of 64 logged points = 512 steps). We resample whole windows with
-    replacement (cluster bootstrap), recompute the mean rho, and take the
-    2.5th and 97.5th percentiles.
-
-    Returns (mean_rho, ci_lower, ci_upper). Descriptive only.
-    """
-    n = len(data_x)
-    if n == 0:
-        return float("nan"), float("nan"), float("nan")
-
-    # Point estimate: mean of the per-window rho values
-    rhos = []
-    for x, y in zip(data_x, data_y):
-        if len(x) >= 4 and len(y) >= 4:
-            min_len = min(len(x), len(y))
-            rho, _ = spearmanr(x[:min_len], y[:min_len])
-            if rho is not None and not math.isnan(rho):
-                rhos.append(float(rho))
-
-    if not rhos:
-        return float("nan"), float("nan"), float("nan")
-
-    mean_rho = float(np.mean(rhos))
-
-    if n < 2:
-        return mean_rho, float("nan"), float("nan")
-
-    # Cluster bootstrap: resample whole windows
-    rng = np.random.RandomState(42)
-    boot_means = []
-    for _ in range(n_resamples):
-        idx = rng.randint(0, n, size=n)
-        boot_rhos = [rhos[i] for i in idx]
-        boot_means.append(float(np.mean(boot_rhos)))
-
-    ci_lower = float(np.percentile(boot_means, 100 * (alpha / 2)))
-    ci_upper = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
-    return mean_rho, ci_lower, ci_upper
-
-
 def run_stage0(
     seed: int,
     model_name: str,
@@ -182,9 +134,8 @@ def run_stage0(
 
     from datasets import load_dataset
     raw = load_dataset("glue", "qnli", split="train")
-    raw = raw.shuffle(seed=seed)
 
-    # Use fixed probe indices (PROBE_SEED=0)
+    # B11: select probes from unshuffled order (shuffle happens only for training)
     probe_data = load_probe_indices(probe_indices_file)
     probe_s_ids = set(probe_data["probe_s_ids"])
     probe_e_ids = set(probe_data["probe_e_ids"])
@@ -199,10 +150,13 @@ def run_stage0(
     probe_e = raw.select(sorted(probe_e_ids))
     train_ds = raw.select(train_ids)
 
+    # B11: shuffle only the training dataset, not the probe selections
+    train_ds = train_ds.shuffle(seed=seed)
+
     def tokenize(batch):
         return tokenizer(
-            batch["sentence"], batch["sentence2"],
-            truncation="max_length", padding="max_length", max_length=512
+            batch["question"], batch["sentence"],
+            truncation=True, padding="max_length", max_length=512
         )
 
     probe_s = probe_s.map(tokenize, batched=True)
@@ -238,12 +192,12 @@ def run_stage0(
     probe_s_batch = {
         "input_ids": torch.tensor(probe_s["input_ids"], device=device),
         "attention_mask": torch.tensor(probe_s["attention_mask"], device=device),
-        "labels": torch.tensor(probe_s["label"], device=device),
+        "labels": torch.tensor(probe_s["labels"], device=device),
     }
     probe_e_batch = {
         "input_ids": torch.tensor(probe_e["input_ids"], device=device),
         "attention_mask": torch.tensor(probe_e["attention_mask"], device=device),
-        "labels": torch.tensor(probe_e["label"], device=device),
+        "labels": torch.tensor(probe_e["labels"], device=device),
     }
 
     dataloader = torch.utils.data.DataLoader(
@@ -307,18 +261,12 @@ def run_stage0(
             s1 = forward_gain_score(logits, batch["labels"])
             s1_values.append(s1)
 
-            # S2: alignment score (using G_B = _classifier_grad_from_logits on current batch)
+            # S2: alignment score — B12: uses shared _s2_alignment_core
+            from lerna.utils.forward_gate import _classifier_grad_from_logits, _s2_alignment_core
             h = alignment_probe.last_hidden
             if h is not None and last_gp is not None and last_v is not None:
-                from lerna.utils.forward_gate import _classifier_grad_from_logits
-                G_B = _classifier_grad_from_logits(logits, batch["labels"], h)
-                G_P_f = last_gp.float()
-                v_f = last_v.float()
-                if G_B.shape == G_P_f.shape == v_f.shape:
-                    normalized = G_P_f / (v_f.sqrt() + 1e-8)
-                    s2 = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
-                else:
-                    s2 = float("nan")
+                G_B = _classifier_grad_from_logits(logits.float(), batch["labels"], h)
+                s2 = _s2_alignment_core(G_B, last_gp.float(), last_v.float())
             else:
                 s2 = float("nan")
             s2_values.append(s2)
@@ -360,10 +308,11 @@ def run_stage0(
     # F2/F3: compute rho in non-overlapping windows of 64 logged points
     # (512 actual steps each), only in steps 392-5761
     result = Stage0Result(seed=seed)
+    result.log_steps = list(log_steps)
 
-    # Filter to logged points in [min_step, max_step]
+    # B12: eligible range is 392-5761 (exclusive of 5762)
     eligible_indices = [
-        i for i, s in enumerate(log_steps) if min_step <= s <= max_step
+        i for i, s in enumerate(log_steps) if min_step <= s < max_step
     ]
 
     window_size = 64  # 64 logged points = 512 actual steps
@@ -441,7 +390,7 @@ def run_stage0(
 
 
 def _check_provenance():
-    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r2."""
+    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r3."""
     repo_root = Path(__file__).resolve().parents[1]
     status = subprocess.run(
         ["git", "status", "--porcelain"], capture_output=True, text=True,
@@ -451,17 +400,18 @@ def _check_provenance():
         print(f"FATAL: git tree is dirty. Commit or stash first.\n{status.stdout}")
         sys.exit(1)
     try:
-        tag_sha = subprocess.check_output(
-            ["git", "rev-parse", "v4-prereg-r2"], text=True, cwd=str(repo_root)
-        ).strip()
-        head_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, cwd=str(repo_root)
-        ).strip()
-    except subprocess.CalledProcessError:
-        print("FATAL: could not resolve v4-prereg-r2 tag.")
+        tag_sha = subprocess.run(
+            ["git", "rev-parse", "v4-prereg-r3"],
+            capture_output=True, text=True, cwd=str(repo_root)
+        ).stdout.strip()
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=str(repo_root)
+        ).stdout.strip()
+    except Exception:
+        print("FATAL: could not resolve v4-prereg-r3 tag.")
         sys.exit(1)
     if head_sha != tag_sha:
-        print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r2 ({tag_sha}).")
+        print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r3 ({tag_sha}).")
         sys.exit(1)
     return head_sha
 
@@ -483,15 +433,27 @@ def main():
     run_sha = _check_provenance()
 
     # F6: verify probe file hash matches pre-reg
-    probe_hash = hashlib.sha256(
-        open(args.probe_file, "rb").read()
-    ).hexdigest()
     with open(args.probe_file) as f:
         probe_data = json.load(f)
-    expected_hash = probe_data.get("sha256")
-    if expected_hash and probe_hash != expected_hash:
-        print(f"FATAL: probe file hash mismatch. Expected {expected_hash}, got {probe_hash}")
+    # B1: Verify ids_sha256 (content hash of the probe ids), not the file bytes
+    # (a file cannot contain its own hash).
+    ids_json = json.dumps({
+        "probe_s_ids": probe_data["probe_s_ids"],
+        "probe_e_ids": probe_data["probe_e_ids"],
+    }, sort_keys=True, separators=(",", ":"))
+    ids_sha = hashlib.sha256(ids_json.encode()).hexdigest()
+    expected_ids_sha = probe_data.get("ids_sha256")
+    if expected_ids_sha and ids_sha != expected_ids_sha:
+        print(f"FATAL: probe ids hash mismatch. Expected {expected_ids_sha}, got {ids_sha}")
         sys.exit(1)
+
+    # B1: Assert probe set sizes and disjointness
+    assert len(probe_data["probe_s_ids"]) == 256, \
+        f"FATAL: probe_s_ids must have exactly 256 entries, got {len(probe_data['probe_s_ids'])}"
+    assert len(probe_data["probe_e_ids"]) == 256, \
+        f"FATAL: probe_e_ids must have exactly 256 entries, got {len(probe_data['probe_e_ids'])}"
+    assert set(probe_data["probe_s_ids"]).isdisjoint(probe_data["probe_e_ids"]), \
+        "FATAL: P_s and P_e probe index sets overlap"
 
     results = {}
     for seed in args.seeds:
@@ -513,7 +475,7 @@ def main():
             "s2_spearman": result.s2_spearman,
             "s2_ci_per_seed": list(result.s2_ci_per_seed),
             "s2_mean_rho": result.s2_mean_rho,
-            "log_steps": list(range(args.log_interval, args.total_steps, args.log_interval)),
+            "log_steps": result.log_steps,
         }
         print(f"  S1 mean ρ: {result.s1_mean_rho}")
         print(f"  S2 mean ρ: {result.s2_mean_rho}")
@@ -533,7 +495,7 @@ def main():
         "rate": args.rate,
         "total_steps": args.total_steps,
         "probe_file": args.probe_file,
-        "probe_sha256": probe_hash,
+        "probe_ids_sha256": ids_sha,
         "run_sha": run_sha,
         "selected_score": selected,
         "s1_pooled_mean_rho": float(s1_mean) if not math.isnan(s1_mean) else None,
@@ -548,7 +510,7 @@ def main():
     with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
         json.dump({
             "run_sha": run_sha,
-            "probe_sha256": probe_hash,
+            "probe_ids_sha256": ids_sha,
             "selected_score": selected,
             "seeds": args.seeds,
             "rate": args.rate,
@@ -559,7 +521,7 @@ def main():
     print(f"  S1 pooled mean ρ: {s1_mean}")
     print(f"  S2 pooled mean ρ: {s2_mean}")
     print(f"  Selected score: {selected}")
-    print(f"  Probe SHA256: {probe_hash}")
+    print(f"  Probe SHA256: {ids_sha}")
 
 
 if __name__ == "__main__":

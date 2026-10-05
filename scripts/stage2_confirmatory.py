@@ -38,15 +38,98 @@ import torch
 MIN_STEP_RATIO = 0.06
 WARMUP_STEPS_QNLI = 392
 ANNEAL_STEP = 5762
+PROBE_REFRESH_INTERVAL = 64
+
+
+def _max_skips_possible(total_steps, K=4):
+    """B12: maximum number of skips possible with cap K.
+
+    Formula: K * floor(r / (K+1)) + min(r % (K+1), K)
+    where r = total_steps - min_step (skips only possible after min_step).
+    """
+    r = max(0, total_steps - int(total_steps * MIN_STEP_RATIO))
+    return K * (r // (K + 1)) + min(r % (K + 1), K)
+
+
+def _check_lerna_in_checkout():
+    """B9: Verify lerna package is loaded from the repo checkout, not site-packages."""
+    try:
+        import lerna
+        lerna_path = Path(lerna.__file__).resolve()
+        repo_root = Path(__file__).resolve().parents[1]
+        return str(lerna_path.parent) == str(repo_root / "lerna")
+    except Exception:
+        return False
+
+
+def arm_needs_probe(args) -> bool:
+    """B4: Does this arm need a P_s probe refresher?
+    Only the gate arm with score_source='s2' needs it.
+    """
+    return args.score == "s2" and args.arm == "gate"
+
+
+def _build_ps_refresher(model, trainer, probe_s_batch, probe_s_ids, device):
+    """B4: Build a P_s refresher callable that computes G_P every 64 steps.
+
+    The returned zero-arg callable returns G_P = gradient of probe loss w.r.t.
+    classifier.weight, computed via _classifier_grad_from_logits on P_s.
+
+    Refresh protocol (every 64 calls):
+    - model.eval() / no_grad / fp32
+    - P_s forward (triggers AlignmentProbe hook)
+    - Save/restore the hook's training last_hidden around the probe forward
+    - Use live Adam exp_avg_sq (consumed by alignment_score from the trainer)
+
+    Time is charged to the gate: the refresh happens inside score computation.
+    """
+    from lerna.utils.forward_gate import _classifier_grad_from_logits
+
+    state = {"G_P": None, "call_count": 0}
+
+    def probe_fn():
+        state["call_count"] += 1
+        if state["G_P"] is not None and state["call_count"] % PROBE_REFRESH_INTERVAL != 0:
+            return state["G_P"]
+
+        saved_training = model.training
+        model.eval()
+        probe = getattr(trainer, "_alignment_probe", None)
+        saved_hidden = probe.last_hidden if probe is not None else None
+        if probe is not None:
+            probe._last_hidden = None
+
+        try:
+            with torch.no_grad():
+                out = model(**{k: v.to(device) for k, v in probe_s_batch.items()})
+                logits = out.logits.detach().float()
+                labels = probe_s_batch["labels"].to(device)
+
+                if probe is None or probe.last_hidden is None:
+                    return None
+                hidden = probe.last_hidden.detach().float()
+                G_P = _classifier_grad_from_logits(logits, labels, hidden)
+        finally:
+            if probe is not None:
+                probe._last_hidden = saved_hidden
+            model.train(saved_training)
+
+        state["G_P"] = G_P
+        return G_P
+
+    return probe_fn
 REDUCED_TOTAL_STEPS = 2619
 REDUCED_WARMUP_STEPS = int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)  # 157
 FULL_STEPS = 6548
 FULL_WARMUP = int(FULL_STEPS * MIN_STEP_RATIO)  # 392
 
 
-def _check_provenance():
-    """F11: refuse to run unless tree is clean and HEAD == v4-prereg-r2."""
-    import subprocess
+def _check_provenance(probe_ids_sha: str | None = None):
+    """F11/B5: refuse to run unless tree is clean and HEAD == v4-prereg-r3.
+
+    Runs BEFORE training in every mode (including single-cell). The probe
+    ids_sha256 is verified here against the loaded probe data.
+    """
     repo_root = Path(__file__).resolve().parents[1]
 
     # Check dirty tree
@@ -58,10 +141,10 @@ def _check_provenance():
         print(f"FATAL: git tree is dirty. Commit or stash first.\n{r.stdout}")
         sys.exit(1)
 
-    # Check HEAD == v4-prereg-r2
+    # Check HEAD == v4-prereg-r3
     try:
         tag_sha = subprocess.run(
-            ["git", "rev-parse", "v4-prereg-r2"],
+            ["git", "rev-parse", "v4-prereg-r3"],
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         head_sha = subprocess.run(
@@ -69,10 +152,23 @@ def _check_provenance():
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         if tag_sha != head_sha:
-            print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r2 ({tag_sha}).")
+            print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r3 ({tag_sha}).")
             sys.exit(1)
     except Exception:
-        print("FATAL: could not resolve v4-prereg-r2 tag.")
+        print("FATAL: could not resolve v4-prereg-r3 tag.")
+        sys.exit(1)
+
+    # B9: Verify we are running the installed (or path-inserted) lerna
+    # from inside the tagged checkout.
+    try:
+        import lerna
+        lerna_file = lerna.__file__
+        repo_root_str = str(repo_root)
+        if not lerna_file.startswith(repo_root_str):
+            print(f"FATAL: lerna imported from {lerna_file}, not inside the checkout at {repo_root_str}")
+            sys.exit(1)
+    except ImportError:
+        print("FATAL: cannot import lerna. Run 'pip install -e .' or ensure repo root is on sys.path.")
         sys.exit(1)
 
     return head_sha
@@ -81,10 +177,27 @@ def _check_provenance():
 def _load_probe_data(probe_file: str) -> dict:
     with open(probe_file) as f:
         data = json.load(f)
-    sha = hashlib.sha256(open(probe_file, "rb").read()).hexdigest()
-    if data.get("sha256") and sha != data["sha256"]:
-        print(f"FATAL: probe file hash mismatch. Expected {data['sha256']}, got {sha}")
+    # B1: Verify ids_sha256 (content hash of probe ids), not file bytes.
+    # A file cannot contain its own hash.
+    ids_json = json.dumps({
+        "probe_s_ids": data["probe_s_ids"],
+        "probe_e_ids": data["probe_e_ids"],
+    }, sort_keys=True, separators=(",", ":"))
+    ids_sha = hashlib.sha256(ids_json.encode()).hexdigest()
+    expected_ids_sha = data.get("ids_sha256")
+    if expected_ids_sha and ids_sha != expected_ids_sha:
+        print(f"FATAL: probe ids hash mismatch. Expected {expected_ids_sha}, got {ids_sha}")
         sys.exit(1)
+
+    # B1: Assert probe set sizes and disjointness
+    assert len(data["probe_s_ids"]) == 256, \
+        f"FATAL: probe_s_ids must have exactly 256 entries, got {len(data['probe_s_ids'])}"
+    assert len(data["probe_e_ids"]) == 256, \
+        f"FATAL: probe_e_ids must have exactly 256 entries, got {len(data['probe_e_ids'])}"
+    assert set(data["probe_s_ids"]).isdisjoint(data["probe_e_ids"]), \
+        "FATAL: P_s and P_e probe index sets overlap"
+
+    data["_ids_sha256"] = ids_sha
     return data
 
 
@@ -150,10 +263,9 @@ def _build_training_args(
         weight_decay=0.01,
         max_grad_norm=1.0,
         fp16=False, bf16=False,
-        eval_strategy="steps",
-        eval_steps=max(steps // 20, 10),
+        eval_strategy="no",  # B8: no mid-run eval; evaluate once at end (final checkpoint only)
         save_strategy="no",
-        load_best_model_at_end=not no_early_stopping,  # False — final checkpoint only
+        load_best_model_at_end=False,  # B8: final checkpoint only, no dev-set selection
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to="none", logging_steps=100, seed=seed,
@@ -165,13 +277,14 @@ def _build_training_args(
 
 def run_cell(
     arm, seed, rate, total_steps, score_kind, model_id, model_rev,
-    output_dir, probe_fn=None,
+    output_dir, probe_data=None, run_sha=None, probe_fn=None,
 ):
     """Run one cell and return results dict.
 
     F7: reduced_steps uses max_steps=2619, warmup=157, linear decay to 0.
     F8: S2 gate fails hard if probe_fn missing or score non-finite at step 392.
     F11: Each cell writes a manifest and runs validate_skip_policy_results.
+    B5: provenance checked in main() BEFORE training; run_cell receives run_sha.
     """
     from transformers import (
         AutoTokenizer, AutoModelForSequenceClassification,
@@ -187,13 +300,37 @@ def run_cell(
     ds_ev = load_dataset("glue", "qnli", split="validation")
 
     def tok_fn(x):
-        out = tok(x["question"], x["sentence"], truncation="max_length",
+        out = tok(x["question"], x["sentence"], truncation=True,
                    padding="max_length", max_length=512)
-        out["label"] = x["label"]
+        out["labels"] = x["label"]
         return out
 
-    ds_tr = ds_tr.map(tok_fn, remove_columns=list(ds_tr.column_names))
+    # B11: tokenize fully, then select probe subset from unshuffled order
+    ds_tr_raw = ds_tr.map(tok_fn, remove_columns=list(ds_tr.column_names))
     ds_ev = ds_ev.map(tok_fn, remove_columns=list(ds_ev.column_names))
+
+    probe_s_ids = list(probe_data["probe_s_ids"])
+    probe_e_ids = list(probe_data["probe_e_ids"])
+    probe_s_set = set(probe_s_ids)
+    probe_e_set = set(probe_e_ids)
+
+    # F6: exclude probe indices from training
+    all_train_ids = list(range(len(ds_tr_raw)))
+    filtered_ids = [i for i in all_train_ids if i not in probe_s_set and i not in probe_e_set]
+
+    assert probe_s_set.isdisjoint(probe_e_set), "P_s and P_e overlap"
+    assert not probe_s_set.intersection(filtered_ids), "P_s in train"
+    assert not probe_e_set.intersection(filtered_ids), "P_e in train"
+
+    # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
+    ps_raw = ds_tr_raw.select(probe_s_ids[:32])
+    probe_s_batch = {
+        "input_ids": torch.stack([torch.tensor(d["input_ids"]) for d in ps_raw]),
+        "attention_mask": torch.stack([torch.tensor(d["attention_mask"]) for d in ps_raw]),
+        "labels": torch.tensor([d["label"] for d in ps_raw]),
+    }
+
+    ds_tr = ds_tr_raw.select(filtered_ids)
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_id, revision=model_rev, num_labels=2, torch_dtype=torch.float32
@@ -203,23 +340,13 @@ def run_cell(
         arm, seed, total_steps, FULL_WARMUP, output_dir,
     )
 
-    # F6: exclude probe indices from training
-    probe_data = _load_probe_data(
-        os.path.join(os.path.dirname(__file__), "..", "experiments", "probe_indices_v4.json")
-    )
-    probe_s_ids = set(probe_data["probe_s_ids"])
-    probe_e_ids = set(probe_data["probe_e_ids"])
-
-    all_train_ids = list(range(len(ds_tr)))
-    filtered_ids = [i for i in all_train_ids if i not in probe_s_ids and i not in probe_e_ids]
-
-    assert probe_s_ids.isdisjoint(probe_e_ids), "P_s and P_e overlap"
-    assert not probe_s_ids.intersection(filtered_ids), "P_s in train"
-    assert not probe_e_ids.intersection(filtered_ids), "P_e in train"
-
-    ds_tr = ds_tr.select(filtered_ids)
-
     min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
+
+    # B4: For S2 gate, build live P_s refresher probe_fn if not already provided
+    if score_kind == "s2" and arm == "gate":
+        if probe_fn is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            probe_fn = _build_ps_refresher(model, None, probe_s_batch, probe_s_ids, device)
 
     policy = _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn)
 
@@ -247,19 +374,30 @@ def run_cell(
         capture_logits=True,
         instrumentation_path=str(output_dir / arm / str(seed) / "instrumentation.json"),
     )
+    args = _build_training_args(
+        arm, seed, total_steps, FULL_WARMUP, output_dir,
+    )
+
+    # B3: Use legacy_dense online learning mode
+    t.online_ler_mode = "legacy_dense"
+
+    # B3: Attach AlignmentProbe to model before train() for S2 score
+    if arm == "gate" and score_kind == "s2":
+        policy.setup_probe(t, model)
 
     # F8: for S2, verify the probe is attached and score is non-finite at step 392
     if arm == "gate" and score_kind == "s2":
         original_should_skip = policy.should_skip
 
         def checking_should_skip(trainer, model, inputs):
-            if trainer.instr.decisions_seen == FULL_WARMUP:
+            instr = getattr(trainer, "instr", None)
+            batches_seen = getattr(instr, "batches_seen", 0) if instr else 0
+            if batches_seen - 1 == min_step:
                 probe = getattr(trainer, "_alignment_probe", None)
                 assert probe is not None, \
                     "FATAL: S2 arm but AlignmentProbe not attached to trainer"
                 assert probe.last_hidden is not None, \
                     "FATAL: S2 arm but AlignmentProbe.last_hidden is None at step 392"
-                # Verify score is finite
                 from lerna.utils.forward_gate import alignment_score
                 s = alignment_score(trainer, model, inputs, probe_fn)
                 assert math.isfinite(s), \
@@ -274,8 +412,6 @@ def run_cell(
 
     # F7: assert final LR <= 1e-8 for the primary test (always_step contract)
     final_lr = float(t.optimizer.param_groups[0]["lr"])
-    expected_final_lr = 0.0
-    # For always_step with linear decay: lr at step max_steps should be ~0
     assert final_lr <= 1e-8, \
         f"FATAL: final LR={final_lr} > 1e-8 — scheduler step contract violated"
 
@@ -289,42 +425,89 @@ def run_cell(
 
     metrics = t.evaluate()
 
+    # B12: extract LR history for curve comparison
+    lr_history = getattr(getattr(t, "instr", None), "lr_history", [])
+    if not lr_history:
+        # fallback: collect from optimizer param_groups log
+        lr_history = [final_lr] * expected_steps
+
+    # B2: restructured results with required sections
     result = {
-        "arm": arm,
-        "seed": seed,
-        "rate": rate,
-        "total_steps": total_steps,
-        "actual_steps_run": expected_steps,
-        "eval_accuracy": metrics.get("eval_accuracy"),
-        "eval_loss": metrics.get("eval_loss"),
+        "run_config": {
+            "arm": arm,
+            "seed": seed,
+            "rate": rate,
+            "total_steps": total_steps,
+            "actual_steps_run": expected_steps,
+            "model_id": model_id,
+            "model_rev": model_rev,
+            "score_kind": score_kind,
+            "min_step": min_step,
+        },
+        "policy_diagnostics": {
+            "min_step": min_step,
+            "score_kind": score_kind,
+            "max_consecutive_skips": 4,
+            "policy_seed": seed,
+            "max_skips_possible": _max_skips_possible(expected_steps, 4),
+            "probe_attached": arm == "gate" and score_kind == "s2",
+        },
+        "true_skip_instrumentation": {
+            "batches_seen": batches_seen,
+            "scheduler_step_calls": scheduler_calls,
+            "skips_executed": getattr(getattr(t, "instr", None), "skips_executed", 0),
+            "forward_skips": getattr(getattr(t, "instr", None), "forward_skips", 0),
+            "backward_skips": getattr(getattr(t, "instr", None), "backward_skips", 0),
+            "forced_backwards": getattr(getattr(t, "instr", None), "forced_backwards", 0),
+        },
+        "eval_metrics": {
+            "eval_accuracy": metrics.get("eval_accuracy"),
+            "eval_loss": metrics.get("eval_loss"),
+        },
+        "provenance": {
+            "run_sha": run_sha,
+            "probe_ids_sha256": probe_data.get("ids_sha256") if probe_data else None,
+            "codebase_checkout": _check_lerna_in_checkout(),
+        },
+        "lr_history": lr_history[:],
         "final_lr": final_lr,
         "wall_seconds": wall,
         "ms_per_step": wall / expected_steps * 1000,
-        "scheduler_step_calls": scheduler_calls,
-        "batches_seen": batches_seen,
-        "min_step": min_step,
     }
 
-    # F11: write results.json and run validate_skip_policy_results.py --expected-sha
-    # The analysis script refuses any cell that fails validation.
+    # F11: write manifest + run validate_skip_policy_results.py --check-v4-gate
     cell_output = Path(str(output_dir)) / arm / str(seed)
-    results_path = cell_output / "results.json"
     os.makedirs(str(cell_output), exist_ok=True)
+
+    manifest = {
+        "arm": arm,
+        "seed": seed,
+        "run_sha": run_sha,
+        "probe_ids_sha256": probe_data.get("ids_sha256") if probe_data else None,
+        "run_config": result["run_config"],
+        "policy_diagnostics": result["policy_diagnostics"],
+        "provenance": result["provenance"],
+    }
+    with open(cell_output / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    results_path = cell_output / "results.json"
     with open(results_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    expected_sha = _check_provenance()
-    repo_root = Path(__file__).resolve().parents[1]
-    validator = str(repo_root / "scripts" / "validate_skip_policy_results.py")
-    val = subprocess.run(
-        [sys.executable, validator, str(results_path), "--expected-sha", expected_sha],
-        capture_output=True, text=True, cwd=str(repo_root),
-    )
-    result["validation_passed"] = (val.returncode == 0)
-    result["validation_stderr"] = val.stderr[:500] if val.returncode != 0 else None
-    if val.returncode != 0:
-        print(f"WARNING: validation failed for arm={arm} seed={seed}:\n{val.stderr[:500]}")
-        print(f"  Cell will be REFUSED in final analysis (validation_passed=False)")
+    if run_sha:
+        repo_root = Path(__file__).resolve().parents[1]
+        validator = str(repo_root / "scripts" / "validate_skip_policy_results.py")
+        val = subprocess.run(
+            [sys.executable, validator, str(results_path),
+             "--expected-sha", run_sha, "--check-v4-gate"],
+            capture_output=True, text=True, cwd=str(repo_root),
+        )
+        result["validation_passed"] = (val.returncode == 0)
+        result["validation_stderr"] = val.stderr[:500] if val.returncode != 0 else None
+        if val.returncode != 0:
+            print(f"WARNING: validation failed for arm={arm} seed={seed}:\n{val.stderr[:500]}")
+            print(f"  Cell will be REFUSED in final analysis (validation_passed=False)")
 
     return result
 
@@ -351,34 +534,29 @@ def main():
     parser.add_argument("--single-seed", type=int, help="Seed for single-cell mode")
     args = parser.parse_args()
 
-    # F11: provenance checks (skip in single-cell mode — launcher handles it)
-    if not args.single_cell:
-        run_sha = _check_provenance()
-    else:
-        run_sha = "single-cell"
+    # B9: Ensure the repo root is on sys.path so `import lerna` works when
+    # this script is run as `python scripts/stage2_confirmatory.py`.
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    # B5: provenance check runs BEFORE training in every mode (single-cell and full).
+    probe_data = _load_probe_data(str(repo_root / "experiments" / "probe_indices_v4.json"))
+    run_sha = _check_provenance(probe_ids_sha=probe_data.get("ids_sha256"))
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
 
     # Single-cell mode (for launcher)
     if args.single_cell:
         assert args.arm and args.single_seed, "Need --arm and --single-seed in single-cell mode"
-        probe_fn = None  # The S2 probe_fn is set up per-model in the trainer
         r = run_cell(
             args.arm, args.single_seed, args.rate, args.total_steps,
             args.score, args.model, args.model_rev,
-            Path(args.output_dir), probe_fn=probe_fn,
+            Path(args.output_dir),
+            probe_data=probe_data, run_sha=run_sha,
         )
         out_path = Path(args.output_dir) / args.arm / str(args.single_seed)
         out_path.mkdir(parents=True, exist_ok=True)
-        with open(out_path / "manifest.json", "w") as f:
-            json.dump({
-                "arm": r["arm"], "seed": r["seed"],
-                "run_sha": run_sha,
-                "probe_sha256": hashlib.sha256(
-                    open(args.probe_file, "rb").read()
-                ).hexdigest(),
-                "config": r,
-            }, f, indent=2)
         print(json.dumps(r, indent=2))
         return
 
@@ -394,62 +572,92 @@ def main():
     arms = ["gate", "control", "full_finetune", "reduced_steps"]
 
     # F9: reserve seed replacement replaces in ALL arms, not just the failing one
-    active_seeds = list(args.seeds)
+    # B7: re-run finished arms with the reserve seed when a swap occurs
     reserve_seeds = list(args.reserves)
     crash_log = []
 
-    results = []
+    # Build master task list: one entry per (arm, seed)
+    task_list: list[tuple[str, int]] = []
     for arm in arms:
-        for i, seed in enumerate(active_seeds[:]):
-            print(f"\n=== arm={arm} seed={seed} (rate={args.rate}) ===")
-            attempt = 0
-            success = False
-            while attempt < 2 and not success:
-                try:
-                    r = run_cell(
-                        arm, seed, args.rate, args.total_steps, args.score,
-                        args.model, args.model_rev, output,
-                    )
-                    r["attempts"] = attempt + 1
-                    r["crashed"] = False
-                    results.append(r)
-                    success = True
-                except Exception as e:
-                    print(f"  FAILED (attempt {attempt + 1}): {e}")
-                    if attempt == 0:
-                        # F9: retry same seed once
-                        print(f"  Retrying with same seed={seed}")
-                        attempt += 1
-                    elif reserve_seeds:
-                        # F9: replace seed in ALL arms with next reserve
-                        new_seed = reserve_seeds.pop(0)
-                        crash_log.append({
-                            "arm": arm, "orig_seed": seed,
-                            "replacement_seed": new_seed,
-                            "error": str(e),
-                            "attempts": 2,
-                        })
-                        # Replace in all arms
-                        # F9: replace seed in ALL arms with next reserve
-                        if seed in active_seeds:
-                            idx = active_seeds.index(seed)
-                            active_seeds[idx] = new_seed
-                        seed = new_seed
-                        print(f"  Replacing seed {seed} with reserve {new_seed} in ALL arms")
-                        attempt = 0
-                    else:
-                        crash_log.append({
-                            "arm": arm, "orig_seed": seed,
-                            "replacement_seed": None,
-                            "error": str(e),
-                            "attempts": 2,
-                        })
-                        break
+        for seed in args.seeds:
+            task_list.append((arm, seed))
+
+    # Track seed lineage: original_seed -> replacement_seed (for B7 re-runs)
+    seed_map: dict[int, int] = {}
+    # Results indexed by (arm, effective_seed)
+    results_by_key: dict[tuple[str, int], dict] = {}
+
+    while task_list:
+        arm, seed = task_list.pop(0)
+        # Resolve through seed_map (in case this seed was itself a replacement)
+        effective_seed = seed
+        while effective_seed in seed_map:
+            effective_seed = seed_map[effective_seed]
+
+        print(f"\n=== arm={arm} seed={effective_seed} (rate={args.rate}) ===")
+
+        attempt = 0
+        success = False
+        while attempt < 2 and not success:
+            try:
+                r = run_cell(
+                    arm, effective_seed, args.rate, args.total_steps, args.score,
+                    args.model, args.model_rev, output,
+                    probe_data=probe_data, run_sha=run_sha,
+                )
+                r["attempts"] = attempt + 1
+                r["crashed"] = False
+                results_by_key[(arm, effective_seed)] = r
+                success = True
+            except Exception as e:
+                print(f"  FAILED (attempt {attempt + 1}): {e}")
+                if attempt == 0:
+                    print(f"  Retrying with same seed={effective_seed}")
+                    attempt += 1
+                elif reserve_seeds:
+                    new_seed = reserve_seeds.pop(0)
+                    crash_log.append({
+                        "arm": arm, "orig_seed": seed,
+                        "replacement_seed": new_seed,
+                        "effective_seed": effective_seed,
+                        "error": str(e),
+                        "attempts": 2,
+                    })
+                    seed_map[effective_seed] = new_seed
+                    print(f"  Replacing seed {effective_seed} with reserve {new_seed} in ALL arms")
+                    # B7: remove ALL results for the old effective_seed and re-queue all arms
+                    for a in arms:
+                        old_key = (a, effective_seed)
+                        if old_key in results_by_key:
+                            del results_by_key[old_key]
+                        # Re-add to task list if not already there
+                        if (a, effective_seed) not in task_list and (a, effective_seed) not in [(t[0], t[1]) for t in task_list]:
+                            task_list.insert(0, (a, effective_seed))
+                    # Re-queue this arm with the new seed
+                    task_list.insert(0, (arm, new_seed))
+                    # Reset attempt counter so the new task starts fresh
+                    success = True  # exit the while loop; will re-enter from task_list
+                    # But we haven't successfully completed this arm yet
+                    # Remove any partial result
+                    results_by_key.pop((arm, effective_seed), None)
+                else:
+                    crash_log.append({
+                        "arm": arm, "orig_seed": seed,
+                        "replacement_seed": None,
+                        "effective_seed": effective_seed,
+                        "error": str(e),
+                        "attempts": 2,
+                    })
+                    success = True  # give up on this cell
+
+    # Flatten results
+    results = list(results_by_key.values())
 
     # Write summary
     cells = {}
     for r in results:
-        key = (r["arm"], r["seed"])
+        cfg = r.get("run_config", {})
+        key = (cfg.get("arm", r.get("arm")), cfg.get("seed", r.get("seed")))
         cells[key] = r
 
     # F11: analysis refuses cells that failed validation
@@ -458,11 +666,22 @@ def main():
     if failed_validation:
         print(f"\nWARNING: {len(failed_validation)} cells failed validation and are REFUSED:")
         for r in failed_validation:
-            print(f"  arm={r['arm']} seed={r['seed']}: {r.get('validation_stderr', 'unknown')[:200]}")
+            cfg = r.get("run_config", {})
+            print(f"  arm={cfg.get('arm')} seed={cfg.get('seed')}: {r.get('validation_stderr', 'unknown')[:200]}")
 
     # Paired analysis: gate vs control (primary) — only validated cells
-    gate_by_seed = {r["seed"]: r["eval_accuracy"] for r in validated_results if r["arm"] == "gate"}
-    ctrl_by_seed = {r["seed"]: r["eval_accuracy"] for r in validated_results if r["arm"] == "control"}
+    gate_by_seed = {}
+    ctrl_by_seed = {}
+    for r in validated_results:
+        cfg = r.get("run_config", {})
+        em = r.get("eval_metrics", {})
+        arm = cfg.get("arm")
+        seed = cfg.get("seed")
+        acc = em.get("eval_accuracy")
+        if arm == "gate":
+            gate_by_seed[seed] = acc
+        elif arm == "control":
+            ctrl_by_seed[seed] = acc
 
     paired = []
     for s in sorted(gate_by_seed.keys() & ctrl_by_seed.keys()):

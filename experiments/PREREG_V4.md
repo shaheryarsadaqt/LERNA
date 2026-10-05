@@ -19,7 +19,7 @@ retrospective baseline. V4 Stage 2 uses a new design: 4 arms × 24 seeds × rate
 | Field | Value | Purpose |
 |-------|-------|---------|
 | `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
-| `v4_prereg_sha` | `v4-prereg-r2` (annotated git tag) | Git tag pointing to the V4 final pre-registration commit. Contains `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `tests/test_stage2_s2_probe_validation.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confirmatory.py` + `scripts/run_stage2_multi_gpu.py` + `scripts/run_timing_cells.py` + `docs/supervisor_signoff_v4.md` (Q1 reworded). The validator resolves the tag at runtime via `git rev-parse v4-prereg-r2` and checks `run_sha == git rev-parse v4-prereg-r2`. No hardcoded SHA is embedded in this commit. |
+| `v4_prereg_sha` | `v4-prereg-r3` (annotated git tag) | Git tag pointing to the V4 final pre-registration commit. Contains `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `tests/test_stage2_s2_probe_validation.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confurmatory.py` + `scripts/run_stage2_multi_gpu.py` + `scripts/run_timing_cells.py` + `scripts/validate_skip_policy_results.py` + `docs/supervisor_signoff_v4.md` (Q1 reworded). The validator resolves the tag at runtime via `git rev-parse v4-prereg-r3` and checks `run_sha == git rev-parse v4-prereg-r3`. No hardcoded SHA is embedded in this commit. |
 
 The V4 code does **not** exist at `93ec6e4` — it is committed separately and
 additively. No V4 artifact rebases or modifies the V3 frozen block.
@@ -67,6 +67,7 @@ it does not consume the Stage 2 budget. The stand-in answers bind procedure only
 | 2026-10-05 | `549acf6` superseded before any cell ran; reasons F1–F12 | Pre-registration text finalized at this commit, superseded by F1–F12 fixes |
 | 2026-10-05 | `v4-prereg-r1` (annotated tag) | **F1–F12 fixes before any cell ran**: (F1) per-step gain (before-after, sign-corrected); (F2) mean rho, pooled seeds 101+103, steps 392–5761; (F3) cluster bootstrap (512-step windows, 10k resamples); (F4) old LER score removed; (F5) G_P via `_classifier_grad_from_logits` (no backward); (F6) fixed probe indices (PROBE_SEED=0) in `experiments/probe_indices_v4.json`; (F7) reduced_steps = 2619 steps, 157 warmup, linear decay; (F8) S2 fails hard at step 392; (F9) reserve seeds replaced in all arms; (F10) 8-GPU launcher; (F11) provenance in Stage 0 + Stage 2, validator on every cell; (F12) RNG isolation tests. |
 | 2026-10-05 | `v4-prereg-r2` (annotated tag) | **Q1 rewording + config parity + harness check**: (1) Q1 in supervisor_signoff_v4.md reworded — contribution is now "forward-predicted-gain gate vs matched random control", not "backward vs forward estimator comparison"; (2) Stage 0 shadow loop now clips gradients at `max_grad_norm=1.0` to match Stage 2 config; (3) time-trend control test added (mean window ρ near 0 for trend-only data, proving F1/F2 fix); (4) GPU nondeterminism harness check added as §14.9 check (descriptive, not a test). |
+| 2026-10-05 | `v4-prereg-r3` (annotated tag) | **B1–B16 fixes before any cell ran**: (B1) Probe file hash fixed — replaced self-referential sha256 with `ids_sha256` (hash of the probe ID list contents, not the file bytes); assertions on 256 entries and disjointness added. (B2) `results.json` restructured with `run_config`, `policy_diagnostics`, `true_skip_instrumentation`, `eval_metrics`, `provenance` sections; validator `--check-v4-gate` flag added. (B3) Score computation deferred until `min_step − score_history_window`; `online_ler_mode="legacy_dense"` set on trainer; `setup_probe()` called before `train()`. (B4) S2 probe refresher (`_build_ps_refresher`) wired into `run_cell`; `checking_should_skip` fixed to use `batches_seen - 1 == min_step` instead of nonexistent `instr.decisions_seen`. (B5) Provenance check (`_check_provenance`) runs in `main()` before any cell runs, in both single-cell and full-run modes; `lerna.__file__` verified inside checkout. (B6) GPU collisions fixed — launcher uses `queue.Queue` of free GPU ids, no more `cell_idx % 8`; retry-once on failure with crash log. (B7) Serial path reserve-seed swap re-runs finished arms with the replacement seed across all 4 arms. (B8) `eval_strategy` set to `"no"`, `load_best_model_at_end=False`. (B9) `sys.path.insert(0, repo_root)` in stage2 main(); codebase-checkout assertion in provenance. (B10) QNLI tokenization uses `question`/`sentence` (not `sentence`/`sentence2`); `truncation=True` (not `"max_length"`); `label` → `labels` in probe batches. (B11) Probe indices selected from unshuffled dataset before `raw.shuffle(seed)`. (B12) S2 computation unified via shared `_s2_alignment_core` in `forward_gate.py`; `cluster_bootstrap_ci` deleted; eligible Spearman range fixed to 392–5761 (exclusive); real `log_steps` saved in Stage 0 output. (B13) Gate `_consecutive_skips` reset on all non-skip paths (forced-backward, quota-met, warmup). (B14) Timing cells use cell index for alternation (`cell_idx % 2`, not `seed % 2` which is always 1 for odd seeds); f-string None crash guarded; trainer step timer from instrumentation. (B15) F8 tests use `batches_seen=393` (not 392, which gives idx 391 and skips the min_step=392 check); specific error message asserted. (B16) Smoke test asserts `len(lr_gate) == len(lr_ctrl) == 200` before comparing LR curves. **Dynamic padding (pad to longest in batch, cap 512) required for all tokenization in Stage 2 and timing cells; `padding="max_length"` prohibited in production cells.** |
 
 ---
 
@@ -199,16 +200,19 @@ on S1 vs S2 only.
 
 **Final checkpoint only — no dev-set selection.**
 
-- `no_early_stopping=True` is enforced for every Phase 1.3 cell (asserted in
+- `no_early_stopping=True` is enforced for every Phase 3 cell (asserted in
   `_validate_cell_contract`).
 - `load_best_model_at_end=False` is derived from `not no_early_stopping`;
   this is guaranteed, not optional.
 - Accuracy on the dev/test set is taken from the **final** checkpoint after the
   full `total_steps` schedule. No early-stopping selection, no best-model
   selection, no checkpoint averaging.
-- `eval_strategy="steps"` with `eval_steps = max(total_steps // 20, 10)` is used
-  only for monitoring/logging, never for model selection.
+- `eval_strategy="no"` — no mid-run evaluation. Evaluation runs once at the end
+  on the final checkpoint.
 - `metric_for_best_model` is recorded in metadata but never acted upon.
+- **Dynamic padding**: All tokenization in Stage 2 and timing cells uses
+  `padding=True` (pad to longest in batch, cap 512) via a custom collator.
+  `padding="max_length"` is prohibited in production cells for performance.
 
 This is a deliberate **deviation from `run_baseline_glue_modernbert.py`** (which
 uses `load_best_model_at_end=True` with patience-based early stopping). The Phase 1.3
@@ -554,7 +558,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    and `scheduler_step_calls == 6548`.
    → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
 
-6. **Clean git tree**: The `v4-prereg-r2` annotated tag is resolved dynamically via `git rev-parse v4-prereg-r2` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRPC smoke min_step correction, and the SST-2/Pareto secondary sections — are included in the tagged commit.
+6. **Clean git tree**: The `v4-prereg-r3` annotated tag is resolved dynamically via `git rev-parse v4-prereg-r3` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRFC smoke min_step correction, the B1–B16 bug fixes, and the SST-2/Pareto secondary sections — are included in the tagged commit.
 
 7. **SST-2 replication plan**: 10 seeds, rate 0.60, min_step=int(2205×0.06)=132.
    → See §10.

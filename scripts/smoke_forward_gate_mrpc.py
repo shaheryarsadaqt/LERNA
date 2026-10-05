@@ -40,12 +40,12 @@ from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 MODEL_ID = "jhu-clsp/ettin-encoder-150m"
 MODEL_REV = "45d08642849e5c5701b162671ac811b7654bfd9f"
 def _v4_prereg_sha() -> str:
-    """Resolve the v4-prereg-r2 tag at runtime. The validator checks
-    run_sha == git rev-parse v4-prereg-r2.
+    """Resolve the v4-prereg-r3 tag at runtime. The validator checks
+    run_sha == git rev-parse v4-prereg-r3.
     """
     import subprocess
     try:
-        h = subprocess.run(["git", "rev-parse", "v4-prereg-r2"], capture_output=True, text=True,
+        h = subprocess.run(["git", "rev-parse", "v4-prereg-r3"], capture_output=True, text=True,
                            cwd=str(Path(__file__).resolve().parents[1]))
         sha = h.stdout.strip()
         if sha and len(sha) == 40:
@@ -259,6 +259,9 @@ def main():
             f"per-phase quota allocation is infeasible for this rate/horizon"
 
     lrg = r_gate["lr_curve"]; lrc = r_ctrl["lr_curve"]
+    # B16: assert LR curve lengths match expected step count before comparing
+    assert len(lrg) == len(lrc) == TOTAL_STEPS, \
+        f"LR curves must have {TOTAL_STEPS} points: gate={len(lrg)} ctrl={len(lrc)}"
     max_diff = max(abs(a - b) for a, b in zip(lrg, lrc)) if lrg and lrc else None
     assert max_diff is not None and max_diff < 1e-9, \
         f"LR curves must be identical under always_step; max|diff|={max_diff}"

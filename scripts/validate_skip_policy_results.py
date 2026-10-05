@@ -1989,11 +1989,90 @@ def _check_provenance_sha(report: ValidationReport, data: dict,
                    "SHA in any recognized field")
 
 
+def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[str]) -> None:
+    """B2: Validate V4 Stage 2 gate results structure.
+
+    Checks that all required sections are present and internally consistent:
+    run_config, policy_diagnostics, true_skip_instrumentation, eval_metrics,
+    provenance. Validates probe attachment for S2 gate arms, scheduler contract,
+    and provenance SHA match.
+    """
+    required_sections = (
+        "run_config",
+        "policy_diagnostics",
+        "true_skip_instrumentation",
+        "eval_metrics",
+        "provenance",
+    )
+    for sec in required_sections:
+        if sec not in data or not isinstance(getattr(data, sec, None), dict) if hasattr(data, sec) else True:
+            val = data.get(sec)
+            if not isinstance(val, dict):
+                report.add(SEVERITY_ERROR, f"results.{sec}", "JSON object", val,
+                           f"required section '{sec}' is missing or not an object")
+
+    run_config = data.get("run_config", {})
+    diag = data.get("policy_diagnostics", {})
+    instr = data.get("true_skip_instrumentation", {})
+    em = data.get("eval_metrics", {})
+    prov = data.get("provenance", {})
+
+    arm = run_config.get("arm")
+    score_kind = run_config.get("score_kind")
+    total_steps = _as_int(run_config.get("total_steps"))
+
+    # S2 probe attachment check
+    if arm == "gate" and score_kind == "s2":
+        if not diag.get("probe_attached"):
+            report.add(SEVERITY_ERROR, "policy_diagnostics.probe_attached", True,
+                       diag.get("probe_attached"),
+                       "S2 gate arm requires an attached AlignmentProbe")
+
+    # Scheduler contract: scheduler_step_calls == batches_seen
+    sched_calls = instr.get("scheduler_step_calls")
+    batches_seen = instr.get("batches_seen")
+    if sched_calls is not None and batches_seen is not None:
+        if sched_calls != batches_seen:
+            report.add(SEVERITY_ERROR,
+                       "true_skip_instrumentation.scheduler_vs_batches",
+                       batches_seen, sched_calls,
+                       "scheduler_step_calls must equal batches_seen")
+
+    # Step count contract
+    if total_steps is not None and batches_seen is not None:
+        if batches_seen != total_steps:
+            report.add(SEVERITY_ERROR,
+                       "true_skip_instrumentation.batches_seen",
+                       total_steps, batches_seen,
+                       f"batches_seen must equal total_steps ({total_steps})")
+
+    # Provenance SHA match
+    if expected_sha and prov.get("run_sha") != expected_sha:
+        report.add(SEVERITY_ERROR, "provenance.run_sha", expected_sha,
+                   prov.get("run_sha"),
+                   "run_sha does not match expected pre-registration SHA")
+
+    # Codebase checkout
+    if not prov.get("codebase_checkout"):
+        report.add(SEVERITY_WARNING, "provenance.codebase_checkout", True,
+                   prov.get("codebase_checkout"),
+                   "lerna not imported from repo checkout (may be site-packages)")
+
+    # Eval accuracy must be a finite float
+    acc = em.get("eval_accuracy")
+    acc_float = _as_float(acc)
+    if acc_float is None or not (0.0 <= acc_float <= 1.0):
+        report.add(SEVERITY_ERROR, "eval_metrics.eval_accuracy",
+                   "float in [0, 1]", acc,
+                   "eval_accuracy missing or out of range")
+
+
 def validate_results(path: Path, *, rate_tolerance: float = 0.005,
                      count_tolerance: int = 0,
                      allow_historical_momentum: bool = False,
                      required_artifacts: Optional[List[str]] = None,
                      expected_sha: Optional[str] = None,
+                     v4_gate: bool = False,
                      ) -> ValidationReport:
     path = Path(path)
     report = ValidationReport(path=str(path))
@@ -2117,6 +2196,9 @@ def validate_results(path: Path, *, rate_tolerance: float = 0.005,
             require_policy_diagnostics=not (is_full_finetune or is_reduced_steps),
         )
 
+    if v4_gate:
+        _check_v4_gate(report, data, expected_sha)
+
     return report
 
 
@@ -2140,7 +2222,13 @@ def main() -> None:
                         help="Frozen SHA from the pre-registration; the run's "
                              "provenance.frozen_confirmatory_sha must match "
                              "exactly and tree must be clean.")
+    parser.add_argument("--check-v4-gate", action="store_true", default=False,
+                        help="B2: validate V4 Stage 2 gate results structure")
     args = parser.parse_args()
+
+    extra = {}
+    if args.check_v4_gate:
+        extra["v4_gate"] = True
 
     report = validate_results(
         args.results_json,
@@ -2149,6 +2237,7 @@ def main() -> None:
         allow_historical_momentum=args.allow_historical_momentum,
         required_artifacts=args.require_artifact,
         expected_sha=args.expected_sha,
+        **extra,
     )
     print(json.dumps(report.to_dict(), indent=2, default=str))
     if not report.ok:

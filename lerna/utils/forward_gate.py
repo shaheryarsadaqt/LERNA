@@ -338,6 +338,17 @@ class ScoreQuantileGate:
             # terminal absorbs: never skip again after a fatal score
             return False
 
+        # B3: Do not compute score before (min_step - score_history_window).
+        # S1 (||p-y||) and S2 (alignment) are NaN before the warmup window ends
+        # and before the AlignmentProbe hook is attached, so computing them here
+        # would terminal the run at step 0. The score is only computed once
+        # decisions are eligible.
+        early_return = max(self.min_step - self.score_history_window, 0)
+        if decision_index < early_return:
+            # B13: reset streak on non-skip
+            self._consecutive_skips = 0
+            return False
+
         score = self._score_source(decision_index, model, inputs)
         if not (score == score and score != float("inf") and score != float("-inf")):
             self._terminal = True
@@ -347,7 +358,11 @@ class ScoreQuantileGate:
         annealed = decision_index >= self.anneal_step
 
         if decision_index < self.min_step:
+            # Record score into history so the quantile window is full when
+            # min_step is reached, but still never skip.
             self.warmup_blocked += 1
+            # B13: reset streak on non-skip
+            self._consecutive_skips = 0
             self.note_score(score)
             return False
 
@@ -356,6 +371,8 @@ class ScoreQuantileGate:
         # Hard invariant: never skip beyond the per-window quota. Once a phase's
         # quota is met, remaining_quota == 0 and we stop skipping in that phase.
         if remaining_quota <= 0:
+            # B13: reset streak on non-skip
+            self._consecutive_skips = 0
             self.note_score(score)
             return False
 
@@ -420,6 +437,8 @@ class ScoreQuantileGate:
             # Fall back to global reachability to minimize total deficit.
             if not global_skip_possible and not global_real_possible:
                 # Globally infeasible too: cannot recover. Don't skip (conservative).
+                # B13: reset streak on non-skip
+                self._consecutive_skips = 0
                 self.note_score(score)
                 return False
             elif not global_real_possible:
@@ -437,11 +456,15 @@ class ScoreQuantileGate:
                 # global_skip_possible is False (skipping globally infeasible):
                 # force backward to preserve global quota.
                 self.global_forced_skips += 1
+                # B13: reset streak on non-skip
+                self._consecutive_skips = 0
                 self.note_score(score)
                 return False
         elif not per_phase_skip_possible:
             # Skipping would make this phase's quota unreachable; force backward.
             self.forced_skips += 1
+            # B13: reset streak on non-skip
+            self._consecutive_skips = 0
             self.note_score(score)
             return False
         elif not per_phase_real_possible:
@@ -755,11 +778,28 @@ def alignment_score(
         if G_B.shape != G_P.shape or G_B.shape != v.shape:
             return float("nan")
 
-        normalized = G_P / (v.sqrt() + eps)
-        s = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
-        if not math.isfinite(s):
-            return float("nan")
+        s = _s2_alignment_core(G_B, G_P, v, eps)
         return s
+
+
+
+def _s2_alignment_core(G_B, G_P, v, eps: float = 1e-8) -> float:
+    """B12: shared S2 alignment computation used by both stage0 and stage2.
+
+    s_B = <G_B, G_P ⊘ (sqrt(v) + eps)>
+
+    where G_B is the current batch's gradient w.r.t. classifier.weight,
+    G_P is the probe gradient, and v is AdamW's exp_avg_sq for classifier.weight.
+
+    Returns NaN if shapes mismatch or result is non-finite.
+    """
+    if G_B.shape != G_P.shape or G_B.shape != v.shape:
+        return float("nan")
+    normalized = G_P / (v.sqrt() + eps)
+    s = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
+    if not math.isfinite(s):
+        return float("nan")
+    return s
 
 
 class ScoreQuantileGatePolicy:
@@ -834,9 +874,23 @@ class ScoreQuantileGatePolicy:
             score_source=_source,
         )
 
+    def setup_probe(self, trainer, model) -> None:
+        """Attach the AlignmentProbe before training begins (B3).
+
+        For score_source='s2', the forward-pre-hook on model.classifier must
+        be installed before train() so that hidden states are captured from the
+        very first forward pass.  Attaching lazily on the first should_skip()
+        risks missing early forward passes and producing a None last_hidden
+        when the first eligible decision at min_step fires.
+        """
+        if self.score_source_kind == "s2":
+            trainer._alignment_probe = AlignmentProbe(model)
+
     def should_skip(self, trainer, model, inputs) -> bool:
         self._trainer_ref = trainer
         if self.score_source_kind == "s2":
+            # B3: probe should already be attached via setup_probe() before train().
+            # If not, attach now as a fallback.
             if not hasattr(trainer, "_alignment_probe"):
                 trainer._alignment_probe = AlignmentProbe(model)
             # F8: fail hard at min_step if probe not attached or score non-finite

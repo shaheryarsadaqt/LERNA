@@ -34,15 +34,16 @@ def test_s2_score_source_requires_probe_fn():
     )
 
     trainer = mock.Mock()
-    trainer.instr = mock.Mock(batches_seen=392)
+    trainer.instr = mock.Mock(batches_seen=393)
     trainer._alignment_probe = mock.Mock()
     trainer._alignment_probe.last_hidden = None
 
     inputs = _FakeInputs()
     model = mock.Mock()
 
-    with pytest.raises((RuntimeError, ValueError, AssertionError, AttributeError)):
+    with pytest.raises((RuntimeError, ValueError, AssertionError, AttributeError)) as exc_info:
         policy.should_skip(trainer, model, inputs)
+    assert "AlignmentProbe" in str(exc_info.value) or "probe_fn" in str(exc_info.value).lower()
 
 
 def test_s2_nonfinite_score_raises():
@@ -67,7 +68,7 @@ def test_s2_score_finite_with_attached_probe():
         alignment_probe_fn=mock.Mock(return_value=0.5),
     )
     trainer = mock.Mock()
-    trainer.instr = mock.Mock(batches_seen=392)
+    trainer.instr = mock.Mock(batches_seen=393)
     probe = mock.Mock()
     probe.last_hidden = torch.randn(4, 768)
     trainer._alignment_probe = probe

@@ -4,23 +4,28 @@ Runs 3 seeds per arm (gate, control, full_finetune, reduced_steps) = 12 cells.
 Alternates arm order to avoid scheduling bias. Takes ms/step from the trainer's
 instrumented step timer, not from total wall time.
 
+B14: alternation uses cell index (not seed % 2, which is always 1 for odd seeds).
+B14: f-strings guard against None from instrumentation keys.
+
 Usage:
     python scripts/run_timing_cells.py \
         --score s1 \
         --seeds 11 13 17 \
         --rate 0.60 \
-        --model jhu-clsp/ettin-encoder-150m@45d0864 \
+        --model jhu-clsp/ettin-encoder-150m \
+        --model-rev 45d0864 \
         --output-dir /raid/stage2_timing/
 """
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
 
 ARMS = ["gate", "control", "full_finetune", "reduced_steps"]
 
@@ -39,20 +44,31 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    sys.path.insert(0, str(repo_root / "scripts"))
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
-    from stage2_confirmatory import run_cell
+    from stage2_confirmatory import run_cell, _load_probe_data, _check_provenance
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Build cell list with alternating arm order per seed
+    # B5: provenance check before any training
+    probe_data = _load_probe_data(str(repo_root / "experiments" / "probe_indices_v4.json"))
+    run_sha = _check_provenance(probe_ids_sha=probe_data.get("ids_sha256"))
+
+    # B14: Build cell list with alternating arm order per cell index
     cells = []
+    cell_idx = 0
     for seed in args.seeds:
-        arm_order = ARMS[:]  # alternate order
-        order = arm_order if seed % 2 == 0 else list(reversed(arm_order))
+        arm_order = ARMS[:]
+        # B14: use cell_idx % 2, not seed % 2 (all seeds are odd → seed % 2 == 1 always)
+        order = arm_order if cell_idx % 2 == 0 else list(reversed(arm_order))
         for arm in order:
             cells.append((arm, seed))
+            cell_idx += 1
 
     results = []
     for arm, seed in cells:
@@ -61,6 +77,7 @@ def main():
             arm, seed, args.rate, args.total_steps,
             args.score, args.model, args.model_rev,
             output,
+            probe_data=probe_data, run_sha=run_sha,
         )
         instr_path = output / arm / str(seed) / "instrumentation.json"
         if instr_path.exists():
@@ -73,9 +90,14 @@ def main():
                 instr.get("mean_step_ms_skipped")
             )
         results.append(r)
-        print(f"  ms/step={r.get('mean_step_ms', 'N/A'):.2f} "
-              f"final_acc={r['eval_accuracy']:.4f} "
-              f"scheduler_calls={r['scheduler_step_calls']}")
+        ms_val = r.get("mean_step_ms")
+        ms_str = f"{ms_val:.2f}" if ms_val is not None else "N/A"
+        acc = r.get("eval_metrics", {}).get("eval_accuracy")
+        acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+        sched = r.get("true_skip_instrumentation", {}).get("scheduler_step_calls", "N/A")
+        print(f"  ms/step={ms_str} "
+              f"final_acc={acc_str} "
+              f"scheduler_calls={sched}")
 
     # Write timing summary
     summary = {
