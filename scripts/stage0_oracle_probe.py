@@ -193,10 +193,12 @@ def run_stage0(
 
     def tokenize(batch):
         # B12: dynamic padding — no padding here, handled by DataLoader collate
-        return tokenizer(
+        out = tokenizer(
             batch["question"], batch["sentence"],
             truncation=True, max_length=512,
         )
+        out["labels"] = batch["label"]
+        return out
 
     probe_s = probe_s.map(tokenize, batched=True)
     probe_e = probe_e.map(tokenize, batched=True)
@@ -246,7 +248,7 @@ def run_stage0(
         return {k: v.to(device) for k, v in padded.items()}
 
     dataloader = torch.utils.data.DataLoader(
-        train_ds.remove_columns(["sentence", "sentence2", "idx"]),
+        train_ds.remove_columns(["sentence", "sentence2", "idx", "label", "question"]),
         batch_size=32,
         shuffle=True,
         generator=torch.Generator().manual_seed(seed),
