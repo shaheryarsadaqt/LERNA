@@ -69,6 +69,39 @@ def arm_needs_probe(args) -> bool:
     return args.score == "s2" and args.arm == "gate"
 
 
+def _load_tokenizer(model_name: str, revision: str):
+    """Load tokenizer, falling back to BertTokenizer for models without
+    tokenizer_config.json (e.g. prajjwal1/bert-tiny)."""
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(model_name, revision=revision)
+    except (ValueError, OSError):
+        from transformers import BertTokenizer
+        from huggingface_hub import hf_hub_download
+        vocab_path = hf_hub_download(model_name, "vocab.txt", revision=revision)
+        return BertTokenizer(vocab_path, model_max_length=512)
+
+
+def _load_model(model_name: str, revision: str):
+    """Load model, falling back to BertForSequenceClassification for models
+    whose config.json lacks model_type (e.g. prajjwal1/bert-tiny)."""
+    from transformers import AutoModelForSequenceClassification
+    try:
+        return AutoModelForSequenceClassification.from_pretrained(
+            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32)
+    except (ValueError, OSError):
+        import json
+        from transformers import BertConfig, BertForSequenceClassification
+        from huggingface_hub import hf_hub_download
+        config_path = hf_hub_download(model_name, "config.json", revision=revision)
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        cfg_dict["model_type"] = "bert"
+        config = BertConfig.from_dict(cfg_dict)
+        config.num_labels = 2
+        return BertForSequenceClassification(config)
+
+
 def _build_ps_refresher(model, trainer, probe_s_batch, probe_s_ids, device):
     """B4: Build a P_s refresher callable that computes G_P every 64 steps.
 
@@ -295,7 +328,7 @@ def run_cell(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    tok = AutoTokenizer.from_pretrained(model_id, revision=model_rev)
+    tok = _load_tokenizer(model_id, revision=model_rev)
     ds_tr = load_dataset("glue", "qnli", split="train")
     ds_ev = load_dataset("glue", "qnli", split="validation")
 
@@ -324,17 +357,13 @@ def run_cell(
 
     # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
     ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
-    probe_s_batch = {
-        "input_ids": torch.stack([torch.tensor(d["input_ids"]) for d in ps_raw]),
-        "attention_mask": torch.stack([torch.tensor(d["attention_mask"]) for d in ps_raw]),
-        "labels": torch.tensor([d["labels"] for d in ps_raw]),
-    }
+    probe_s_batch = tok.pad(
+        {"input_ids": ps_raw["input_ids"], "attention_mask": ps_raw["attention_mask"]},
+        padding="longest", max_length=512, return_tensors="pt")
 
     ds_tr = ds_tr_raw.select(filtered_ids)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_id, revision=model_rev, num_labels=2, torch_dtype=torch.float32
-    )
+    model = _load_model(model_id, revision=model_rev)
 
     min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
 
