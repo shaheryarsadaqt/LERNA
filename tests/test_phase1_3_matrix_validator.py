@@ -752,6 +752,43 @@ class Phase13MatrixValidatorTests(unittest.TestCase):
                 plan[FULL][field] = value
                 self.assertIn(field, _fields(_findings(plan)))
 
+    # 12a. min_step must equal int(total_steps * 0.06) — canonical V4 warmup.
+    def test_min_step_matches_canonical_warmup_ratio(self):
+        """min_step must equal int(total_steps * 0.06). Any other value is rejected."""
+        plan = _build_plan()
+        plan[RANDOM]["min_step"] = POLICY_MIN_STEP + 1
+        findings = _findings(plan)
+        self.assertIn("min_step", _fields(findings))
+        msgs = _messages(findings, "min_step")
+        self.assertTrue(
+            any("must equal int(total_steps * warmup_ratio)" in m for m in msgs),
+            f"Expected min_step formula error, got: {msgs}",
+        )
+
+    # 12b. warmup_ratio must be 0.06 if explicitly provided.
+    def test_warmup_ratio_must_be_canonical(self):
+        """If warmup_ratio is provided in identity_inputs, it must be 0.06."""
+        plan = _build_plan()
+        plan[RANDOM]["identity_inputs"] = {"warmup_ratio": 0.05}
+        findings = _findings(plan)
+        self.assertIn("warmup_ratio", _fields(findings))
+        msgs = _messages(findings, "warmup_ratio")
+        self.assertTrue(
+            any("must be 0.06" in m for m in msgs),
+            f"Expected warmup_ratio canonical error, got: {msgs}",
+        )
+
+    # 12c. Cells without warmup_ratio default to 0.06 and pass if min_step matches.
+    def test_min_step_without_warmup_ratio_defaults_to_canonical(self):
+        """Cells without warmup_ratio in identity_inputs should still validate
+        against the default 0.06."""
+        plan = _build_plan()
+        # Remove warmup_ratio if present (default plan shouldn't have it)
+        if "identity_inputs" in plan[RANDOM]:
+            plan[RANDOM]["identity_inputs"] = {}
+        findings = _findings(plan)
+        self.assertNotIn("min_step", _fields(findings))
+
     # 13. Exact quotas for the five skipping arms and infeasibility.
     def test_exact_quota_for_all_skipping_arms(self):
         for offset, arm in zip(

@@ -1493,9 +1493,13 @@ def _validate_cell_contract(
             cell_id,
             "total_steps must be greater than min_step",
         )
+    # Canonical V4 warmup_ratio is 0.06. min_step must equal int(total_steps * 0.06).
+    # If warmup_ratio is explicitly provided in identity_inputs, validate against it;
+    # otherwise default to 0.06 and validate against that.
+    if warmup_ratio is None:
+        warmup_ratio = 0.06
     if (
         _is_int(total_steps)
-        and _is_float(warmup_ratio)
         and _is_int(min_step)
         and min_step != int(total_steps * warmup_ratio)
     ):
@@ -1507,6 +1511,15 @@ def _validate_cell_contract(
             f"= int({total_steps} * {warmup_ratio}) = {int(total_steps * warmup_ratio)}, "
             f"got {min_step}",
         )
+    # When warmup_ratio is explicitly set, verify it matches the canonical 0.06.
+    if _is_float(cell.get("identity_inputs", {}).get("warmup_ratio") if isinstance(cell.get("identity_inputs"), dict) else None):
+        if cell["identity_inputs"]["warmup_ratio"] != 0.06:
+            _add_error(
+                findings,
+                "warmup_ratio",
+                cell_id,
+                f"warmup_ratio must be 0.06 (canonical V4 value), got {cell['identity_inputs']['warmup_ratio']}",
+            )
 
     if arm == "full_finetune":
         _expect(cell, "requested_quota", None, findings, cell_id)

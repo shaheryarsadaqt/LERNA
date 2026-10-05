@@ -437,6 +437,12 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    but the global check recovers the total. Longest skip run ≤ 4 (cap respected
    under forcing). → See `tests/test_forward_gate.py` (tests 15–17).
 
+2. **Strict min_step validator**: `_validate_cell_contract` now enforces
+   `min_step == int(total_steps * 0.06)` (canonical V4 warmup_ratio=0.06),
+   whether or not `warmup_ratio` is present in the cell. Cells with
+   `warmup_ratio != 0.06` are rejected. → See
+   `tests/test_phase1_3_matrix_validator.py` (tests 12a–12c).
+
 2. **S2 hook + probe refresh**: On a tiny model, `G_B` (from
    `_classifier_grad_from_logits`) matches the autograd gradient for
    `classifier.weight` within 1e-5, and the output is finite with the right
