@@ -19,12 +19,9 @@ Usage:
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
-
-import numpy as np
 
 
 ARMS = ["gate", "control", "full_finetune", "reduced_steps"]

@@ -31,9 +31,8 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
-from typing import Optional
 
 
 ARMS = ["gate", "control", "full_finetune", "reduced_steps"]

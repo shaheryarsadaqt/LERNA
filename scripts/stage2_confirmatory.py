@@ -323,11 +323,11 @@ def run_cell(
     assert not probe_e_set.intersection(filtered_ids), "P_e in train"
 
     # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
-    ps_raw = ds_tr_raw.select(probe_s_ids[:32])
+    ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
     probe_s_batch = {
         "input_ids": torch.stack([torch.tensor(d["input_ids"]) for d in ps_raw]),
         "attention_mask": torch.stack([torch.tensor(d["attention_mask"]) for d in ps_raw]),
-        "labels": torch.tensor([d["label"] for d in ps_raw]),
+        "labels": torch.tensor([d["labels"] for d in ps_raw]),
     }
 
     ds_tr = ds_tr_raw.select(filtered_ids)
@@ -336,17 +336,17 @@ def run_cell(
         model_id, revision=model_rev, num_labels=2, torch_dtype=torch.float32
     )
 
+    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
+
     args = _build_training_args(
         arm, seed, total_steps, FULL_WARMUP, output_dir,
     )
-
-    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
 
     # B4: For S2 gate, build live P_s refresher probe_fn if not already provided
     if score_kind == "s2" and arm == "gate":
         if probe_fn is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            probe_fn = _build_ps_refresher(model, None, probe_s_batch, probe_s_ids, device)
+            probe_fn = _build_ps_refresher(model, None, probe_s_batch, sorted(probe_s_ids), device)
 
     policy = _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn)
 
@@ -360,9 +360,19 @@ def run_cell(
             return {
                 "input_ids": _T.tensor([d["input_ids"] for d in batch]),
                 "attention_mask": _T.tensor([d["attention_mask"] for d in batch]),
-                "labels": _T.tensor([d["label"] for d in batch]),
+                "labels": _T.tensor([d["labels"] for d in batch]),
             }
         return coll
+
+    from transformers import TrainerCallback
+    lr_history: list = []
+
+    class _LRCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            trainer = kwargs.get("trainer")
+            opt = getattr(trainer, "optimizer", None) if trainer else None
+            if opt is not None:
+                lr_history.append(float(opt.param_groups[0]["lr"]))
 
     t = TrueBackwardSkippingTrainer(
         model=model, args=args,
@@ -372,14 +382,10 @@ def run_cell(
         skip_policy=policy,
         scheduler_step_policy="always_step",
         capture_logits=True,
+        online_ler_mode="legacy_dense",  # B3: logit capture + legacy dense mode
         instrumentation_path=str(output_dir / arm / str(seed) / "instrumentation.json"),
+        callbacks=[_LRCallback()],
     )
-    args = _build_training_args(
-        arm, seed, total_steps, FULL_WARMUP, output_dir,
-    )
-
-    # B3: Use legacy_dense online learning mode
-    t.online_ler_mode = "legacy_dense"
 
     # B3: Attach AlignmentProbe to model before train() for S2 score
     if arm == "gate" and score_kind == "s2":
@@ -425,11 +431,12 @@ def run_cell(
 
     metrics = t.evaluate()
 
-    # B12: extract LR history for curve comparison
-    lr_history = getattr(getattr(t, "instr", None), "lr_history", [])
-    if not lr_history:
-        # fallback: collect from optimizer param_groups log
-        lr_history = [final_lr] * expected_steps
+    instr = getattr(t, "instr", None)
+
+    # B2: capture policy diagnostics from the gate/control policy
+    pol_diag = {}
+    if hasattr(t.skip_policy, "get_diagnostics"):
+        pol_diag = t.skip_policy.get_diagnostics()
 
     # B2: restructured results with required sections
     result = {
@@ -443,33 +450,34 @@ def run_cell(
             "model_rev": model_rev,
             "score_kind": score_kind,
             "min_step": min_step,
+            "skip_update_mode": "freeze",
+            "scheduler_step_policy": "always_step",
         },
-        "policy_diagnostics": {
-            "min_step": min_step,
-            "score_kind": score_kind,
-            "max_consecutive_skips": 4,
-            "policy_seed": seed,
-            "max_skips_possible": _max_skips_possible(expected_steps, 4),
-            "probe_attached": arm == "gate" and score_kind == "s2",
-        },
+        "policy_diagnostics": pol_diag,
         "true_skip_instrumentation": {
             "batches_seen": batches_seen,
             "scheduler_step_calls": scheduler_calls,
-            "skips_executed": getattr(getattr(t, "instr", None), "skips_executed", 0),
-            "forward_skips": getattr(getattr(t, "instr", None), "forward_skips", 0),
-            "backward_skips": getattr(getattr(t, "instr", None), "backward_skips", 0),
-            "forced_backwards": getattr(getattr(t, "instr", None), "forced_backwards", 0),
+            "optimizer_step_attempts": getattr(instr, "optimizer_step_attempts", 0) if instr else 0,
+            "skipped_backward_steps": getattr(instr, "skipped_backward_steps", 0) if instr else 0,
+            "skipped_batches": getattr(instr, "skipped_batches", 0) if instr else 0,
+            "forward_calls": getattr(instr, "forward_calls", 0) if instr else 0,
+            "backward_calls": getattr(instr, "backward_calls", 0) if instr else 0,
+            "skip_ratio_by_batch": getattr(instr, "skip_ratio_by_batch", None) if instr else None,
+            "scheduler_step_policy": getattr(instr, "scheduler_step_policy", "always_step") if instr else "always_step",
+            "skip_update_mode": getattr(instr, "skip_update_mode", "freeze") if instr else "freeze",
         },
         "eval_metrics": {
             "eval_accuracy": metrics.get("eval_accuracy"),
             "eval_loss": metrics.get("eval_loss"),
         },
         "provenance": {
-            "run_sha": run_sha,
+            "v4_prereg_sha": run_sha,
             "probe_ids_sha256": probe_data.get("ids_sha256") if probe_data else None,
+            "probe_file_sha256": probe_data.get("sha256") if probe_data else None,
             "codebase_checkout": _check_lerna_in_checkout(),
+            "tree_dirty": not _check_lerna_in_checkout(),
         },
-        "lr_history": lr_history[:],
+        "lr_history": list(lr_history),
         "final_lr": final_lr,
         "wall_seconds": wall,
         "ms_per_step": wall / expected_steps * 1000,
@@ -482,7 +490,7 @@ def run_cell(
     manifest = {
         "arm": arm,
         "seed": seed,
-        "run_sha": run_sha,
+        "v4_prereg_sha": run_sha,
         "probe_ids_sha256": probe_data.get("ids_sha256") if probe_data else None,
         "run_config": result["run_config"],
         "policy_diagnostics": result["policy_diagnostics"],
