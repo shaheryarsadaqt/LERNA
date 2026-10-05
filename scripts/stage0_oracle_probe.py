@@ -121,6 +121,27 @@ def _load_tokenizer(model_name: str, revision: str):
         return BertTokenizer(vocab_path, model_max_length=512)
 
 
+def _load_model(model_name: str, revision: str):
+    """Load model, falling back to BertForSequenceClassification for models
+    whose config.json lacks model_type (e.g. prajjwal1/bert-tiny)."""
+    from transformers import AutoModelForSequenceClassification
+    try:
+        return AutoModelForSequenceClassification.from_pretrained(
+            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32)
+    except (ValueError, OSError):
+        from transformers import BertConfig, BertForSequenceClassification
+        from huggingface_hub import hf_hub_download
+        import json
+        config_path = hf_hub_download(model_name, "config.json", revision=revision)
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        cfg_dict["model_type"] = "bert"
+        config = BertConfig.from_dict(cfg_dict)
+        config.num_labels = 2
+        model = BertForSequenceClassification(config)
+        return model
+
+
 def run_stage0(
     seed: int,
     model_name: str,
@@ -144,12 +165,7 @@ def run_stage0(
     os.makedirs(output_dir, exist_ok=True)
 
     tokenizer = _load_tokenizer(model_name, revision=model_rev)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        revision=model_rev,
-        num_labels=2,
-        torch_dtype=torch.float32,
-    )
+    model = _load_model(model_name, revision=model_rev)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
