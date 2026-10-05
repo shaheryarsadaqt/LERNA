@@ -408,7 +408,46 @@ The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ---
 
-## 9. Stage 2 Failure Policy
+## 9. SST-2 Replication (pre-declared secondary)
+
+**Scope**: Gate vs control at rate 0.60, 10 seeds each, on SST-2.
+
+- Uses the score chosen in Stage 0 (same score as QNLI).
+- Total steps: 2,205 (SST-2 train corpus, batch=32).
+- `min_step = int(2205 * 0.06) = 132`.
+- Seeds: [101, 103, 107, 109, 113, 127, 131, 137, 139, 149] (disjoint from Stage 0
+  and Stage 2 QNLI seeds).
+- Cost: ~1 GPU-hour on V100.
+- Primary test: `Δacc(gate − control)`, paired t-test, two-sided, α = 0.05, df = 9.
+- Reported alongside QNLI as a within-protocol replication to address the
+  "one task only" concern. No claim of generalization across tasks is asserted.
+- **If the Stage 0 chosen score is S1**: SST-2 uses `score_source="s1"`.
+- **If the Stage 0 chosen score is S2**: SST-2 uses `score_source="s2"`.
+  The probe is refreshed on the same 64-step cadence.
+
+---
+
+## 10. Pareto Analysis (pre-declared secondary)
+
+**Scope**: Accuracy vs measured GPU-seconds for all 4 arms (gate, control,
+full_finetune, reduced_steps), built from serial timing cells.
+
+- **Timing cells**: 3 seeds × 4 arms = 12 cells, each on a single isolated V100.
+  Measures wall-clock time per step (ms/step) and peak GPU memory.
+- **Pareto frontier**: accuracy vs GPU-seconds (forward × batch_size × ms_per_step × steps_run).
+  Four points on the frontier:
+  1. `full_finetune` (100% compute)
+  2. `reduced_steps` (40% compute)
+  3. `gate` (40% backward compute + 100% forward compute)
+  4. `control` (40% backward compute + 100% forward compute)
+- **Claim scope**: The gate's efficiency claim is limited to settings where
+  forward passes are already paid for (e.g., during a forward-only evaluation
+  pass on unlabeled data). The Pareto plot will show where `reduced_steps`
+  dominates and where the gate's forward-cost amortization matters.
+
+---
+
+## 11. Stage 2 Failure Policy
 
 - Strict forward-loss check ON (`nonfinite_forward_loss_policy="fail"`)
 - `forward_loss_observations == total_steps` (6548 for QNLI)
@@ -419,7 +458,7 @@ The "matched budget" for gate vs reduced_steps is NOT total compute.
 
 ---
 
-## 10. Probe Exclusion Assertion
+## 12. Probe Exclusion Assertion
 
 Both `P_s` (256 examples) and `P_e` (256 examples) are removed from the training
 sampler in every arm. The runner asserts:
@@ -434,7 +473,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ---
 
-## 11. Execution Protocol
+## 13. Execution Protocol
 
 1. **Stage 0 first**: Run oracle probe (seeds 101, 103) in shadow mode.
 2. **Decision recorded**: `docs/gate_a_decision.md` must be dated and committed
@@ -448,7 +487,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
 
 ---
 
-## 12. Checklist Before Pre-Reg Commit
+## 14. Checklist Before Pre-Reg Commit
 
 1. **Per-step global feasibility enforcement**: Tests verify `realized == requested`
    at 0.45 and 0.60 over 6548 steps, including when a phase is locally infeasible
@@ -468,7 +507,7 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    → See `tests/test_forward_gate.py` (test 13).
 
 3. **Both probes excluded from training sampler**: Asserted in the runner.
-   → See §9.
+   → See §12.
 
 4. **Pre-reg text fixes**: Seeds 101/103 (Stage 0), 24 Stage 2 seeds, reserves
    157/163; rate fixed at 0.60; selection rule; power output.
@@ -478,12 +517,18 @@ probe doing both scoring and outcome would make S2 "look good by construction."
    and `scheduler_step_calls == 6548`.
    → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
 
-6. **Clean git tree**: The `v4-prereg` tag is resolved dynamically via `git rev-parse v4-prereg` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement and its pre-reg documentation — are included in the tagged commit.
-   so it cannot be the run SHA.
+6. **Clean git tree**: The `v4-prereg` tag is resolved dynamically via `git rev-parse v4-prereg` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRPC smoke min_step correction, and the SST-2/Pareto secondary sections — are included in the tagged commit.
+
+7. **SST-2 replication plan**: 10 seeds, rate 0.60, min_step=int(2205×0.06)=132.
+   → See §9.
+
+8. **Pareto analysis plan**: 12 timing cells (3 seeds × 4 arms), accuracy vs
+   GPU-seconds frontier.
+   → See §10.
 
 ---
 
-## 13. Addendum: Changes from V3
+## 15. Addendum: Changes from V3
 
 | Section | V3 | V4 (this amendment) |
 |---------|-----|---------------------|
