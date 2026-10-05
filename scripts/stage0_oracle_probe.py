@@ -108,6 +108,19 @@ def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
         model.train(saved["training"])
 
 
+def _load_tokenizer(model_name: str, revision: str):
+    """Load tokenizer, falling back to BertTokenizer for models without
+    tokenizer_config.json (e.g. prajjwal1/bert-tiny)."""
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(model_name, revision=revision)
+    except (ValueError, OSError):
+        from transformers import BertTokenizer
+        from huggingface_hub import hf_hub_download
+        vocab_path = hf_hub_download(model_name, "vocab.txt", revision=revision)
+        return BertTokenizer(vocab_path, model_max_length=512)
+
+
 def run_stage0(
     seed: int,
     model_name: str,
@@ -130,7 +143,7 @@ def run_stage0(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=model_rev)
+    tokenizer = _load_tokenizer(model_name, revision=model_rev)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         revision=model_rev,
