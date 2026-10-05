@@ -510,6 +510,11 @@ def main():
     # F11: provenance check
     run_sha = _check_provenance()
 
+    # B9: ensure repo root is on sys.path so `import lerna` works
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     # F6: verify probe file hash matches pre-reg
     with open(args.probe_file) as f:
         probe_data = json.load(f)
