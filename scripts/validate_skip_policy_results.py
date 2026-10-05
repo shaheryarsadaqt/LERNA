@@ -2046,11 +2046,12 @@ def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[
                        total_steps, batches_seen,
                        f"batches_seen must equal total_steps ({total_steps})")
 
-    # Provenance SHA match
-    if expected_sha and prov.get("run_sha") != expected_sha:
-        report.add(SEVERITY_ERROR, "provenance.run_sha", expected_sha,
-                   prov.get("run_sha"),
-                   "run_sha does not match expected pre-registration SHA")
+    # Provenance SHA match — check both field name variants
+    actual_sha = prov.get("v4_prereg_sha") or prov.get("run_sha") or prov.get("frozen_confirmatory_sha")
+    if expected_sha and actual_sha != expected_sha:
+        report.add(SEVERITY_ERROR, "provenance.v4_prereg_sha", expected_sha,
+                   actual_sha,
+                   "run SHA does not match expected pre-registration SHA")
 
     # Codebase checkout
     if not prov.get("codebase_checkout"):
@@ -2068,8 +2069,8 @@ def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[
 
     # B2: Gate-specific numerical contracts
     # realized_total == requested_total == round(rate×T)
-    realized = _as_int(diag.get("realized_skips"))
-    requested = _as_int(diag.get("requested_skips"))
+    realized = _as_int(diag.get("realized_total")) or _as_int(diag.get("realized_skips"))
+    requested = _as_int(diag.get("requested_total")) or _as_int(diag.get("requested_skips"))
     rate = _as_float(diag.get("skip_rate"))
     if rate is not None and total_steps is not None:
         expected_skips = round(rate * total_steps)
