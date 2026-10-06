@@ -2039,12 +2039,15 @@ def _check_v4_gate(report: ValidationReport, data: dict, expected_sha: Optional[
                        "scheduler_step_calls must equal batches_seen")
 
     # Step count contract
-    if total_steps is not None and batches_seen is not None:
-        if batches_seen != total_steps:
+    expected_steps = total_steps
+    if arm == "reduced_steps":
+        expected_steps = _as_int(run_config.get("actual_steps_run")) or total_steps
+    if expected_steps is not None and batches_seen is not None:
+        if batches_seen != expected_steps:
             report.add(SEVERITY_ERROR,
                        "true_skip_instrumentation.batches_seen",
-                       total_steps, batches_seen,
-                       f"batches_seen must equal total_steps ({total_steps})")
+                       expected_steps, batches_seen,
+                       f"batches_seen must equal expected steps ({expected_steps})")
 
     # Provenance SHA match — check both field name variants
     actual_sha = prov.get("v4_prereg_sha") or prov.get("run_sha") or prov.get("frozen_confirmatory_sha")
