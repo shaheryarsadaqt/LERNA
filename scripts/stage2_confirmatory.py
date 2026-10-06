@@ -9,6 +9,11 @@ Arms:
 - full_finetune: AlwaysFalsePolicy (0% skip, 6548 steps)
 - reduced_steps: train 40% of steps (2619), matched backward budget
 
+**Amendment r3 -> r4** (applied after dry-run but before any real cell):
+- B17: ModernBert models produce NaN loss with sdpa attention on CUDA V100.
+  Fixed by forcing `attn_implementation="eager"` in `_load_model`.
+  Affects only GPU+ModernBert; bert-tiny (CPU) and Stage 0 are unaffected.
+
 Pre-registered: experiments/PREREG_V4.md §7.
 
 Usage:
@@ -88,7 +93,9 @@ def _load_model(model_name: str, revision: str):
     from transformers import AutoModelForSequenceClassification
     try:
         return AutoModelForSequenceClassification.from_pretrained(
-            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32)
+            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32,
+            attn_implementation="eager",
+        )
     except (ValueError, OSError):
         import json
         from transformers import BertConfig, BertForSequenceClassification
