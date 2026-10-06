@@ -184,7 +184,7 @@ def _check_provenance(probe_ids_sha: str | None = None):
     # Check HEAD == v4-prereg-r3
     try:
         tag_sha = subprocess.run(
-            ["git", "rev-parse", "v4-prereg-r3"],
+            ["git", "rev-parse", "v4-prereg-r3^{commit}"],
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         head_sha = subprocess.run(
