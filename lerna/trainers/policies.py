@@ -101,8 +101,21 @@ def build_exact_random_skip_set(
 class AlwaysFalsePolicy:
     name = "always_false"
 
+    def __init__(self):
+        self.decisions_seen = 0
+
     def should_skip(self, trainer, model, inputs) -> bool:
+        self.decisions_seen += 1
         return False
+
+    def get_diagnostics(self) -> dict:
+        return {
+            "name": self.name,
+            "skip_decisions": 0,
+            "decisions_seen": self.decisions_seen,
+            "quota_size": 0,
+            "quota_total_steps": 0,
+        }
 
 
 # ---------------------------------------------------------------------------
