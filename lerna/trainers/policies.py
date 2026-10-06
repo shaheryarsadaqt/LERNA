@@ -109,13 +109,12 @@ class AlwaysFalsePolicy:
         return False
 
     def get_diagnostics(self) -> dict:
-        return {
+        diag = {
             "name": self.name,
             "skip_decisions": 0,
             "decisions_seen": self.decisions_seen,
-            "quota_size": 0,
-            "quota_total_steps": 0,
         }
+        return diag
 
 
 # ---------------------------------------------------------------------------

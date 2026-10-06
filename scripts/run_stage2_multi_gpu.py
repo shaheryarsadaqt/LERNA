@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--model-rev", type=str, required=True)
     parser.add_argument("--n-gpus", type=int, default=8)
     parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--script", type=str, default="scripts/stage2_confirmatory.py",
+                        help="Script to run for each cell")
     parser.add_argument("--probe-file", type=str,
                         default="experiments/probe_indices_v4.json")
     args = parser.parse_args()
@@ -113,7 +115,7 @@ def main():
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
             cmd = [
-                sys.executable, "scripts/stage2_confirmatory.py",
+                sys.executable, args.script,
                 "--score", args.score,
                 "--seeds", str(seed),
                 "--rate", str(args.rate),
