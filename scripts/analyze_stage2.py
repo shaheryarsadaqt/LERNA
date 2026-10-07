@@ -133,17 +133,23 @@ def main():
         diffs_tost = [arm_dict[s]["eval_accuracy"] - full[s]["eval_accuracy"] for s in common]
         if diffs_tost:
             diff_arr = np.array(diffs_tost)
-            margin = 0.5
-            lower = diff_arr.mean() - t_dist.ppf(0.95, len(diff_arr) - 1) * diff_arr.std(ddof=1) / math.sqrt(len(diff_arr))
-            upper = diff_arr.mean() + t_dist.ppf(0.95, len(diff_arr) - 1) * diff_arr.std(ddof=1) / math.sqrt(len(diff_arr))
-            ttest1 = _paired_ttest([d - margin for d in diffs_tost])
-            ttest2 = _paired_ttest([d + margin for d in diffs_tost])
-            t1 = ttest1["t_stat"]; t2 = ttest2["t_stat"]
-            tost_p = max(ttest1["p_val"], ttest2["p_val"])
+            margin = 0.005
+            n = len(diff_arr)
+            df = n - 1
+            mean_delta = float(diff_arr.mean())
+            sd = float(diff_arr.std(ddof=1))
+            se = sd / math.sqrt(n) if sd > 0 else 0.0
+            t1 = (mean_delta + margin) / se if se > 0 else float("inf")
+            t2 = (mean_delta - margin) / se if se > 0 else float("-inf")
+            p1 = 1 - t_dist.cdf(t1, df) if se > 0 else 0.0
+            p2 = t_dist.cdf(t2, df) if se > 0 else 0.0
+            tost_p = max(p1, p2)
+            lower = mean_delta - t_dist.ppf(0.95, df) * se
+            upper = mean_delta + t_dist.ppf(0.95, df) * se
             tost_results[f"{arm_name}_vs_full_finetune"] = {
-                "margin_pt": margin,
-                "mean_delta": float(diff_arr.mean()),
-                "ci_95": [float(lower), float(upper)],
+                "margin_pt": margin * 100,
+                "mean_delta_pt": mean_delta * 100,
+                "ci_95_pt": [lower * 100, upper * 100],
                 "tost_p": float(tost_p),
                 "tost_passed": tost_p < 0.05,
             }
