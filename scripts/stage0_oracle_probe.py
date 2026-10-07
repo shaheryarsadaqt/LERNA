@@ -150,7 +150,7 @@ def run_stage0(
     rate: float,
     probe_indices_file: str,
     log_interval: int = 8,
-    probe_refresh: int = 512,
+    probe_refresh: int = 64,
     output_dir: str = "/raid/stage0_oracle_probe/",
 ) -> Stage0Result:
     """Run Stage 0 oracle probe for a single seed.
@@ -478,7 +478,7 @@ def _check_provenance():
         sys.exit(1)
     try:
         tag_sha = subprocess.run(
-            ["git", "rev-parse", "v4-prereg-r3"],
+            ["git", "rev-parse", "v4-prereg-r3^{commit}"],
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
         head_sha = subprocess.run(
@@ -503,7 +503,7 @@ def main():
     parser.add_argument("--probe-file", type=str,
                         default="experiments/probe_indices_v4.json")
     parser.add_argument("--log-interval", type=int, default=8)
-    parser.add_argument("--probe-refresh", type=int, default=512)
+    parser.add_argument("--probe-refresh", type=int, default=64)
     parser.add_argument("--output-dir", type=str, default="/raid/stage0_oracle_probe/")
     args = parser.parse_args()
 
