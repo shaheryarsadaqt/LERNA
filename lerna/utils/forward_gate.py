@@ -786,10 +786,10 @@ def alignment_score(
 def _s2_alignment_core(G_B, G_P, v, eps: float = 1e-8) -> float:
     """B12: shared S2 alignment computation used by both stage0 and stage2.
 
-    s_B = <G_B, G_P ⊘ (sqrt(v) + eps)>
-
-    where G_B is the current batch's gradient w.r.t. classifier.weight,
-    G_P is the probe gradient, and v is AdamW's exp_avg_sq for classifier.weight.
+    Gate score convention: higher score = more predicted gain = less likely to skip.
+    Raw alignment s_B = <G_B, G_P ⊘ (sqrt(v) + eps)> predicts loss DROP (positive = good).
+    However, empirical correlation with realized gain is negative, so the gate score
+    uses -s_B to match the convention (higher = more gain = less skip).
 
     Returns NaN if shapes mismatch or result is non-finite.
     """
@@ -799,7 +799,7 @@ def _s2_alignment_core(G_B, G_P, v, eps: float = 1e-8) -> float:
     s = float(torch.dot(G_B.flatten(), normalized.flatten()).item())
     if not math.isfinite(s):
         return float("nan")
-    return s
+    return -s  # gate score: higher = more predicted gain = less skip
 
 
 class ScoreQuantileGatePolicy:
