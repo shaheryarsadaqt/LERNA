@@ -371,6 +371,13 @@ def run_stage0(
         i for i, s in enumerate(log_steps) if min_step <= s < max_step
     ]
 
+    print(f"  DEBUG: log_steps={len(log_steps)}, eligible_indices={len(eligible_indices)}, min_step={min_step}, max_step={max_step}")
+    print(f"  DEBUG: s1_values={len(s1_values)}, s2_values={len(s2_values)}, pe_gain_values={len(pe_gain_values)}")
+    if eligible_indices:
+        print(f"  DEBUG: first eligible idx={eligible_indices[0]}, last={eligible_indices[-1]}")
+        print(f"  DEBUG: s1_values[first]={s1_values[eligible_indices[0]]}, s1_values[last]={s1_values[eligible_indices[-1]]}")
+        print(f"  DEBUG: pe_gain_values[first]={pe_gain_values[eligible_indices[0]]}, pe_gain_values[last]={pe_gain_values[eligible_indices[-1]]}")
+
     window_size = 64  # 64 logged points = 512 actual steps
 
     for score_name, score_values, spearmans, ci_lowers, ci_uppers, attr_mean in [
@@ -386,6 +393,9 @@ def run_stage0(
             (pe_gain_values[i] if i < len(pe_gain_values) else float("nan"))
             for i in eligible_indices
         ]
+
+        print(f"  DEBUG {score_name}: eligible_scores[:5]={eligible_scores[:5]}, eligible_gains[:5]={eligible_gains[:5]}")
+        print(f"  DEBUG {score_name}: NaN count in scores={sum(1 for x in eligible_scores if isinstance(x, float) and math.isnan(x))}, NaN count in gains={sum(1 for x in eligible_gains if isinstance(x, float) and math.isnan(x))}")
 
         n = len(eligible_scores)
         if n < 4:
@@ -407,6 +417,7 @@ def run_stage0(
             valid = [(xi, yi) for xi, yi in zip(x, y)
                      if not (math.isnan(xi) if isinstance(xi, float) else False)
                      and not (math.isnan(yi) if isinstance(yi, float) else False)]
+            print(f"  DEBUG {score_name}: window {start_idx}-{end_idx}, valid={len(valid)}")
             if len(valid) < 4:
                 continue
 
@@ -414,6 +425,7 @@ def run_stage0(
             vy = [v[1] for v in valid]
             min_len = min(len(vx), len(vy))
             rho, _ = spearmanr(vx[:min_len], vy[:min_len])
+            print(f"  DEBUG {score_name}: rho={rho}")
             if rho is not None and not math.isnan(rho):
                 window_rhos.append(float(rho))
                 spearmans.append(float(rho))
