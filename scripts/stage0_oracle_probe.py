@@ -308,9 +308,14 @@ def run_stage0(
 
         # Log at interval
         if step > 0 and step % log_interval == 0:
+            # Debug: print batch info at first log
+            if step == log_interval:
+                print(f"  DEBUG: batch keys={list(batch.keys())}, logits shape={logits.shape}, labels shape={batch['labels'].shape}, labels dtype={batch['labels'].dtype}")
+
             # S1: forward gain score
             from lerna.utils.forward_gate import forward_gain_score
             s1 = forward_gain_score(logits, batch["labels"])
+            print(f"  DEBUG step={step}: s1={s1}")
             s1_values.append(s1)
 
             # S2: alignment score — B12: uses shared _s2_alignment_core
@@ -330,13 +335,16 @@ def run_stage0(
             # F1 fix: per-step gain, correct sign (before - after)
             # We compute P_e loss BEFORE optimizer.step(), step, then compute AFTER.
             pe_loss_before = compute_probe_loss(model, probe_e_batch, device)
+            print(f"  DEBUG step={step}: pe_loss_before={pe_loss_before}")
 
             # Optimizer step
             optimizer.step()
             scheduler.step()
 
             pe_loss_after = compute_probe_loss(model, probe_e_batch, device)
+            print(f"  DEBUG step={step}: pe_loss_after={pe_loss_after}")
             gain = pe_loss_before - pe_loss_after  # positive = loss decreased = gain
+            print(f"  DEBUG step={step}: gain={gain}")
             pe_gain_values.append(gain)
             pe_loss_at_step[step] = pe_loss_after
             log_steps.append(step)
