@@ -75,7 +75,9 @@ def compute_probe_loss(model, batch, device):
     try:
         with torch.no_grad():
             out = model(**{k: v.to(device) for k, v in batch.items()})
-            return out.loss.item()
+            loss_val = out.loss.item()
+            print(f"  DEBUG compute_probe_loss: loss={loss_val}, out.loss={out.loss}")
+            return loss_val
     finally:
         model.train(saved)
 
@@ -311,6 +313,7 @@ def run_stage0(
             # Debug: print batch info at first log
             if step == log_interval:
                 print(f"  DEBUG: batch keys={list(batch.keys())}, logits shape={logits.shape}, labels shape={batch['labels'].shape}, labels dtype={batch['labels'].dtype}")
+                print(f"  DEBUG: logits[:2]={logits[:2]}, logits has nan={torch.isnan(logits).any().item()}")
 
             # S1: forward gain score
             from lerna.utils.forward_gate import forward_gain_score
