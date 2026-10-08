@@ -127,7 +127,8 @@ def _load_model(model_name: str, revision: str):
     from transformers import AutoModelForSequenceClassification
     try:
         return AutoModelForSequenceClassification.from_pretrained(
-            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32)
+            model_name, revision=revision, num_labels=2, torch_dtype=torch.float32,
+            attn_implementation="eager", reference_compile=False)
     except (ValueError, OSError):
         from transformers import BertConfig, BertForSequenceClassification
         from huggingface_hub import hf_hub_download
