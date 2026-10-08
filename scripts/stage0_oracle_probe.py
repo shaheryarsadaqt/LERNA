@@ -70,16 +70,13 @@ def load_probe_indices(probe_file: str) -> dict:
 
 
 def compute_probe_loss(model, batch, device):
-    saved = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            out = model(**{k: v.to(device) for k, v in batch.items()})
-            loss_val = out.loss.item()
-            print(f"  DEBUG compute_probe_loss: loss={loss_val}, out.loss={out.loss}")
-            return loss_val
-    finally:
-        model.train(saved)
+    # NOTE: Avoid model.eval()/model.train() transitions to prevent state corruption.
+    # In torch.no_grad() with LayerNorm (no BatchNorm), forward is deterministic.
+    with torch.no_grad():
+        out = model(**{k: v.to(device) for k, v in batch.items()})
+        loss_val = out.loss.item()
+        print(f"  DEBUG compute_probe_loss: loss={loss_val}, out.loss={out.loss}")
+        return loss_val
 
 
 def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
@@ -88,26 +85,27 @@ def compute_gp_from_logits(model, probe_s_batch, device, alignment_probe_fn):
     Uses _classifier_grad_from_logits on P_s (eval-mode hook), the same
     function as G_B. Does NOT do a backward pass or zero_grad, so it
     cannot wipe the training gradient.
+
+    NOTE: We avoid model.eval()/model.train() transitions because they
+    corrupt ModernBERT state on CUDA (NaN logits in subsequent training steps).
+    Since we're in torch.no_grad() and ModernBERT uses LayerNorm (not BatchNorm),
+    the forward pass is deterministic without mode change. Dropout is disabled
+    by no_grad for inference-like computation.
     """
     from lerna.utils.forward_gate import _classifier_grad_from_logits
 
-    saved = {"training": model.training}
-    model.eval()
-    try:
-        probe_s_batch = {k: v.to(device) for k, v in probe_s_batch.items()}
-        with torch.no_grad():
-            out = model(**probe_s_batch)
-            logits = out.logits.detach()
-            labels = probe_s_batch["labels"]
+    probe_s_batch = {k: v.to(device) for k, v in probe_s_batch.items()}
+    with torch.no_grad():
+        out = model(**probe_s_batch)
+        logits = out.logits.detach()
+        labels = probe_s_batch["labels"]
 
-        hidden = alignment_probe_fn() if alignment_probe_fn else None
-        if hidden is None:
-            return None
+    hidden = alignment_probe_fn() if alignment_probe_fn else None
+    if hidden is None:
+        return None
 
-        G_P = _classifier_grad_from_logits(logits, labels, hidden)
-        return G_P
-    finally:
-        model.train(saved["training"])
+    G_P = _classifier_grad_from_logits(logits, labels, hidden)
+    return G_P
 
 
 def _load_tokenizer(model_name: str, revision: str):
