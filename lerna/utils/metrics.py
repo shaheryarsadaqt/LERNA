@@ -421,6 +421,7 @@ class LERTracker:
         n_steps: int = 1,
         model: Optional[torch.nn.Module] = None,
         gradients: Optional[Dict[str, torch.Tensor]] = None,
+        **kwargs,
     ):
         self.loss_history.append(loss)
 
