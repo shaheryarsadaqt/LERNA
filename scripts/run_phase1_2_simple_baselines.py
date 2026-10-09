@@ -1117,6 +1117,7 @@ Examples:
     parser.add_argument("--model-revision", default=MODEL_REVISION)
     parser.add_argument("--wandb-project", default="lerna-phase1.2")
     parser.add_argument("--wandb-group", default=None)
+    parser.add_argument("--wandb", action="store_true", help="disabled; placeholder for compatibility")
     parser.add_argument(
         "--max-samples", type=int, default=None,
         help="Cap training samples per task (default: auto based on profile)",
