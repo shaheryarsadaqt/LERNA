@@ -585,7 +585,7 @@ def run_single_baseline_experiment(
 
     model_kwargs = {
         "num_labels": cfg["num_labels"],
-        "attn_implementation": "sdpa",
+        "attn_implementation": "eager",  # B17: SDPA produces NaN on ModernBERT/CUDA
         "reference_compile": False,
     }
     model = safe_from_pretrained(model_name, revision=model_revision, **model_kwargs)
