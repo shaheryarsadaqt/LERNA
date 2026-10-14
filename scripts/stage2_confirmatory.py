@@ -281,13 +281,18 @@ def _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn=N
 
 def _build_training_args(
     arm, seed, total_steps, warmup_steps, output_dir, no_early_stopping=True,
+    reduced_fraction=None,
 ):
     """Build TrainingArguments for the given arm."""
     from transformers import TrainingArguments
 
     if arm == "reduced_steps":
-        steps = REDUCED_TOTAL_STEPS
-        warmup = REDUCED_WARMUP_STEPS
+        if reduced_fraction is not None:
+            steps = int(total_steps * reduced_fraction)
+            warmup = int(steps * MIN_STEP_RATIO)
+        else:
+            steps = REDUCED_TOTAL_STEPS
+            warmup = REDUCED_WARMUP_STEPS
     else:
         steps = total_steps
         warmup = warmup_steps
@@ -318,6 +323,7 @@ def _build_training_args(
 def run_cell(
     arm, seed, rate, total_steps, score_kind, model_id, model_rev,
     output_dir, probe_data=None, run_sha=None, probe_fn=None,
+    reduced_fraction=None, task="qnli",
 ):
     """Run one cell and return results dict.
 
@@ -336,49 +342,66 @@ def run_cell(
     np.random.seed(seed)
 
     tok = _load_tokenizer(model_id, revision=model_rev)
-    ds_tr = load_dataset("glue", "qnli", split="train")
-    ds_ev = load_dataset("glue", "qnli", split="validation")
+    ds_tr = load_dataset("glue", task, split="train")
+    ds_ev = load_dataset("glue", task, split="validation")
+
+    # Task-aware tokenization: QNLI uses question/sentence, MRPC uses sentence1/sentence2.
+    if task == "qnli":
+        _a, _b = "question", "sentence"
+    else:
+        _a, _b = "sentence1", "sentence2"
 
     def tok_fn(x):
-        out = tok(x["question"], x["sentence"], truncation=True,
+        out = tok(x[_a], x[_b], truncation=True,
                    max_length=512)
         out["labels"] = x["label"]
         return out
 
-    # B11: tokenize fully, then select probe subset from unshuffled order
+    # B11: tokenize fully, then select probe subset from unshuffled order.
     ds_tr_raw = ds_tr.map(tok_fn, remove_columns=list(ds_tr.column_names))
-    ds_ev = ds_ev.map(tok_fn, remove_columns=list(ds_ev.column_names))
+    ds_ev = ds_ev.map(tok_fn, remove_columns=list(ds_tr.column_names))
 
-    probe_s_ids = list(probe_data["probe_s_ids"])
-    probe_e_ids = list(probe_data["probe_e_ids"])
-    probe_s_set = set(probe_s_ids)
-    probe_e_set = set(probe_e_ids)
+    # Probe exclusion only applies to qnli (the probe indices are QNLI-specific
+    # and only the S2 gate arm needs P_s/P_e held out).
+    if task == "qnli":
+        probe_s_ids = list(probe_data["probe_s_ids"])
+        probe_e_ids = list(probe_data["probe_e_ids"])
+        probe_s_set = set(probe_s_ids)
+        probe_e_set = set(probe_e_ids)
 
-    # F6: exclude probe indices from training
-    all_train_ids = list(range(len(ds_tr_raw)))
-    filtered_ids = [i for i in all_train_ids if i not in probe_s_set and i not in probe_e_set]
+        # F6: exclude probe indices from training
+        all_train_ids = list(range(len(ds_tr_raw)))
+        filtered_ids = [i for i in all_train_ids if i not in probe_s_set and i not in probe_e_set]
 
-    assert probe_s_set.isdisjoint(probe_e_set), "P_s and P_e overlap"
-    assert not probe_s_set.intersection(filtered_ids), "P_s in train"
-    assert not probe_e_set.intersection(filtered_ids), "P_e in train"
+        assert probe_s_set.isdisjoint(probe_e_set), "P_s and P_e overlap"
+        assert not probe_s_set.intersection(filtered_ids), "P_s in train"
+        assert not probe_e_set.intersection(filtered_ids), "P_e in train"
 
-    # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
-    ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
-    probe_s_batch = tok.pad(
-        {"input_ids": ps_raw["input_ids"], "attention_mask": ps_raw["attention_mask"]},
-        padding="longest", max_length=512, return_tensors="pt")
+        # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
+        ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
+        probe_s_batch = tok.pad(
+            {"input_ids": ps_raw["input_ids"], "attention_mask": ps_raw["attention_mask"]},
+            padding="longest", max_length=512, return_tensors="pt")
+    else:
+        filtered_ids = list(range(len(ds_tr_raw)))
+        probe_s_batch = None
 
     ds_tr = ds_tr_raw.select(filtered_ids)
 
     model = _load_model(model_id, revision=model_rev)
 
-    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
+    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(
+        (int(total_steps * reduced_fraction) if reduced_fraction is not None else REDUCED_TOTAL_STEPS)
+        * MIN_STEP_RATIO
+    )
 
     args = _build_training_args(
         arm, seed, total_steps, FULL_WARMUP, output_dir,
+        reduced_fraction=reduced_fraction,
     )
 
-    # B4: For S2 gate, build live P_s refresher probe_fn if not already provided
+    # B4: For S2 gate, build live P_s refresher probe_fn if not already provided.
+    # S2 is QNLI-only (probe indices and P_s/P_e holdout are QNLI-specific).
     if score_kind == "s2" and arm == "gate":
         if probe_fn is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -403,11 +426,18 @@ def run_cell(
     lr_history: list = []
 
     class _LRCallback(TrainerCallback):
+        def __init__(self):
+            self._trainer = None
+
         def on_step_end(self, args, state, control, **kwargs):
-            trainer = kwargs.get("trainer")
+            # transformers 5.x calls on_step_end(args, state, control) without
+            # a trainer kwarg; use the bound trainer reference instead.
+            trainer = self._trainer if self._trainer is not None else kwargs.get("trainer")
             opt = getattr(trainer, "optimizer", None) if trainer else None
             if opt is not None:
                 lr_history.append(float(opt.param_groups[0]["lr"]))
+
+    _lr_cb = _LRCallback()
 
     t = TrueBackwardSkippingTrainer(
         model=model, args=args,
@@ -419,8 +449,9 @@ def run_cell(
         capture_logits=True,
         online_ler_mode="legacy_dense",  # B3: logit capture + legacy dense mode
         instrumentation_path=str(output_dir / arm / str(seed) / "instrumentation.json"),
-        callbacks=[_LRCallback()],
+        callbacks=[_lr_cb],
     )
+    _lr_cb._trainer = t
 
     # B3: Attach AlignmentProbe to model before train() for S2 score
     if arm == "gate" and score_kind == "s2":
@@ -460,7 +491,8 @@ def run_cell(
     batches_seen = getattr(getattr(t, "instr", None), "batches_seen", 0)
 
     # Assert scheduler steps == batches seen (always_step contract)
-    expected_steps = REDUCED_TOTAL_STEPS if arm == "reduced_steps" else FULL_STEPS
+    expected_steps = (int(total_steps * reduced_fraction) if reduced_fraction is not None and arm == "reduced_steps"
+                      else REDUCED_TOTAL_STEPS if arm == "reduced_steps" else FULL_STEPS)
     assert scheduler_calls == batches_seen == expected_steps, \
         f"FATAL: scheduler_step_calls={scheduler_calls} != batches_seen={batches_seen} != expected={expected_steps}"
 
@@ -575,6 +607,11 @@ def main():
                         help="Run a single cell (for launcher dispatch)")
     parser.add_argument("--arm", type=str, choices=["gate", "control", "full_finetune", "reduced_steps"])
     parser.add_argument("--single-seed", type=int, help="Seed for single-cell mode")
+    parser.add_argument("--reduced-fraction", type=float, default=None,
+                        help="E1 override: fraction of total_steps for the reduced_steps "
+                             "arm (e.g. 0.20, 0.80). Defaults to REDUCED_TOTAL_STEPS/total_steps.")
+    parser.add_argument("--task", type=str, default="qnli",
+                        help="GLUE task name (qnli for Stage 2 confirmatory; mrpc for E3).")
     args = parser.parse_args()
 
     # B9: Ensure the repo root is on sys.path so `import lerna` works when
@@ -597,6 +634,8 @@ def main():
             args.score, args.model, args.model_rev,
             Path(args.output_dir),
             probe_data=probe_data, run_sha=run_sha,
+            reduced_fraction=args.reduced_fraction,
+            task=args.task,
         )
         out_path = Path(args.output_dir) / args.arm / str(args.single_seed)
         out_path.mkdir(parents=True, exist_ok=True)

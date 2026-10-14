@@ -72,3 +72,12 @@ true effect size.
 - PREREG_V4.md names jhu-clsp/ettin-encoder-150m at revision 45d0864.
 - No new Stage 2 seeds, rates, or scores. No extra SST-2 seeds.
   No reruns of the primary.
+
+## 11. Phase 1.2 addendum (2026-10-09)
+- Phase 1.2 "full" baseline matrix launched 2026-10-09 at commit d3397aa
+  (6 baselines x 4 GLUE tasks x 5 seeds = 120 cells, Ettin-150M at 45d0864).
+- Pre-registered as an addendum; the V4 primary (QNLI gate vs control) is untouched.
+- Full 720-cell GLUE matrix (8 tasks x 6 baselines x 2 rates x 5-10 seeds) is
+  future work, not completed. Orchestrator and 7 analysis scripts archived and reusable.
+- `v4-prereg-r3` moved to d3397aa to satisfy the provenance check for this addendum.
+  The V4 Stage 2 cells ran at 30bca95 and retain that SHA in their results.json files.
