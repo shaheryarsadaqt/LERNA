@@ -261,11 +261,18 @@ def run_cell(arm, seed, rate, total_steps, score_kind, model_id, model_rev,
     lr_history = []
 
     class _LRCallback(TrainerCallback):
+        def __init__(self):
+            self._trainer = None
+
         def on_step_end(self, args, state, control, **kwargs):
-            trainer = kwargs.get("trainer")
+            # transformers 5.x calls on_step_end(args, state, control) without
+            # a trainer kwarg; use the bound trainer reference instead.
+            trainer = self._trainer if self._trainer is not None else kwargs.get("trainer")
             opt = getattr(trainer, "optimizer", None) if trainer else None
             if opt is not None:
                 lr_history.append(float(opt.param_groups[0]["lr"]))
+
+    _lr_cb = _LRCallback()
 
     t = TrueBackwardSkippingTrainer(
         model=model, args=args,
@@ -277,8 +284,9 @@ def run_cell(arm, seed, rate, total_steps, score_kind, model_id, model_rev,
         capture_logits=True,
         online_ler_mode="legacy_dense",
         instrumentation_path=str(output_dir / arm / str(seed) / "instrumentation.json"),
-        callbacks=[_LRCallback()],
+        callbacks=[_lr_cb],
     )
+    _lr_cb._trainer = t
 
     t0 = time.perf_counter()
     t.train()

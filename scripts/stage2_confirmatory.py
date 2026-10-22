@@ -164,11 +164,49 @@ FULL_STEPS = 6548
 FULL_WARMUP = int(FULL_STEPS * MIN_STEP_RATIO)  # 392
 
 
-def _check_provenance(probe_ids_sha: str | None = None):
+def _prereg_tag_sha() -> str | None:
+    """Resolve the v4-prereg-r3 tag to a commit SHA (None if unresolvable)."""
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "v4-prereg-r3^{commit}"],
+            capture_output=True, text=True, cwd=str(repo_root)
+        ).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _tree_is_dirty() -> bool:
+    """True iff the git checkout has uncommitted changes.
+
+    Used for the provenance block written into every results.json. The
+    previous implementation returned `not _check_lerna_in_checkout()`, which
+    reported whether the lerna package was importable from the checkout and
+    NOT whether the tree was clean. Every results.json produced before this
+    fix therefore carries a meaningless `tree_dirty` value.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=str(repo_root)
+        )
+        return bool(r.stdout.strip())
+    except Exception:
+        return True
+
+
+def _check_provenance(probe_ids_sha: str | None = None, post_hoc: bool = False):
     """F11/B5: refuse to run unless tree is clean and HEAD == v4-prereg-r3.
 
     Runs BEFORE training in every mode (including single-cell). The probe
     ids_sha256 is verified here against the loaded probe data.
+
+    ``post_hoc=True`` is the escape hatch for POST-HOC EXTENSION experiments
+    (E1 Pareto, E3 MRPC/RTE) that are not covered by the V4 pre-registration.
+    In that mode the tree must still be clean, but HEAD need not equal the
+    pre-registration tag; the actual commit SHA is recorded instead, and the
+    caller must stamp the run as post-hoc in the manifest.
     """
     repo_root = Path(__file__).resolve().parents[1]
 
@@ -191,7 +229,7 @@ def _check_provenance(probe_ids_sha: str | None = None):
             ["git", "rev-parse", "HEAD"],
             capture_output=True, text=True, cwd=str(repo_root)
         ).stdout.strip()
-        if tag_sha != head_sha:
+        if tag_sha != head_sha and not post_hoc:
             print(f"FATAL: HEAD ({head_sha}) != v4-prereg-r3 ({tag_sha}).")
             sys.exit(1)
     except Exception:
@@ -279,15 +317,34 @@ def _build_policy(arm, seed, rate, total_steps, score_kind, min_step, probe_fn=N
     return AlwaysFalsePolicy()
 
 
+def _resolve_reduced_steps(total_steps, reduced_fraction=None, reduced_steps=None):
+    """Resolve the absolute step count for the reduced_steps arm.
+
+    Precedence: explicit ``reduced_steps`` (absolute) > ``reduced_fraction``
+    (relative) > the QNLI-specific ``REDUCED_TOTAL_STEPS`` constant.
+
+    The absolute form exists because the relative form cannot express every
+    integer budget exactly: round(0.40 * 377) = 151 but int(377 * 0.40) = 150.
+    E3 (MRPC/RTE) needs the backward budget of the gate/control arms to match
+    exactly, so the step count is passed explicitly rather than derived.
+    """
+    if reduced_steps is not None:
+        return int(reduced_steps)
+    if reduced_fraction is not None:
+        return int(total_steps * reduced_fraction)
+    return REDUCED_TOTAL_STEPS
+
+
 def _build_training_args(
     arm, seed, total_steps, warmup_steps, output_dir, no_early_stopping=True,
+    reduced_fraction=None, reduced_steps=None,
 ):
     """Build TrainingArguments for the given arm."""
     from transformers import TrainingArguments
 
     if arm == "reduced_steps":
-        steps = REDUCED_TOTAL_STEPS
-        warmup = REDUCED_WARMUP_STEPS
+        steps = _resolve_reduced_steps(total_steps, reduced_fraction, reduced_steps)
+        warmup = int(steps * MIN_STEP_RATIO)
     else:
         steps = total_steps
         warmup = warmup_steps
@@ -318,6 +375,7 @@ def _build_training_args(
 def run_cell(
     arm, seed, rate, total_steps, score_kind, model_id, model_rev,
     output_dir, probe_data=None, run_sha=None, probe_fn=None,
+    reduced_fraction=None, reduced_steps=None, task="qnli", post_hoc=False,
 ):
     """Run one cell and return results dict.
 
@@ -336,49 +394,67 @@ def run_cell(
     np.random.seed(seed)
 
     tok = _load_tokenizer(model_id, revision=model_rev)
-    ds_tr = load_dataset("glue", "qnli", split="train")
-    ds_ev = load_dataset("glue", "qnli", split="validation")
+    ds_tr = load_dataset("glue", task, split="train")
+    ds_ev = load_dataset("glue", task, split="validation")
+
+    # Task-aware tokenization: QNLI uses question/sentence, MRPC uses sentence1/sentence2.
+    if task == "qnli":
+        _a, _b = "question", "sentence"
+    else:
+        _a, _b = "sentence1", "sentence2"
 
     def tok_fn(x):
-        out = tok(x["question"], x["sentence"], truncation=True,
+        out = tok(x[_a], x[_b], truncation=True,
                    max_length=512)
         out["labels"] = x["label"]
         return out
 
-    # B11: tokenize fully, then select probe subset from unshuffled order
+    # B11: tokenize fully, then select probe subset from unshuffled order.
     ds_tr_raw = ds_tr.map(tok_fn, remove_columns=list(ds_tr.column_names))
-    ds_ev = ds_ev.map(tok_fn, remove_columns=list(ds_ev.column_names))
+    ds_ev = ds_ev.map(tok_fn, remove_columns=list(ds_tr.column_names))
 
-    probe_s_ids = list(probe_data["probe_s_ids"])
-    probe_e_ids = list(probe_data["probe_e_ids"])
-    probe_s_set = set(probe_s_ids)
-    probe_e_set = set(probe_e_ids)
+    # Probe exclusion only applies to qnli (the probe indices are QNLI-specific
+    # and only the S2 gate arm needs P_s/P_e held out).
+    if task == "qnli":
+        probe_s_ids = list(probe_data["probe_s_ids"])
+        probe_e_ids = list(probe_data["probe_e_ids"])
+        probe_s_set = set(probe_s_ids)
+        probe_e_set = set(probe_e_ids)
 
-    # F6: exclude probe indices from training
-    all_train_ids = list(range(len(ds_tr_raw)))
-    filtered_ids = [i for i in all_train_ids if i not in probe_s_set and i not in probe_e_set]
+        # F6: exclude probe indices from training
+        all_train_ids = list(range(len(ds_tr_raw)))
+        filtered_ids = [i for i in all_train_ids if i not in probe_s_set and i not in probe_e_set]
 
-    assert probe_s_set.isdisjoint(probe_e_set), "P_s and P_e overlap"
-    assert not probe_s_set.intersection(filtered_ids), "P_s in train"
-    assert not probe_e_set.intersection(filtered_ids), "P_e in train"
+        assert probe_s_set.isdisjoint(probe_e_set), "P_s and P_e overlap"
+        assert not probe_s_set.intersection(filtered_ids), "P_s in train"
+        assert not probe_e_set.intersection(filtered_ids), "P_e in train"
 
-    # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
-    ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
-    probe_s_batch = tok.pad(
-        {"input_ids": ps_raw["input_ids"], "attention_mask": ps_raw["attention_mask"]},
-        padding="longest", max_length=512, return_tensors="pt")
+        # B4: prepare P_s batch from raw (unfiltered) dataset for refresher probe_fn
+        ps_raw = ds_tr_raw.select(sorted(probe_s_ids)[:32])
+        probe_s_batch = tok.pad(
+            {"input_ids": ps_raw["input_ids"], "attention_mask": ps_raw["attention_mask"]},
+            padding="longest", max_length=512, return_tensors="pt")
+    else:
+        filtered_ids = list(range(len(ds_tr_raw)))
+        probe_s_batch = None
 
     ds_tr = ds_tr_raw.select(filtered_ids)
 
     model = _load_model(model_id, revision=model_rev)
 
-    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(REDUCED_TOTAL_STEPS * MIN_STEP_RATIO)
+    min_step = int(total_steps * MIN_STEP_RATIO) if arm not in ("reduced_steps",) else int(
+        _resolve_reduced_steps(total_steps, reduced_fraction, reduced_steps)
+        * MIN_STEP_RATIO
+    )
 
     args = _build_training_args(
         arm, seed, total_steps, FULL_WARMUP, output_dir,
+        reduced_fraction=reduced_fraction,
+        reduced_steps=reduced_steps,
     )
 
-    # B4: For S2 gate, build live P_s refresher probe_fn if not already provided
+    # B4: For S2 gate, build live P_s refresher probe_fn if not already provided.
+    # S2 is QNLI-only (probe indices and P_s/P_e holdout are QNLI-specific).
     if score_kind == "s2" and arm == "gate":
         if probe_fn is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -403,11 +479,18 @@ def run_cell(
     lr_history: list = []
 
     class _LRCallback(TrainerCallback):
+        def __init__(self):
+            self._trainer = None
+
         def on_step_end(self, args, state, control, **kwargs):
-            trainer = kwargs.get("trainer")
+            # transformers 5.x calls on_step_end(args, state, control) without
+            # a trainer kwarg; use the bound trainer reference instead.
+            trainer = self._trainer if self._trainer is not None else kwargs.get("trainer")
             opt = getattr(trainer, "optimizer", None) if trainer else None
             if opt is not None:
                 lr_history.append(float(opt.param_groups[0]["lr"]))
+
+    _lr_cb = _LRCallback()
 
     t = TrueBackwardSkippingTrainer(
         model=model, args=args,
@@ -419,8 +502,9 @@ def run_cell(
         capture_logits=True,
         online_ler_mode="legacy_dense",  # B3: logit capture + legacy dense mode
         instrumentation_path=str(output_dir / arm / str(seed) / "instrumentation.json"),
-        callbacks=[_LRCallback()],
+        callbacks=[_lr_cb],
     )
+    _lr_cb._trainer = t
 
     # B3: Attach AlignmentProbe to model before train() for S2 score
     if arm == "gate" and score_kind == "s2":
@@ -460,7 +544,8 @@ def run_cell(
     batches_seen = getattr(getattr(t, "instr", None), "batches_seen", 0)
 
     # Assert scheduler steps == batches seen (always_step contract)
-    expected_steps = REDUCED_TOTAL_STEPS if arm == "reduced_steps" else FULL_STEPS
+    expected_steps = (_resolve_reduced_steps(total_steps, reduced_fraction, reduced_steps)
+                      if arm == "reduced_steps" else FULL_STEPS)
     assert scheduler_calls == batches_seen == expected_steps, \
         f"FATAL: scheduler_step_calls={scheduler_calls} != batches_seen={batches_seen} != expected={expected_steps}"
 
@@ -510,7 +595,9 @@ def run_cell(
             "probe_ids_sha256": probe_data.get("ids_sha256") if probe_data else None,
             "probe_file_sha256": probe_data.get("sha256") if probe_data else None,
             "codebase_checkout": _check_lerna_in_checkout(),
-            "tree_dirty": not _check_lerna_in_checkout(),
+            "tree_dirty": _tree_is_dirty(),
+            "post_hoc": bool(post_hoc),
+            "prereg_tag_sha": _prereg_tag_sha(),
         },
         "lr_history": list(lr_history),
         "final_lr": final_lr,
@@ -575,6 +662,20 @@ def main():
                         help="Run a single cell (for launcher dispatch)")
     parser.add_argument("--arm", type=str, choices=["gate", "control", "full_finetune", "reduced_steps"])
     parser.add_argument("--single-seed", type=int, help="Seed for single-cell mode")
+    parser.add_argument("--reduced-fraction", type=float, default=None,
+                        help="E1 override: fraction of total_steps for the reduced_steps "
+                             "arm (e.g. 0.20, 0.80). Defaults to REDUCED_TOTAL_STEPS/total_steps.")
+    parser.add_argument("--reduced-steps", type=int, default=None,
+                        help="Absolute step count for the reduced_steps arm. Takes "
+                             "precedence over --reduced-fraction. Used to match the "
+                             "backward budget of the gate/control arms exactly "
+                             "(E3: MRPC 151, RTE 103).")
+    parser.add_argument("--task", type=str, default="qnli",
+                        help="GLUE task name (qnli for Stage 2 confirmatory; mrpc for E3).")
+    parser.add_argument("--post-hoc", action="store_true",
+                        help="Mark the run as a POST-HOC EXTENSION (E1/E3) that is not "
+                             "covered by the v4-prereg-r3 pre-registration. Requires a "
+                             "clean tree; records the actual HEAD sha as provenance.")
     args = parser.parse_args()
 
     # B9: Ensure the repo root is on sys.path so `import lerna` works when
@@ -585,7 +686,8 @@ def main():
 
     # B5: provenance check runs BEFORE training in every mode (single-cell and full).
     probe_data = _load_probe_data(str(repo_root / "experiments" / "probe_indices_v4.json"))
-    run_sha = _check_provenance(probe_ids_sha=probe_data.get("ids_sha256"))
+    run_sha = _check_provenance(probe_ids_sha=probe_data.get("ids_sha256"),
+                                post_hoc=args.post_hoc)
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
 
@@ -597,6 +699,10 @@ def main():
             args.score, args.model, args.model_rev,
             Path(args.output_dir),
             probe_data=probe_data, run_sha=run_sha,
+            reduced_fraction=args.reduced_fraction,
+            reduced_steps=args.reduced_steps,
+            task=args.task,
+            post_hoc=args.post_hoc,
         )
         out_path = Path(args.output_dir) / args.arm / str(args.single_seed)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -647,6 +753,10 @@ def main():
                     arm, effective_seed, args.rate, args.total_steps, args.score,
                     args.model, args.model_rev, output,
                     probe_data=probe_data, run_sha=run_sha,
+                    reduced_fraction=args.reduced_fraction,
+                    reduced_steps=args.reduced_steps,
+                    task=args.task,
+                    post_hoc=args.post_hoc,
                 )
                 r["attempts"] = attempt + 1
                 r["crashed"] = False
