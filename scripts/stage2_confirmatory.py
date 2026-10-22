@@ -638,6 +638,11 @@ def run_cell(
         if val.returncode != 0:
             print(f"WARNING: validation failed for arm={arm} seed={seed}:\n{val.stderr[:500]}")
             print(f"  Cell will be REFUSED in final analysis (validation_passed=False)")
+        # Rewrite results.json so the on-disk artifact carries the validation
+        # verdict. Previously the file was written before the validator ran,
+        # so single-cell results.json never recorded validation_passed.
+        with open(results_path, "w") as f:
+            json.dump(result, f, indent=2)
 
     return result
 
