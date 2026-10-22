@@ -81,3 +81,51 @@ true effect size.
   future work, not completed. Orchestrator and 7 analysis scripts archived and reusable.
 - `v4-prereg-r3` moved to d3397aa to satisfy the provenance check for this addendum.
   The V4 Stage 2 cells ran at 30bca95 and retain that SHA in their results.json files.
+
+## 12. E3 reduced_steps budget defect and rerun (2026-10-22)
+- **Defect**: the E3 (MRPC/RTE) `reduced_steps` arms ran **2619** optimizer
+  steps — QNLI's hardcoded `REDUCED_TOTAL_STEPS` — because
+  `scripts/stage2_confirmatory.py` resolved the reduced-step count from
+  `REDUCED_TOTAL_STEPS` whenever `--reduced-fraction` was not supplied. On
+  MRPC (`total_steps=377`) and RTE (`total_steps=258`) this trained 7x and 10x
+  longer than the full-finetune arm. Those two rows were therefore **not
+  compute-matched**, and their apparent accuracy advantage was over-training,
+  not a compute-saving result.
+  Archived (not deleted) at `/raid/stage2_e3/{mrpc,rte}/reduced_steps/`.
+- **Fix**: commit `5f2c161` on branch `fix/e3-reduced-steps-budget` adds an
+  absolute `--reduced-steps` override (taking precedence over
+  `--reduced-fraction`) and resolves the reduced-step count in a single place
+  (`_resolve_reduced_steps`) so `TrainingArguments.max_steps`, `min_step`, and
+  the scheduler-step assertion cannot disagree. `int(total_steps*0.40)` cannot
+  express the required budgets exactly (377*0.40 -> 150, not 151).
+- **Rerun**: commit `7ef4d9d`, 24 cells (12 seeds x {MRPC, RTE}), output
+  `/raid/stage2_e3_fixed/{mrpc,rte}/reduced_steps/`.
+  MRPC = **151** steps, RTE = **103** steps (= the gate/control backward
+  budget, 377 - round(0.60*377) and 258 - round(0.60*258)).
+  All 24 cells: `validation_passed=true`, `backward_calls == forward_calls ==
+  expected`, `skipped_backward_steps == 0`, `tree_dirty=false`,
+  `provenance.post_hoc=true`.
+- **Effect of the correction** (accuracy, budget-matched):
+
+  | Task | Arm | defective (2619 steps) | corrected (matched budget) |
+  |---|---|---|---|
+  | MRPC | reduced_steps | 0.8597 +/- 0.0129 | **0.7625 +/- 0.0237** |
+  | RTE | reduced_steps | 0.7428 +/- 0.0208 | **0.5912 +/- 0.0197** |
+
+  The corrected reduced_steps arms are no longer above the gate/control arms
+  (MRPC gate 0.7637, control 0.7676; RTE gate 0.6014, control 0.6038).
+  Paired: MRPC vs control -0.51 pt (p=0.39), RTE vs control -1.26 pt (p=0.11).
+  The earlier "reduced_steps wins" claim does not survive budget matching.
+- **Provenance caveat**: E3 is a post-hoc extension and is **not** covered by
+  `PREREG_V4.md`; the rerun is stamped `post_hoc=true` and records both its own
+  HEAD sha and `prereg_tag_sha` in every results.json.
+- **Provenance bug found and fixed**: `provenance.tree_dirty` was computed as
+  `not _check_lerna_in_checkout()`, i.e. it reported whether the `lerna`
+  package was importable from the checkout, not whether the git tree was
+  clean. Every results.json written before commit `7ef4d9d` therefore carries
+  a meaningless `tree_dirty` value and must not be cited as evidence of a
+  clean tree. Separately, results.json was written **before** the validator
+  ran, so single-cell artifacts never recorded `validation_passed`; the file is
+  now rewritten after validation.
+- **Unchanged**: the QNLI V4 primary (gate vs control, 24 seeds, rate 0.60)
+  was not re-run and is unaffected.
