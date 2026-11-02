@@ -486,21 +486,17 @@ class ExperimentConfig:
                     raise ValueError(
                         f"QNLI {key} must not be empty; real execution blocked."
                     )
-                # Validate probe IDs are within QNLI training split row positions.
-                # The actual split size is checked at load time in
-                # _load_train_dataset_production (len(ds) after load_dataset).
-                # IDs are zero-based positions in the unshuffled training split.
-                probe_s_set = set(probe_s_ids)
-                probe_e_set = set(probe_e_ids)
-                # The two probe sets must be disjoint (a probe can't be both s and e).
-                if not probe_s_set.isdisjoint(probe_e_set):
-                    raise ValueError(
-                        "QNLI probe_s_ids and probe_e_ids must be disjoint; "
-                        f"overlap: {sorted(probe_s_set & probe_e_set)}. "
-                        "Real execution blocked."
-                    )
-                # Store combined probe IDs for the production loader to apply.
-                self._qnli_exclusion_probe_ids = probe_s_set | probe_e_set
+            # The two probe sets must be disjoint (a probe can't be both s and e).
+            probe_s_set = set(probe_s_ids)
+            probe_e_set = set(probe_e_ids)
+            if not probe_s_set.isdisjoint(probe_e_set):
+                raise ValueError(
+                    "QNLI probe_s_ids and probe_e_ids must be disjoint; "
+                    f"overlap: {sorted(probe_s_set & probe_e_set)}. "
+                    "Real execution blocked."
+                )
+            # Store combined probe IDs for the production loader to apply.
+            self._qnli_exclusion_probe_ids = probe_s_set | probe_e_set
 
     @property
     def requested_skips(self) -> int:
@@ -1025,7 +1021,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"model loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "model_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
     try:
         if cfg.dry_run:

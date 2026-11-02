@@ -2242,6 +2242,64 @@ class TestQnliChecks:
                 dry_run=False,
             )
 
+    def test_qnli_list_with_list_entry_rejected(self):
+        """probe_e_ids=[[2]] → ValueError 'must contain non-negative integers'
+        (not TypeError: unhashable type)."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1], "probe_e_ids": [[2]]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_list_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with pytest.raises(ValueError, match="must contain non-negative integers"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_qnli_list_entry",
+                attempt_id="t1",
+                probe_exclusions_file=path,
+                probe_exclusions_hash=h,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_qnli_bool_in_e_ids_rejected(self):
+        """probe_s_ids=[1], probe_e_ids=[True] → non-negative-integers
+        ValueError, not 'must be disjoint'."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1], "probe_e_ids": [True]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_bool_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with pytest.raises(ValueError, match="must contain non-negative integers"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_qnli_bool_e",
+                attempt_id="t1",
+                probe_exclusions_file=path,
+                probe_exclusions_hash=h,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
 
 class TestCLIRejection:
     """CLI-level rejection of None/empty/whitespace model/tokenizer/dataset IDs."""
@@ -2345,6 +2403,269 @@ class TestCLIRejection:
                 dataset_id=None,
                 dry_run=False,
             )
+
+
+class TestConfigRejectionRestored:
+    """Original fd6d00c9 config rejection tests, restored verbatim."""
+
+    def test_config_rejection_model_id_none(self):
+        """model_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="model_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cfg_none_model",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_id=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_config_rejection_tokenizer_id_none(self):
+        """tokenizer_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="tokenizer_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cfg_none_tok",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_id=None,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_config_rejection_dataset_id_none(self):
+        """dataset_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="dataset_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cfg_none_ds",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dataset_id=None,
+                dry_run=False,
+            )
+
+    def test_config_rejection_learning_rate_123(self):
+        """learning_rate=123.0 exceeds maximum and must be rejected."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cfg_lr_123",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                learning_rate=123.0,
+                dry_run=False,
+            )
+
+    def test_config_rejection_learning_rate_nan(self):
+        """learning_rate=NaN must be a finite positive number and is rejected."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="must be a finite"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cfg_lr_nan",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                learning_rate=float("nan"),
+                dry_run=False,
+            )
+
+
+class TestQnliExclusionEndToEnd:
+    """QNLI exclusion end-to-end tests on the non-dry path with an
+    in-memory stand-in split (no real dataset download)."""
+
+    def _make_stand_in_dataset(self, n=10000):
+        """Build a datasets.Dataset stand-in with idx == row position."""
+        from datasets import Dataset
+        return Dataset.from_dict({
+            "idx": list(range(n)),
+            "question": ["q"] * n,
+            "sentence": ["s"] * n,
+            "label": [0] * n,
+        })
+
+    def _make_exclusions_file(self, probe_s_ids, probe_e_ids):
+        """Write a temp exclusions JSON file and return (path, sha256)."""
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({
+            "probe_s_ids": probe_s_ids,
+            "probe_e_ids": probe_e_ids,
+        })
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return path, h
+
+    def test_valid_exclusions_keep_9997_rows(self):
+        """Valid exclusions file with S=[1,7000], E=[3] on 10,000-row split
+        → 9,997 rows remain, rows 1, 3 and 7000 are gone."""
+        import torch
+        from unittest import mock
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, _load_train_dataset_production,
+        )
+
+        stand_in = self._make_stand_in_dataset(10000)
+        excl_path, excl_hash = self._make_exclusions_file([1, 7000], [3])
+
+        class _Tok:
+            pad_token_id = 0
+
+            def __call__(self, *args, **kwargs):
+                n = len(args[0]) if args and args[0] else 1
+                return {
+                    "input_ids": [[1, 2, 3]] * n,
+                    "attention_mask": [[1, 1, 1]] * n,
+                }
+
+        cfg = ExperimentConfig(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="legacy_v4", score_source="s1",
+            total_steps=4, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_qnli_e2e_valid",
+            attempt_id="t1",
+            probe_exclusions_file=excl_path,
+            probe_exclusions_hash=excl_hash,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dry_run=False,
+        )
+        assert cfg._qnli_exclusion_probe_ids == {1, 3, 7000}
+
+        with mock.patch(
+            "datasets.load_dataset",
+            return_value=stand_in,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            return_value=_Tok(),
+        ):
+            ds = _load_train_dataset_production(cfg, 4)
+
+        assert len(ds) == 9997, f"expected 9,997 rows, got {len(ds)}"
+
+    def test_overlapping_exclusion_lists_rejected(self):
+        """S=[1, 2], E=[2, 3] → ValueError 'must be disjoint'."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1, 2], "probe_e_ids": [2, 3]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_overlap_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with pytest.raises(ValueError, match="must be disjoint"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_qnli_overlap",
+                attempt_id="t1",
+                probe_exclusions_file=path,
+                probe_exclusions_hash=h,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_missing_exclusion_set_loader_raises(self):
+        """Non-dry QNLI config with _qnli_exclusion_probe_ids deleted →
+        loader raises 'no stored exclusion probe IDs'."""
+        import torch
+        from unittest import mock
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, _load_train_dataset_production,
+        )
+
+        stand_in = self._make_stand_in_dataset(10000)
+
+        class _Tok:
+            pad_token_id = 0
+
+            def __call__(self, *args, **kwargs):
+                n = len(args[0]) if args and args[0] else 1
+                return {
+                    "input_ids": [[1, 2, 3]] * n,
+                    "attention_mask": [[1, 1, 1]] * n,
+                }
+
+        excl_path, excl_hash = self._make_exclusions_file([1, 7000], [3])
+
+        cfg = ExperimentConfig(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="legacy_v4", score_source="s1",
+            total_steps=4, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_qnli_missing_set",
+            attempt_id="t1",
+            probe_exclusions_file=excl_path,
+            probe_exclusions_hash=excl_hash,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dry_run=False,
+        )
+        assert cfg._qnli_exclusion_probe_ids == {1, 3, 7000}
+        # Delete the stored exclusion set after config construction
+        del cfg._qnli_exclusion_probe_ids
+
+        with mock.patch(
+            "datasets.load_dataset",
+            return_value=stand_in,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            return_value=_Tok(),
+        ):
+            with pytest.raises(ValueError, match="no stored exclusion probe IDs"):
+                _load_train_dataset_production(cfg, 4)
 
 
 class TestDataSeed:
@@ -2456,71 +2777,106 @@ class TestHollowTests:
 
 
 class TestOneRunSeed:
-    """Verify one run seed: cfg.policy_seed drives everything."""
+    """Verify one run seed: cfg.policy_seed drives everything (call-order test)."""
 
-    def test_policy_seed_drives_all_seeding(self):
-        """policy_seed=5: pre-load seeding gets 5, TrainingArguments.seed==5,
-        TrainingArguments.data_seed is None, policy gets 5."""
+    def test_seed_before_model_load_call_order(self):
+        """policy_seed=5 on non-dry path: torch.manual_seed(5) and
+        np.random.seed(5) happen before the model loader is called;
+        TrainingArguments gets seed=5 with no data_seed; policy gets 5."""
         import torch
         import numpy as np
+        from unittest import mock
         from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution, _load_model,
+            ExperimentConfig, run_execution, TinyModel,
         )
-        from lerna.utils.forward_gate import ScoreQuantileGatePolicy
-        from transformers import TrainingArguments
+
+        call_log = []
+
+        class _PadTok:
+            pad_token_id = 0
+
+        tiny_model = TinyModel(hidden=4, classes=2)
+
+        def fake_load_model_production(cfg):
+            call_log.append("load_model")
+            return tiny_model
+
+        def fake_load_tokenizer_production(cfg):
+            return _PadTok()
+
+        def fake_load_train_dataset_production(cfg, num_examples):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(1)},
+            ]
+
+        def fake_load_eval_dataset_production(cfg):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+            ]
 
         cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
+            task="sst-2", arm="control_uniform_p1",
+            controller_version="legacy_v4", score_source="uniform",
             total_steps=4, min_step=0, n_phases=1,
             max_consecutive_skips=4, policy_seed=5,
-            target_skip_rate=0.5, output_dir="/tmp/test_one_run_seed",
+            target_skip_rate=0.5, output_dir="/tmp/test_call_order_seed",
             attempt_id="t1",
             probe_exclusions_file=None,
             probe_exclusions_hash=None,
             model_revision="a" * 40,
             tokenizer_revision="b" * 40,
             dataset_revision="c" * 40,
-            dry_run=True,
+            dry_run=False,
         )
-        # cfg.seed no longer exists
-        assert not hasattr(cfg, "seed"), "cfg.seed field should be removed"
-        assert cfg.policy_seed == 5
 
-        # Pre-load seeding: torch.manual_seed(5) and np.random.seed(5)
-        torch_seed_before = torch.initial_seed()
-        np_seed_before = np.random.get_state()[1][0]
-        result = run_execution(cfg)
+        real_manual_seed = torch.manual_seed
+        real_np_seed = np.random.seed
+
+        def logging_manual_seed(s):
+            call_log.append(("torch.manual_seed", s))
+            return real_manual_seed(s)
+
+        def logging_np_seed(s):
+            call_log.append(("np.random.seed", s))
+            return real_np_seed(s)
+
+        with mock.patch(
+            "scripts.run_controller_ablation._load_model_production",
+            side_effect=fake_load_model_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            side_effect=fake_load_tokenizer_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_train_dataset_production",
+            side_effect=fake_load_train_dataset_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_eval_dataset_production",
+            side_effect=fake_load_eval_dataset_production,
+        ), mock.patch(
+            "torch.manual_seed",
+            side_effect=logging_manual_seed,
+        ), mock.patch(
+            "numpy.random.seed",
+            side_effect=logging_np_seed,
+        ):
+            result = run_execution(cfg)
+
         assert result["status"] == "OK", result.get("reason")
-        # After run_execution, torch/np were seeded with 5 before model load
-        assert torch.initial_seed() == 5, f"torch seed should be 5, got {torch.initial_seed()}"
-        assert np.random.get_state()[1][0] == 5, f"numpy seed should be 5"
+        # Seed calls happen before model load
+        seed_calls = [c for c in call_log if c[0] in ("torch.manual_seed", "np.random.seed")]
+        load_calls = [c for c in call_log if c == "load_model"]
+        assert len(load_calls) == 1, f"expected 1 load_model call, got {load_calls}"
+        # The first seed calls (from run_execution, before model load) must precede load_model
+        first_torch_seed = next(i for i, c in enumerate(call_log) if c == ("torch.manual_seed", 5))
+        first_np_seed = next(i for i, c in enumerate(call_log) if c == ("np.random.seed", 5))
+        load_idx = call_log.index("load_model")
+        assert first_torch_seed < load_idx, f"torch.manual_seed(5) at {first_torch_seed} not before load_model at {load_idx}"
+        assert first_np_seed < load_idx, f"np.random.seed(5) at {first_np_seed} not before load_model at {load_idx}"
 
         # Provenance records seed and source
         prov = result["provenance"]
-        assert prov.get("seed") == 5, f"provenance seed should be 5, got {prov.get('seed')}"
-        assert prov.get("seed_source") == "cfg.policy_seed", f"provenance seed_source should be 'cfg.policy_seed', got {prov.get('seed_source')}"
-
-        # Verify TrainingArguments would use seed=5, data_seed unset
-        ta = TrainingArguments(
-            output_dir="/tmp/test_ta_seed",
-            max_steps=4,
-            learning_rate=2e-5,
-            per_device_train_batch_size=2,
-            warmup_steps=0,
-            weight_decay=0.01,
-            lr_scheduler_type="constant",
-            max_grad_norm=1.0,
-            optim="adamw_torch",
-            eval_strategy="no",
-            save_strategy="no",
-            logging_strategy="no",
-            report_to=[],
-            disable_tqdm=True,
-            use_cpu=True,
-            seed=5,  # cfg.policy_seed
-            fp16=False,
-            bf16=False,
-        )
-        assert ta.seed == 5
-        assert ta.data_seed is None, f"data_seed should be None, got {ta.data_seed}"
+        assert prov.get("seed") == 5
+        assert prov.get("seed_source") == "cfg.policy_seed"

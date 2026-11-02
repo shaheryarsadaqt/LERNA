@@ -756,6 +756,50 @@ def test_bit_identical_loss_no_skips():
         assert la == lb, f"loss mismatch at step {i}: gate={la} control={lb}"
 
 
+def test_bit_identical_loss_no_skips_legacy_v4():
+    """Legacy-v4 form: rate=0.5, min_step=50, default controller. With
+    min_step=T=50 the gate skips 0 times in 50 steps, so loss sequences
+    must match bit-for-bit against the always-step control."""
+    torch.manual_seed(42)
+    model_a = torch.nn.Sequential(torch.nn.Linear(10, 2))
+    model_b = torch.nn.Sequential(torch.nn.Linear(10, 2))
+    model_b.load_state_dict(model_a.state_dict())
+    torch.manual_seed(123)
+    x = torch.randn(32, 10)
+    y = torch.randint(0, 2, (32,))
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    # Gate: min_step=50 means no skips in 50 steps; default controller (legacy_v4).
+    g_gate = ScoreQuantileGate(rate=0.5, total_steps=50, min_step=50, n_phases=4,
+                               max_consecutive_skips=4, seed=7,
+                               score_source=lambda i, m, tx: 0.5)
+    opt_a = torch.optim.SGD(model_a.parameters(), lr=0.01)
+    opt_b = torch.optim.SGD(model_b.parameters(), lr=0.01)
+    losses_a = []
+    losses_b = []
+    decisions = []
+    for i in range(50):
+        opt_a.zero_grad()
+        loss_a = loss_fn(model_a(x), y)
+        loss_a.backward()
+        skip = g_gate.decide(i, None, None)
+        decisions.append(skip)
+        if not skip:
+            opt_a.step()
+        losses_a.append(loss_a.item())
+
+        opt_b.zero_grad()
+        loss_b = loss_fn(model_b(x), y)
+        loss_b.backward()
+        opt_b.step()  # control always steps
+        losses_b.append(loss_b.item())
+
+    assert all(d is False for d in decisions), "gate should not skip in 50 steps"
+    assert len(losses_a) == len(losses_b) == 50
+    for i, (la, lb) in enumerate(zip(losses_a, losses_b)):
+        assert la == lb, f"loss mismatch at step {i}: gate={la} control={lb}"
+
+
 # ---------------------------------------------------------------------------
 # 25) Time-trend control: synthetic score and gain both trending, no within-window relation
 # ---------------------------------------------------------------------------
