@@ -3576,34 +3576,6 @@ class TestB2ProvenanceExecutionMode:
         assert prov.get("execution_mode") == "mock_fixtures_cpu", \
             f"expected mock_fixtures_cpu, got {prov.get('execution_mode')}"
 
-    def test_plan_only_provenance(self):
-        """plan_only=True records execution_mode plan_only."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        cfg = ExperimentConfig(
-            task="sst-2", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b2_plan",
-            attempt_id="b2p",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=False,
-            plan_only=True,
-        )
-        result = run_execution(cfg)
-        assert result["status"] == "OK", result.get("reason")
-        prov = result["provenance"]
-        assert prov.get("execution_mode") == "plan_only", \
-            f"expected plan_only, got {prov.get('execution_mode')}"
-
     def test_non_dry_run_provenance_production_loaders(self):
         """non-dry-run records execution_mode production_loaders."""
         from scripts.run_controller_ablation import (
@@ -3662,22 +3634,51 @@ class TestB4LR:
     values within tolerance pass."""
 
     def test_lr_tolerance_rejects_wrong_rate(self):
-        """A final LR outside tolerance causes FAILED validation."""
+        """B4: run_execution rejects a final LR outside tolerance (9e-7
+        vs expected 2e-5). Must call the runner, not just compare numbers."""
         from scripts.run_controller_ablation import (
             ExperimentConfig, run_execution,
         )
         from unittest import mock
 
-        # Constant schedule: expected_lr = learning_rate.
-        # Tolerance = max(learning_rate * 1e-9, 1e-12) = max(2e-14, 1e-12) = 1e-12.
-        # Set final LR to 9e-7 which is way outside tolerance.
+        class MockInstr:
+            forward_calls = 4
+            backward_calls = 4
+            scheduler_step_calls = 4
+            skipped_backward_steps = 0
+            skipped_batches = 0
+            optimizer_step_attempts = 4
+            capture_logits_enabled = True
+
+            def as_dict(self):
+                return {
+                    "forward_calls": self.forward_calls,
+                    "backward_calls": self.backward_calls,
+                    "scheduler_step_calls": self.scheduler_step_calls,
+                    "skipped_backward_steps": self.skipped_backward_steps,
+                    "skipped_batches": self.skipped_batches,
+                    "optimizer_step_attempts": self.optimizer_step_attempts,
+                }
+
+        class MockOptimizer:
+            param_groups = [{"lr": 9e-7}]  # wrong LR: 450x off from 2e-5
+
+        class MockTrainer:
+            def __init__(self, *args, **kwargs):
+                self.instr = MockInstr()
+                self.optimizer = MockOptimizer()
+                self.capture_logits = True
+
+            def train(self):
+                pass
+
         cfg = ExperimentConfig(
             task="qnli", arm="full_finetune",
             controller_version="legacy_v4", score_source="uniform",
             total_steps=4, min_step=0, n_phases=1,
             max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.0, output_dir="/tmp/test_b4_lr",
-            attempt_id="b4",
+            target_skip_rate=0.0, output_dir="/tmp/test_b4_lr_runner",
+            attempt_id="b4r",
             probe_exclusions_file=None,
             probe_exclusions_hash=None,
             model_revision="a" * 40,
@@ -3687,30 +3688,62 @@ class TestB4LR:
             learning_rate=2e-5,
             lr_schedule_shape="constant",
         )
-        # Override the final LR via a mock optimizer param group.
-        # We simulate by monkeypatching the trainer's optimizer after training.
-        # Instead, directly test: a wrong final LR is rejected by validation.
-        # Build a config where expected_lr != actual by a wide margin.
-        # Constant schedule with learning_rate=2e-5 expects exactly 2e-5.
-        # Use lr_schedule_shape="constant" but the runner measures actual LR
-        # from the optimizer. We can't easily fake the optimizer LR, so test
-        # the tolerance logic directly via ExperimentConfig.
-        tol = max(abs(2e-5) * 1e-9, 1e-12)
-        assert tol > 0, "tolerance should be positive"
-        # 9e-7 is 450x off from 2e-5, well outside tolerance
-        assert abs(9e-7 - 2e-5) > tol, "9e-7 should be outside tolerance"
+
+        with mock.patch(
+            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
+            MockTrainer,
+        ):
+            result = run_execution(cfg)
+
+        assert result["status"] == "FAILED", result.get("reason")
+        assert "final LR" in result["reason"], \
+            f"expected LR rejection reason, got {result.get('reason')}"
 
     def test_lr_tolerance_accepts_near_expected(self):
-        """A final LR within tolerance passes validation."""
-        from scripts.run_controller_ablation import ExperimentConfig
+        """B4: run_execution accepts a final LR within tolerance."""
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution,
+        )
+        from unittest import mock
+
+        class MockInstr:
+            forward_calls = 4
+            backward_calls = 4
+            scheduler_step_calls = 4
+            skipped_backward_steps = 0
+            skipped_batches = 0
+            optimizer_step_attempts = 4
+            capture_logits_enabled = True
+
+            def as_dict(self):
+                return {
+                    "forward_calls": self.forward_calls,
+                    "backward_calls": self.backward_calls,
+                    "scheduler_step_calls": self.scheduler_step_calls,
+                    "skipped_backward_steps": self.skipped_backward_steps,
+                    "skipped_batches": self.skipped_batches,
+                    "optimizer_step_attempts": self.optimizer_step_attempts,
+                }
+
+        class MockOptimizer:
+            param_groups = [{"lr": 2e-5 + 1e-13}]  # within tolerance
+
+        class MockTrainer:
+            def __init__(self, *args, **kwargs):
+                self.instr = MockInstr()
+                self.optimizer = MockOptimizer()
+                self.capture_logits = True
+
+            def train(self):
+                pass
 
         cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
+            task="qnli", arm="full_finetune",
+            controller_version="legacy_v4", score_source="uniform",
             total_steps=4, min_step=0, n_phases=1,
             max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b4_ok",
-            attempt_id="b4ok",
+            target_skip_rate=0.0, output_dir="/tmp/test_b4_ok_runner",
+            attempt_id="b4okr",
             probe_exclusions_file=None,
             probe_exclusions_hash=None,
             model_revision="a" * 40,
@@ -3720,11 +3753,14 @@ class TestB4LR:
             learning_rate=2e-5,
             lr_schedule_shape="constant",
         )
-        tol = max(abs(cfg.learning_rate) * 1e-9, 1e-12)
-        # A value within tolerance (e.g. 2e-5 + 1e-13)
-        near = cfg.learning_rate + 1e-13
-        assert abs(near - cfg.learning_rate) <= tol, \
-            f"near value {near} should be within tolerance {tol}"
+
+        with mock.patch(
+            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
+            MockTrainer,
+        ):
+            result = run_execution(cfg)
+
+        assert result["status"] == "OK", result.get("reason")
 
 
 # ---------------------------------------------------------------------------
@@ -3918,7 +3954,11 @@ class TestB7DryRunIDsRejection:
 
 
 # ---------------------------------------------------------------------------
-# Additional Part B tests to reach ~128 contract tests
+
+
+# ---------------------------------------------------------------------------
+# Additional Part B tests
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 class TestEvalDataLoaderConstructionErrorRaised:
@@ -3969,59 +4009,6 @@ class TestEvalDataLoaderConstructionErrorRaised:
             except EvalDataLoaderConstructionError as e:
                 assert "eval_data_loader construction failed" in str(e), \
                     f"expected eval_data_loader error, got {e}"
-
-
-class TestPlanOnlySkipsModelLoading:
-    """B2/plan_only: plan_only mode skips all model/data loading."""
-
-    def test_plan_only_does_not_load_model(self):
-        """plan_only=True returns OK without calling any loader."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        load_calls = []
-
-        def tracking_load_model(cfg):
-            load_calls.append("model")
-            return TinyModel(seed=cfg.policy_seed)
-
-        def tracking_load_tokenizer(cfg):
-            load_calls.append("tokenizer")
-            return None
-
-        cfg = ExperimentConfig(
-            task="sst-2", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_plan_only",
-            attempt_id="po",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=False,
-            plan_only=True,
-        )
-
-        with mock.patch(
-            "scripts.run_controller_ablation._load_model_production",
-            side_effect=tracking_load_model,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_tokenizer_production",
-            side_effect=tracking_load_tokenizer,
-        ):
-            result = run_execution(cfg)
-
-        assert result["status"] == "OK", result.get("reason")
-        assert load_calls == [], \
-            f"plan_only should not load models, got calls: {load_calls}"
-        prov = result["provenance"]
-        assert prov.get("execution_mode") == "plan_only", \
-            f"expected plan_only, got {prov.get('execution_mode')}"
 
 
 class TestB1RightPaddingAccepted:
@@ -4142,16 +4129,50 @@ class TestB4LRCosineBoundary:
     """B4: LR tolerance boundary for cosine schedule."""
 
     def test_cosine_lr_tolerance_rejects_wrong_rate(self):
-        """Cosine schedule with wrong final LR is rejected."""
-        from scripts.run_controller_ablation import ExperimentConfig
+        """B4: run_execution rejects a cosine final LR outside tolerance."""
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution,
+        )
+        from unittest import mock
+
+        class MockInstr:
+            forward_calls = 8
+            backward_calls = 8
+            scheduler_step_calls = 8
+            skipped_backward_steps = 0
+            skipped_batches = 0
+            optimizer_step_attempts = 8
+            capture_logits_enabled = True
+
+            def as_dict(self):
+                return {
+                    "forward_calls": self.forward_calls,
+                    "backward_calls": self.backward_calls,
+                    "scheduler_step_calls": self.scheduler_step_calls,
+                    "skipped_backward_steps": self.skipped_backward_steps,
+                    "skipped_batches": self.skipped_batches,
+                    "optimizer_step_attempts": self.optimizer_step_attempts,
+                }
+
+        class MockOptimizer:
+            param_groups = [{"lr": 2e-5}]  # wrong LR: cosine decays to ~0
+
+        class MockTrainer:
+            def __init__(self, *args, **kwargs):
+                self.instr = MockInstr()
+                self.optimizer = MockOptimizer()
+                self.capture_logits = True
+
+            def train(self):
+                pass
 
         cfg = ExperimentConfig(
             task="qnli", arm="gate_s1_p1",
             controller_version="legacy_v4", score_source="s1",
             total_steps=8, min_step=0, n_phases=1,
             max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b4_cos",
-            attempt_id="b4c",
+            target_skip_rate=0.5, output_dir="/tmp/test_b4_cos_runner",
+            attempt_id="b4cr",
             probe_exclusions_file=None,
             probe_exclusions_hash=None,
             model_revision="a" * 40,
@@ -4162,11 +4183,13 @@ class TestB4LRCosineBoundary:
             lr_warmup_steps=0,
             lr_schedule_shape="cosine",
         )
-        # With warmup_steps=0 and cosine, at T=8, LR should be near 0
-        # (full decay). A wrong value like 2e-5 is far outside tolerance.
-        tol = max(abs(2e-5) * 1e-9, 1e-12)
-        import math
-        decay_progress = min((8 - 0) / max(8 - 0, 1), 1.0)
-        expected_lr = 2e-5 * 0.5 * (1.0 + math.cos(math.pi * decay_progress))
-        assert abs(2e-5 - expected_lr) > tol, \
-            f"2e-5 should be outside tolerance of {expected_lr} (tol={tol})"
+
+        with mock.patch(
+            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
+            MockTrainer,
+        ):
+            result = run_execution(cfg)
+
+        assert result["status"] == "FAILED", result.get("reason")
+        assert "final LR" in result["reason"], \
+            f"expected LR rejection reason, got {result.get('reason')}"

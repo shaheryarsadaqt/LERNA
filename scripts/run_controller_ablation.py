@@ -243,7 +243,6 @@ class ExperimentConfig:
     output_dir: str = "/tmp/lerna_step3b_runner"
     attempt_id: Optional[str] = None
     dry_run: bool = False
-    plan_only: bool = False
 
     def __post_init__(self):
         if self.task not in TASK_INPUTS:
@@ -973,12 +972,12 @@ def _dynamic_padding_collator(features, pad_token_id: int = 0):
 
 def run_execution(cfg: ExperimentConfig) -> dict:
     """Execute the controller sweep through TrueBackwardSkippingTrainer with
-    mocked external loading (TinyModel, TinyDataLoader) and tiny CPU states.
+    CPU mock score sources and tiny CPU states.
 
-    Real pretrained training is NOT invoked; no GPU, no model downloads, no
+    Real pretrained training is not invoked; no GPU, no model downloads, no
     dependency installation. This is a distinct code path from dry-run
     validation: provenance records dry_run=false and execution_mode =
-    "mocked_loading_cpu".
+    "production_loaders".
 
     The execution wires ScoreQuantileGatePolicy.should_skip() into the
     TrueBackwardSkippingTrainer training loop:
@@ -1006,23 +1005,6 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         skip_policy_obj = None  # set below
         use_gate = True
 
-    # --- plan_only: validate and plan, skip all loading/training/evaluation ---
-    seed = cfg.policy_seed
-    seed_source = "cfg.policy_seed"
-    if cfg.plan_only:
-        return {
-            "status": "OK",
-            "config": cfg.to_dict(),
-            "config_hash": _config_hash(cfg.to_dict()),
-            "result": {
-                "arm": cfg.arm,
-                "effective_total": effective_total,
-                "plan_only": True,
-                "note": "execution planned; training deferred to Step 4",
-            },
-            "provenance": _provenance(dry_run=cfg.dry_run, seed=seed, seed_source=seed_source, plan_only=True),
-        }
-
     # --- External loading boundaries (injectable for CPU tests) ---
     # Loader, constructor, and evaluator exceptions are caught below and
     # returned as structured FAILED manifests before evaluation (R4-C).
@@ -1031,13 +1013,12 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     # --- Seed HF global randomness before any model/data loads ---
     import numpy as np
     import torch
-    # Single run seed: cfg.policy_seed drives torch/np seeding, TrainingArguments.seed,
-    # and the policy. data_seed is used only by the TinyDataLoader mock.
+    seed = cfg.policy_seed
+    seed_source = "cfg.policy_seed"
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
+
     # Record which config field supplied the seed for manifest provenance
-    # seed_source already set above for plan_only path
     try:
         if cfg.dry_run:
             model = _load_model(cfg)
@@ -1212,7 +1193,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
-    # --- Instantiate TrueBackwardSkippingTrainer with mocked loading ---
+    # --- Instantiate TrueBackwardSkippingTrainer with CPU mock loading ---
     try:
         trainer = TrueBackwardSkippingTrainer(
             model=model,
@@ -1616,10 +1597,9 @@ def _load_model_production(cfg: ExperimentConfig):
     compile disabled). Requires ``_MODEL_LOADER_AVAILABLE`` and immutable
     revision preflight (already enforced in ExperimentConfig.__post_init__).
 
-    Not called by default execution — only when a test or caller explicitly
-    requests production loading. No pretrained weights are downloaded in this
-    step; callers must supply local_files_only-compatible revisions or inject
-    their own loader.
+    Only used when a test or caller explicitly requests production loading.
+    No pretrained weights are downloaded in this step; callers must supply
+    local_files_only-compatible revisions or inject their own loader.
     """
     if not _MODEL_LOADER_AVAILABLE:
         raise ImportError(
@@ -1640,8 +1620,7 @@ def _load_tokenizer_production(cfg: ExperimentConfig):
     """Production tokenizer loading via the approved training primitives.
 
     Uses ``lerna.utils.model_loader.load_tokenizer`` with revision enforcement.
-    Not called by default execution — only when a test or caller explicitly
-    requests production loading.
+    Only used when a test or caller explicitly requests production loading.
     """
     if not _MODEL_LOADER_AVAILABLE:
         raise ImportError(
@@ -1663,9 +1642,9 @@ def _load_train_dataset_production(cfg: ExperimentConfig, num_examples: int):
     applies QNLI matched-probe-ID exclusions before idx removal (training
     split only), removes ``idx`` and other non-model inputs, and preserves
     approved sentence order. Returns a torch Dataset with dynamic padding
-    deferred to the minibatch collator. Not called by default execution — only
-    when a test or caller explicitly requests production loading. Real-dataset
-    training is NOT performed in this step.
+    deferred to the minibatch collator. Only used when a test or caller
+    explicitly requests production loading. Real-dataset training is not
+    performed in this step.
     """
     from datasets import load_dataset
 
@@ -1927,8 +1906,7 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
 
 
 def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
-                seed: Optional[int] = None, seed_source: Optional[str] = None,
-                plan_only: bool = False) -> dict:
+                seed: Optional[int] = None, seed_source: Optional[str] = None) -> dict:
     prov = {
         "resolved_code_sha": _git_sha(),
         "v4_prereg_sha": _v4_prereg_sha(),
@@ -1946,8 +1924,7 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
         "scheduler_step_policy": "always_step",
         "dry_run": dry_run,
         "execution_mode": execution_mode
-        or ("mock_fixtures_cpu" if dry_run
-            else ("plan_only" if plan_only else "production_loaders")),
+        or ("mock_fixtures_cpu" if dry_run else "production_loaders"),
     }
     if seed is not None:
         prov["seed"] = seed
@@ -1956,8 +1933,7 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
     prov["note"] = (
         "dry-run validation only; no training, no model download, no GPU"
         if dry_run
-        else ("planned only; execution deferred" if plan_only
-              else "production loader functions selected")
+        else "production loader functions selected"
     )
     return prov
 
@@ -2038,8 +2014,6 @@ def main() -> int:
     parser.add_argument("--score-source", default="s1", choices=["s1", "uniform"])
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate configuration without training")
-    parser.add_argument("--plan-only", action="store_true",
-                        help="Validate and plan, skip actual training/evaluation")
     parser.add_argument("--cpu-mock-test", action="store_true",
                         help="Run CPU mock score-path tests (no model)")
     parser.add_argument("--skip-rate", type=float, default=0.60)
@@ -2089,7 +2063,6 @@ def main() -> int:
             "output_dir": args.output_dir,
             "attempt_id": args.attempt_id,
             "dry_run": True,
-            "plan_only": args.plan_only,
         }
         if args.model_id is not None:
             raw_cfg["model_id"] = args.model_id
@@ -2140,9 +2113,8 @@ def main() -> int:
         return 0 if result["status"] == "OK" else 1
 
     # Non-dry-run: execute the controller sweep with CPU mock score sources.
-    # Real pretrained training is NOT invoked; execution uses mocked loading
-    # boundaries and tiny CPU states. Full config validation runs before any
-    # output is written.
+    # Execution uses CPU mock loading boundaries and tiny CPU states.
+    # Full config validation runs before any output is written.
     raw_cfg = {
         "task": args.task,
         "arm": args.arm,
@@ -2157,7 +2129,6 @@ def main() -> int:
         "output_dir": args.output_dir,
         "attempt_id": args.attempt_id,
         "dry_run": False,
-        "plan_only": args.plan_only,
     }
     if args.model_id is not None:
         raw_cfg["model_id"] = args.model_id
