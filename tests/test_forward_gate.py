@@ -724,10 +724,11 @@ def test_bit_identical_loss_no_skips():
     y = torch.randint(0, 2, (32,))
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    # Gate: min_step=50 means no skips in 50 steps
-    g_gate = ScoreQuantileGate(rate=0.5, total_steps=50, min_step=50, n_phases=4,
+    # Gate: min_step=50 means no skips in 50 steps (all-warmup, Q=0 valid).
+    g_gate = ScoreQuantileGate(rate=0.0, total_steps=50, min_step=50, n_phases=4,
                                max_consecutive_skips=4, seed=7,
-                               score_source=lambda i, m, tx: 0.5)
+                               score_source=lambda i, m, tx: 0.5,
+                               controller_version="phase_exact_v1")
     opt_a = torch.optim.SGD(model_a.parameters(), lr=0.01)
     opt_b = torch.optim.SGD(model_b.parameters(), lr=0.01)
     losses_a = []

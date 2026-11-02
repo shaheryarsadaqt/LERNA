@@ -93,11 +93,10 @@ def load_model_and_tokenizer(
     if is_modernbert or is_ettin:
         model_kwargs["reference_compile"] = False
         model_kwargs["attn_implementation"] = "eager"
-    if is_ettin:
-        if revision is not None:
-            model_kwargs["revision"] = revision
-        if local_files_only:
-            model_kwargs["local_files_only"] = local_files_only
+    if revision is not None:
+        model_kwargs["revision"] = revision
+    if local_files_only:
+        model_kwargs["local_files_only"] = local_files_only
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, **model_kwargs

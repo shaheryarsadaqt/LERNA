@@ -48,6 +48,11 @@ from collections import deque
 
 import torch
 
+from lerna.utils.phase_suffix_feasibility import (
+    PhaseSuffixFeasibility,
+    PhaseSuffixInfeasibleError,
+)
+
 
 class TerminalInvalidScoreError(RuntimeError):
     """Raised when a score feeding the gate is non-finite.
@@ -102,6 +107,10 @@ def _eligible_phase_quota(
       absorbed by the eligible windows, so the sum of per-window quotas is exactly
       requested_total.
     - Raises InfeasibleBudgetError if requested_total exceeds total eligible steps.
+
+    When total_eligible == 0, requested_total is recorded as 0 (legacy contract).
+    Positive Q at W=T with zero eligible steps is an explicit rejection for
+    phase_exact_v1, applied by the caller after the allocator.
     """
     requested_total = int(round(rate * total_steps))
     windows = _phase_bounds(total_steps, n_phases)
@@ -211,9 +220,67 @@ class ScoreQuantileGate:
         anneal_fraction: float = 0.88,
         seed: int = 0,
         score_source,
+        controller_version: str = "legacy_v4",
     ):
-        if not 0.0 < rate <= 1.0:
-            raise ValueError(f"rate must be in (0, 1], got {rate!r}")
+        if controller_version not in ("legacy_v4", "phase_exact_v1"):
+            raise ValueError(
+                f"controller_version must be 'legacy_v4' or 'phase_exact_v1', "
+                f"got {controller_version!r}"
+            )
+        # Validate new-version config inputs before wrapper conversions.
+        # Strict validation applies only to phase_exact_v1; legacy_v4 keeps its
+        # original permissive contract (convert with int(), no rejection).
+        if controller_version == "phase_exact_v1":
+            if isinstance(rate, bool) or isinstance(total_steps, bool) or \
+               isinstance(n_phases, bool) or isinstance(max_consecutive_skips, bool) or \
+               isinstance(score_history_window, bool) or isinstance(min_step, bool) or \
+               isinstance(anneal_fraction, bool):
+                raise TypeError(
+                    "boolean values are not accepted for numeric config fields"
+                )
+            if not isinstance(rate, (int, float)) or rate != rate or rate == float("inf") or rate == float("-inf"):
+                raise ValueError(f"rate must be finite, got {rate!r}")
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(f"rate must be in [0, 1], got {rate!r}")
+            if not isinstance(total_steps, (int, float)) or total_steps != total_steps or total_steps == float("inf") or total_steps == float("-inf"):
+                raise ValueError(f"total_steps must be finite, got {total_steps!r}")
+            if float(total_steps) != int(total_steps):
+                raise ValueError(f"total_steps must be an integer, got {total_steps!r}")
+            if int(total_steps) <= 0:
+                raise ValueError(f"total_steps must be > 0, got {total_steps!r}")
+            if not isinstance(anneal_fraction, (int, float)) or anneal_fraction != anneal_fraction or anneal_fraction == float("inf") or anneal_fraction == float("-inf"):
+                raise ValueError(f"anneal_fraction must be finite, got {anneal_fraction!r}")
+            if not 0.0 <= anneal_fraction <= 1.0:
+                raise ValueError(f"anneal_fraction must be in [0, 1], got {anneal_fraction!r}")
+            if not isinstance(n_phases, (int, float)) or float(n_phases) != int(n_phases):
+                raise ValueError(f"n_phases must be an integer, got {n_phases!r}")
+            if int(n_phases) < 1 or int(n_phases) > int(total_steps):
+                raise ValueError(f"n_phases must be in [1, {int(total_steps)}], got {n_phases!r}")
+            if not isinstance(max_consecutive_skips, (int, float)) or float(max_consecutive_skips) != int(max_consecutive_skips):
+                raise ValueError(f"max_consecutive_skips must be an integer, got {max_consecutive_skips!r}")
+            if int(max_consecutive_skips) < 1:
+                raise ValueError(f"max_consecutive_skips must be >= 1, got {max_consecutive_skips!r}")
+            if not isinstance(score_history_window, (int, float)) or float(score_history_window) != int(score_history_window):
+                raise ValueError(f"score_history_window must be an integer, got {score_history_window!r}")
+            if int(score_history_window) < 1:
+                raise ValueError(f"score_history_window must be >= 1, got {score_history_window!r}")
+            if not isinstance(min_step, (int, float)) or float(min_step) != int(min_step):
+                raise ValueError(f"min_step must be an integer, got {min_step!r}")
+            if int(min_step) < 0 or int(min_step) > int(total_steps):
+                raise ValueError(f"min_step must be in [0, {int(total_steps)}], got {min_step!r}")
+            if not isinstance(seed, (int, float)) or seed != seed or seed == float("inf") or seed == float("-inf"):
+                raise ValueError(f"seed must be finite, got {seed!r}")
+            if isinstance(seed, bool):
+                raise TypeError("boolean values are not accepted for numeric config fields")
+            if float(seed) != int(seed):
+                raise ValueError(f"seed must be an integer, got {seed!r}")
+
+        # Legacy input contract: rate in (0, 1]. phase_exact_v1 allows rate=0
+        # (all retain with ordinary scoring/history schedule).
+        if controller_version == "legacy_v4":
+            if not 0.0 < rate <= 1.0:
+                raise ValueError(f"rate must be in (0, 1], got {rate!r}")
+        # Legacy path: total_steps etc. are converted with int(), not validated.
         if total_steps <= 0:
             raise ValueError(f"total_steps must be > 0, got {total_steps!r}")
         self.rate = float(rate)
@@ -226,6 +293,7 @@ class ScoreQuantileGate:
         self.seed = int(seed)
         self._rng = random.Random(self.seed)
         self._score_source = score_source
+        self.controller_version = controller_version
 
         self._phase_windows = _phase_bounds(self.total_steps, self.n_phases)
         # Quota is defined over ELIGIBLE steps (decision_index >= min_step), matching
@@ -233,28 +301,78 @@ class ScoreQuantileGate:
         # round(rate * total_steps), sampled from eligible steps. A window with zero
         # eligible steps carries no quota and its share is absorbed by the eligible
         # windows (equivalently: it "passes its quota to the next" eligible window).
+        #
+        # Q=round(rate*total_steps) is computed first, before the allocator. If
+        # total_eligible==0 and Q>0, the caller must reject (W=T with Q>0). Genuine
+        # Q=0 (including rounding to zero) is valid.
+        # Q=round(rate*total_steps) computed before allocator so the W=T
+        # rejection can use the original requested value even when the
+        # allocator overwrites requested_total to 0 for total_eligible==0.
+        requested_total = int(round(self.rate * self.total_steps))
         self._phase_quota, self._requested_total, self._total_eligible, self._eligible_per_window = (
             _eligible_phase_quota(self.rate, self.total_steps, self.min_step, self.n_phases)
         )
+        # W=T with Q>0: no eligible steps exist, so positive skips cannot be placed.
+        # Reject for phase_exact_v1; genuine Q=0 remains valid.
+        if (
+            controller_version == "phase_exact_v1"
+            and self._total_eligible == 0
+            and requested_total > 0
+        ):
+            raise InfeasibleBudgetError(
+                f"Infeasible skip quota under cap: requested {requested_total} skips "
+                f"({self.rate:.3f} of {self.total_steps}), but min_step={self.min_step} "
+                f"leaves 0 eligible steps. W=T with Q>0 cannot be scheduled. Lower the "
+                f"skip rate or reduce min_step."
+            )
         # Hard feasibility: the requested quota must be achievable under the cap.
         # With cap K, max_skips_possible(n_elig, K) is the most skips possible
         # across all eligible steps. If the quota exceeds this, the run would
         # dead-lock (forced skips hit the cap and can never catch up). Reject
-        # loudly rather than silently under-spend.
-        max_achievable = max_skips_possible(self._total_eligible, self.max_consecutive_skips)
-        if self._requested_total > max_achievable:
-            raise InfeasibleBudgetError(
-                f"Infeasible skip quota under cap: requested {self._requested_total} skips "
-                f"({self.rate:.3f} of {self.total_steps}), but max achievable under "
-                f"max_consecutive_skips={self.max_consecutive_skips} is {max_achievable} "
-                f"over {self._total_eligible} eligible steps. Lower the skip rate, "
-                f"raise the cap, or increase total_steps."
+        # loudly rather than silently under-spend. Only applies when there are
+        # eligible steps; W=T with Q=0 is valid (no skips possible/requested).
+        if self._total_eligible > 0:
+            max_achievable = max_skips_possible(self._total_eligible, self.max_consecutive_skips)
+            if self._requested_total > max_achievable:
+                raise InfeasibleBudgetError(
+                    f"Infeasible skip quota under cap: requested {self._requested_total} skips "
+                    f"({self.rate:.3f} of {self.total_steps}), but max achievable under "
+                    f"max_consecutive_skips={self.max_consecutive_skips} is {max_achievable} "
+                    f"over {self._total_eligible} eligible steps. Lower the skip rate, "
+                    f"raise the cap, or increase total_steps."
+                )
+
+        # --- phase_exact_v1: exact suffix feasibility precomputation -------
+        self._feasibility: Optional[PhaseSuffixFeasibility] = None
+        if controller_version == "phase_exact_v1":
+            # Reject jointly infeasible initial phase assignments at construction.
+            # The exact suffix checker validates that every phase quota can be met
+            # under the hard cap across the full horizon.
+            self._feasibility = PhaseSuffixFeasibility(
+                total_steps=self.total_steps,
+                n_phases=self.n_phases,
+                phase_quotas=self._phase_quota,
+                min_step=self.min_step,
+                max_consecutive_skips=self.max_consecutive_skips,
             )
+            if not self._feasibility.initial_feasible():
+                raise PhaseSuffixInfeasibleError(
+                    t=0,
+                    c=0,
+                    q=self._phase_quota[0],
+                    phase=0,
+                    phase_quota=self._phase_quota[0],
+                    phase_used=0,
+                    message="initial phase assignment is jointly infeasible under "
+                    "hard cap and fixed phase quotas",
+                )
+
         self._phase_used = [0] * self.n_phases
         self._consecutive_skips = 0
         self._longest_skip_run = 0
         self._terminal = False
         self._terminal_at: Optional[int] = None
+        self._terminal_error: Optional[Exception] = None
 
         # counters used in tests / diagnostics
         self.decisions_seen = 0
@@ -264,12 +382,27 @@ class ScoreQuantileGate:
         self.warmup_blocked = 0
         self.anneal_skips = 0
         self.global_forced_skips = 0
+        # New exclusive counters for phase_exact_v1 (legacy_v4 keeps them at 0)
+        self.suffix_force_skip = 0
+        self.suffix_force_retain = 0
+
+        # Sequential decision-index validation (phase_exact_v1 only)
+        self._next_decision_index = 0
+
+        # Exclusive reason-count summary (valid decisions only; terminal/error
+        # events recorded separately, not as valid actions).
+        self._reason_counts: dict[str, int] = {}
 
         self._scores: Deque[float] = deque(maxlen=self.score_history_window)
 
         # per-window skip-position diagnostics (bug d): track where skips land
         # within each phase window to detect front-loading or back-loading bias.
         self._phase_skip_positions: list[list[int]] = [[] for _ in range(self.n_phases)]
+
+        # Exclusive per-decision diagnostic records (action + reason separate).
+        # Empty for legacy_v4 unless diagnostics_logging is enabled.
+        self._decision_records: list[dict] = []
+        self._diagnostics_logging = False
 
     def _record_skip_position(self, decision_index: int, skip: bool) -> None:
         """Record the phase-relative position of skips for parity diagnostics."""
@@ -279,6 +412,64 @@ class ScoreQuantileGate:
         start, _ = self._phase_windows[phase]
         rel = decision_index - start
         self._phase_skip_positions[phase].append(rel)
+
+    def enable_diagnostics_logging(self) -> None:
+        """Enable per-decision diagnostic record collection.
+
+        When enabled, every :meth:`decide` call appends a record with the
+        decision index, phase, quota/steps, streak, score, threshold,
+        feasibility flags, action, and reason. Logging ON/OFF produces
+        identical actions, scores, histories, counters, and RNG states;
+        only trace storage differs.
+        """
+        self._diagnostics_logging = True
+
+    def _record_decision(
+        self,
+        decision_index: int,
+        action: int,
+        reason: str,
+        *,
+        score: Optional[float] = None,
+        threshold: Optional[float] = None,
+        q: Optional[int] = None,
+        n: Optional[int] = None,
+        feasible_retain: Optional[bool] = None,
+        feasible_skip: Optional[bool] = None,
+        streak_before: int = 0,
+        streak_after: int = 0,
+        is_terminal: bool = False,
+    ) -> None:
+        """Record one exclusive decision record.
+
+        Logging ON/OFF must produce identical actions, scores, histories,
+        counters, and RNG states — only trace storage differs.
+        """
+        # Exclusive reason-count summary (valid decisions only;
+        # terminal/error events are recorded separately, not as valid actions).
+        if not is_terminal:
+            self._reason_counts[reason] = self._reason_counts.get(reason, 0) + 1
+
+        if not self._diagnostics_logging:
+            return
+        phase = self.phase_for(decision_index)
+        record = {
+            "index": decision_index,
+            "phase": phase,
+            "action": action,
+            "reason": reason,
+            "score": score,
+            "threshold": threshold,
+            "q": q,
+            "n": n,
+            "feasible_retain": feasible_retain,
+            "feasible_skip": feasible_skip,
+            "streak_before": streak_before,
+            "streak_after": streak_after,
+            "version": self.controller_version,
+            "is_terminal": is_terminal,
+        }
+        self._decision_records.append(record)
 
     # ------------------------------------------------------------------ api
     def phase_for(self, decision_index: int) -> int:
@@ -323,200 +514,523 @@ class ScoreQuantileGate:
 
         Terminal state is recorded before raising so callers can see the index
         that invalidated the run (consistent with strict-mode semantics).
+        Subsequent calls must raise the stored terminal condition without
+        computing a score, drawing RNG, advancing the sequential pointer, or
+        changing valid-action counters.
         """
         if not (score == score and score != float("inf") and score != float("-inf")):
             if not self._terminal:
                 self._terminal = True
-                # decision_index is the last observed step index
-            raise TerminalInvalidScoreError(self.decisions_seen, score)
+                self._terminal_at = self.decisions_seen
+                self._terminal_error = TerminalInvalidScoreError(
+                    self.decisions_seen, score
+                )
+            raise self._terminal_error
         self._scores.append(float(score))
 
-    def decide(self, decision_index: int, model, inputs) -> bool:
-        """Run one gate decision. Returns whether to skip the backward pass."""
-        self.decisions_seen += 1
+    def _is_terminal(self) -> bool:
+        return self._terminal
+
+    def _check_terminal_raise(self, decision_index: int) -> None:
+        """If already terminal, raise the stored terminal condition without
+        any state mutation, scoring, RNG draw, or sequential-pointer advance."""
         if self._terminal:
-            # terminal absorbs: never skip again after a fatal score
+            raise self._terminal_error
+
+    def _validate_decision_index(self, decision_index) -> int:
+        """Validate decision_index type and range before any mutation or scoring.
+
+        Reject booleans, non-integers, t<0, and t>=total_steps. Returns the
+        validated integer index.
+        """
+        if isinstance(decision_index, bool):
+            raise TypeError(
+                f"decision_index must be an integer, got boolean {decision_index!r}"
+            )
+        if not isinstance(decision_index, int):
+            raise TypeError(
+                f"decision_index must be an integer, got {type(decision_index).__name__}"
+            )
+        if decision_index < 0:
+            raise ValueError(f"decision_index must be >= 0, got {decision_index}")
+        if decision_index >= self.total_steps:
+            raise ValueError(
+                f"decision_index must be < total_steps={self.total_steps}, "
+                f"got {decision_index}"
+            )
+        return decision_index
+
+    def _validate_sequential(self, decision_index: int) -> None:
+        """phase_exact_v1: reject duplicate/out-of-order/end/past-end calls."""
+        if decision_index != self._next_decision_index:
+            raise ValueError(
+                f"decision_index {decision_index} != expected "
+                f"{self._next_decision_index}; calls must be sequential"
+            )
+
+    def _validate_prefix_invariants(
+        self, decision_index: int, c: int, q: int
+    ) -> None:
+        """phase_exact_v1: validate prefix/phase-use/streak invariants before
+        warmup/quota-exhausted/cap early returns.
+
+        - Earlier phases must be fully satisfied (expired-phase debt not masked).
+        - Current-phase usage cannot exceed quota.
+        - Streak must be within cap.
+        """
+        phase = self.phase_for(decision_index)
+        # All earlier phases must have exact quota met.
+        for i in range(phase):
+            if self._phase_used[i] != self._phase_quota[i]:
+                self._terminal = True
+                self._terminal_at = decision_index
+                self._terminal_error = PhaseSuffixInfeasibleError(
+                    t=decision_index,
+                    c=c,
+                    q=q,
+                    phase=i,
+                    phase_quota=self._phase_quota[i],
+                    phase_used=self._phase_used[i],
+                    message="earlier phase quota not exactly satisfied before "
+                    "current phase",
+                )
+                raise self._terminal_error
+        # Current phase usage cannot exceed quota.
+        if self._phase_used[phase] > self._phase_quota[phase]:
+            self._terminal = True
+            self._terminal_at = decision_index
+            self._terminal_error = PhaseSuffixInfeasibleError(
+                t=decision_index,
+                c=c,
+                q=q,
+                phase=phase,
+                phase_quota=self._phase_quota[phase],
+                phase_used=self._phase_used[phase],
+                message="current phase usage exceeds quota",
+            )
+            raise self._terminal_error
+        # Streak within cap.
+        if c > self.max_consecutive_skips:
+            self._terminal = True
+            self._terminal_at = decision_index
+            self._terminal_error = PhaseSuffixInfeasibleError(
+                t=decision_index,
+                c=c,
+                q=q,
+                phase=phase,
+                phase_quota=self._phase_quota[phase],
+                phase_used=self._phase_used[phase],
+                message="consecutive-skip streak exceeds cap",
+            )
+            raise self._terminal_error
+
+    def _assert_phase_completion(self, phase: int) -> None:
+        """Assert exact quota usage at every phase boundary completion."""
+        if self._phase_used[phase] != self._phase_quota[phase]:
+            self._terminal = True
+            self._terminal_at = self.total_steps - 1
+            self._terminal_error = PhaseSuffixInfeasibleError(
+                t=self.total_steps - 1,
+                c=self._consecutive_skips,
+                q=self._phase_quota[phase] - self._phase_used[phase],
+                phase=phase,
+                phase_quota=self._phase_quota[phase],
+                phase_used=self._phase_used[phase],
+                message="phase completion quota not exactly satisfied",
+            )
+            raise self._terminal_error
+
+    def _assert_horizon_completion(self) -> None:
+        """Assert exact phases/total and decisions at successful horizon completion."""
+        total_used = sum(self._phase_used)
+        if total_used != self._requested_total:
+            self._terminal = True
+            self._terminal_at = self.total_steps - 1
+            self._terminal_error = PhaseSuffixInfeasibleError(
+                t=self.total_steps - 1,
+                c=self._consecutive_skips,
+                q=self._requested_total - total_used,
+                phase=self.n_phases - 1,
+                phase_quota=self._phase_quota[-1],
+                phase_used=self._phase_used[-1],
+                message="horizon completion total quota not exactly satisfied",
+            )
+            raise self._terminal_error
+        # Internal skip counter must match requested total; inconsistent
+        # injected accounting (e.g. skipped=1 on zero-budget run) is rejected.
+        if self.skipped != self._requested_total:
+            self._terminal = True
+            self._terminal_at = self.total_steps - 1
+            self._terminal_error = PhaseSuffixInfeasibleError(
+                t=self.total_steps - 1,
+                c=self._consecutive_skips,
+                q=self._requested_total - self.skipped,
+                phase=self.n_phases - 1,
+                phase_quota=self._phase_quota[-1],
+                phase_used=self._phase_used[-1],
+                message="skip counter inconsistent with requested quota at horizon",
+            )
+            raise self._terminal_error
+
+    def decide(self, decision_index: int, model, inputs) -> bool:
+        """Run one gate decision. Returns whether to skip the backward pass.
+
+        For ``controller_version="legacy_v4"`` the behavior is identical to the
+        original implementation. For ``controller_version="phase_exact_v1"``,
+        exact suffix feasibility is checked before ordinary score/tie/anneal
+        selection: if only one action leaves a feasible completion, it is chosen
+        without consuming an ordinary-decision random draw; if both are feasible,
+        the existing quantile/anneal rule applies; if neither is feasible, a
+        :class:`PhaseSuffixInfeasibleError` is raised.
+
+        Lifecycle invariants (phase_exact_v1):
+        - Terminal state is checked first, before any mutation/scoring/RNG.
+        - Decision index is validated (type, range, sequential) before scoring.
+        - Prefix/phase-use/streak invariants are validated before early returns.
+        - Exact phase quotas are asserted at every phase boundary and at horizon
+          completion.
+        - Terminal error is stored before raising; subsequent calls re-raise
+          without state change.
+        """
+        # --- Terminal check FIRST (no mutation/scoring/RNG after terminal) ---
+        if self._terminal:
+            if self.controller_version == "phase_exact_v1":
+                raise self._terminal_error
+            # legacy_v4: terminal absorbs, never skip again after a fatal score.
+            # decisions_seen advances even on absorbed calls to match original
+            # legacy behavior (2 after terminal: 1 trigger + 1 absorbed).
+            self.decisions_seen += 1
+            self._record_decision(
+                decision_index, 0, "terminal_absorbed",
+                streak_before=self._consecutive_skips, streak_after=0,
+                is_terminal=True,
+            )
             return False
 
-        # B3: Do not compute score before (min_step - score_history_window).
-        # S1 (||p-y||) and S2 (alignment) are NaN before the warmup window ends
-        # and before the AlignmentProbe hook is attached, so computing them here
-        # would terminal the run at step 0. The score is only computed once
-        # decisions are eligible.
+        # --- Sequential decision-index validation (phase_exact_v1 only) ---
+        if self.controller_version == "phase_exact_v1":
+            self._validate_sequential(decision_index)
+
+        # --- Validate decision index type/range before any mutation ---
+        t = self._validate_decision_index(decision_index)
+
+        self.decisions_seen += 1
+        if self.controller_version == "phase_exact_v1":
+            self._next_decision_index = t + 1
+
+        annealed = decision_index >= self.anneal_step
+
+        # --- Warmup early return: no score computed (matches legacy behavior) ---
         early_return = max(self.min_step - self.score_history_window, 0)
         if decision_index < early_return:
-            # B13: reset streak on non-skip
+            if self.controller_version == "phase_exact_v1":
+                self._validate_prefix_invariants(
+                    decision_index, self._consecutive_skips, 0
+                )
+                if decision_index == self.total_steps - 1:
+                    self._assert_horizon_completion()
+            streak_before = self._consecutive_skips
             self._consecutive_skips = 0
+            self._record_decision(
+                decision_index, 0, "warmup_early",
+                streak_before=streak_before, streak_after=0,
+            )
             return False
 
         score = self._score_source(decision_index, model, inputs)
         if not (score == score and score != float("inf") and score != float("-inf")):
+            # Store terminal before raising.
             self._terminal = True
             self._terminal_at = decision_index
-            raise TerminalInvalidScoreError(decision_index, score)
-
-        annealed = decision_index >= self.anneal_step
+            self._terminal_error = TerminalInvalidScoreError(decision_index, score)
+            raise self._terminal_error
 
         if decision_index < self.min_step:
             # Record score into history so the quantile window is full when
             # min_step is reached, but still never skip.
             self.warmup_blocked += 1
-            # B13: reset streak on non-skip
+            if self.controller_version == "phase_exact_v1":
+                self._validate_prefix_invariants(
+                    decision_index, self._consecutive_skips, self._remaining_in_phase(decision_index)[0]
+                )
+                if decision_index == self.total_steps - 1:
+                    self._assert_horizon_completion()
+            streak_before = self._consecutive_skips
             self._consecutive_skips = 0
             self.note_score(score)
+            self._record_decision(
+                decision_index, 0, "warmup_history",
+                score=score,
+                threshold=None,
+                q=None, n=None,
+                feasible_retain=None, feasible_skip=None,
+                streak_before=streak_before, streak_after=0,
+            )
             return False
 
         remaining_quota, remaining_steps = self._remaining_in_phase(decision_index)
+        K = self.max_consecutive_skips
+        c = self._consecutive_skips
+        q = remaining_quota
+        n = remaining_steps
 
-        # Hard invariant: never skip beyond the per-window quota. Once a phase's
-        # quota is met, remaining_quota == 0 and we stop skipping in that phase.
+        # --- Prefix/phase-use/streak invariant validation before early returns ---
+        if self.controller_version == "phase_exact_v1":
+            self._validate_prefix_invariants(decision_index, c, q)
+
+        # Hard invariant: never skip beyond the per-window quota.
         if remaining_quota <= 0:
-            # B13: reset streak on non-skip
+            if self.controller_version == "phase_exact_v1" and decision_index == self.total_steps - 1:
+                self._assert_horizon_completion()
+            streak_before = self._consecutive_skips
             self._consecutive_skips = 0
             self.note_score(score)
+            self._record_decision(
+                decision_index, 0, "phase_quota_exhausted",
+                score=score, threshold=None,
+                q=remaining_quota, n=remaining_steps,
+                feasible_retain=True, feasible_skip=False,
+                streak_before=streak_before, streak_after=0,
+            )
             return False
 
-        K = self.max_consecutive_skips
-
         # At the cap: must run a real backward step to avoid exceeding K.
-        if self._consecutive_skips >= K:
+        if c >= K:
+            if self.controller_version == "phase_exact_v1":
+                # At the cap, retain is the only legal action. If retain is not
+                # feasible, no completion exists — terminal instead of retaining.
+                assert self._feasibility is not None
+                feasible_retain_cap = self._feasibility.is_action_feasible(
+                    decision_index, c, q, 0
+                )
+                if not feasible_retain_cap:
+                    self._terminal = True
+                    self._terminal_at = decision_index
+                    self._terminal_error = PhaseSuffixInfeasibleError(
+                        t=decision_index,
+                        c=c,
+                        q=q,
+                        phase=self.phase_for(decision_index),
+                        phase_quota=self._phase_quota[self.phase_for(decision_index)],
+                        phase_used=self._phase_used[self.phase_for(decision_index)],
+                        message="no feasible action at cap",
+                    )
+                    raise self._terminal_error
             self.cap_blocked += 1
             self._consecutive_skips = 0
             self.note_score(score)
+            self._record_decision(
+                decision_index, 0, "cap_retain",
+                score=score, threshold=None,
+                q=q, n=n,
+                feasible_retain=True, feasible_skip=False,
+                streak_before=c, streak_after=0,
+            )
             return False
 
-        # Exact feasibility check:
-        # We check BOTH per-phase and global reachability to guarantee
-        # realized == requested at end-of-run.
-        #
-        # Per-phase (local): if skipping now would make this phase's quota
-        # unreachable, or if not skipping would, we force the other choice.
-        #
-        # Global (total): the sum of per-phase F values is NOT the same as
-        # F(total), so we must also check global reachability. If the current
-        # phase is locally infeasible (cannot meet its quota either way), we
-        # fall back to the global check: force a skip if skipping is still
-        # globally feasible, or force a backward if not skipping is still
-        # globally feasible.
-        #
-        # - F(r, K) = K * floor(r/(K+1)) + min(r mod (K+1), K)
-        # - F_with_consec(r, K, c) = max skips in r steps starting with c
-        #   consecutive (c skips already in the current run).
-        #
-        # per_phase_skip_possible: can this phase still be satisfied if we skip now?
-        #   remaining_quota - 1 skips in remaining_steps - 1 steps (from c+1 consec)
-        per_phase_skip_possible = (
-            max_skips_possible_with_consec(
-                remaining_steps - 1, K, self._consecutive_skips + 1
+        # --- Exact suffix feasibility (phase_exact_v1) --------------------
+        feasible_retain = None
+        feasible_skip = None
+        threshold = None
+        if self.controller_version == "phase_exact_v1":
+            assert self._feasibility is not None
+            feasible_retain = self._feasibility.is_action_feasible(
+                decision_index, c, q, 0
             )
-            >= remaining_quota - 1
-        )
-        # per_phase_real_possible: can this phase still be satisfied if we backward now?
-        #   remaining_quota skips in remaining_steps - 1 steps, starting from 0 consec
-        per_phase_real_possible = max_skips_possible(remaining_steps - 1, K) >= remaining_quota
-
-        # Global check over ALL remaining phases (for cross-phase compensation).
-        total_quota, total_steps = self._remaining_global(decision_index)
-        # global_skip_possible: can the TOTAL quota still be met if we skip now?
-        global_skip_possible = (
-            max_skips_possible_with_consec(
-                total_steps - 1, K, self._consecutive_skips + 1
+            feasible_skip = self._feasibility.is_action_feasible(
+                decision_index, c, q, 1
             )
-            >= total_quota - 1
-        ) if total_quota > 0 else False
-        # global_real_possible: can the TOTAL quota still be met if we backward now?
-        global_real_possible = max_skips_possible(total_steps - 1, K) >= total_quota if total_quota > 0 else True
 
-        # Determine if we're forced in either direction.
-        # Priority:
-        # 1. Cap: at the consecutive limit, must backward.
-        # 2. Per-phase forcing: local check dominates when it's decisive.
-        # 3. Global forcing: if per-phase is infeasible both ways, use global.
-        if not per_phase_skip_possible and not per_phase_real_possible:
-            # Phase is locally infeasible (cannot meet its quota either way).
-            # Fall back to global reachability to minimize total deficit.
-            if not global_skip_possible and not global_real_possible:
-                # Globally infeasible too: cannot recover. Don't skip (conservative).
-                # B13: reset streak on non-skip
-                self._consecutive_skips = 0
-                self.note_score(score)
-                return False
-            elif not global_real_possible:
-                # Not skipping is globally infeasible; force skip (minimize deficit).
-                self.global_forced_skips += 1
-                phase = self.phase_for(decision_index)
-                self._phase_used[phase] += 1
-                self.skipped += 1
-                self._consecutive_skips += 1
-                self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
-                self._record_skip_position(decision_index, True)
-                self.note_score(score)
-                return True
+            if not feasible_retain and not feasible_skip:
+                # Store terminal before raising.
+                self._terminal = True
+                self._terminal_at = decision_index
+                self._terminal_error = PhaseSuffixInfeasibleError(
+                    t=decision_index,
+                    c=c,
+                    q=q,
+                    phase=self.phase_for(decision_index),
+                    phase_quota=self._phase_quota[self.phase_for(decision_index)],
+                    phase_used=self._phase_used[self.phase_for(decision_index)],
+                    message="no feasible action from accepted gate state",
+                )
+                raise self._terminal_error
+
+            if feasible_retain and feasible_skip:
+                # Both actions feasible: use existing quantile/anneal rule.
+                skip, threshold, sub_reason = self._score_decides(
+                    score, q, n, annealed, decision_index, return_threshold=True
+                )
+                reason = sub_reason if not annealed else "anneal"
+            elif feasible_skip:
+                # Only skip is feasible: force skip, no ordinary RNG draw.
+                skip = True
+                self.suffix_force_skip += 1
+                reason = "suffix_force_skip"
             else:
-                # global_skip_possible is False (skipping globally infeasible):
-                # force backward to preserve global quota.
-                self.global_forced_skips += 1
-                # B13: reset streak on non-skip
-                self._consecutive_skips = 0
-                self.note_score(score)
-                return False
-        elif not per_phase_skip_possible:
-            # Skipping would make this phase's quota unreachable; force backward.
-            self.forced_skips += 1
-            # B13: reset streak on non-skip
-            self._consecutive_skips = 0
-            self.note_score(score)
-            return False
-        elif not per_phase_real_possible:
-            # Not skipping would make this phase's quota unreachable; force skip.
-            self.forced_skips += 1
-            phase = self.phase_for(decision_index)
-            self._phase_used[phase] += 1
-            self.skipped += 1
-            self._consecutive_skips += 1
-            self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
-            self._record_skip_position(decision_index, True)
-            self.note_score(score)
-            return True
-
-        # Both are feasible: the score decides.
-        skip = False
-        if annealed:
-            # (b) Annealing: use Bernoulli(q) directly. Do NOT feed Uniform[0,1]
-            # into the score history (which holds gain scores in [0, sqrt2]);
-            # that would skew the quantile threshold for ~window steps.
-            q = remaining_quota / remaining_steps if remaining_steps > 0 else 0.0
-            skip = self._rng.random() < q
-            if skip:
-                self.anneal_skips += 1
+                # Only retain is feasible: force retain, no ordinary RNG draw.
+                skip = False
+                self.suffix_force_retain += 1
+                reason = "suffix_force_retain"
         else:
-            q = remaining_quota / remaining_steps if remaining_steps > 0 else 0.0
-            if self._scores:
-                threshold = _nanquantile(list(self._scores), q)
-                if score < threshold:
-                    skip = True
-                elif score == threshold:
-                    skip = self._rng.random() < 0.5  # tie-break
-                # score > threshold -> don't skip
-            # no history yet -> don't skip
+            # --- Legacy v4: existing per-phase and global forcing logic -----
+            skip, reason, threshold = self._legacy_force_and_decide(
+                score, q, n, annealed, c, K, decision_index
+            )
 
+        # Apply the skip/retain decision.
+        streak_before = c
         if skip:
             phase = self.phase_for(decision_index)
             self._phase_used[phase] += 1
             self.skipped += 1
             self._consecutive_skips += 1
-            self._longest_skip_run = max(self._longest_skip_run, self._consecutive_skips)
+            self._longest_skip_run = max(
+                self._longest_skip_run, self._consecutive_skips
+            )
             self._record_skip_position(decision_index, True)
         else:
             self._consecutive_skips = 0
 
-        self.note_score(score)  # always append the original score, not uniform
+        # --- Phase completion assertion: exact quota at every boundary ---
+        if self.controller_version == "phase_exact_v1":
+            phase = self.phase_for(decision_index)
+            start, end = self._phase_windows[phase]
+            if decision_index == end - 1:
+                self._assert_phase_completion(phase)
+                # Advance to next phase's quota at boundary (not streak reset).
+            if decision_index == self.total_steps - 1:
+                self._assert_horizon_completion()
+
+        self.note_score(score)
+        streak_after = self._consecutive_skips
+        self._record_decision(
+            decision_index, 1 if skip else 0, reason,
+            score=score, threshold=threshold, q=q, n=n,
+            feasible_retain=feasible_retain, feasible_skip=feasible_skip,
+            streak_before=streak_before, streak_after=streak_after,
+        )
         return skip
+
+    def _score_decides(
+        self,
+        score: float,
+        q: int,
+        n: int,
+        annealed: bool,
+        decision_index: int,
+        return_threshold: bool = False,
+    ):
+        """Apply the existing quantile/anneal rule when both actions are feasible.
+
+        Returns (skip, threshold, sub_reason). Consumes an ordinary-decision
+        random draw only for tie-break or anneal Bernoulli. sub_reason is one
+        of "score", "tie", "empty_history", or "anneal".
+        """
+        threshold = None
+        if annealed:
+            q_ratio = q / n if n > 0 else 0.0
+            skip = self._rng.random() < q_ratio
+            if skip:
+                self.anneal_skips += 1
+            sub_reason = "anneal"
+            return ((skip, threshold, sub_reason) if return_threshold
+                    else (skip, sub_reason))
+
+        if self._scores:
+            threshold = _nanquantile(list(self._scores), q / n if n > 0 else 0.0)
+            if score < threshold:
+                sub_reason = "score"
+                return ((True, threshold, sub_reason) if return_threshold
+                        else (True, sub_reason))
+            elif score == threshold:
+                skip = self._rng.random() < 0.5  # tie-break
+                sub_reason = "tie"
+                return ((skip, threshold, sub_reason) if return_threshold
+                        else (skip, sub_reason))
+            # score > threshold -> don't skip
+            sub_reason = "score"
+            return ((False, threshold, sub_reason) if return_threshold
+                    else (False, sub_reason))
+        # no history yet -> don't skip
+        sub_reason = "empty_history"
+        return ((False, threshold, sub_reason) if return_threshold
+                else (False, sub_reason))
+
+    def _legacy_force_and_decide(
+        self,
+        score: float,
+        q: int,
+        n: int,
+        annealed: bool,
+        c: int,
+        K: int,
+        decision_index: int,
+    ) -> tuple[bool, str, Optional[float]]:
+        """Existing legacy v4 per-phase and global forcing logic.
+
+        Returns (skip, reason, threshold). Updates only the
+        global_forced_skips / forced_skips counters; the caller applies
+        the decision (state mutation + recording) exactly once.
+        threshold is None for forced actions, otherwise the quantile
+        threshold used by the score rule.
+        """
+        # Per-phase feasibility
+        per_phase_skip_possible = (
+            max_skips_possible_with_consec(
+                n - 1, K, c + 1
+            )
+            >= q - 1
+        )
+        per_phase_real_possible = max_skips_possible(n - 1, K) >= q
+
+        # Global check over ALL remaining phases
+        total_quota, total_steps = self._remaining_global(decision_index)
+        global_skip_possible = (
+            max_skips_possible_with_consec(
+                total_steps - 1, K, c + 1
+            )
+            >= total_quota - 1
+        ) if total_quota > 0 else False
+        global_real_possible = (
+            max_skips_possible(total_steps - 1, K) >= total_quota
+        ) if total_quota > 0 else True
+
+        # Determine forcing
+        if not per_phase_skip_possible and not per_phase_real_possible:
+            # Phase is locally infeasible; fall back to global reachability.
+            if not global_skip_possible and not global_real_possible:
+                # Globally infeasible: don't skip (conservative).
+                return False, "phase_quota_exhausted", None
+            elif not global_real_possible:
+                # Not skipping is globally infeasible; force skip.
+                self.global_forced_skips += 1
+                return True, "global_forced_skip", None
+            else:
+                # Skipping globally infeasible: force backward.
+                self.global_forced_skips += 1
+                return False, "global_forced_retain", None
+        elif not per_phase_skip_possible:
+            # Skipping would make this phase's quota unreachable; force backward.
+            self.forced_skips += 1
+            return False, "forced_backward_phase", None
+        elif not per_phase_real_possible:
+            # Not skipping would make this phase's quota unreachable; force skip.
+            self.forced_skips += 1
+            return True, "forced_skip_phase", None
+
+        # Both feasible: score decides
+        skip, threshold, sub_reason = self._score_decides(
+            score, q, n, annealed, decision_index, return_threshold=True
+        )
+        reason = sub_reason if not annealed else "anneal"
+        return skip, reason, threshold
 
     def terminate_on_score(self, decision_index: int, value: float) -> None:
         self._terminal = True
         self._terminal_at = decision_index
-        raise TerminalInvalidScoreError(decision_index, value)
+        self._terminal_error = TerminalInvalidScoreError(decision_index, value)
+        raise self._terminal_error
 
     def phase_quotas_met(self) -> list[bool]:
         return [
@@ -544,7 +1058,7 @@ class ScoreQuantileGate:
                 })
             else:
                 window_positions.append({"skip_count": 0, "median_rel_position": None})
-        return {
+        result = {
             "rate": self.rate,
             "total_steps": self.total_steps,
             "min_step": self.min_step,
@@ -569,7 +1083,17 @@ class ScoreQuantileGate:
             "phase_skip_positions": window_positions,
             "terminal": self._terminal,
             "terminal_at": self._terminal_at,
+            # New exclusive counters for phase_exact_v1 (legacy_v4 keeps them at 0)
+            "suffix_force_skip": self.suffix_force_skip,
+            "suffix_force_retain": self.suffix_force_retain,
+            "controller_version": self.controller_version,
+            # Exclusive reason-count summary (valid decisions only; terminal/error
+            # events recorded separately, not as valid actions).
+            "reason_counts": dict(self._reason_counts),
         }
+        if self._diagnostics_logging:
+            result["decision_records"] = list(self._decision_records)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -832,10 +1356,22 @@ class ScoreQuantileGatePolicy:
         alignment_probe_fn=None,
         alignment_adam_state_key: str = "classifier.weight",
         alignment_eps: float = 1e-8,
+        controller_version: str = "legacy_v4",
     ):
+        if controller_version not in ("legacy_v4", "phase_exact_v1"):
+            raise ValueError(
+                f"controller_version must be 'legacy_v4' or 'phase_exact_v1', "
+                f"got {controller_version!r}"
+            )
         if score_source not in ("s1", "s2", "uniform"):
             raise ValueError(
                 f"score_source must be 's1', 's2', or 'uniform', got {score_source!r}"
+            )
+        # phase_exact_v1 does not support S2 in this stage; reject clearly.
+        if controller_version == "phase_exact_v1" and score_source == "s2":
+            raise ValueError(
+                f"score_source='s2' is not supported for controller_version="
+                f"'phase_exact_v1' in this stage. Use 's1' or 'uniform'."
             )
         self.score_source_kind = score_source
         self._rng = random.Random(int(policy_seed))
@@ -843,6 +1379,52 @@ class ScoreQuantileGatePolicy:
         self.alignment_probe_fn = alignment_probe_fn
         self.alignment_adam_state_key = alignment_adam_state_key
         self.alignment_eps = float(alignment_eps)
+        self.controller_version = controller_version
+
+        # Validate new-version config inputs before any int/float coercion,
+        # so booleans/fractions are rejected at the policy boundary.
+        if controller_version == "phase_exact_v1":
+            if isinstance(target_skip_rate, bool) or isinstance(total_steps, bool) or \
+               isinstance(min_step, bool) or isinstance(max_consecutive_skips, bool) or \
+               isinstance(n_phases, bool) or isinstance(score_history_window, bool) or \
+               isinstance(anneal_fraction, bool) or isinstance(policy_seed, bool):
+                raise TypeError(
+                    "boolean values are not accepted for numeric config fields"
+                )
+            if not isinstance(target_skip_rate, (int, float)) or target_skip_rate != target_skip_rate or target_skip_rate == float("inf") or target_skip_rate == float("-inf"):
+                raise ValueError(f"target_skip_rate must be finite, got {target_skip_rate!r}")
+            if not 0.0 <= target_skip_rate <= 1.0:
+                raise ValueError(f"target_skip_rate must be in [0, 1], got {target_skip_rate!r}")
+            if not isinstance(total_steps, (int, float)) or total_steps != total_steps or total_steps == float("inf") or total_steps == float("-inf"):
+                raise ValueError(f"total_steps must be finite, got {total_steps!r}")
+            if float(total_steps) != int(total_steps):
+                raise ValueError(f"total_steps must be an integer, got {total_steps!r}")
+            if int(total_steps) <= 0:
+                raise ValueError(f"total_steps must be > 0, got {total_steps!r}")
+            if not isinstance(min_step, (int, float)) or float(min_step) != int(min_step):
+                raise ValueError(f"min_step must be an integer, got {min_step!r}")
+            if int(min_step) < 0 or int(min_step) > int(total_steps):
+                raise ValueError(f"min_step must be in [0, {int(total_steps)}], got {min_step!r}")
+            if not isinstance(max_consecutive_skips, (int, float)) or float(max_consecutive_skips) != int(max_consecutive_skips):
+                raise ValueError(f"max_consecutive_skips must be an integer, got {max_consecutive_skips!r}")
+            if int(max_consecutive_skips) < 1:
+                raise ValueError(f"max_consecutive_skips must be >= 1, got {max_consecutive_skips!r}")
+            if not isinstance(n_phases, (int, float)) or float(n_phases) != int(n_phases):
+                raise ValueError(f"n_phases must be an integer, got {n_phases!r}")
+            if int(n_phases) < 1 or int(n_phases) > int(total_steps):
+                raise ValueError(f"n_phases must be in [1, {int(total_steps)}], got {n_phases!r}")
+            if not isinstance(score_history_window, (int, float)) or float(score_history_window) != int(score_history_window):
+                raise ValueError(f"score_history_window must be an integer, got {score_history_window!r}")
+            if int(score_history_window) < 1:
+                raise ValueError(f"score_history_window must be >= 1, got {score_history_window!r}")
+            if not isinstance(anneal_fraction, (int, float)) or anneal_fraction != anneal_fraction or anneal_fraction == float("inf") or anneal_fraction == float("-inf"):
+                raise ValueError(f"anneal_fraction must be finite, got {anneal_fraction!r}")
+            if not 0.0 <= anneal_fraction <= 1.0:
+                raise ValueError(f"anneal_fraction must be in [0, 1], got {anneal_fraction!r}")
+            if not isinstance(policy_seed, (int, float)) or policy_seed != policy_seed or policy_seed == float("inf") or policy_seed == float("-inf"):
+                raise ValueError(f"policy_seed must be finite, got {policy_seed!r}")
+            if float(policy_seed) != int(policy_seed):
+                raise ValueError(f"policy_seed must be an integer, got {policy_seed!r}")
 
         def _source(decision_index, model, inputs):
             if score_source == "uniform":
@@ -872,6 +1454,7 @@ class ScoreQuantileGatePolicy:
             anneal_fraction=float(anneal_fraction),
             seed=int(policy_seed) + 1,
             score_source=_source,
+            controller_version=controller_version,
         )
 
     def setup_probe(self, trainer, model) -> None:
@@ -912,10 +1495,51 @@ class ScoreQuantileGatePolicy:
                         "S2 alignment score will be NaN."
                     )
         instr = getattr(trainer, "instr", None)
-        idx = (getattr(instr, "batches_seen", 0) - 1) if instr is not None else self._gate.decisions_seen
+        if instr is not None:
+            batches_seen = getattr(instr, "batches_seen", None)
+            if batches_seen is not None:
+                # Validate batches_seen BEFORE subtraction.
+                # phase_exact_v1 rejects booleans and non-integer floats at the
+                # policy boundary. legacy_v4 preserves its original permissive
+                # contract: booleans and non-integer floats are converted with
+                # int() (True->1, False->0, 1.9->1) before the subtraction.
+                if isinstance(batches_seen, bool):
+                    if self.controller_version == "phase_exact_v1":
+                        raise TypeError(
+                            f"decision index must be an integer, got boolean {batches_seen!r}"
+                        )
+                    # legacy_v4: convert with int() per original contract.
+                    batches_seen = int(batches_seen)
+                raw_idx = batches_seen - 1
+                if isinstance(batches_seen, float):
+                    if float(batches_seen) != int(batches_seen):
+                        if self.controller_version == "legacy_v4":
+                            raw_idx = int(batches_seen) - 1
+                        else:
+                            raise ValueError(
+                                f"decision index must be an integer, got {batches_seen!r}"
+                            )
+                    else:
+                        raw_idx = int(batches_seen) - 1
+            else:
+                raw_idx = self._gate.decisions_seen
+        else:
+            raw_idx = self._gate.decisions_seen
+        # Reject non-integer floats at the policy boundary.
+        if isinstance(raw_idx, float):
+            if float(raw_idx) != int(raw_idx):
+                if self.controller_version == "legacy_v4":
+                    raw_idx = int(raw_idx)
+                else:
+                    raise ValueError(
+                        f"decision index must be an integer, got {raw_idx!r}"
+                    )
+            else:
+                raw_idx = int(raw_idx)
+        idx = raw_idx
         if idx < 0:
             idx = self._gate.decisions_seen
-        return bool(self._gate.decide(int(idx), trainer, inputs))
+        return bool(self._gate.decide(idx, trainer, inputs))
 
     def get_diagnostics(self) -> dict:
         d = self._gate.diagnostics()
