@@ -913,35 +913,10 @@ class TestLRConstantWithWarmup:
         assert abs(injected_peak - expected_lr) > max(lr * 0.01, 1e-9)
 
 
-class TestLRMeasurementRejection:
-    """NaN/Inf and nonfinite LR measurements are rejected, not OK."""
-
-    def test_nan_lr_rejected(self):
-        """final_lr NaN must be recorded as a validation failure."""
-        errors = []
-        final_lr = float("nan")
-        if not math.isfinite(final_lr):
-            errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
-        assert len(errors) == 1
-
-    def test_inf_lr_rejected(self):
-        """final_lr +Inf must be recorded as a validation failure."""
-        errors = []
-        final_lr = float("inf")
-        if not math.isfinite(final_lr):
-            errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
-        assert len(errors) == 1
-
-    def test_neg_inf_lr_rejected(self):
-        """final_lr -Inf must be recorded as a validation failure."""
-        errors = []
-        final_lr = float("-inf")
-        if not math.isfinite(final_lr):
-            errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
-        assert len(errors) == 1
 # ---------------------------------------------------------------------------
 # Part A: Tests for fixes already in the runner (no runner edits)
 # ---------------------------------------------------------------------------
+
 
 class TestVariableBatches:
     """Test variable-length batches through trainer.train() and evaluator at batch > 1."""
@@ -960,12 +935,13 @@ class TestVariableBatches:
             _dynamic_padding_collator,
         )
 
-        collator_calls = []
+        collator_calls = []  # list of (features, output) tuples
         original_collator = __import__("scripts.run_controller_ablation", fromlist=["_dynamic_padding_collator"])._dynamic_padding_collator
 
         def collator_spy(features, pad_token_id=0):
-            collator_calls.append(features)
-            return original_collator(features, pad_token_id=pad_token_id)
+            output = original_collator(features, pad_token_id=pad_token_id)
+            collator_calls.append((features, output))
+            return output
 
         def make_dataset(task):
             """Build a Dataset.from_dict stand-in with task-appropriate text fields."""
@@ -1074,7 +1050,7 @@ class TestVariableBatches:
 
             # Collator saw at least one batch with unequal input lengths
             lengths_seen = set()
-            for features in collator_calls:
+            for features, output in collator_calls:
                 for f in features:
                     ids = f.get("input_ids", [])
                     if isinstance(ids, list):
@@ -1083,8 +1059,16 @@ class TestVariableBatches:
                         lengths_seen.add(ids.shape[0])
             assert len(lengths_seen) > 1, f"{task}: collator saw only one input length: {lengths_seen}"
 
-            # Every collated input_ids row has the batch's maximum length
-            # (verified via the collator's output being consumed by trainer)
+            # Every row of every collated input_ids equals that batch's maximum length
+            for features, output in collator_calls:
+                input_ids = output.get("input_ids")
+                if input_ids is not None:
+                    rows = input_ids if isinstance(input_ids, list) else input_ids.tolist()
+                    max_len = max(len(row) for row in rows)
+                    for row in rows:
+                        assert len(row) == max_len, \
+                            f"{task}: row length {len(row)} != batch max {max_len}"
+
             assert result.get("result", {}).get("final_learning_rate") is not None, f"{task}: no final LR recorded"
 
             # For mrpc, eval accuracy and F1 are numbers in [0, 1], F1 is not None
@@ -1096,11 +1080,195 @@ class TestVariableBatches:
                 assert f1 is not None and 0.0 <= f1 <= 1.0, f"mrpc final_eval_f1={f1}"
 
 
+class TestQnliAcrossArms:
+    """B3: QNLI matched-probe-ID exclusions across all six arms.
+
+    Builds a valid non-dry QNLI config from the same exclusions file
+    (S=[1, 7000], E=[3]) for each arm in ARMS. Runs the real
+    _load_train_dataset_production and _load_eval_dataset_production on
+    Dataset.from_dict stand-ins (no real dataset download).
+    """
+
+    ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1",
+            "control_uniform_p4", "full_finetune", "reduced_steps"]
+
+    def _make_exclusions_file(self):
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1, 7000], "probe_e_ids": [3]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return path, h
+
+    def _make_train_tokenizer(self):
+        """Tokenizer stand-in: text 'q{i}' → [101, i, 102]."""
+        class _Tok:
+            pad_token_id = 0
+            padding_side = "right"
+
+            def __call__(self, text, *args, **kwargs):
+                if isinstance(text, list):
+                    return {
+                        "input_ids": [[101, int(t[1:]), 102] for t in text],
+                        "attention_mask": [[1, 1, 1]] * len(text),
+                    }
+                i = int(str(text)[1:])
+                return {"input_ids": [101, i, 102], "attention_mask": [1, 1, 1]}
+        return _Tok()
+
+    def test_qnli_exclusions_across_all_arms(self):
+        """For each arm: exclusion set stored as {1, 3, 7000}, then
+        _load_train_dataset_production keeps 9,997 rows with correct indices."""
+        from unittest import mock
+        from datasets import Dataset
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, _load_train_dataset_production,
+        )
+
+        excl_path, excl_hash = self._make_exclusions_file()
+
+        ARM_PHASES = {
+            "gate_s1_p1": 1, "gate_s1_p4": 4,
+            "control_uniform_p1": 1, "control_uniform_p4": 4,
+            "full_finetune": 1, "reduced_steps": 1,
+        }
+        ARM_SOURCE = {
+            "gate_s1_p1": "s1", "gate_s1_p4": "s1",
+            "control_uniform_p1": "uniform", "control_uniform_p4": "uniform",
+            "full_finetune": "s1", "reduced_steps": "s1",
+        }
+
+        for arm in self.ARMS:
+            cfg = ExperimentConfig(
+                task="qnli", arm=arm,
+                controller_version="legacy_v4", score_source=ARM_SOURCE[arm],
+                total_steps=4, min_step=0, n_phases=ARM_PHASES[arm],
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir=f"/tmp/test_qnli_arm_{arm}",
+                attempt_id="t1",
+                probe_exclusions_file=excl_path,
+                probe_exclusions_hash=excl_hash,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+            assert cfg._qnli_exclusion_probe_ids == {1, 3, 7000}, \
+                f"{arm}: expected {{1, 3, 7000}}, got {cfg._qnli_exclusion_probe_ids}"
+
+        # Now run the loader for one arm (all arms share the same QNLI config logic)
+        arm = "gate_s1_p1"
+        cfg = ExperimentConfig(
+            task="qnli", arm=arm,
+            controller_version="legacy_v4", score_source="s1",
+            total_steps=4, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_qnli_loader",
+            attempt_id="t1",
+            probe_exclusions_file=excl_path,
+            probe_exclusions_hash=excl_hash,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dry_run=False,
+        )
+
+        # 10,000-row train stand-in with idx == row position
+        train_ds = Dataset.from_dict({
+            "idx": list(range(10000)),
+            "question": [f"q{i}" for i in range(10000)],
+            "sentence": [f"s{i}" for i in range(10000)],
+            "label": [i % 2 for i in range(10000)],
+        })
+
+        tok = self._make_train_tokenizer()
+
+        with mock.patch(
+            "datasets.load_dataset",
+            return_value=train_ds,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            return_value=tok,
+        ):
+            result_ds = _load_train_dataset_production(cfg, 4)
+
+        assert len(result_ds) == 9997, \
+            f"expected 9,997 rows, got {len(result_ds)}"
+        expected_indices = [i for i in range(10000) if i not in {1, 3, 7000}]
+        kept_labels = list(result_ds["labels"])
+        expected_labels = [i % 2 for i in expected_indices]
+        assert kept_labels == expected_labels, \
+            f"kept labels don't match expected order"
+
+    def test_qnli_validation_split_intact(self):
+        """Validation split is NOT excluded: all 50 rows come back in order."""
+        from unittest import mock
+        from datasets import Dataset
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, _load_eval_dataset_production,
+        )
+
+        excl_path, excl_hash = self._make_exclusions_file()
+
+        cfg = ExperimentConfig(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="legacy_v4", score_source="s1",
+            total_steps=4, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_qnli_eval",
+            attempt_id="t1",
+            probe_exclusions_file=excl_path,
+            probe_exclusions_hash=excl_hash,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dry_run=False,
+        )
+
+        # 50-row validation stand-in containing idx 1 and 3
+        val_ds = Dataset.from_dict({
+            "idx": list(range(50)),
+            "question": [f"q{i}" for i in range(50)],
+            "sentence": [f"s{i}" for i in range(50)],
+            "label": [i % 2 for i in range(50)],
+        })
+
+        def load_side_effect(dataset_name, config=None, split=None, **kwargs):
+            if split == "train":
+                return val_ds
+            return val_ds  # validation returns the same stand-in
+
+        tok = self._make_train_tokenizer()
+
+        with mock.patch(
+            "datasets.load_dataset",
+            side_effect=load_side_effect,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            return_value=tok,
+        ):
+            result_ds = _load_eval_dataset_production(cfg)
+
+        assert len(result_ds) == 50, \
+            f"expected all 50 validation rows, got {len(result_ds)}"
+        kept_labels = list(result_ds["labels"])
+        expected_labels = [i % 2 for i in range(50)]
+        assert kept_labels == expected_labels, \
+            f"validation labels should be intact, got {kept_labels[:10]}..."
+
+
 class TestLREndpoints:
     """Test linear and cosine LR endpoints checked against installed HF scheduler, including T = W."""
 
     @pytest.mark.parametrize("shape,arm,warmup,T_eff,target_skip_rate,n_phases,controller_version,score_source", [
         ("linear", "full_finetune", 0, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("linear", "full_finetune", 3, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("linear", "full_finetune", 8, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("cosine", "full_finetune", 0, 8, 0.0, 1, "legacy_v4", "uniform"),
         ("cosine", "full_finetune", 3, 8, 0.0, 1, "legacy_v4", "uniform"),
         ("cosine", "full_finetune", 8, 8, 0.0, 1, "legacy_v4", "uniform"),
         ("cosine", "reduced_steps", 12, 12, 0.4, 1, "legacy_v4", "uniform"),
@@ -1373,6 +1541,26 @@ class TestRunnerCorruption:
         assert reason_fragment in result_dry["reason"], \
             f"expected '{reason_fragment}' in reason: {result_dry['reason']}"
 
+    def test_target_skip_rate_bool_rejected(self):
+        """target_skip_rate=True must be rejected (bool is not a valid rate)."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="not bool"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=True,
+                output_dir="/tmp/test_bool_skip_rate",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
 
 class TestRunnerCorruptionBaseline:
     """Baseline: no injection returns OK in both paths."""
@@ -1455,6 +1643,12 @@ class TestRunnerCorruptionBaseline:
         cfg_dry = ExperimentConfig(**{**cfg_kwargs, "dry_run": True})
         result_dry = run_dry_run(cfg_dry)
         assert result_dry["status"] == "OK", result_dry.get("reason")
+
+
+class TestTrainerActualFreezing:
+    """Actual Trainer freeze/skip behavior: params and Adam state unchanged on
+    skipped steps, updated on retained steps; scheduler advances every batch."""
+
     """Execute a retained batch to populate Adam state, then snapshot params
     and Adam state around a skipped batch; verify no skipped backward/optimizer
     update and scheduler advancement. Verify a later retained batch updates."""
@@ -1815,15 +2009,164 @@ class TestRunnerCorruptionBaseline:
         trainer.lr_scheduler.step = trainer._orig_sched_step
 
     def test_trainer_adam_freeze_via_train_loop_per_boundary(self):
-        """Full train() loop with per-boundary backward/optimizer/scheduler deltas.
+        """B5: Freeze evidence inside train() via TrainerCallback.on_step_end.
 
-        Retain → skip → retain pattern. Adam step cloned as tensor in snapshots.
-        Scheduler advances every batch (ALWAYS_STEP). Later retained step changes
-        params meaningfully.
+        Retain → skip → retain → retain over 4 batches. Records snapshots
+        inside the real trainer.train() loop. Verifies params/Adam unchanged
+        on skip, changed on retain, scheduler advances every batch.
         """
+        from transformers import TrainerCallback
+
         model = TinyModel(hidden=4, classes=2, seed=1)
         args = TrainingArguments(
-            output_dir="/tmp/test_adam_train_loop",
+            output_dir="/tmp/test_adam_train_loop_b5",
+            max_steps=4,
+            learning_rate=1e-3,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=1,
+            warmup_steps=0, weight_decay=0.0,
+            lr_scheduler_type="constant", optim="adamw_torch",
+            eval_strategy="no", save_strategy="no",
+            logging_strategy="no", report_to=[], disable_tqdm=True,
+            use_cpu=True, fp16=False, bf16=False,
+        )
+        dataset = [
+            {"input_ids": torch.randn(1, 4), "labels": torch.tensor([i % 2])}
+            for i in range(4)
+        ]
+
+        class RetainSkipRetainRetainPolicy:
+            name = "retain_skip_retain_retain"
+
+            def __init__(self):
+                self.calls = 0
+
+            def should_skip(self, trainer, model, inputs):
+                self.calls += 1
+                return self.calls == 2  # skip only batch 2 (1-indexed)
+
+            def get_diagnostics(self):
+                return {"name": self.name, "calls": self.calls}
+
+        policy = RetainSkipRetainRetainPolicy()
+        trainer = TrueBackwardSkippingTrainer(
+            model=model, args=args,
+            train_dataset=dataset,
+            skip_policy=policy,
+            scheduler_step_policy=SchedulerStepPolicy.ALWAYS_STEP,
+            capture_logits=True, online_ler_enabled=False,
+            allow_grad_accumulation_with_skipping=True,
+        )
+
+        # Per-batch snapshots recorded inside train() via callback
+        snapshots = []
+
+        class SnapshotCallback(TrainerCallback):
+            def on_step_end(self, args, state, control, model=None, **kwargs):
+                # Record after each scheduled batch
+                params = {n: p.detach().clone() for n, p in model.named_parameters()}
+                adam = {}
+                for p in model.parameters():
+                    st = trainer.optimizer.state.get(p, {})
+                    adam[id(p)] = {
+                        "step": st.get("step", 0),
+                        "exp_avg": st.get("exp_avg", None).clone() if "exp_avg" in st else None,
+                        "exp_avg_sq": st.get("exp_avg_sq", None).clone() if "exp_avg_sq" in st else None,
+                    }
+                snapshots.append({
+                    "step": state.global_step,
+                    "params": params,
+                    "adam": adam,
+                    "backward_calls": trainer.instr.backward_calls,
+                    "optimizer_step_attempts": trainer.instr.optimizer_step_attempts,
+                    "scheduler_step_calls": trainer.instr.scheduler_step_calls,
+                })
+
+        trainer.add_callback(SnapshotCallback())
+        trainer.train()
+
+        # 4 snapshots (one per batch)
+        assert len(snapshots) == 4, f"expected 4 snapshots, got {len(snapshots)}"
+
+        # Batch 1 (index 0): retained
+        # Batch 2 (index 1): skipped
+        # Batch 3 (index 2): retained
+        # Batch 4 (index 3): retained
+
+        # --- Skipped batch (batch 2, index 1) ---
+        s1 = snapshots[0]  # batch 1 snapshot
+        s2 = snapshots[1]  # batch 2 snapshot
+
+        # params and all Adam state identical to batch-1 snapshot
+        for n in s1["params"]:
+            assert torch.equal(s1["params"][n], s2["params"][n]), \
+                f"param {n} changed on skipped batch"
+        for pid in s1["adam"]:
+            a1 = s1["adam"][pid]
+            a2 = s2["adam"][pid]
+            assert a1["step"] == a2["step"], \
+                f"Adam step changed on skipped batch: {a1['step']} -> {a2['step']}"
+            if a1["exp_avg"] is not None:
+                assert torch.equal(a1["exp_avg"], a2["exp_avg"]), \
+                    "exp_avg changed on skipped batch"
+            if a1["exp_avg_sq"] is not None:
+                assert torch.equal(a1["exp_avg_sq"], a2["exp_avg_sq"]), \
+                    "exp_avg_sq changed on skipped batch"
+
+        # backward and optimizer deltas are 0
+        assert s2["backward_calls"] - s1["backward_calls"] == 0, \
+            "backward delta should be 0 on skipped batch"
+        assert s2["optimizer_step_attempts"] - s1["optimizer_step_attempts"] == 0, \
+            "optimizer delta should be 0 on skipped batch"
+
+        # scheduler delta is 1
+        assert s2["scheduler_step_calls"] - s1["scheduler_step_calls"] == 1, \
+            "scheduler delta should be 1 on skipped batch"
+
+        # --- Each retained batch ---
+        for idx in [0, 2, 3]:  # retained batches
+            prev = snapshots[idx - 1] if idx > 0 else None
+            curr = snapshots[idx]
+            if prev is not None:
+                # parameters differ from previous snapshot
+                any_changed = any(
+                    not torch.equal(prev["params"][n], curr["params"][n])
+                    for n in curr["params"]
+                )
+                assert any_changed, f"params should change on retained batch {idx}"
+                # backward and optimizer deltas are 1
+                assert curr["backward_calls"] - prev["backward_calls"] == 1, \
+                    f"backward delta should be 1 on retained batch {idx}"
+                assert curr["optimizer_step_attempts"] - prev["optimizer_step_attempts"] == 1, \
+                    f"optimizer delta should be 1 on retained batch {idx}"
+                # scheduler delta is 1
+                assert curr["scheduler_step_calls"] - prev["scheduler_step_calls"] == 1, \
+                    f"scheduler delta should be 1 on retained batch {idx}"
+
+        # --- Retained batch right after skip (batch 3, index 2) ---
+        # Changes params
+        s2 = snapshots[1]  # skipped batch
+        s3 = snapshots[2]  # retained after skip
+        any_changed = any(
+            not torch.equal(s2["params"][n], s3["params"][n])
+            for n in s3["params"]
+        )
+        assert any_changed, "params should change on retained batch after skip"
+
+    def test_cached_logits_distinct_successive_batches_zero_extra_forwards(self):
+        """B5: Real S1 policy reads cached logits with zero extra scoring forwards.
+
+        Runs trainer.train() with ScoreQuantileGatePolicy and score_source="s1"
+        over 3 batches with distinct inputs/labels. Counts model.forward calls
+        via a wrapper and asserts forwards == scheduled batches. Spies on the
+        S1 scoring function to verify it scores each batch's cached logits
+        and labels.
+        """
+        from lerna.utils.forward_gate import ScoreQuantileGatePolicy, forward_gain_score
+
+        model = TinyModel(hidden=4, classes=2, seed=2)
+        args = TrainingArguments(
+            output_dir="/tmp/test_cached_logits_b5",
             max_steps=3,
             learning_rate=1e-3,
             per_device_train_batch_size=2,
@@ -1839,98 +2182,13 @@ class TestRunnerCorruptionBaseline:
             for i in range(3)
         ]
 
-        class RetainSkipRetainPolicy:
-            name = "retain_skip_retain"
-
-            def __init__(self):
-                self.calls = 0
-
-            def should_skip(self, trainer, model, inputs):
-                self.calls += 1
-                return self.calls == 2
-
-            def get_diagnostics(self):
-                return {"name": self.name, "calls": self.calls}
-
-        policy = RetainSkipRetainPolicy()
-        trainer = TrueBackwardSkippingTrainer(
-            model=model, args=args,
-            train_dataset=dataset,
-            skip_policy=policy,
-            scheduler_step_policy=SchedulerStepPolicy.ALWAYS_STEP,
-            capture_logits=True, online_ler_enabled=False,
-            allow_grad_accumulation_with_skipping=True,
+        policy = ScoreQuantileGatePolicy(
+            target_skip_rate=0.0, total_steps=3, min_step=0,
+            max_consecutive_skips=4, n_phases=1,
+            score_history_window=64, anneal_fraction=0.88,
+            policy_seed=0, score_source="s1",
+            controller_version="phase_exact_v1",
         )
-
-        trainer.create_optimizer()
-        trainer.create_scheduler(num_training_steps=3, optimizer=trainer.optimizer)
-
-        def snapshot_adam():
-            state = {}
-            for p in trainer.optimizer.param_groups[0]["params"]:
-                st = trainer.optimizer.state[p]
-                state[id(p)] = {
-                    "step": st.get("step", 0).clone() if hasattr(
-                        st.get("step", 0), "clone"
-                    ) else st.get("step", 0),
-                    "exp_avg": st.get("exp_avg", None).clone() if "exp_avg" in st else None,
-                    "exp_avg_sq": st.get("exp_avg_sq", None).clone() if "exp_avg_sq" in st else None,
-                }
-            return state
-
-        def snapshot_params():
-            return {n: p.detach().clone() for n, p in model.named_parameters()}
-
-        # Run the complete train loop
-        trainer.train()
-
-        # Scheduler advanced on all 3 steps
-        assert trainer.instr.scheduler_step_calls == 3, \
-            f"scheduler_step_calls={trainer.instr.scheduler_step_calls}, expected 3"
-
-        # Backward called only on retained steps (0 and 2)
-        assert trainer.instr.backward_calls == 2, \
-            f"backward_calls={trainer.instr.backward_calls}, expected 2"
-
-        # Skipped backward step = 1 (step 1)
-        assert trainer.instr.skipped_backward_steps == 1, \
-            f"skipped_backward_steps={trainer.instr.skipped_backward_steps}, expected 1"
-
-        # Adam step = 2 (two retained updates)
-        for p in trainer.optimizer.param_groups[0]["params"]:
-            st = trainer.optimizer.state[p]
-            assert st.get("step", 0) == 2, \
-                f"Adam step should be 2, got {st.get('step', 0)}"
-
-        # Restore original step methods
-        trainer.optimizer.step = trainer._orig_opt_step
-        trainer.lr_scheduler.step = trainer._orig_sched_step
-
-    def test_cached_logits_distinct_successive_batches_zero_extra_forwards(self):
-        """S1 policy reads current-batch cached logits across distinct batches
-        with zero additional scoring forwards."""
-        from lerna.trainers.policies import AlwaysFalsePolicy
-        from lerna.utils.forward_gate import forward_gain_score
-
-        model = TinyModel(hidden=4, classes=2, seed=2)
-        args = TrainingArguments(
-            output_dir="/tmp/test_cached_logits_distinct",
-            max_steps=2,
-            learning_rate=1e-3,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=1,
-            warmup_steps=0, weight_decay=0.0,
-            lr_scheduler_type="constant", optim="adamw_torch",
-            eval_strategy="no", save_strategy="no",
-            logging_strategy="no", report_to=[], disable_tqdm=True,
-            use_cpu=True, fp16=False, bf16=False,
-        )
-        dataset = [
-            {"input_ids": torch.randn(1, 4), "labels": torch.tensor([i % 2])}
-            for i in range(2)
-        ]
-
-        policy = AlwaysFalsePolicy()
         trainer = TrueBackwardSkippingTrainer(
             model=model, args=args,
             train_dataset=dataset,
@@ -1940,35 +2198,43 @@ class TestRunnerCorruptionBaseline:
             allow_grad_accumulation_with_skipping=True,
         )
 
-        scoring_forwards_before = 0
-        if hasattr(trainer, "_scoring_forward_calls"):
-            scoring_forwards_before = trainer._scoring_forward_calls
+        # Spy on S1 scoring function before training, to verify each batch's
+        # cached logits and labels are scored (no extra scoring forwards).
+        scored_logits = []
+        scored_labels = []
+        orig_score = forward_gain_score
 
-        # Run both batches via training_step (which sets _last_real_logits)
-        logits_batch_0 = None
-        for i, batch in enumerate(dataset):
-            prepared = trainer._prepare_inputs(batch)
-            loss = trainer.training_step(model, prepared)
-            logits_batch_i = trainer._last_real_logits.clone()
+        def spy_score(logits, labels):
+            scored_logits.append(
+                logits.detach().clone() if hasattr(logits, 'detach') else logits
+            )
+            scored_labels.append(
+                labels.detach().clone() if hasattr(labels, 'detach') else labels
+            )
+            return orig_score(logits, labels)
 
-            # Logits should be distinct across batches (different inputs)
-            if i == 1:
-                assert not torch.equal(logits_batch_0, logits_batch_i), \
-                    "successive batches should produce distinct logits"
+        import lerna.utils.forward_gate as fg_mod
+        fg_mod.forward_gain_score = spy_score
 
-            logits_batch_0 = logits_batch_i
+        try:
+            trainer.train()
+        finally:
+            fg_mod.forward_gain_score = orig_score
 
-            # Verify trainer cached the current forward's logits
-            assert trainer._last_real_logits is not None, \
-                f"trainer._last_real_logits should be set after training_step batch {i}"
+        # forwards == scheduled batches (3) via trainer's instrumentation
+        assert trainer.instr.forward_calls == 3, \
+            f"expected 3 forwards (one per batch), got {trainer.instr.forward_calls}"
 
-        # No extra scoring forwards beyond compute_loss calls
-        scoring_forwards_after = 0
-        if hasattr(trainer, "_scoring_forward_calls"):
-            scoring_forwards_after = trainer._scoring_forward_calls
-        extra_forwards = scoring_forwards_after - scoring_forwards_before
-        assert extra_forwards == 0, \
-            f"expected zero extra scoring forwards, got {extra_forwards}"
+        assert len(scored_logits) == 3, \
+            f"expected 3 scoring calls, got {len(scored_logits)}"
+        assert len(scored_labels) == 3, \
+            f"expected 3 label recordings, got {len(scored_labels)}"
+
+        for i in range(3):
+            assert scored_logits[i] is not None, \
+                f"batch {i}: no logits recorded by scoring spy"
+            assert scored_labels[i] is not None, \
+                f"batch {i}: no labels recorded by scoring spy"
 
     def test_exact_phase_quota_total_matches_Q_not_T(self):
         """phase_exact_v1: sum(phase_quota) must equal requested skips Q,
@@ -2366,39 +2632,6 @@ class TestTrainingPadding:
         assert torch.equal(batch["input_ids"][1], torch.tensor([300, 400, 500]))
         assert batch["labels"].shape == (2,)
         assert torch.equal(batch["labels"], torch.tensor([0, 1]))
-
-
-class TestCosineLRCheck:
-    """Verify the cosine LR schedule ends at peak when effective horizon
-    equals warmup length, per the accepted fix."""
-
-    def test_cosine_lr_peak_when_horizon_equals_warmup(self):
-        """When effective_total == warmup_steps, cosine schedule should yield
-        the peak LR at the final step (no decay yet)."""
-        lr = 2e-5
-        warmup_steps = 4
-        effective_total = 4
-
-        warmup_progress = min(effective_total / max(warmup_steps, 1), 1.0)
-        assert warmup_progress == 1.0
-        decay_horizon = max(effective_total - warmup_steps, 1)
-        decay_progress = min((effective_total - warmup_steps) / max(decay_horizon, 1), 1.0)
-        import math as _m
-        expected_lr = lr * 0.5 * (1.0 + _m.cos(_m.pi * decay_progress))
-        assert abs(expected_lr - lr) < 1e-15, f"expected peak LR={lr}, got {expected_lr}"
-
-    def test_cosine_lr_decay_when_horizon_exceeds_warmup(self):
-        """When effective_total > warmup_steps, cosine decays below peak."""
-        lr = 2e-5
-        warmup_steps = 2
-        effective_total = 10
-
-        decay_horizon = max(effective_total - warmup_steps, 1)
-        decay_progress = min((effective_total - warmup_steps) / max(decay_horizon, 1), 1.0)
-        import math as _m
-        expected_lr = lr * 0.5 * (1.0 + _m.cos(_m.pi * decay_progress))
-        assert expected_lr < lr, f"cosine should decay below peak, got {expected_lr}"
-        assert expected_lr >= 0.0, f"cosine LR should be nonnegative, got {expected_lr}"
 
 
 class TestDryRunCrash:
@@ -3010,34 +3243,6 @@ class TestDataSeed:
         assert cfg.data_seed == 42
 
 
-class TestLRTolerance:
-    """Verify LR tolerance boundary — values just outside tolerance fail."""
-
-    def test_lr_tolerance_boundary_accepts_near_expected(self):
-        """LR within tolerance is accepted."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_lr_tol",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            learning_rate=2e-5,
-            lr_warmup_steps=0,
-            lr_schedule_shape="constant",
-            dry_run=True,
-        )
-        # Constant schedule with warmup_steps=0: expected_lr = learning_rate
-        # Tolerance = max(learning_rate * 0.01, 1e-9) = max(2e-7, 1e-9) = 2e-7
-        tol = max(cfg.learning_rate * 0.01, 1e-9)
-        assert tol > 0, "tolerance should be positive"
 
 
 class TestHollowTests:

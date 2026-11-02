@@ -392,27 +392,28 @@ class ExperimentConfig:
                     )
 
         # --- Preflight: reject empty or None model/tokenizer/dataset IDs ---
-        if not self.dry_run:
-            for field_name, value in (
-                ("model_id", self.model_id),
-                ("tokenizer_id", self.tokenizer_id),
-                ("dataset_id", self.dataset_id),
-            ):
-                if value is None or not isinstance(value, str):
-                    raise ValueError(
-                        f"{field_name} is {value!r}; must be a non-empty string. "
-                        f"Real execution blocked."
-                    )
-                if value.strip() != value:
-                    raise ValueError(
-                        f"{field_name} is {value!r}; must not contain "
-                        f"leading/trailing whitespace."
-                    )
-                if len(value.strip()) == 0:
-                    raise ValueError(
-                        f"{field_name} is empty; must be a non-empty model/dataset "
-                        f"identifier. Real execution blocked."
-                    )
+        # Applied in both dry-run and non-dry-run modes so that invalid IDs
+        # are caught before any loader is invoked.
+        for field_name, value in (
+            ("model_id", self.model_id),
+            ("tokenizer_id", self.tokenizer_id),
+            ("dataset_id", self.dataset_id),
+        ):
+            if value is None or not isinstance(value, str):
+                raise ValueError(
+                    f"{field_name} is {value!r}; must be a non-empty string. "
+                    f"Real execution blocked."
+                )
+            if value.strip() != value:
+                raise ValueError(
+                    f"{field_name} is {value!r}; must not contain "
+                    f"leading/trailing whitespace."
+                )
+            if len(value.strip()) == 0:
+                raise ValueError(
+                    f"{field_name} is empty; must be a non-empty model/dataset "
+                    f"identifier. Real execution blocked."
+                )
 
         # --- Preflight: QNLI exclusion-file/hash prerequisites ---
         # QNLI arms apply the same verified matched-probe-ID exclusions across
@@ -1021,7 +1022,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"model loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "model_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
     try:
         if cfg.dry_run:
@@ -1034,7 +1035,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"tokenizer loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "tokenizer_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 # Use the tokenizer's pad_token_id for padding (instead of hardcoded 0)
     # This ensures the collator respects the tokenizer's actual padding token
@@ -1048,9 +1049,24 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                           "Real execution blocked.",
                 "config": cfg.to_dict(),
                 "failure_stage": "tokenizer_pad_id",
-                "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+                "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
             }
         _padding_kwargs['pad_token_id'] = _pad_token_id
+
+    # B1: reject tokenizers that pad on the left or any side other than "right".
+    # The dynamic padding collator only pads on the right; a left-padding
+    # tokenizer would write pad tokens at the start of each sequence and break
+    # attention-mask alignment.
+    if tokenizer is not None and hasattr(tokenizer, 'padding_side'):
+        if tokenizer.padding_side != "right":
+            return {
+                "status": "FAILED",
+                "reason": f"tokenizer padding_side={tokenizer.padding_side!r}; only 'right' is supported. "
+                          "Real execution blocked.",
+                "config": cfg.to_dict(),
+                "failure_stage": "tokenizer_padding_side",
+                "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
+            }
 
     
     try:
@@ -1064,7 +1080,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"train dataset loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "train_dataset_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
     try:
         if cfg.dry_run:
@@ -1077,7 +1093,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"eval dataset loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "eval_dataset_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     class _TinyDataset(torch.utils.data.Dataset):
@@ -1136,7 +1152,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"training arguments construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "training_arguments",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Build the real policy as the skip policy ---
@@ -1166,7 +1182,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"policy construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "policy_construction",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Instantiate TrueBackwardSkippingTrainer with mocked loading ---
@@ -1192,7 +1208,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"trainer construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "trainer_construction",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Execution loop via trainer.train() ---
@@ -1205,7 +1221,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "terminal",
             "config": cfg.to_dict(),
             "error": str(e),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     except SkipPolicyDecisionError as e:
@@ -1214,7 +1230,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "policy_decision_failure",
             "config": cfg.to_dict(),
             "error": str(e),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     except Exception as e:
@@ -1223,7 +1239,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"training failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "training",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
     wall = time.perf_counter() - t0
     instr = trainer.instr
@@ -1407,21 +1423,19 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             if lr_schedule_shape == "constant":
                 # Constant schedule: no warmup, LR stays at peak throughout.
                 expected_lr = learning_rate
-                tol = max(learning_rate * 0.01, 1e-9)
+                tol = max(abs(expected_lr) * 1e-9, 1e-12)
             else:
-                # HF schedules with warmup: LR ramps from 0 to peak over
-                # warmup_steps. Validate against HF's own scheduler functions
-                # instead of a hand-written formula (correct when effective_total
-                # equals warmup length, and for all other cases).
+                # Schedules with warmup: LR ramps from 0 to peak over
+                # warmup_steps. Validation uses a formula, not HF's scheduler.
                 warmup_progress = min(effective_total / max(warmup_steps, 1), 1.0)
                 warmup_lr = learning_rate * warmup_progress
                 if warmup_progress < 1.0:
                     # Still in warmup: expect warmup progress * peak.
                     expected_lr = warmup_lr
-                    tol = max(learning_rate * 0.01, 1e-9)
+                    tol = max(abs(expected_lr) * 1e-9, 1e-12)
                 elif lr_schedule_shape == "constant_with_warmup":
                     expected_lr = learning_rate
-                    tol = max(learning_rate * 0.01, 1e-9)
+                    tol = max(abs(expected_lr) * 1e-9, 1e-12)
                 elif lr_schedule_shape == "cosine":
                     # HF cosine: at T == W warmup just completed, LR at peak.
                     if effective_total <= warmup_steps:
@@ -1432,10 +1446,10 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                             (effective_total - warmup_steps) / max(decay_horizon, 1),
                             1.0,
                         )
-                        # cosine decay factor approximated by HF cosine schedule
+                        # cosine decay factor computed from the formula
                         import math as _m
                         expected_lr = learning_rate * 0.5 * (1.0 + _m.cos(_m.pi * decay_progress))
-                    tol = max(learning_rate * 0.05, 1e-9)
+                    tol = max(abs(expected_lr) * 1e-9, 1e-12)
                 else:  # linear
                     if effective_total <= warmup_steps:
                         expected_lr = 0.0
@@ -1446,7 +1460,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                             1.0,
                         )
                         expected_lr = learning_rate * (1.0 - decay_progress)
-                    tol = max(learning_rate * 0.05, 1e-9)
+                    tol = max(abs(expected_lr) * 1e-9, 1e-12)
             if abs(final_lr - expected_lr) > tol:
                 errors.append(
                     f"final LR {final_lr} != expected {expected_lr} for "
@@ -1468,7 +1482,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "; ".join(errors),
             "config": cfg.to_dict(),
             "diagnostics": instr_diag,
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Final evaluation: actual task accuracy on eval dataset ---
@@ -1477,6 +1491,17 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         final_eval_loss, final_eval_acc, final_eval_f1 = _evaluate_model(
             trainer, model, eval_dataset, cfg, pad_token_id=_pad_token_id
         )
+    except RuntimeError as e:
+        if "eval_data_loader construction failed" in str(e):
+            return {
+                "status": "FAILED",
+                "reason": str(e),
+                "config": cfg.to_dict(),
+                "failure_stage": "eval_data_loader_construction",
+                "diagnostics": instr.as_dict(),
+                "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
+            }
+        raise
     except Exception as e:
         return {
             "status": "FAILED",
@@ -1484,7 +1509,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "config": cfg.to_dict(),
             "failure_stage": "evaluation",
             "diagnostics": instr.as_dict(),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     return {
@@ -1524,7 +1549,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "tokenizer_loaded": tokenizer is not None,
         },
         "diagnostics": instr.as_dict(),
-        "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+        "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
     }
 
 
@@ -1801,13 +1826,9 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_tok
         eval_loader = DataLoader(eval_dataset, batch_size=cfg.eval_batch_size, shuffle=False,
                                  collate_fn=lambda features, _pd=pad_token_id: _dynamic_padding_collator(features, pad_token_id=_pd))
     except Exception as e:
-        return {
-            "status": "FAILED",
-            "reason": f"eval_data_loader construction failed: {type(e).__name__}: {e}",
-            "config": None,
-            "failure_stage": "eval_data_loader_construction",
-            "provenance": _provenance(dry_run=False, execution_mode="mocked_loading_cpu"),
-        }
+        raise RuntimeError(
+            f"eval_data_loader construction failed: {type(e).__name__}: {e}"
+        )
     with torch.no_grad():
         for batch in eval_loader:
             outputs = model(**batch)
@@ -1899,7 +1920,7 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
         "scheduler_step_policy": "always_step",
         "dry_run": dry_run,
         "execution_mode": execution_mode
-        or ("mocked_loading_cpu" if not dry_run else None),
+        or ("mock_fixtures_cpu" if dry_run else "production_loaders"),
     }
     if seed is not None:
         prov["seed"] = seed
@@ -1908,7 +1929,7 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
     prov["note"] = (
         "dry-run validation only; no training, no model download, no GPU"
         if dry_run
-        else "execution with CPU mock score sources; no pretrained training"
+        else "loaded through the production loader functions"
     )
     return prov
 
