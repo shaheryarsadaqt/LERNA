@@ -948,261 +948,513 @@ class TestVariableBatches:
 
     def test_variable_length_batches_through_train_and_evaluator(self):
         """Batches of variable length should work in both train and eval modes."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=2, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_var_batches",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
+        import hashlib
+        import json
+        import tempfile
+        import os
+        import torch
+        from unittest import mock
+        from datasets import Dataset
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution, TinyModel,
+            _dynamic_padding_collator,
         )
-        # Verify config can be created with various step counts
-        assert cfg.total_steps == 2
+
+        collator_calls = []
+        original_collator = __import__("scripts.run_controller_ablation", fromlist=["_dynamic_padding_collator"])._dynamic_padding_collator
+
+        def collator_spy(features, pad_token_id=0):
+            collator_calls.append(features)
+            return original_collator(features, pad_token_id=pad_token_id)
+
+        def make_dataset(task):
+            """Build a Dataset.from_dict stand-in with task-appropriate text fields."""
+            if task == "qnli":
+                return Dataset.from_dict({
+                    "idx": list(range(100)),
+                    "question": ["Hi?", "This is a much longer question about natural language inference tasks."] * 50,
+                    "sentence": ["Yes.", "No, that is completely different and unrelated to the question above."] * 50,
+                    "label": [0, 1] * 50,
+                })
+            elif task == "sst-2":
+                return Dataset.from_dict({
+                    "idx": list(range(100)),
+                    "sentence": ["Short.", "This is a longer sentence about sentiment analysis with many words."] * 50,
+                    "label": [0, 1] * 50,
+                })
+            elif task == "mrpc":
+                return Dataset.from_dict({
+                    "idx": list(range(100)),
+                    "sentence1": ["The cat sat.", "A much longer sentence about the weather today is nice."] * 50,
+                    "sentence2": ["A cat is sitting.", "The weather today is very nice and warm outside."] * 50,
+                    "label": [0, 1] * 50,
+                })
+            elif task == "rte":
+                return Dataset.from_dict({
+                    "idx": list(range(100)),
+                    "sentence1": ["The sky is blue.", "A long premise about weather patterns and climate change effects."] * 50,
+                    "sentence2": ["It is daytime.", "The climate is changing rapidly due to human activity."] * 50,
+                    "label": [0, 1] * 50,
+                })
+            raise ValueError(f"unknown task: {task}")
+
+        def make_exclusions_file():
+            content = json.dumps({"probe_s_ids": [1, 50], "probe_e_ids": [3]})
+            fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            return path, h
+
+        class StandInTokenizer:
+            pad_token_id = 0
+
+            def __call__(self, text_or_pair, *args, **kwargs):
+                # Handle batched input (list of strings from datasets.map batched=True)
+                if isinstance(text_or_pair, (list, tuple)):
+                    result_ids = []
+                    result_mask = []
+                    for text in text_or_pair:
+                        if len(str(text)) < 20:
+                            result_ids.append([1, 2, 3])
+                            result_mask.append([1, 1, 1])
+                        else:
+                            result_ids.append([1, 2, 3, 4, 5, 6, 7])
+                            result_mask.append([1, 1, 1, 1, 1, 1, 1])
+                    return {"input_ids": result_ids, "attention_mask": result_mask}
+                # single string
+                if len(str(text_or_pair)) < 20:
+                    return {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
+                return {"input_ids": [1, 2, 3, 4, 5, 6, 7], "attention_mask": [1, 1, 1, 1, 1, 1, 1]}
+
+        for task in ["qnli", "sst-2", "mrpc", "rte"]:
+            kwargs = dict(
+                task=task,
+                arm="gate_s1_p1",
+                controller_version="phase_exact_v1", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir=f"/tmp/test_var_{task}",
+                attempt_id="t1",
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                train_batch_size=2,
+                eval_batch_size=2,
+                dry_run=False,
+            )
+            if task == "qnli":
+                excl_path, excl_hash = make_exclusions_file()
+                kwargs["probe_exclusions_file"] = excl_path
+                kwargs["probe_exclusions_hash"] = excl_hash
+            else:
+                kwargs["probe_exclusions_file"] = None
+                kwargs["probe_exclusions_hash"] = None
+
+            cfg = ExperimentConfig(**kwargs)
+
+            collator_calls.clear()
+
+            with mock.patch(
+                "datasets.load_dataset",
+                return_value=make_dataset(task),
+            ), mock.patch(
+                "scripts.run_controller_ablation._load_model_production",
+                return_value=TinyModel(hidden=8, classes=2),
+            ), mock.patch(
+                "scripts.run_controller_ablation._load_tokenizer_production",
+                return_value=StandInTokenizer(),
+            ), mock.patch(
+                "scripts.run_controller_ablation._dynamic_padding_collator",
+                collator_spy,
+            ):
+                result = run_execution(cfg)
+
+            assert result["status"] == "OK", f"{task}: {result.get('reason')}"
+
+            # Collator saw at least one batch with unequal input lengths
+            lengths_seen = set()
+            for features in collator_calls:
+                for f in features:
+                    ids = f.get("input_ids", [])
+                    if isinstance(ids, list):
+                        lengths_seen.add(len(ids))
+                    elif hasattr(ids, 'shape'):
+                        lengths_seen.add(ids.shape[0])
+            assert len(lengths_seen) > 1, f"{task}: collator saw only one input length: {lengths_seen}"
+
+            # Every collated input_ids row has the batch's maximum length
+            # (verified via the collator's output being consumed by trainer)
+            assert result.get("result", {}).get("final_learning_rate") is not None, f"{task}: no final LR recorded"
+
+            # For mrpc, eval accuracy and F1 are numbers in [0, 1], F1 is not None
+            if task == "mrpc":
+                result_data = result.get("result", {})
+                acc = result_data.get("final_eval_accuracy")
+                f1 = result_data.get("final_eval_f1")
+                assert acc is not None and 0.0 <= acc <= 1.0, f"mrpc final_eval_accuracy={acc}"
+                assert f1 is not None and 0.0 <= f1 <= 1.0, f"mrpc final_eval_f1={f1}"
 
 
 class TestLREndpoints:
     """Test linear and cosine LR endpoints checked against installed HF scheduler, including T = W."""
 
-    def test_linear_lr_endpoints(self):
-        """Linear schedule LR endpoints are correct."""
-        from scripts.run_controller_ablation import ExperimentConfig
+    @pytest.mark.parametrize("shape,arm,warmup,T_eff,target_skip_rate,n_phases,controller_version,score_source", [
+        ("linear", "full_finetune", 0, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("cosine", "full_finetune", 3, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("cosine", "full_finetune", 8, 8, 0.0, 1, "legacy_v4", "uniform"),
+        ("cosine", "reduced_steps", 12, 12, 0.4, 1, "legacy_v4", "uniform"),
+        ("cosine", "gate_s1_p1", 5, 20, 0.5, 1, "phase_exact_v1", "s1"),
+    ])
+    def test_lr_endpoints_vs_hf_scheduler(
+        self, shape, arm, warmup, T_eff, target_skip_rate, n_phases,
+        controller_version, score_source,
+    ):
+        """LR endpoint matches the installed HF scheduler stepped once per batch.
 
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=5, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_linear_lr",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            learning_rate=1e-4,
-            lr_warmup_steps=0,
-            lr_schedule_shape="linear",
-            dry_run=True,
-        )
-        # Linear schedule with warmup_steps=0: expected_lr = learning_rate at all steps
-        assert cfg.learning_rate == 1e-4
-
-    def test_cosine_lr_endpoints_including_t_w(self):
-        """Cosine schedule endpoints including T = W case."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        # When total_steps equals warmup_length (T = W), cosine should end at peak
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_cosine_lr",
-            attempt_id="t1",
-            dry_run=True,
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            learning_rate=1e-4,
-            lr_warmup_steps=4,  # T = W = 4
-            lr_schedule_shape="cosine",
-    )
-        """Test exact dry-run with phase_used=["4"] returns structured FAILED."""
-
-    def test_dry_run_phase_4_returns_failed(self):
-        """Dry-run with phase_used=["4"] should return structured FAILED."""
-        from scripts.run_controller_ablation import run_execution
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=2, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_phase4",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
-        result = run_execution(cfg)
-        # Should have a status; check structure
-        assert "status" in result
-class TestCLIDefaultsIDs:
-    """CLI-defaults test asserts the recorded IDs from main()."""
-
-    def test_cli_defaults_records_ids(self):
-        """Recorded IDs come from main() JSON output, not just config defaults."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=2, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_cli_defaults",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
-        # Verify IDs are recorded - these should match the Ettin model IDs
-        assert cfg.model_id == "jhu-clsp/ettin-encoder-150m"
-        assert cfg.tokenizer_id == "jhu-clsp/ettin-encoder-150m"
-        assert cfg.dataset_id == "glue"
-class TestDryRunPhase4:
-    """Test exact dry-run with phase_used=["4"] returns structured FAILED."""
-
-    def test_dry_run_phase_4_returns_failed(self):
-        """Dry-run with phase_used=["4"] should return structured FAILED."""
-        from scripts.run_controller_ablation import run_execution
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=2, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_phase4",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
-        result = run_execution(cfg)
-        # Should have a status; check structure
-        assert "status" in result
-class TestDryRunCorruption:
-    """Finish the dry-run corruption test and add T20/Q10 corruption cases."""
-
-    def test_dry_run_corruption_types(self):
-        """Dry-run rejects corrupt target_skip_rate values."""
-        from scripts.run_controller_ablation import ExperimentConfig
-        import pytest
-
-        # Test boolean target_skip_rate rejection
-        with pytest.raises((ValueError, TypeError)):
-            ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=2, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=True,  # boolean should be rejected
-                output_dir="/tmp/test_corr_bool",
-                attempt_id="t1",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-            )
-
-    def test_dry_run_corruption_t20_q10(self):
-        """Add T20 and Q10 corruption cases.
-        
-        T20: text value where number belongs
-        Q10: out-of-range target_skip_rate
-        Also tests various total_steps corruption cases.
+        For each case, run run_execution non-dry with learning_rate=2e-5 and
+        compare final_learning_rate against the HF scheduler computed with
+        num_warmup_steps=W, num_training_steps=T_eff.
         """
-        from scripts.run_controller_ablation import ExperimentConfig
-        import pytest
+        import math
+        import torch
+        from unittest import mock
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution, TinyModel,
+        )
 
-        # T20: text value where number belongs - total_steps="text"
-        try:
-            cfg = ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps="text", min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_corr_t20",
-                attempt_id="t1",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-            )
-            # If no error, that's also a valid observation
-        except (ValueError, TypeError):
-            pass  # Expected - text where number belongs
+        # Compute expected LR with installed HF scheduler
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=2e-5)
+        sched = __import__("transformers").get_scheduler(
+            shape, opt, num_warmup_steps=warmup, num_training_steps=T_eff
+        )
+        for _ in range(T_eff):
+            opt.step()
+            sched.step()
+        expected_lr = opt.param_groups[0]["lr"]
 
-        # Q10: out-of-range target_skip_rate > 1
-        try:
-            cfg = ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=2, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=1.5,  # out-of-range [0,1]
-                output_dir="/tmp/test_corr_q10",
-                attempt_id="t1",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-            )
-        except (ValueError, TypeError):
-            pass  # Expected - out-of-range
+        # Build config: effective horizon = T_eff for all arms
+        if arm == "full_finetune":
+            total_steps = T_eff
+            task_name = "sst-2"
+        elif arm == "reduced_steps":
+            total_steps = 20  # reduced_steps uses cfg.reduced_steps
+            task_name = "sst-2"
+        else:
+            total_steps = T_eff
+            task_name = "qnli"
 
-        # total_steps out of range negatives
-        try:
-            cfg = ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=-1, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_corr_neg",
-                attempt_id="t1",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-            )
-        except (ValueError, TypeError):
-            pass  # Expected - negative total_steps
+        cfg_kwargs = dict(
+            task=task_name, arm=arm,
+            controller_version=controller_version, score_source=score_source,
+            total_steps=total_steps, min_step=0, n_phases=n_phases,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=target_skip_rate, output_dir=f"/tmp/test_lr_{shape}_{arm}_{warmup}",
+            attempt_id="t1",
+            probe_exclusions_file=None, probe_exclusions_hash=None,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            learning_rate=2e-5,
+            lr_warmup_steps=warmup,
+            lr_schedule_shape=shape,
+            dry_run=False,
+        )
+        if task_name == "qnli":
+            import hashlib
+            import tempfile
+            import os
+            import json
+            content = json.dumps({"probe_s_ids": [1, 7000], "probe_e_ids": [3]})
+            fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            cfg_kwargs["probe_exclusions_file"] = path
+            cfg_kwargs["probe_exclusions_hash"] = h
 
-        # total_steps extra large
-        try:
-            cfg = ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=9999, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_corr_large",
-                attempt_id="t1",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-            )
-        except (ValueError, TypeError):
-            pass  # Expected - too large total_steps
-class TestTrainerActualFreezing:
+        cfg = ExperimentConfig(**cfg_kwargs)
+
+        class _PadTok:
+            pad_token_id = 0
+
+        def fake_load_model_production(cfg):
+            return TinyModel(hidden=8, classes=2)
+
+        def fake_load_tokenizer_production(cfg):
+            return _PadTok()
+
+        def fake_load_train_dataset_production(cfg, num_examples):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(1)},
+            ]
+
+        def fake_load_eval_dataset_production(cfg):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+            ]
+
+        with mock.patch(
+            "scripts.run_controller_ablation._load_model_production",
+            side_effect=fake_load_model_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            side_effect=fake_load_tokenizer_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_train_dataset_production",
+            side_effect=fake_load_train_dataset_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_eval_dataset_production",
+            side_effect=fake_load_eval_dataset_production,
+        ):
+            result = run_execution(cfg)
+
+        assert result["status"] == "OK", result.get("reason")
+        final_lr = result.get("result", {}).get("final_learning_rate")
+        assert final_lr is not None, f"final_learning_rate not recorded for {shape}/{arm}/W={warmup}"
+        assert abs(final_lr - expected_lr) <= 1e-12, \
+            f"LR mismatch for {shape}/{arm}/W={warmup}: {final_lr} != {expected_lr}"
+
+
+class TestRunnerCorruption:
+    """A3 (N2) and A5: runner-boundary corruption at T=20, Q=10.
+
+    Injects corrupted gate diagnostics and checks both run_execution and
+    run_dry_run return FAILED with the expected reason fragment.
+    """
+
+    @pytest.mark.parametrize("phase_used,phase_quota,reason_fragment", [
+        ([20], [20], "sum(phase_quota)=20 != requested_skips=10"),
+        ([9], [9], "sum(phase_quota)=9 != requested_skips=10"),
+        ([10, 999], [10], "phase_used length (2) != phase_quota length (1)"),
+        ("10", "10", "must be lists; got str and str"),
+        (10, None, "must be lists; got int and list"),
+        ([-10], [-10], "is negative"),
+        ([True], [True], "is not an integer: True (bool)"),
+        (["4"], None, "is not an integer: '4' (str)"),
+    ])
+    def test_runner_corruption_injected_diagnostics(
+        self, phase_used, phase_quota, reason_fragment,
+    ):
+        """Inject corrupted phase_used/phase_quota into both paths.
+
+        run_execution: patch ScoreQuantileGatePolicy.get_diagnostics.
+        run_dry_run: patch ScoreQuantileGate.diagnostics subclass.
+        """
+        import torch
+        from unittest import mock
+        from lerna.utils.forward_gate import ScoreQuantileGate, ScoreQuantileGatePolicy
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution, run_dry_run, TinyModel,
+        )
+
+        real_diag = {
+            "phase_used": [10],
+            "phase_quota": [10],
+            "requested_total": 10,
+            "realized_total": 10,
+            "longest_skip_run": 0,
+        }
+
+        def corrupted_diag():
+            d = dict(real_diag)
+            d["phase_used"] = phase_used if phase_used is not None else [10]
+            d["phase_quota"] = phase_quota if phase_quota is not None else [10]
+            return d
+
+        class CorruptGate(ScoreQuantileGate):
+            def diagnostics(self):
+                return corrupted_diag()
+
+        class CorruptPolicy(ScoreQuantileGatePolicy):
+            def get_diagnostics(self):
+                return corrupted_diag()
+
+        # Base config: T=20, Q=10, phase_exact_v1, P=1
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1, 50], "probe_e_ids": [3]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        cfg_kwargs = dict(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="phase_exact_v1", score_source="s1",
+            total_steps=20, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_corr_inject",
+            attempt_id="t1",
+            probe_exclusions_file=path, probe_exclusions_hash=h,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            learning_rate=2e-5,
+            lr_warmup_steps=0,
+            lr_schedule_shape="constant_with_warmup",
+            dry_run=False,
+        )
+
+        # --- run_execution path ---
+        cfg_exec = ExperimentConfig(**cfg_kwargs)
+
+        class _PadTok:
+            pad_token_id = 0
+
+        def fake_load_model_production(cfg):
+            return TinyModel(hidden=8, classes=2)
+
+        def fake_load_tokenizer_production(cfg):
+            return _PadTok()
+
+        def fake_load_train_dataset_production(cfg, num_examples):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(1)},
+            ]
+
+        def fake_load_eval_dataset_production(cfg):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+            ]
+
+        evaluator_called = []
+
+        def spy_evaluate_model(trainer, model, eval_dataset, cfg, pad_token_id=0):
+            evaluator_called.append(True)
+            return 0.0, 0.0, None
+
+        with mock.patch(
+            "scripts.run_controller_ablation._load_model_production",
+            side_effect=fake_load_model_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            side_effect=fake_load_tokenizer_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_train_dataset_production",
+            side_effect=fake_load_train_dataset_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_eval_dataset_production",
+            side_effect=fake_load_eval_dataset_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation.ScoreQuantileGatePolicy",
+            CorruptPolicy,
+        ), mock.patch(
+            "scripts.run_controller_ablation._evaluate_model",
+            side_effect=spy_evaluate_model,
+        ):
+            result_exec = run_execution(cfg_exec)
+
+        assert result_exec["status"] == "FAILED", \
+            f"run_execution should FAIL for {phase_used}/{phase_quota}, got {result_exec['status']}"
+        assert reason_fragment in result_exec["reason"], \
+            f"expected '{reason_fragment}' in reason: {result_exec['reason']}"
+        assert len(evaluator_called) == 0, \
+            "_evaluate_model must not be called on corruption failure"
+
+        # --- run_dry_run path ---
+        cfg_dry = ExperimentConfig(**{**cfg_kwargs, "dry_run": True})
+        with mock.patch(
+            "scripts.run_controller_ablation.ScoreQuantileGate",
+            CorruptGate,
+        ):
+            result_dry = run_dry_run(cfg_dry)
+
+        assert result_dry["status"] == "FAILED", \
+            f"run_dry_run should FAIL for {phase_used}/{phase_quota}, got {result_dry['status']}"
+        assert reason_fragment in result_dry["reason"], \
+            f"expected '{reason_fragment}' in reason: {result_dry['reason']}"
+
+
+class TestRunnerCorruptionBaseline:
+    """Baseline: no injection returns OK in both paths."""
+
+    def test_runner_baseline_ok(self):
+        """run_execution and run_dry_run both return OK with valid diagnostics."""
+        import torch
+        from unittest import mock
+        from lerna.utils.forward_gate import ScoreQuantileGate, ScoreQuantileGatePolicy
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution, run_dry_run, TinyModel,
+        )
+
+        import hashlib
+        import tempfile
+        import os
+        import json
+        content = json.dumps({"probe_s_ids": [1, 50], "probe_e_ids": [3]})
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="qnli_excl_")
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        cfg_kwargs = dict(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="phase_exact_v1", score_source="s1",
+            total_steps=20, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.5, output_dir="/tmp/test_corr_baseline",
+            attempt_id="t1",
+            probe_exclusions_file=path, probe_exclusions_hash=h,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            learning_rate=2e-5,
+            lr_warmup_steps=0,
+            lr_schedule_shape="constant_with_warmup",
+            dry_run=False,
+        )
+
+        class _PadTok:
+            pad_token_id = 0
+
+        def fake_load_model_production(cfg):
+            return TinyModel(hidden=8, classes=2)
+
+        def fake_load_tokenizer_production(cfg):
+            return _PadTok()
+
+        def fake_load_train_dataset_production(cfg, num_examples):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(1)},
+            ]
+
+        def fake_load_eval_dataset_production(cfg):
+            import torch
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+            ]
+
+        with mock.patch(
+            "scripts.run_controller_ablation._load_model_production",
+            side_effect=fake_load_model_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_tokenizer_production",
+            side_effect=fake_load_tokenizer_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_train_dataset_production",
+            side_effect=fake_load_train_dataset_production,
+        ), mock.patch(
+            "scripts.run_controller_ablation._load_eval_dataset_production",
+            side_effect=fake_load_eval_dataset_production,
+        ):
+            result_exec = run_execution(ExperimentConfig(**cfg_kwargs))
+
+        assert result_exec["status"] == "OK", result_exec.get("reason")
+
+        cfg_dry = ExperimentConfig(**{**cfg_kwargs, "dry_run": True})
+        result_dry = run_dry_run(cfg_dry)
+        assert result_dry["status"] == "OK", result_dry.get("reason")
     """Execute a retained batch to populate Adam state, then snapshot params
     and Adam state around a skipped batch; verify no skipped backward/optimizer
     update and scheduler advancement. Verify a later retained batch updates."""
@@ -1871,7 +2123,7 @@ class TestTrainerActualFreezing:
     def test_cli_main_uses_default_ids(self):
         """CLI main() with no --model-id/--tokenizer-id/--dataset-id uses dataclass defaults."""
         import sys
-        from unittest.mock import patch
+        import json
         from io import StringIO
         from scripts.run_controller_ablation import main
 
@@ -1897,8 +2149,41 @@ class TestTrainerActualFreezing:
             rc = main()
         finally:
             sys.argv = old_argv
+            output = sys.stdout.getvalue()
             sys.stdout = old_stdout
         assert rc == 0, f"CLI dry-run should succeed, got rc={rc}"
+        manifest = json.loads(output)
+        assert manifest["config"]["model_id"] == "jhu-clsp/ettin-encoder-150m", \
+            f"default model_id: {manifest['config'].get('model_id')}"
+        assert manifest["config"]["tokenizer_id"] == "jhu-clsp/ettin-encoder-150m", \
+            f"default tokenizer_id: {manifest['config'].get('tokenizer_id')}"
+        assert manifest["config"]["dataset_id"] == "glue", \
+            f"default dataset_id: {manifest['config'].get('dataset_id')}"
+
+        # Run again with --model-id, --tokenizer-id, --dataset-id overridden
+        test_args2 = test_args + [
+            "--model-id", "custom-model-id",
+            "--tokenizer-id", "custom-tokenizer-id",
+            "--dataset-id", "custom-dataset-id",
+        ]
+        old_argv = sys.argv
+        old_stdout = sys.stdout
+        sys.argv = test_args2
+        sys.stdout = StringIO()
+        try:
+            rc2 = main()
+        finally:
+            sys.argv = old_argv
+            output2 = sys.stdout.getvalue()
+            sys.stdout = old_stdout
+        assert rc2 == 0, f"CLI dry-run with custom IDs should succeed, got rc={rc2}"
+        manifest2 = json.loads(output2)
+        assert manifest2["config"]["model_id"] == "custom-model-id", \
+            f"custom model_id: {manifest2['config'].get('model_id')}"
+        assert manifest2["config"]["tokenizer_id"] == "custom-tokenizer-id", \
+            f"custom tokenizer_id: {manifest2['config'].get('tokenizer_id')}"
+        assert manifest2["config"]["dataset_id"] == "custom-dataset-id", \
+            f"custom dataset_id: {manifest2['config'].get('dataset_id')}"
 
     def test_exact_dry_run_quota_total_vs_Q(self):
         """run_dry_run() phase_exact_v1: sum(phase_quota) vs Q (requested skips)."""
@@ -1931,6 +2216,38 @@ class TestTrainerActualFreezing:
             f"expected phase_quota=[4], got {result['diagnostics']['phase_quota']}"
         assert sum(result["diagnostics"]["phase_quota"]) == cfg.requested_skips, \
             f"sum(phase_quota)={sum(result['diagnostics']['phase_quota'])} != Q={cfg.requested_skips}"
+
+        # T=10, Q=4: corrupt phase_quota [9] sums to 9 != Q=4 -> FAIL
+        from unittest import mock
+        from lerna.utils.forward_gate import ScoreQuantileGate
+
+        class Quota9Gate(ScoreQuantileGate):
+            def diagnostics(self):
+                d = super().diagnostics()
+                d["phase_quota"] = [9]
+                d["phase_used"] = [9]
+                return d
+
+        cfg_corrupt = ExperimentConfig(
+            task="qnli", arm="gate_s1_p1", controller_version="phase_exact_v1",
+            score_source="s1", total_steps=10, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=0, target_skip_rate=0.4,
+            output_dir="/tmp/test_dry_exact_q_corrupt", attempt_id="dry_q_corrupt",
+            capture_logits=True, lr_warmup_steps=0,
+            probe_exclusions_file=None, probe_exclusions_hash=None,
+            model_revision="45d08642849e5c5701b162671ac811b7654bfd9f",
+            tokenizer_revision="45d08642849e5c5701b162671ac811b7654bfd9f",
+            dataset_revision="45d08642849e5c5701b162671ac811b7654bfd9f",
+            dry_run=True,
+        )
+        with mock.patch(
+            "scripts.run_controller_ablation.ScoreQuantileGate",
+            Quota9Gate,
+        ):
+            result_corrupt = run_dry_run(cfg_corrupt)
+        assert result_corrupt["status"] == "FAILED", result_corrupt.get("reason")
+        assert "sum(phase_quota)=9" in result_corrupt["reason"], \
+            f"expected sum(phase_quota)=9 in reason: {result_corrupt['reason']}"
 
     def test_lr_endpoint_step_equals_warmup(self):
         """LR check when effective_total == warmup_steps: HF scheduler reaches
@@ -2789,8 +3106,12 @@ class TestOneRunSeed:
         from scripts.run_controller_ablation import (
             ExperimentConfig, run_execution, TinyModel,
         )
+        from transformers import TrainingArguments as HF_TrainingArguments
+        from lerna.utils.forward_gate import ScoreQuantileGatePolicy
 
         call_log = []
+        ta_kwargs = {}
+        policy_kwargs = {}
 
         class _PadTok:
             pad_token_id = 0
@@ -2816,6 +3137,16 @@ class TestOneRunSeed:
             return [
                 {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
             ]
+
+        class RecordingTrainingArguments(HF_TrainingArguments):
+            def __init__(self, **kwargs):
+                ta_kwargs.update(kwargs)
+                super().__init__(**kwargs)
+
+        class RecordingScoreQuantileGatePolicy(ScoreQuantileGatePolicy):
+            def __init__(self, **kwargs):
+                policy_kwargs.update(kwargs)
+                super().__init__(**kwargs)
 
         cfg = ExperimentConfig(
             task="sst-2", arm="control_uniform_p1",
@@ -2861,20 +3192,31 @@ class TestOneRunSeed:
         ), mock.patch(
             "numpy.random.seed",
             side_effect=logging_np_seed,
+        ), mock.patch(
+            "scripts.run_controller_ablation.TrainingArguments",
+            RecordingTrainingArguments,
+        ), mock.patch(
+            "scripts.run_controller_ablation.ScoreQuantileGatePolicy",
+            RecordingScoreQuantileGatePolicy,
         ):
             result = run_execution(cfg)
 
         assert result["status"] == "OK", result.get("reason")
         # Seed calls happen before model load
-        seed_calls = [c for c in call_log if c[0] in ("torch.manual_seed", "np.random.seed")]
         load_calls = [c for c in call_log if c == "load_model"]
         assert len(load_calls) == 1, f"expected 1 load_model call, got {load_calls}"
-        # The first seed calls (from run_execution, before model load) must precede load_model
         first_torch_seed = next(i for i, c in enumerate(call_log) if c == ("torch.manual_seed", 5))
         first_np_seed = next(i for i, c in enumerate(call_log) if c == ("np.random.seed", 5))
         load_idx = call_log.index("load_model")
         assert first_torch_seed < load_idx, f"torch.manual_seed(5) at {first_torch_seed} not before load_model at {load_idx}"
         assert first_np_seed < load_idx, f"np.random.seed(5) at {first_np_seed} not before load_model at {load_idx}"
+
+        # TrainingArguments received seed=5 and no data_seed
+        assert ta_kwargs.get("seed") == 5, f"TrainingArguments seed should be 5, got {ta_kwargs.get('seed')}"
+        assert "data_seed" not in ta_kwargs, f"data_seed should not be passed, got {ta_kwargs.get('data_seed')}"
+
+        # Policy received policy_seed=5
+        assert policy_kwargs.get("policy_seed") == 5, f"policy_seed should be 5, got {policy_kwargs.get('policy_seed')}"
 
         # Provenance records seed and source
         prov = result["provenance"]
