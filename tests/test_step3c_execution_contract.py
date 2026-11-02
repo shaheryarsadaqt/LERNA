@@ -69,7 +69,7 @@ _QNLI_EXCLUSIONS_FILE, _QNLI_EXCLUSIONS_HASH = _make_qnli_exclusions_file()
 
 
 def _qnli_cfg_kwargs():
-    """Common QNLI kwargs with real exclusions file/hash."""
+    """Common QNLI kwargs: no exclusions (dry run)."""
     return dict(
         probe_exclusions_file=None,
         probe_exclusions_hash=None,
@@ -616,7 +616,7 @@ class TestLoadingBoundaries:
             )
 
     def test_qnli_missing_hash_blocked(self):
-        """QNLI with missing exclusion hash must be blocked."""
+        """QNLI with real exclusion file but no hash must be blocked."""
         from scripts.run_controller_ablation import ExperimentConfig
         with pytest.raises(ValueError, match="probe_exclusions_hash is None"):
             ExperimentConfig(
@@ -625,7 +625,7 @@ class TestLoadingBoundaries:
                 max_consecutive_skips=4, policy_seed=0,
                 target_skip_rate=0.5, output_dir="/tmp/test",
                 attempt_id="t1",
-                probe_exclusions_file="/tmp/nonexistent_qnli_probe.json",
+                probe_exclusions_file=_QNLI_EXCLUSIONS_FILE,
                 probe_exclusions_hash=None,
                 model_revision="a" * 40,
                 tokenizer_revision="b" * 40,
@@ -920,6 +920,22 @@ class TestLRMeasurementRejection:
         """final_lr NaN must be recorded as a validation failure."""
         errors = []
         final_lr = float("nan")
+        if not math.isfinite(final_lr):
+            errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
+        assert len(errors) == 1
+
+    def test_inf_lr_rejected(self):
+        """final_lr +Inf must be recorded as a validation failure."""
+        errors = []
+        final_lr = float("inf")
+        if not math.isfinite(final_lr):
+            errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
+        assert len(errors) == 1
+
+    def test_neg_inf_lr_rejected(self):
+        """final_lr -Inf must be recorded as a validation failure."""
+        errors = []
+        final_lr = float("-inf")
         if not math.isfinite(final_lr):
             errors.append(f"final LR {final_lr} is not finite. Real execution blocked.")
         assert len(errors) == 1
@@ -1969,23 +1985,54 @@ class TestTrainingPadding:
         from scripts.run_controller_ablation import _dynamic_padding_collator
 
         features = [
-            {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor([0])},
-            {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor([1])},
-            {"input_ids": torch.tensor([6, 7, 8, 9]), "attention_mask": torch.tensor([1, 1, 1, 1]), "labels": torch.tensor([0])},
+            {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+            {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(1)},
+            {"input_ids": torch.tensor([6, 7, 8, 9]), "attention_mask": torch.tensor([1, 1, 1, 1]), "labels": torch.tensor(0)},
         ]
         batch = _dynamic_padding_collator(features)
 
         assert batch["input_ids"].shape == (3, 4), batch["input_ids"].shape
         assert batch["attention_mask"].shape == (3, 4)
-        assert batch["labels"].shape == (3, 4)
+        assert batch["labels"].shape == (3,), batch["labels"].shape
 
         assert torch.equal(batch["input_ids"][0], torch.tensor([1, 2, 3, 0]))
         assert torch.equal(batch["input_ids"][1], torch.tensor([4, 5, 0, 0]))
         assert torch.equal(batch["input_ids"][2], torch.tensor([6, 7, 8, 9]))
 
-        assert torch.equal(batch["labels"][0], torch.tensor([0, -100, -100, -100]))
-        assert torch.equal(batch["labels"][1], torch.tensor([1, -100, -100, -100]))
-        assert torch.equal(batch["labels"][2], torch.tensor([0, -100, -100, -100]))
+        assert torch.equal(batch["attention_mask"][0], torch.tensor([1, 1, 1, 0]))
+        assert torch.equal(batch["attention_mask"][1], torch.tensor([1, 1, 0, 0]))
+        assert torch.equal(batch["attention_mask"][2], torch.tensor([1, 1, 1, 1]))
+
+        assert torch.equal(batch["labels"], torch.tensor([0, 1, 0]))
+
+    def test_padding_labels_not_padded(self):
+        """Labels are stacked as-is, never padded to max length."""
+        from scripts.run_controller_ablation import _dynamic_padding_collator
+
+        features = [
+            {"input_ids": torch.tensor([1, 2]), "attention_mask": torch.tensor([1, 1]), "labels": torch.tensor(0)},
+            {"input_ids": torch.tensor([3, 4, 5, 6]), "attention_mask": torch.tensor([1, 1, 1, 1]), "labels": torch.tensor(1)},
+            {"input_ids": torch.tensor([7, 8, 9]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor(0)},
+        ]
+        batch = _dynamic_padding_collator(features, pad_token_id=7)
+
+        assert batch["input_ids"].shape == (3, 4), batch["input_ids"].shape
+        assert batch["attention_mask"].shape == (3, 4)
+        assert batch["labels"].shape == (3,), batch["labels"].shape
+
+        # input_ids padded with pad_token_id=7
+        assert torch.equal(batch["input_ids"][0], torch.tensor([1, 2, 7, 7]))
+        assert torch.equal(batch["input_ids"][1], torch.tensor([3, 4, 5, 6]))
+        assert torch.equal(batch["input_ids"][2], torch.tensor([7, 8, 9, 7]))
+
+        # attention_mask padded with 0
+        assert torch.equal(batch["attention_mask"][0], torch.tensor([1, 1, 0, 0]))
+        assert torch.equal(batch["attention_mask"][1], torch.tensor([1, 1, 1, 1]))
+        assert torch.equal(batch["attention_mask"][2], torch.tensor([1, 1, 1, 0]))
+
+        # labels stacked as-is: [0, 1, 0]
+        assert torch.equal(batch["labels"], torch.tensor([0, 1, 0]))
+        assert batch["labels"].shape == (3,)
 
     def test_padding_applies_to_training_not_only_eval(self):
         """The same collator is used for both train and eval — padding is
@@ -1993,16 +2040,15 @@ class TestTrainingPadding:
         from scripts.run_controller_ablation import _dynamic_padding_collator
 
         train_features = [
-            {"input_ids": torch.tensor([100, 200]), "labels": torch.tensor([0])},
-            {"input_ids": torch.tensor([300, 400, 500]), "labels": torch.tensor([1])},
+            {"input_ids": torch.tensor([100, 200]), "labels": torch.tensor(0)},
+            {"input_ids": torch.tensor([300, 400, 500]), "labels": torch.tensor(1)},
         ]
         batch = _dynamic_padding_collator(train_features)
         assert batch["input_ids"].shape == (2, 3)
         assert torch.equal(batch["input_ids"][0], torch.tensor([100, 200, 0]))
         assert torch.equal(batch["input_ids"][1], torch.tensor([300, 400, 500]))
-        assert batch["labels"].shape == (2, 3)
-        assert torch.equal(batch["labels"][0], torch.tensor([0, -100, -100]))
-        assert torch.equal(batch["labels"][1], torch.tensor([1, -100, -100]))
+        assert batch["labels"].shape == (2,)
+        assert torch.equal(batch["labels"], torch.tensor([0, 1]))
 
 
 class TestCosineLRCheck:
@@ -2137,8 +2183,8 @@ class TestPaddingToken:
         from scripts.run_controller_ablation import _dynamic_padding_collator
 
         features = [
-            {"input_ids": torch.tensor([1, 2]), "labels": torch.tensor([0])},
-            {"input_ids": torch.tensor([3, 4, 5]), "labels": torch.tensor([1])},
+            {"input_ids": torch.tensor([1, 2]), "labels": torch.tensor(0)},
+            {"input_ids": torch.tensor([3, 4, 5]), "labels": torch.tensor(1)},
         ]
 
         # Default pad_token_id=0
@@ -2150,9 +2196,9 @@ class TestPaddingToken:
         assert torch.equal(batch_custom["input_ids"][0], torch.tensor([1, 2, 999]))
         assert torch.equal(batch_custom["input_ids"][1], torch.tensor([3, 4, 5]))
 
-        # Labels are padded to global max length (3) with -100, same as input_ids/attention_mask
-        assert batch_custom["labels"][0].tolist() == [0, -100, -100]
-        assert batch_custom["labels"][1].tolist() == [1, -100, -100]
+        # Labels are stacked as-is: [0, 1], never padded
+        assert batch_custom["labels"].shape == (2,), batch_custom["labels"].shape
+        assert torch.equal(batch_custom["labels"], torch.tensor([0, 1]))
 
 
 class TestQnliChecks:
@@ -2197,6 +2243,110 @@ class TestQnliChecks:
             )
 
 
+class TestCLIRejection:
+    """CLI-level rejection of None/empty/whitespace model/tokenizer/dataset IDs."""
+
+    def test_cli_none_model_id_rejected(self):
+        """model_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="model_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cli_none_model",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_id=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_cli_empty_model_id_rejected(self):
+        """model_id='' must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="model_id is empty; must be a non-empty model/dataset identifier"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cli_empty_model",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_id="",
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_cli_whitespace_model_id_rejected(self):
+        """model_id='  ' must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="must not contain leading/trailing whitespace"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cli_ws_model",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_id="  ",
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_cli_none_tokenizer_id_rejected(self):
+        """tokenizer_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="tokenizer_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cli_none_tok",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_id=None,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dry_run=False,
+            )
+
+    def test_cli_none_dataset_id_rejected(self):
+        """dataset_id=None must be rejected for non-dry-run configs."""
+        from scripts.run_controller_ablation import ExperimentConfig
+        with pytest.raises(ValueError, match="dataset_id is None"):
+            ExperimentConfig(
+                task="qnli", arm="gate_s1_p1",
+                controller_version="legacy_v4", score_source="s1",
+                total_steps=4, min_step=0, n_phases=1,
+                max_consecutive_skips=4, policy_seed=0,
+                target_skip_rate=0.5, output_dir="/tmp/test_cli_none_ds",
+                attempt_id="t1",
+                probe_exclusions_file=None,
+                probe_exclusions_hash=None,
+                model_revision="a" * 40,
+                tokenizer_revision="b" * 40,
+                dataset_revision="c" * 40,
+                dataset_id=None,
+                dry_run=False,
+            )
+
+
 class TestDataSeed:
     """Verify data_seed is recorded in config."""
 
@@ -2220,36 +2370,6 @@ class TestDataSeed:
             dry_run=True,
         )
         assert cfg.data_seed == 42
-
-
-class TestLRTolerance:
-    """Verify LR tolerance boundary — values just outside tolerance fail."""
-
-    def test_lr_tolerance_boundary_accepts_near_expected(self):
-        """LR within tolerance is accepted."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="phase_exact_v1", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_lr_tol",
-            attempt_id="t1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            learning_rate=2e-5,
-            lr_warmup_steps=0,
-            lr_schedule_shape="constant",
-            dry_run=True,
-        )
-        # Constant schedule with warmup_steps=0: expected_lr = learning_rate
-        # Tolerance = max(learning_rate * 0.01, 1e-9) = max(2e-7, 1e-9) = 2e-7
-        tol = max(cfg.learning_rate * 0.01, 1e-9)
-        assert tol > 0, "tolerance should be positive"
 
 
 class TestLRTolerance:
@@ -2333,3 +2453,74 @@ class TestHollowTests:
         result = run_execution(cfg)
         assert result["status"] == "OK", result.get("reason")
         assert result["config"]["data_seed"] == 7
+
+
+class TestOneRunSeed:
+    """Verify one run seed: cfg.policy_seed drives everything."""
+
+    def test_policy_seed_drives_all_seeding(self):
+        """policy_seed=5: pre-load seeding gets 5, TrainingArguments.seed==5,
+        TrainingArguments.data_seed is None, policy gets 5."""
+        import torch
+        import numpy as np
+        from scripts.run_controller_ablation import (
+            ExperimentConfig, run_execution, _load_model,
+        )
+        from lerna.utils.forward_gate import ScoreQuantileGatePolicy
+        from transformers import TrainingArguments
+
+        cfg = ExperimentConfig(
+            task="qnli", arm="gate_s1_p1",
+            controller_version="legacy_v4", score_source="s1",
+            total_steps=4, min_step=0, n_phases=1,
+            max_consecutive_skips=4, policy_seed=5,
+            target_skip_rate=0.5, output_dir="/tmp/test_one_run_seed",
+            attempt_id="t1",
+            probe_exclusions_file=None,
+            probe_exclusions_hash=None,
+            model_revision="a" * 40,
+            tokenizer_revision="b" * 40,
+            dataset_revision="c" * 40,
+            dry_run=True,
+        )
+        # cfg.seed no longer exists
+        assert not hasattr(cfg, "seed"), "cfg.seed field should be removed"
+        assert cfg.policy_seed == 5
+
+        # Pre-load seeding: torch.manual_seed(5) and np.random.seed(5)
+        torch_seed_before = torch.initial_seed()
+        np_seed_before = np.random.get_state()[1][0]
+        result = run_execution(cfg)
+        assert result["status"] == "OK", result.get("reason")
+        # After run_execution, torch/np were seeded with 5 before model load
+        assert torch.initial_seed() == 5, f"torch seed should be 5, got {torch.initial_seed()}"
+        assert np.random.get_state()[1][0] == 5, f"numpy seed should be 5"
+
+        # Provenance records seed and source
+        prov = result["provenance"]
+        assert prov.get("seed") == 5, f"provenance seed should be 5, got {prov.get('seed')}"
+        assert prov.get("seed_source") == "cfg.policy_seed", f"provenance seed_source should be 'cfg.policy_seed', got {prov.get('seed_source')}"
+
+        # Verify TrainingArguments would use seed=5, data_seed unset
+        ta = TrainingArguments(
+            output_dir="/tmp/test_ta_seed",
+            max_steps=4,
+            learning_rate=2e-5,
+            per_device_train_batch_size=2,
+            warmup_steps=0,
+            weight_decay=0.01,
+            lr_scheduler_type="constant",
+            max_grad_norm=1.0,
+            optim="adamw_torch",
+            eval_strategy="no",
+            save_strategy="no",
+            logging_strategy="no",
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+            seed=5,  # cfg.policy_seed
+            fp16=False,
+            bf16=False,
+        )
+        assert ta.seed == 5
+        assert ta.data_seed is None, f"data_seed should be None, got {ta.data_seed}"

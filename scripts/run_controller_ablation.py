@@ -229,8 +229,7 @@ class ExperimentConfig:
     ler_tracker: bool = False
 
     # Seeds / output / logging
-    data_seed: int = 0
-    seed: int = 0  # HF global randomness seed; data_seed=cfg.data_seed for data order
+    data_seed: int = 0  # data order seed for TinyDataLoader mock only
     output_dir: str = "/tmp/lerna_step3b_runner"
     attempt_id: Optional[str] = None
     dry_run: bool = False
@@ -241,16 +240,17 @@ class ExperimentConfig:
         if self.arm not in ARMS:
             raise ValueError(f"unknown arm: {self.arm!r}")
         # Validate skip rate: negative rates and out-of-range rates rejected
-        # before any rounding can hide them.
+        # before any rounding can hide them. Accept ints (0, 1) as well as
+        # floats; bools are rejected.
         if isinstance(self.target_skip_rate, bool):
             raise ValueError(
-                f"target_skip_rate must be a float, not bool (got {self.target_skip_rate!r})"
+                f"target_skip_rate must be a float or int, not bool (got {self.target_skip_rate!r})"
             )
-        if not isinstance(self.target_skip_rate, float):
+        if not isinstance(self.target_skip_rate, (int, float)):
             raise ValueError(
-                f"target_skip_rate must be a float (got {type(self.target_skip_rate).__name__})"
+                f"target_skip_rate must be a float or int (got {type(self.target_skip_rate).__name__})"
             )
-        if not 0.0 <= self.target_skip_rate <= 1.0:
+        if not 0.0 <= float(self.target_skip_rate) <= 1.0:
             raise ValueError(
                 f"target_skip_rate must be in [0, 1], got {self.target_skip_rate!r}"
             )
@@ -487,16 +487,20 @@ class ExperimentConfig:
                         f"QNLI {key} must not be empty; real execution blocked."
                     )
                 # Validate probe IDs are within QNLI training split row positions.
-                # QNLI training split has ~73K row positions; IDs are zero-based positions.
-                for pid in id_list:
-                    if pid >= _QNLI_TRAIN_SPLIT_SIZE:
-                        raise ValueError(
-                            f"QNLI {key} contains id={pid} which exceeds "
-                            f"QNLI training split size {_QNLI_TRAIN_SPLIT_SIZE}; "
-                            f"real execution blocked."
-                        )
+                # The actual split size is checked at load time in
+                # _load_train_dataset_production (len(ds) after load_dataset).
+                # IDs are zero-based positions in the unshuffled training split.
                 probe_s_set = set(probe_s_ids)
                 probe_e_set = set(probe_e_ids)
+                # The two probe sets must be disjoint (a probe can't be both s and e).
+                if not probe_s_set.isdisjoint(probe_e_set):
+                    raise ValueError(
+                        "QNLI probe_s_ids and probe_e_ids must be disjoint; "
+                        f"overlap: {sorted(probe_s_set & probe_e_set)}. "
+                        "Real execution blocked."
+                    )
+                # Store combined probe IDs for the production loader to apply.
+                self._qnli_exclusion_probe_ids = probe_s_set | probe_e_set
 
     @property
     def requested_skips(self) -> int:
@@ -519,7 +523,7 @@ def allocate_output_dir(cfg: ExperimentConfig) -> Path:
     base = Path(cfg.output_dir)
     # Config identity hash
     cfg_hash = _config_hash(cfg.to_dict())
-    out = base / cfg.task / cfg.arm / f"v{cfg_hash}" / f"seed{cfg.policy_seed}" / f"data_seed{cfg.data_seed}" / f"attempt{cfg.attempt_id}"
+    out = base / cfg.task / cfg.arm / f"v{cfg_hash}" / f"seed{cfg.policy_seed}" / f"attempt{cfg.attempt_id}"
     if out.exists():
         raise FileExistsError(
             f"Output path already exists: {out}. Refusing to overwrite. "
@@ -901,14 +905,13 @@ def _dynamic_padding_collator(features, pad_token_id: int = 0):
 
     For GLUE sentence-pair tasks (MRPC, RTE), examples have variable-length
     tokenized sequences. This collator pads input_ids to the longest sequence
-    in the batch (not to a fixed max_length), uses -100 for label padding
-    (ignored by cross-entropy loss), and stacks scalar class labels.
+    in the batch (not to a fixed max_length). Labels are stacked as-is with
+    no padding — one label per example, shape (batch,).
     No max_length truncation is applied here — truncation happens in the
     tokenizer (max_length=cfg.max_length) before the DataLoader sees the data.
 
-    Pads ALL keys (input_ids, attention_mask, labels) to the SAME global max
-    length across all tensors in the batch, ensuring consistent batch shape
-    for stacked training. Labels are padded with -100 (ignored by loss).
+    input_ids are padded with pad_token_id; attention_mask and token_type_ids
+    are padded with 0. Labels are never padded.
 
     Args:
         features: list of feature dicts from the dataset.
@@ -920,33 +923,37 @@ def _dynamic_padding_collator(features, pad_token_id: int = 0):
         return {}
     batch = {}
     keys = features[0].keys()
-    # Compute global max length across ALL tensor values in the batch
-    global_max_len = max(v.shape[0] for f in features for v in f.values() if isinstance(v, torch.Tensor) and v.ndim >= 1)
+    # Compute max length across all 1D sequence tensors (input_ids, attention_mask, etc.)
+    seq_lens = []
+    for f in features:
+        for v in f.values():
+            if isinstance(v, torch.Tensor) and v.ndim >= 1:
+                seq_lens.append(v.shape[0])
+    max_seq_len = max(seq_lens) if seq_lens else 0
     for key in keys:
         values = [f[key] for f in features]
         if not isinstance(values[0], torch.Tensor):
             batch[key] = values
             continue
-        # All tensors should have the same number of dimensions.
         ndim = values[0].ndim
         if ndim == 0:
-            # Scalar labels (class labels) — just stack.
+            # Scalar labels (class labels) — stack as-is, no padding.
             batch[key] = torch.stack(values, dim=0)
         elif ndim == 1:
-            # Sequences (input_ids, attention_mask, labels) — pad to global max length.
-            max_len = global_max_len  # Use global max, not per-key max
-            padded = []
-            for v in values:
-                if v.shape[0] < max_len:
-                    pad_len = max_len - v.shape[0]
-                    if key == "labels":
-                        pad_val = -100  # ignored by loss
-                    else:
-                        pad_val = pad_token_id
-                    padding = torch.full((pad_len,), pad_val, dtype=v.dtype, device=v.device)
-                    v = torch.cat([v, padding], dim=0)
-                padded.append(v)
-            batch[key] = torch.stack(padded, dim=0)
+            if key == "labels":
+                # Labels are stacked as-is — one label per example, shape (batch,).
+                batch[key] = torch.stack(values, dim=0)
+            else:
+                # Sequences (input_ids, attention_mask, token_type_ids) — pad to max_seq_len.
+                pad_val = pad_token_id if key == "input_ids" else 0
+                padded = []
+                for v in values:
+                    if v.shape[0] < max_seq_len:
+                        pad_len = max_seq_len - v.shape[0]
+                        padding = torch.full((pad_len,), pad_val, dtype=v.dtype, device=v.device)
+                        v = torch.cat([v, padding], dim=0)
+                    padded.append(v)
+                batch[key] = torch.stack(padded, dim=0)
         else:
             batch[key] = torch.stack(values, dim=0)
     return batch
@@ -996,6 +1003,17 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     # returned as structured FAILED manifests before evaluation (R4-C).
     # Production loading failures do NOT fall back to synthetic TinyModel/
     # TinyDataLoader — they produce a stage-specific FAILED manifest.
+    # --- Seed HF global randomness before any model/data loads ---
+    import numpy as np
+    import torch
+    # Single run seed: cfg.policy_seed drives torch/np seeding, TrainingArguments.seed,
+    # and the policy. data_seed is used only by the TinyDataLoader mock.
+    seed = cfg.policy_seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    # Record which config field supplied the seed for manifest provenance
+    seed_source = "cfg.policy_seed"
     try:
         if cfg.dry_run:
             model = _load_model(cfg)
@@ -1007,7 +1025,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"model loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "model_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed),
         }
     try:
         if cfg.dry_run:
@@ -1020,23 +1038,23 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"tokenizer loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "tokenizer_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
-    # --- Seed HF global randomness before any model/data loading ---
-    import numpy as np
-    import torch
-    # Use cfg.seed for HF global randomness; cfg.data_seed for data order in TrainingArguments
-    seed = cfg.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # Record which config field supplied the seed for manifest provenance
-    seed_source = "cfg.seed"
 # Use the tokenizer's pad_token_id for padding (instead of hardcoded 0)
     # This ensures the collator respects the tokenizer's actual padding token
     _padding_kwargs = {}
     if tokenizer is not None and hasattr(tokenizer, 'pad_token_id'):
-        _padding_kwargs['pad_token_id'] = tokenizer.pad_token_id
+        _pad_token_id = tokenizer.pad_token_id
+        if _pad_token_id is None:
+            return {
+                "status": "FAILED",
+                "reason": "tokenizer pad_token_id is None; cannot pad input_ids. "
+                          "Real execution blocked.",
+                "config": cfg.to_dict(),
+                "failure_stage": "tokenizer_pad_id",
+                "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
+            }
+        _padding_kwargs['pad_token_id'] = _pad_token_id
 
     
     try:
@@ -1050,7 +1068,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"train dataset loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "train_dataset_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
     try:
         if cfg.dry_run:
@@ -1063,7 +1081,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"eval dataset loading failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "eval_dataset_loading",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     class _TinyDataset(torch.utils.data.Dataset):
@@ -1112,7 +1130,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             report_to=[],
             disable_tqdm=True,
             use_cpu=True,
-            seed=cfg.data_seed,
+            seed=cfg.policy_seed,
             fp16=False,
             bf16=False,
         )
@@ -1122,7 +1140,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"training arguments construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "training_arguments",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Build the real policy as the skip policy ---
@@ -1152,7 +1170,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"policy construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "policy_construction",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Instantiate TrueBackwardSkippingTrainer with mocked loading ---
@@ -1178,7 +1196,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"trainer construction failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "trainer_construction",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Execution loop via trainer.train() ---
@@ -1191,7 +1209,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "terminal",
             "config": cfg.to_dict(),
             "error": str(e),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     except SkipPolicyDecisionError as e:
@@ -1200,7 +1218,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "policy_decision_failure",
             "config": cfg.to_dict(),
             "error": str(e),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     except Exception as e:
@@ -1209,7 +1227,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": f"training failed: {type(e).__name__}: {e}",
             "config": cfg.to_dict(),
             "failure_stage": "training",
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
     wall = time.perf_counter() - t0
     instr = trainer.instr
@@ -1454,13 +1472,14 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "reason": "; ".join(errors),
             "config": cfg.to_dict(),
             "diagnostics": instr_diag,
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     # --- Final evaluation: actual task accuracy on eval dataset ---
+    _pad_token_id = _padding_kwargs.get('pad_token_id', 0)
     try:
         final_eval_loss, final_eval_acc, final_eval_f1 = _evaluate_model(
-            trainer, model, eval_dataset, cfg
+            trainer, model, eval_dataset, cfg, pad_token_id=_pad_token_id
         )
     except Exception as e:
         return {
@@ -1469,7 +1488,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "config": cfg.to_dict(),
             "failure_stage": "evaluation",
             "diagnostics": instr.as_dict(),
-            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+            "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
         }
 
     return {
@@ -1509,7 +1528,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "tokenizer_loaded": tokenizer is not None,
         },
         "diagnostics": instr.as_dict(),
-        "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu"),
+        "provenance": _provenance(dry_run=cfg.dry_run, execution_mode="mocked_loading_cpu", seed=cfg.policy_seed, seed_source=seed_source),
     }
 
 
@@ -1616,14 +1635,46 @@ def _load_train_dataset_production(cfg: ExperimentConfig, num_examples: int):
 
     # Capture idx values before removal for QNLI matched-probe-ID exclusions.
     # Exclusions apply to the training split only; validation is left intact.
-    if cfg.task == "qnli" and getattr(cfg, "_qnli_exclusion_probe_ids", None):
-        if "idx" in ds.column_names:
-            exclusion_set = cfg._qnli_exclusion_probe_ids
-            idx_values = ds["idx"]
-            keep_indices = [
-                i for i, v in enumerate(idx_values) if v not in exclusion_set
-            ]
-            ds = ds.select(keep_indices)
+    # A non-dry QNLI config must always carry the stored exclusion set; the
+    # loader must fail, not skip, when it is missing or empty.
+    if cfg.task == "qnli" and not cfg.dry_run:
+        exclusion_set = getattr(cfg, "_qnli_exclusion_probe_ids", None)
+        if not exclusion_set:
+            raise ValueError(
+                "QNLI training config has no stored exclusion probe IDs; "
+                "the preflight did not store them. Real execution blocked."
+            )
+        n = len(ds)
+        # Reject any probe ID >= training split size (determined at load time).
+        for pid in exclusion_set:
+            if pid >= n:
+                raise ValueError(
+                    f"QNLI probe id={pid} exceeds training split size {n}; "
+                    f"real execution blocked."
+                )
+        if "idx" not in ds.column_names:
+            raise ValueError(
+                "QNLI training split missing 'idx' column; cannot apply "
+                "matched-probe-ID exclusions. Real execution blocked."
+            )
+        idx_values = list(ds["idx"])
+        # Require idx == row position (0-based) so probe IDs map to rows.
+        for i, v in enumerate(idx_values):
+            if int(v) != i:
+                raise ValueError(
+                    f"QNLI idx[{i}]={int(v)} != row position {i}; cannot "
+                    "safely map probe IDs to rows. Real execution blocked."
+                )
+        keep_indices = [
+            i for i, v in enumerate(idx_values) if int(v) not in exclusion_set
+        ]
+        removed = n - len(keep_indices)
+        if removed != len(exclusion_set):
+            raise ValueError(
+                f"QNLI exclusions removed {removed} rows but expected "
+                f"{len(exclusion_set)} probe IDs. Real execution blocked."
+            )
+        ds = ds.select(keep_indices)
 
     tokenizer = _load_tokenizer_production(cfg)
 
@@ -1734,12 +1785,14 @@ def _load_eval_dataset(cfg: ExperimentConfig, dataset_loader=None):
                                 seed=cfg.data_seed + 1))
 
 
-def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig):
+def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_token_id: int = 0):
     """Run actual task evaluation: accuracy on the eval dataset.
 
     Returns (eval_loss, eval_accuracy, eval_f1). F1 is computed for MRPC;
     None for other tasks. In CPU tests this computes accuracy from the
     TinyModel's forward pass on the eval batches.
+
+    Uses _dynamic_padding_collator with the same pad_token_id as training.
     """
     if not eval_dataset:
         return 0.0, 0.0, None
@@ -1750,7 +1803,7 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig):
     model.eval()
     try:
         eval_loader = DataLoader(eval_dataset, batch_size=cfg.eval_batch_size, shuffle=False,
-                                 collate_fn=_dynamic_padding_collator)
+                                 collate_fn=lambda features, _pd=pad_token_id: _dynamic_padding_collator(features, pad_token_id=_pd))
     except Exception as e:
         return {
             "status": "FAILED",
@@ -1831,8 +1884,9 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
     }
 
 
-def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None) -> dict:
-    return {
+def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
+                seed: Optional[int] = None, seed_source: Optional[str] = None) -> dict:
+    prov = {
         "resolved_code_sha": _git_sha(),
         "v4_prereg_sha": _v4_prereg_sha(),
         "tree_status": _tree_status(),
@@ -1850,12 +1904,17 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None) -> d
         "dry_run": dry_run,
         "execution_mode": execution_mode
         or ("mocked_loading_cpu" if not dry_run else None),
-        "note": (
-            "dry-run validation only; no training, no model download, no GPU"
-            if dry_run
-            else "execution with CPU mock score sources; no pretrained training"
-        ),
     }
+    if seed is not None:
+        prov["seed"] = seed
+    if seed_source is not None:
+        prov["seed_source"] = seed_source
+    prov["note"] = (
+        "dry-run validation only; no training, no model download, no GPU"
+        if dry_run
+        else "execution with CPU mock score sources; no pretrained training"
+    )
+    return prov
 
 
 # --------------------------------------------------------------------------- #
