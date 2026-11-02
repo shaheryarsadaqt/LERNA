@@ -3548,7 +3548,7 @@ class TestB1PaddingSideRejection:
 
 class TestB2ProvenanceExecutionMode:
     """B2: provenance records truthful execution_mode labels:
-    dry-run -> mock_fixtures_cpu; plan_only -> plan_only;
+    dry-run -> mock_fixtures_cpu;
     non-dry-run -> production_loaders."""
 
     def test_dry_run_provenance_mock_fixtures_cpu(self):
