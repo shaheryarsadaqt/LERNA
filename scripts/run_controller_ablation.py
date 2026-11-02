@@ -86,6 +86,16 @@ except ImportError:
     _MODEL_LOADER_AVAILABLE = False
 
 
+class EvalDataLoaderConstructionError(Exception):
+    """Raised when the evaluation DataLoader cannot be constructed.
+
+    Used by _evaluate_model so that run_execution can return a structured
+    FAILED manifest with failure_stage "eval_data_loader_construction"
+    instead of crashing and leaving no failure record.
+    """
+    pass
+
+
 # --------------------------------------------------------------------------- #
 # Provenance helpers
 # --------------------------------------------------------------------------- #
@@ -233,6 +243,7 @@ class ExperimentConfig:
     output_dir: str = "/tmp/lerna_step3b_runner"
     attempt_id: Optional[str] = None
     dry_run: bool = False
+    plan_only: bool = False
 
     def __post_init__(self):
         if self.task not in TASK_INPUTS:
@@ -995,6 +1006,23 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         skip_policy_obj = None  # set below
         use_gate = True
 
+    # --- plan_only: validate and plan, skip all loading/training/evaluation ---
+    seed = cfg.policy_seed
+    seed_source = "cfg.policy_seed"
+    if cfg.plan_only:
+        return {
+            "status": "OK",
+            "config": cfg.to_dict(),
+            "config_hash": _config_hash(cfg.to_dict()),
+            "result": {
+                "arm": cfg.arm,
+                "effective_total": effective_total,
+                "plan_only": True,
+                "note": "execution planned; training deferred to Step 4",
+            },
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=seed, seed_source=seed_source, plan_only=True),
+        }
+
     # --- External loading boundaries (injectable for CPU tests) ---
     # Loader, constructor, and evaluator exceptions are caught below and
     # returned as structured FAILED manifests before evaluation (R4-C).
@@ -1005,12 +1033,11 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     import torch
     # Single run seed: cfg.policy_seed drives torch/np seeding, TrainingArguments.seed,
     # and the policy. data_seed is used only by the TinyDataLoader mock.
-    seed = cfg.policy_seed
     torch.manual_seed(seed)
     np.random.seed(seed)
     
     # Record which config field supplied the seed for manifest provenance
-    seed_source = "cfg.policy_seed"
+    # seed_source already set above for plan_only path
     try:
         if cfg.dry_run:
             model = _load_model(cfg)
@@ -1491,17 +1518,15 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         final_eval_loss, final_eval_acc, final_eval_f1 = _evaluate_model(
             trainer, model, eval_dataset, cfg, pad_token_id=_pad_token_id
         )
-    except RuntimeError as e:
-        if "eval_data_loader construction failed" in str(e):
-            return {
-                "status": "FAILED",
-                "reason": str(e),
-                "config": cfg.to_dict(),
-                "failure_stage": "eval_data_loader_construction",
-                "diagnostics": instr.as_dict(),
-                "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
-            }
-        raise
+    except EvalDataLoaderConstructionError as e:
+        return {
+            "status": "FAILED",
+            "reason": str(e),
+            "config": cfg.to_dict(),
+            "failure_stage": "eval_data_loader_construction",
+            "diagnostics": instr.as_dict(),
+            "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
+        }
     except Exception as e:
         return {
             "status": "FAILED",
@@ -1826,7 +1851,7 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_tok
         eval_loader = DataLoader(eval_dataset, batch_size=cfg.eval_batch_size, shuffle=False,
                                  collate_fn=lambda features, _pd=pad_token_id: _dynamic_padding_collator(features, pad_token_id=_pd))
     except Exception as e:
-        raise RuntimeError(
+        raise EvalDataLoaderConstructionError(
             f"eval_data_loader construction failed: {type(e).__name__}: {e}"
         )
     with torch.no_grad():
@@ -1902,7 +1927,8 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
 
 
 def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
-                seed: Optional[int] = None, seed_source: Optional[str] = None) -> dict:
+                seed: Optional[int] = None, seed_source: Optional[str] = None,
+                plan_only: bool = False) -> dict:
     prov = {
         "resolved_code_sha": _git_sha(),
         "v4_prereg_sha": _v4_prereg_sha(),
@@ -1920,7 +1946,8 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
         "scheduler_step_policy": "always_step",
         "dry_run": dry_run,
         "execution_mode": execution_mode
-        or ("mock_fixtures_cpu" if dry_run else "production_loaders"),
+        or ("mock_fixtures_cpu" if dry_run
+            else ("plan_only" if plan_only else "production_loaders")),
     }
     if seed is not None:
         prov["seed"] = seed
@@ -1929,7 +1956,8 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
     prov["note"] = (
         "dry-run validation only; no training, no model download, no GPU"
         if dry_run
-        else "loaded through the production loader functions"
+        else ("planned only; execution deferred" if plan_only
+              else "production loader functions selected")
     )
     return prov
 
@@ -2010,6 +2038,8 @@ def main() -> int:
     parser.add_argument("--score-source", default="s1", choices=["s1", "uniform"])
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate configuration without training")
+    parser.add_argument("--plan-only", action="store_true",
+                        help="Validate and plan, skip actual training/evaluation")
     parser.add_argument("--cpu-mock-test", action="store_true",
                         help="Run CPU mock score-path tests (no model)")
     parser.add_argument("--skip-rate", type=float, default=0.60)
@@ -2059,6 +2089,7 @@ def main() -> int:
             "output_dir": args.output_dir,
             "attempt_id": args.attempt_id,
             "dry_run": True,
+            "plan_only": args.plan_only,
         }
         if args.model_id is not None:
             raw_cfg["model_id"] = args.model_id
@@ -2126,6 +2157,7 @@ def main() -> int:
         "output_dir": args.output_dir,
         "attempt_id": args.attempt_id,
         "dry_run": False,
+        "plan_only": args.plan_only,
     }
     if args.model_id is not None:
         raw_cfg["model_id"] = args.model_id
