@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv.*
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+!**/*.ipynb
+
+# PyTorch / ML
+*.pth
+*.pt
+*.bin
+*.ckpt
+checkpoints/
+lightning_logs/
+
+# Experiment outputs
+experiments/
+wandb/
+lightning_logs/
+exp/
+smoke_out/
+smoke_out_nomomentum/
+*.log
+*.csv
+*.json
+!**/baseline_summary.json
+!**/results.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# CUDA/System
+cuda_fix.sh
+*.o
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Environment files
+.env
+.venv
+conda_env.yaml
+environment.yaml
+
+# Git
+*.orig
+*.patch
+*.diff
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

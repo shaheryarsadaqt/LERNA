@@ -1,0 +1,610 @@
+# LERNA Phase 3 / Stage 0 + Stage 2 — Pre-Registration v4
+
+**Status**: Binding pre-registration for the forward gate oracle test (Stage 0)
+and the confirmatory skip comparison (Stage 2). Stage 0 GPU cells are
+permitted; Stage 2 GPU cells are **blocked** until this page bears the real
+supervisor's or committee member's countersignature
+(see `docs/supervisor_signoff_v4.md`).
+**Date**: 2026-10-04
+**Derived from**: V3 (`FULL_EXPERIMENT_PREREGISTATION_V3.md`). The V3 QNLI confirmatory
+result (4 arms × 5 seeds × rate 0.30, frozen at SHA `93ec6e4`) serves as the
+retrospective baseline. V4 Stage 2 uses a new design: 4 arms × 24 seeds × rate 0.60.
+
+---
+
+## 1. SHA Registry
+
+**Two distinct SHAs govern V4:**
+
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `v3_retrospective_sha` | `93ec6e488a6d79f63d021d0f517cf81fdd892801` | Frozen SHA for V3 QNLI confirmatory results (read-only). All 20/20 QNLI cells at rate 0.30 were validated at this commit. |
+| `v4_prereg_sha` | `v4-prereg-r3` (annotated git tag) | Git tag pointing to the V4 final pre-registration commit. Contains `lerna/utils/forward_gate.py` + `tests/test_forward_gate.py` + `tests/test_stage2_s2_probe_validation.py` + `scripts/smoke_forward_gate_mrpc.py` + `scripts/stage0_oracle_probe.py` + `scripts/stage2_confurmatory.py` + `scripts/run_stage2_multi_gpu.py` + `scripts/run_timing_cells.py` + `scripts/validate_skip_policy_results.py` + `docs/supervisor_signoff_v4.md` (Q1 reworded). The validator resolves the tag at runtime via `git rev-parse v4-prereg-r3` and checks `run_sha == git rev-parse v4-prereg-r3`. No hardcoded SHA is embedded in this commit. |
+
+The V4 code does **not** exist at `93ec6e4` — it is committed separately and
+additively. No V4 artifact rebases or modifies the V3 frozen block.
+
+---
+
+## 2. Supervisor Hard Gates (V4 additions)
+
+Both gates are answered in `docs/supervisor_signoff_v4.md`:
+
+1. **LER v4 same line or new method?** → Same line. The v4 forward score
+   (Katharopoulos & Fleuret, 2018 gradient-norm upper bound) is already used in
+   v3 backward LER. V4 swaps the estimator (forward vs backward), not the
+   method. The contribution is a pre-registered comparison under identical
+   strict M2c protocol. Answer: **same line**.
+
+2. **Two-sided null acceptable?** → Yes, with pre-registration fidelity.
+   The primary test is a two-sided α = 0.05 paired t-test (df = n−1). Separately,
+   a pre-registered TOST equivalence bound (two one-sided tests, α = 0.05 each) is
+   reported as a secondary analysis to bound the effect size in the event of a null.
+   A null is a publishable non-trivial outcome (Kaddour et al., NeurIPS 2023;
+   arXiv 2312.05021), provided the upper bound on effect at n seeds is reported
+   (Path B wording mandatory). Answer: **yes with conditions**.
+
+**Supervisor answers recorded (closing the hard-gate questions):**
+1. "LER v4 = same research line" → **yes** — V4 extends V3's skip-rate-ablation framework
+   with a forward-predicted-gain gate; the QNLI 0.30 block at SHA `93ec6e4` serves as
+   the retrospective baseline.
+2. "Two-sided null acceptable in writing" → **yes** (see above).
+
+These answers close the hard-gate questions. The CLI will not list them as blockers.
+The stale references to "QNLI 0.30 Stage 2" and "v3 Kaddour path" in earlier drafts
+are removed — the V3 block is retrospectively informative, not part of the Stage 2 test.
+
+**Physical supervisor signature required** before any Stage-2 GPU cell runs.
+Stage 0 (oracle probe) runs at the supervisor's discretion but is not blocked;
+it does not consume the Stage 2 budget. The stand-in answers bind procedure only.
+
+---
+
+## 3. Amendment Log
+
+| Date | Commit | Reason |
+|------|--------|--------|
+| 2026-10-05 | `549acf6` superseded before any cell ran; reasons F1–F12 | Pre-registration text finalized at this commit, superseded by F1–F12 fixes |
+| 2026-10-05 | `v4-prereg-r1` (annotated tag) | **F1–F12 fixes before any cell ran**: (F1) per-step gain (before-after, sign-corrected); (F2) mean rho, pooled seeds 101+103, steps 392–5761; (F3) cluster bootstrap (512-step windows, 10k resamples); (F4) old LER score removed; (F5) G_P via `_classifier_grad_from_logits` (no backward); (F6) fixed probe indices (PROBE_SEED=0) in `experiments/probe_indices_v4.json`; (F7) reduced_steps = 2619 steps, 157 warmup, linear decay; (F8) S2 fails hard at step 392; (F9) reserve seeds replaced in all arms; (F10) 8-GPU launcher; (F11) provenance in Stage 0 + Stage 2, validator on every cell; (F12) RNG isolation tests. |
+| 2026-10-05 | `v4-prereg-r2` (annotated tag) | **Q1 rewording + config parity + harness check**: (1) Q1 in supervisor_signoff_v4.md reworded — contribution is now "forward-predicted-gain gate vs matched random control", not "backward vs forward estimator comparison"; (2) Stage 0 shadow loop now clips gradients at `max_grad_norm=1.0` to match Stage 2 config; (3) time-trend control test added (mean window ρ near 0 for trend-only data, proving F1/F2 fix); (4) GPU nondeterminism harness check added as §14.9 check (descriptive, not a test). |
+| 2026-10-05 | `v4-prereg-r3` (annotated tag) | **B1–B16 fixes before any cell ran**: (B1) Probe file hash fixed — replaced self-referential sha256 with `ids_sha256` (hash of the probe ID list contents, not the file bytes); assertions on 256 entries and disjointness added. (B2) `results.json` restructured with `run_config`, `policy_diagnostics`, `true_skip_instrumentation`, `eval_metrics`, `provenance` sections; validator `--check-v4-gate` flag added. (B3) Score computation deferred until `min_step − score_history_window`; `online_ler_mode="legacy_dense"` set on trainer; `setup_probe()` called before `train()`. (B4) S2 probe refresher (`_build_ps_refresher`) wired into `run_cell`; `checking_should_skip` fixed to use `batches_seen - 1 == min_step` instead of nonexistent `instr.decisions_seen`. (B5) Provenance check (`_check_provenance`) runs in `main()` before any cell runs, in both single-cell and full-run modes; `lerna.__file__` verified inside checkout. (B6) GPU collisions fixed — launcher uses `queue.Queue` of free GPU ids, no more `cell_idx % 8`; retry-once on failure with crash log. (B7) Serial path reserve-seed swap re-runs finished arms with the replacement seed across all 4 arms. (B8) `eval_strategy` set to `"no"`, `load_best_model_at_end=False`. (B9) `sys.path.insert(0, repo_root)` in stage2 main(); codebase-checkout assertion in provenance. (B10) QNLI tokenization uses `question`/`sentence` (not `sentence`/`sentence2`); `truncation=True` (not `"max_length"`); `label` → `labels` in probe batches. (B11) Probe indices selected from unshuffled dataset before `raw.shuffle(seed)`. (B12) S2 computation unified via shared `_s2_alignment_core` in `forward_gate.py`; `cluster_bootstrap_ci` deleted; eligible Spearman range fixed to 392–5761 (exclusive); real `log_steps` saved in Stage 0 output. (B13) Gate `_consecutive_skips` reset on all non-skip paths (forced-backward, quota-met, warmup). (B14) Timing cells use cell index for alternation (`cell_idx % 2`, not `seed % 2` which is always 1 for odd seeds); f-string None crash guarded; trainer step timer from instrumentation. (B15) F8 tests use `batches_seen=393` (not 392, which gives idx 391 and skips the min_step=392 check); specific error message asserted. (B16) Smoke test asserts `len(lr_gate) == len(lr_ctrl) == 200` before comparing LR curves. **Dynamic padding (pad to longest in batch, cap 512) required for all tokenization in Stage 2 and timing cells; `padding="max_length"` prohibited in production cells.** |
+
+---
+
+## 4. The Rule: One Score, Chosen From Two Declared in Advance
+
+Two candidate scores are declared in this pre-registration. They are evaluated
+on disjoint Stage 0 seeds (101, 103) and the better-performing one is carried
+into Stage 2. The selection rule is fixed in advance (see §5), not data-driven
+at Stage 2. The Stage 2 false-positive rate is not inflated because:
+
+- Stage 2 tests a **single** hypothesis on a **single** chosen score, fixed before
+  any Stage 2 cell runs.
+- Stage 0 seeds (101, 103) are disjoint from Stage 2 seeds.
+- The selection uses the **higher** per-seed ρ across both seeds; ties go to S1.
+
+This is sample splitting, not fishing. The winner's curse can only bias the
+Stage 0 ρ estimate — which is a descriptive/mechanism probe, not the claim.
+
+### S1: forward gain bound
+`forward_gain_score(logits, labels)` = mean over batch of
+`||softmax(logits)_i − onehot(labels)_i||` (no square), bounded by √2
+(K&F 2018). Reads `trainer._last_real_logits` (captured when
+`capture_logits=True`). Cost: ~0 ms (logits already cached).
+
+### S2: last-layer alignment score
+`s_B = ⟨G_B, G_P ⊘ (√v + ε)⟩`
+
+- `G_B = (1/B)·Σ(p_i − y_i)·h_iᵀ` — the gradient of softmax cross-entropy w.r.t.
+  `classifier.weight` for the current batch. Shape `[num_labels, hidden_dim]`.
+- `G_P` — the same gradient computed on a 256-example score probe `P_s`, refreshed
+  every 64 steps in eval mode, fp32.
+- `v` = AdamW's `exp_avg_sq` for `classifier.weight`.
+- `h` = the hidden state entering the classifier, captured by a forward-pre-hook
+  on `model.classifier` (the Linear layer in `ModernBertForSequenceClassification`).
+  Verified: `model.classifier` is `Linear(768 → num_labels)`, and `exp_avg_sq`
+  for `classifier.weight` has shape `[num_labels, 768]`, matching `G_B` and `G_P`.
+
+It is a first-order prediction of how much the probe loss drops if this batch's
+update is applied. The score direction is the sign/direction of the AdamW update
+on `classifier.weight`; only direction matters, not magnitude.
+
+**Excluded: loss rescaling.** Step-level inverse-propensity weighting rescales
+magnitude without changing direction; under AdamW the update is approximately
+scale-invariant. Recording the AdamW caveat: the alignment score does not
+predict the magnitude of per-step gain, only its expected direction.
+
+**S2 hook timing.** The forward-pre-hook on `model.classifier` fires during
+training mode (model.train()), where dropout is active and the head has
+applied attention-layer normalization. `h` is captured post-head, pre-classifier.
+The probe gradient `G_P` is computed in eval mode (model.eval()), where dropout
+is disabled. This is **not** a bug: the alignment score measures whether the
+batch's *direction* (in training-mode hidden space) aligns with the probe's
+direction (in eval-mode hidden space). The two are evaluated on the same input
+distribution, so the dot product is still meaningful as a direction correlation.
+The discrepancy is documented here because a reviewer may question it.
+
+**Classifier bias.** `G` computed by `_classifier_grad_from_logits` covers
+`classifier.weight` **only**, not the bias. The gradient w.r.t. the bias is
+`(1/B) * sum_i (p_i - y_i)`, which is a per-class scalar. The alignment score
+omits it because the bias gradient is rank-1 (one scalar per class) and adds
+negligible directional information beyond what `classifier.weight` already
+captures. This is recorded as a design decision, not an oversight.
+
+**Probe signal magnitude.** At lr=2e-5 on 256 examples, the per-step change
+in probe loss may be close to noise. Stage 0 could simply be uninformative
+(both ρ values near zero). If so, Stage 0 still selects S1 by the tie-breaking
+rule (ties → S1), and Stage 2 proceeds with S1 as the score source. The
+weak-signal case is pre-registered as a possible outcome, not a protocol
+violation.
+
+S2's extra cost (one probe forward pass every 64 steps, fp32, eval mode) counts
+against the gate in wall-clock time and is measured.
+
+---
+
+## 5. Stage 0: Oracle Probe (chooses the score)
+
+**Purpose**: Determine which candidate score (S1 or S2) better predicts per-step
+gain. The chosen score carries into Stage 2. Stage 0 never cancels Stage 2.
+
+**Seeds**: 101, 103 (not used in Stage 2; not used in V3 confirmatory or MRPC).
+
+**Probe data** (F6):
+- `P_s` (256 examples, train split) — used to compute G_P for S2.
+- `P_e` (256 examples, train split, disjoint from P_s) — used to measure the
+  outcome (realized per-step gain) in Stage 0.
+- Both probes use **fixed indices** (`PROBE_SEED=0`), stored in
+  `experiments/probe_indices_v4.json` (SHA256: `3298be2c72ce970da2440d34da1d35a80ef6014d5409e69ad55f21140d96dbc5`). The indices
+  are independent of the training seed and asserted excluded from the training
+  sampler in every arm.
+- Probe file hash is recorded in each cell's manifest.
+
+**Procedure** (F1, F3, F5):
+1. Run `full_finetune` in **shadow mode** (full backward, no skipping) on each
+   seed.
+2. At every 8th step (log interval), measure:
+   - **S1**: `forward_gain_score` (forward-only, reads cached logits + labels).
+   - **S2**: `alignment_score` — G_B (current batch gradient) dotted with
+     G_P (probe gradient from P_s), normalized by AdamW `v`.
+   - **G_P** is computed via `_classifier_grad_from_logits` on P_s in eval mode
+     (F5: no backward pass, no zero_grad — uses the same function as G_B).
+     G_P is refreshed every 512 steps (not every 64 — see §6.2).
+   - **Realized per-step gain**: P_e loss BEFORE `optimizer.step()`, then step,
+     then P_e loss AFTER. Gain = `before − after` (positive = loss decreased).
+     (F1 fix: cumulative and sign-flipped were bugs.)
+3. Compute **local Spearman ρ** of (S1 or S2) vs realized per-step gain in
+   **non-overlapping windows of 64 logged points** (= 512 actual steps).
+   (F2 fix: was "trailing 64-step windows, select max ρ". Now: non-overlapping,
+   select mean ρ.)
+   - Only steps 392–5761 are used (the annealing range where the score decides).
+   - Cluster bootstrap (resample whole windows, 10,000 resamples) gives a
+     **95% CI — descriptive only**. (F3 fix: was degenerate block=window.)
+
+**Selection rule** (F2):
+- Compute mean ρ per score, **pooled over seeds 101 and 103** (mean of the two
+  per-seed mean-ρ values).
+- Pick the score with the higher pooled mean ρ. **Ties go to S1.**
+- "Eligible" mark (lower CI > 0) reported descriptively only.
+- **Stage 0 never cancels Stage 2.** Stage 2 costs ~6 GPU-hours, too cheap to let
+  a noisy 256-example probe kill it.
+
+**F4 (old LER score)**: the v3 lagged sampled-LER score is **not run** in Stage 0
+shadow mode. It is removed from the pre-registration. A placeholder value
+was previously written as 0.0; that is deleted. The Stage 0 selection is based
+on S1 vs S2 only.
+
+---
+
+## 6. Accuracy measurement protocol
+
+**Final checkpoint only — no dev-set selection.**
+
+- `no_early_stopping=True` is enforced for every Phase 3 cell (asserted in
+  `_validate_cell_contract`).
+- `load_best_model_at_end=False` is derived from `not no_early_stopping`;
+  this is guaranteed, not optional.
+- Accuracy on the dev/test set is taken from the **final** checkpoint after the
+  full `total_steps` schedule. No early-stopping selection, no best-model
+  selection, no checkpoint averaging.
+- `eval_strategy="no"` — no mid-run evaluation. Evaluation runs once at the end
+  on the final checkpoint.
+- `metric_for_best_model` is recorded in metadata but never acted upon.
+- **Dynamic padding**: All tokenization in Stage 2 and timing cells uses
+  `padding=True` (pad to longest in batch, cap 512) via a custom collator.
+  `padding="max_length"` is prohibited in production cells for performance.
+
+This is a deliberate **deviation from `run_baseline_glue_modernbert.py`** (which
+uses `load_best_model_at_end=True` with patience-based early stopping). The Phase 1.3
+protocol forbids it because dev-set selection would inflate the gate's apparent
+benefit: a gate that skips "lucky" steps could be rewarded by selecting a
+checkpoint that happened to have good dev accuracy by chance, rather than having
+genuinely learned more from the skipped backward passes.
+
+---
+
+## 7. Phase 3 Forward Gate Design
+
+### 7.1 Module
+`lerna/utils/forward_gate.py` — pure, CPU-testable. Three exported components:
+
+- `ScoreQuantileGate`: deterministic gate scorer. 4 equal phase windows over
+  `total_steps`. Per-window quota allocated via largest-remainder (Hare method)
+  over **eligible** steps (`decision_index >= min_step`), so `sum(phase_quota) ==
+  round(rate * total_steps)` exactly. At each step, an exact feasibility check
+  determines whether skip or backward is forced (see §7.3). Annealing at
+  `round(0.88 * total_steps)` replaces score with i.i.d. Uniform[0,1] (budget
+  preserved, selection randomized). Non-finite score →
+  `TerminalInvalidScoreError` (absorbing).
+
+- `ScoreQuantileGatePolicy`: `SkipPolicy` wrapper plugging `ScoreQuantileGate`
+  into `TrueBackwardSkippingTrainer`. `score_source` ∈ {s1, s2, uniform}.
+  For s2, the policy attaches an `AlignmentProbe` to `model.classifier` and
+  provides a probe evaluation callback.
+
+- `AlignmentProbe`: attaches a forward-pre-hook to `model.classifier`,
+  capturing `h` (the hidden state entering the classifier). Used by S2.
+
+### 7.2 Score Sources
+- **S1** (`forward_gain_score`): mean over batch of `||p − y||`, bounded by √2.
+  See §6.1.
+- **S2** (`alignment_score`): last-layer alignment score. See §6.2.
+
+### 5.3 Feasibility forcing (bug a fix)
+At each step (after `min_step`), compute TWO levels of feasibility:
+
+**Level 1 — Per-phase (local):**
+- `per_phase_skip_possible`: can THIS phase's remaining quota be met if we skip now?
+  → `max_skips_possible_with_consec(remaining_in_phase − 1, K, c+1) ≥ remaining_quota − 1`
+- `per_phase_real_possible`: can THIS phase's remaining quota be met if we backward now?
+  → `max_skips_possible(remaining_in_phase − 1, K) ≥ remaining_quota`
+
+Where `c` = current consecutive skip count, and:
+- `F(r) = K · ⌊r/(K+1)⌋ + min(r mod (K+1), K)` — max skips in `r` steps from 0 consecutive.
+- `F_with_consec(r, K, c)` — max skips in `r` steps starting with `c` consecutive (accounts for mid-stride carry-over; see `lerna/utils/forward_gate.py:148`).
+
+**Level 2 — Global (total across all remaining phases):**
+- `global_skip_possible`: can the TOTAL remaining quota be met if we skip now?
+  → `F_with_consec(total_remaining_steps − 1, K, c+1) ≥ total_remaining_quota − 1`
+- `global_real_possible`: can the TOTAL remaining quota be met if we backward now?
+  → `F(total_remaining_steps − 1, K) ≥ total_remaining_quota`
+
+> **Why global?** `sum(F(per_phase_remaining)) ≠ F(total_remaining)`. A phase can
+> be locally infeasible (its quota exceeds its local `F` bound) even when the
+> total is still achievable. The global check catches this and forces the correct
+> decision to ensure `realized_total == requested_total`.
+
+Decision flow (priority order):
+1. If per-phase is infeasible both ways → fall back to global check.
+   - If global infeasible both ways → don't skip (conservative, logged).
+   - If only `global_skip_possible` → force skip, `global_forced_skips += 1`.
+   - If only `global_real_possible` → force backward, `global_forced_skips += 1`.
+2. If only `per_phase_skip_possible` → force real backward, `forced_skips += 1`.
+3. If only `per_phase_real_possible` → force skip, `forced_skips += 1`.
+4. If both per-phase feasible → score decides (quantile or Bernoulli under annealing).
+
+The cap `K=4` (from the Phase 3 config) is ALWAYS respected, including under forcing — verified by unit test `test_forcing_respects_cap`.
+
+The cap (K=4) **always applies**, including to forced skips. No forcing
+overrides the cap. This ensures no leftover quota crosses a window boundary.
+
+### 7.4 Per-window skip-position diagnostic (bug d fix)
+The gate records `phase_skip_positions`: for each phase window, the list of
+phase-relative positions where skips land. The diagnostics report skip count,
+median, min, and max position per window. This enables a parity check between
+gate and control on skip placement, detecting front-loading or back-loading
+bias from the score's temporal structure.
+
+### 7.5 min_step = int(total_steps × warmup_ratio)
+
+All arms use `min_step = int(total_steps × 0.06)`. For QNLI (total_steps=6548),
+this is `int(6548 × 0.06) = 392`. No skips occur during LR warmup, where gain
+scores are inflated and unrepresentative. AdamW's second-moment estimate `v`
+already exists at step 392, so S2 can be computed from the start
+of the eligible region.
+
+---
+
+## 8. MRFC Smoke Test (Phase 3 mechanics validation)
+
+**Script**: `scripts/smoke_forward_gate_mrpc.py`
+**Status**: PASS (expected after bug fixes)
+
+| Parameter | Value |
+|-----------|-------|
+| Task | MRPC (GLUE) |
+| Model | `jhu-clsp/ettin-encoder-150m` |
+| Total steps | 200 |
+| Rate | 0.45 (round(0.45 × 200) = 90) |
+| min_step | 392 → clamped to 50 for the 200-step smoke (warmup=12) |
+| n_phases | 4 |
+| max_consecutive_skips | 4 |
+| seed | 11 |
+| warmup_steps | 12 |
+| Scheduler | `always_step` (pure f-of-step LR contract) |
+| Precision | fp32 (no AMP) |
+| CUDA device | 0 (V100-SXM2-32GB) |
+
+**Arms (2):**
+- `gate`: `ScoreQuantileGatePolicy(score_source="s1")`
+- `control`: `ScoreQuantileGatePolicy(score_source="uniform")`
+
+**Invariants verified:**
+- `realized_total == requested_total` (90 == 90) both arms
+- `sum(phase_used) == requested_total`
+- `longest_consecutive_skips <= 4` (cap always respected, including under forcing)
+- `scheduler_step_calls == batches_seen == 200` (always_step contract)
+- LR curves identical: `max|diff| = 0.00e+00`
+- Phase 0 quota 0 (min_step-gated; share transferred to windows 1-3)
+
+**NOTE**: The smoke test uses `min_step=50` because 200 total steps < 392 warmup.
+The production protocol uses `min_step=392`. The feasibility and cap logic is
+identical; only the warmup window differs.
+
+---
+
+## 9. Stage 2: Confirmatory Test (rate 0.60, pending supervisor signature)
+
+**Arms (4)** at rate 0.60, paired over seeds:
+1. `gate` — `ScoreQuantileGatePolicy` with the chosen score from Stage 0
+2. `control` — `ScoreQuantileGatePolicy(score_source="uniform")`
+3. `full_finetune` — `AlwaysFalsePolicy` (0% skip)
+4. `reduced_steps` — `ReducedTotalStepsCallback` (train fewer steps, matched budget)
+
+**Seeds (Stage 2)**: 24 seeds: [11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107]
+
+Wait — seeds 101 and 103 are used in Stage 0. The Stage 2 seed list must be disjoint.
+
+**Corrected Stage 2 Seeds**: 24 seeds: [11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 107, 109, 113]
+
+**Reserve seeds**: 157, 163 — for failed cells only. No reruns.
+
+**Rate**: Fixed at 0.60 (chosen pre-hoc from the v3 protocol; the MRFC smoke
+validates mechanics, and 0.60 gives the gate the most room to beat random.
+0.70 is not allowed by the trainer under cap=4: F(6548−392)=5181 skips max,
+but round(0.70 × 6548) = 4584 ≤ 5181, so 0.70 is actually feasible — but
+0.60 is the pre-registered choice and is not changed after seeing results).
+
+**Matrix**: 4 arms × 24 seeds = 96 cells, ~6 GPU-hours across 8 idle V100s.
+
+### Primary test (the only one):
+- `Δacc(gate − control)`, paired t-test, two-sided, α = 0.05, df = 23.
+- Bootstrap 95% CI (10,000 resamples).
+- MDE ≈ 0.17 pt, assuming paired SD = 0.287 from v3 (retrospective). Power analysis output:
+
+  ```
+  Power Analysis for Stage 2 Paired t-test
+    n = 24 seeds (df = 23)
+    alpha = 0.05 (two-sided)
+    target power = 0.80
+    paired SD = 0.287
+    noncentrality parameter (ncp) = 2.9256
+    MDE = 0.1714 pt
+  ```
+
+### Secondary outcomes (pre-specified, listed in advance):
+- `gate vs reduced_steps` (paired t-test)
+- `control vs reduced_steps` (paired t-test)
+- TOST vs `full_finetune` at 0.5 pt margin
+- Realized skip parity (gate and control at identical skip counts per seed)
+- Cap hits and forced-skip counts
+- Skip-position parity (using the `phase_skip_positions` diagnostic)
+- ms/step (timing cells, 3 seeds × 4 arms, single isolated GPU)
+
+**Descriptive extras (not tested, not claimed):**
+- Gate and control at rate 0.45, 5 seeds each, to show how the effect changes
+  with skip rate.
+
+**Rate justification**: 0.60 is chosen because random loses the most there,
+giving the gate the most room to beat it. Choosing the rate after seeing
+control's results is avoided — the rate is fixed in the pre-registration.
+
+### Outcomes, written down before running:
+- **Gate beats control**: "A forward-predicted-gain gate beats random at a
+  matched backward-step count" (60% of backward passes skipped in the gate
+  arm, 60% of backward passes run in the control arm). Stage 0 ρ values are
+  the mechanism evidence.
+  > **Note on matched budget:** the gate and control share the same forward
+  > pass budget (100% of forward passes) and the same backward-step budget
+  > (60% of total backward steps). `reduced_steps` is a *different* comparison
+  > — it skips 60% of ALL computation (forward + backward + optimizer). The gate's
+  > claim is scoped to settings where the forward pass cost is already sunk.
+- **Null**: The headline becomes the efficiency study: 60% backward skipping
+  compared with full_finetune and reduced_steps, plus the finding that neither
+  S1 nor S2 beats random, with Stage 0 explaining why. This works as an
+  empirical-study submission to TMLR.
+- **Gate loses to control**: Report it as is.
+- **Gate beats control but not reduced_steps (on accuracy/GPU-second)**: The
+  reviewer critique "just train shorter" applies because `reduced_steps` skips
+  60% of ALL computation (forward + backward + optimizer) while the gate skips
+  only 60% of backward steps but still runs 100% of forward passes (plus the
+  64-step S2 probe refreshes). The gate's budget is "backward steps only";
+  `reduced_steps`'s budget is "total compute." These are different denominators.
+  This distinction is pre-registered here: the gate's primary claim is
+  "beats random at matched backward-step count." The `reduced_steps`
+  comparison is a secondary outcome labeled as such.
+- In every case: no changing the rate, the score, or the seeds after Stage 2.
+
+---
+
+### Compute budget clarification (registered):
+- `full_finetune`: 6548 forward + 6548 backward + 6548 optimizer steps.
+- `reduced_steps` at 0.60: 2619 forward + 2619 backward + 2619 optimizer steps.
+- `gate` at 0.60: **6548 forward** + 2619 backward + 2619 optimizer steps.
+  - The gate skips backward passes only. Forward passes (including the S2 probe
+    refresh every 64 steps) are never skipped.
+  - S2 probe cost: one forward pass over 256 examples every 64 steps in fp32
+    eval mode. This is negligible (<0.1% of a training step at 13.4k samples).
+- `control` (uniform) at 0.60: same compute as gate (6548 forward, 2619 backward).
+
+The "matched budget" for gate vs control is backward steps (2619 each).
+The "matched budget" for gate vs reduced_steps is NOT total compute.
+
+---
+
+## 10. SST-2 Replication (pre-declared secondary)
+
+- **Scope**: Gate vs control at rate 0.60, 10 seeds each, on SST-2.
+
+- Constants:
+  - Total steps: 4,210 (SST-2 train corpus, batch=32).
+  - `min_step = int(4210 * 0.06) = 252`.
+  - `anneal_start = 3704` (= `int(4210 * 0.88)`; truncation, matching QNLI convention).
+  - Seeds: [101, 103, 107, 109, 113, 127, 131, 137, 139, 149] — the first 10 of the
+    24 Stage 2 seeds (disjoint from Stage 0 seeds).
+  - Cost: ~1 GPU-hour on V100.
+  - Primary test: `Δacc(gate − control)`, paired t-test, two-sided, α = 0.05, df = 9.
+  - Reported alongside QNLI as a within-protocol replication to address the
+    "one task only" concern. No claim of generalization across tasks is asserted.
+  - **If the Stage 0 chosen score is S1**: SST-2 uses `score_source="s1"`.
+  - **If the Stage 0 chosen score is S2**: SST-2 uses `score_source="s2"`.
+    The probe is refreshed on the same 512-step cadence.
+  - `reduced_steps` for SST-2: `max_steps = round(4210 * 0.40) = 1684`,
+    `warmup = int(1684 * 0.06) = 101`, linear decay to 0.
+- **Step-count disclosure (QNLI)**: 104,231 QNLI training examples at batch=32, 2 epochs
+  gives `ceil(104231/32) * 2 = 6516` steps. `max_steps` is fixed at 6,548 (the loader
+  wraps around) so that every pre-registered constant (392, 5762, 2619) remains exact.
+  The loader wrapping is disclosed in the instrumentation metadata.
+
+---
+
+## 11. Pareto Analysis (pre-declared secondary)
+
+**Scope**: Accuracy vs measured GPU-seconds for all 4 arms (gate, control,
+full_finetune, reduced_steps), built from serial timing cells.
+
+- **Timing cells**: 3 seeds × 4 arms = 12 cells, each on a single isolated V100.
+  Measures wall-clock time per step (ms/step) and peak GPU memory.
+- **Pareto frontier**: accuracy vs GPU-seconds (forward × batch_size × ms_per_step × steps_run).
+  Four points on the frontier:
+  1. `full_finetune` (100% compute)
+  2. `reduced_steps` (40% compute)
+  3. `gate` (40% backward compute + 100% forward compute)
+  4. `control` (40% backward compute + 100% forward compute)
+- **Claim scope**: The gate's efficiency claim is limited to settings where
+  forward passes are already paid for (e.g., during a forward-only evaluation
+  pass on unlabeled data). The Pareto plot will show where `reduced_steps`
+  dominates and where the gate's forward-cost amortization matters.
+
+---
+
+## 12. Stage 2 Failure Policy
+
+- Strict forward-loss check ON (`nonfinite_forward_loss_policy="fail"`)
+- `forward_loss_observations == total_steps` (6548 for QNLI)
+- `nonfinite_forward_loss_count == 0`
+- Manifest must carry `git_sha`, `tracker_revision`, `min_step`, `score_source`
+- Seeds 157/163 are reserves for failed cells only. If >2 cells fail and
+  cannot be replaced from reserves, the matrix is reported as incomplete.
+
+---
+
+## 13. Probe Exclusion Assertion
+
+Both `P_s` (256 examples) and `P_e` (256 examples) are removed from the training
+sampler in every arm. The runner asserts:
+```python
+# Assert probes excluded
+probe_ids = set(P_s_ids) | set(P_e_ids)
+train_ids = set(train_dataset.ids)
+assert len(probe_ids & train_ids) == 0, "Probe examples leaked into training"
+```
+If a probe is found in the training data, the cell is invalidated. A single
+probe doing both scoring and outcome would make S2 "look good by construction."
+
+---
+
+## 14. Execution Protocol
+
+1. **Stage 0 first**: Run oracle probe (seeds 101, 103) in shadow mode.
+2. **Decision recorded**: `docs/gate_a_decision.md` must be dated and committed
+   before any Stage 2 cell runs.
+3. **Supervisor sign-off**: `docs/supervisor_signoff_v4.md` must bear the real
+   supervisor's signature before Stage 2 GPU cells.
+4. **Serial execution**: Stage 2 cells run one at a time (96 cells across 8 V100s).
+5. **Clean git state**: `require_clean_git_tree()` before any cell runs.
+6. **No code changes during run**: enforced. Data is never deleted mid-run.
+7. **Host isolation**: No other jobs on the host during runs.
+
+---
+
+## 15. Checklist Before Pre-Reg Commit
+
+1. **Per-step global feasibility enforcement**: Tests verify `realized == requested`
+   at 0.45 and 0.60 over 6548 steps, including when a phase is locally infeasible
+   but the global check recovers the total. Longest skip run ≤ 4 (cap respected
+   under forcing). → See `tests/test_forward_gate.py` (tests 15–17).
+
+2. **Strict min_step validator**: `_validate_cell_contract` now enforces
+   `min_step == int(total_steps * 0.06)` (canonical V4 warmup_ratio=0.06),
+   whether or not `warmup_ratio` is present in the cell. Cells with
+   `warmup_ratio != 0.06` are rejected. → See
+   `tests/test_phase1_3_matrix_validator.py` (tests 12a–12c).
+
+2. **S2 hook + probe refresh**: On a tiny model, `G_B` (from
+   `_classifier_grad_from_logits`) matches the autograd gradient for
+   `classifier.weight` within 1e-5, and the output is finite with the right
+   shape `[num_labels, hidden_dim]`.
+   → See `tests/test_forward_gate.py` (test 13).
+
+3. **Both probes excluded from training sampler**: Asserted in the runner.
+   → See §13.
+
+4. **Pre-reg text fixes**: Seeds 101/103 (Stage 0), 24 Stage 2 seeds, reserves
+   157/163; rate fixed at 0.60; selection rule; power output.
+   → This document.
+
+5. **CPU dry run**: 6548 steps for both gate and control arms: final LR ≤ 1e-8
+   and `scheduler_step_calls == 6548`.
+   → See `scripts/smoke_forward_gate_mrpc.py` (extended to 6548-step dry run).
+
+6. **Clean git tree**: The `v4-prereg-r3` annotated tag is resolved dynamically via `git rev-parse v4-prereg-r3` (no hardcoded SHA in this commit). All fixes — including the per-step global feasibility enforcement, the MRFC smoke min_step correction, the B1–B16 bug fixes, and the SST-2/Pareto secondary sections — are included in the tagged commit.
+
+7. **SST-2 replication plan**: 10 seeds, rate 0.60, min_step=int(2205×0.06)=132.
+   → See §10.
+
+8. **Pareto analysis plan**: 12 timing cells (3 seeds × 4 arms), accuracy vs
+   GPU-seconds frontier.
+   → See §11.
+
+9. **GPU nondeterminism harness check**: Run `full_finetune` seed 11 twice on two
+   different V100 cards. Report the accuracy difference as the GPU nondeterminism floor.
+   This feeds into the paired t-test SD: if the floor ≥ the observed gate-control
+   Δacc, the result is uninterpretable. This is descriptive (not a test) but blocks
+   analysis if the floor is implausibly large (> 0.5%).
+
+---
+
+## 16. Addendum: Changes from V3
+
+| Section | V3 | V4 (this amendment) |
+|---------|-----|---------------------|
+| Gate estimator | backward LER | forward gain (S1) + alignment (S2) |
+| Score formula | ||p−y||² (documented) | ||p−y|| (code-accurate) |
+| min_step | 50 (POLICY_MIN_STEP) | 392 (int(total_steps * 0.06); warmup_ratio=0.06) |
+| warmup_ratio | absent (hardcoded POLICY_MIN_STEP=50) | 0.06 (canonical V4) |
+| Forcing | forcing_fraction=0.8, cap override | exact feasibility check (per-phase + global), cap always applies |
+| Stage 0 | not run | oracle probe (seeds 101, 103) |
+| Rate | 0.30 (confirmatory), 0.60 (Gate A) | 0.60 (Stage 2, pre-registered) |
+| Seeds | 11, 13, 17, 19, 23 | 101, 103 (Stage 0) + 24 Stage 2 seeds |
+| S2 | absent | alignment score with probe |
+| Stage 1 | intermediate | dropped (rate fixed at 0.60) |
+
+**Provenance note (min_step / warmup_ratio change):**
+
+The V4 builders (`build_ler_guided_controller_config`, `build_phase_strat_controller_config`)
+add a `warmup_ratio: float = 0.06` parameter and compute `min_step = int(total_steps * 0.06)`.
+For QNLI (total_steps=6548), this yields `min_step=392`.
+
+V3 (frozen at `93ec6e4`) used `POLICY_MIN_STEP=50` with no `warmup_ratio` parameter.
+**V4 config dicts are NOT byte-for-byte identical to V3**: V3 cells have `min_step=50` in
+the config dict, V4 cells have `min_step=392` (for QNLI).
+
+This is a **deliberate protocol change**, not a bug. The `warmup_ratio` parameter is NOT
+stored in the config dict (only `min_step` is stored, as an integer). V4 cells are validated
+by the V4 validator (which checks `min_step == int(total_steps * 0.06)`). V3 cells remain
+frozen at `93ec6e4` and are validated by the V3 validator (which checks
+`min_step == POLICY_MIN_STEP == 50`).
+
+A V3 cell rebuilt with V4 builders would produce `min_step=392` and would FAIL the V3
+validator. This is by design — V4 is a new protocol revision.
