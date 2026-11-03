@@ -34,6 +34,24 @@ def is_ettin_model(model_name: str) -> bool:
     return any(model_name.startswith(p) for p in _ETTIN_PREFIXES)
 
 
+def _accepts_reference_compile() -> bool:
+    """Whether the installed transformers still has ModernBertConfig.reference_compile.
+
+    transformers deprecated this option during v5 and later removed it. Versions
+    without it raise TypeError in the model constructor if it is passed (seen with
+    5.17.0). from_pretrained hands a keyword to the config only when the config has
+    that attribute, so the same test is used here.
+    """
+    try:
+        from transformers import ModernBertConfig
+    except Exception:
+        return False
+    try:
+        return hasattr(ModernBertConfig(), "reference_compile")
+    except Exception:
+        return False
+
+
 def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_files_only: bool = False):
     """Load tokenizer assets without model weights for CPU-side planning."""
     if is_ettin_model(model_name):
@@ -63,7 +81,8 @@ def load_model_and_tokenizer(
 ) -> Tuple:
     """Load model and tokenizer with architecture-aware defaults.
 
-    ModernBERT/Ettin: reference_compile=False, attn_implementation="eager"
+    ModernBERT/Ettin: attn_implementation="eager", plus reference_compile=False
+    when the installed transformers still has that option
     Others: standard AutoModel loading
     """
     is_modernbert = any(model_name.startswith(p) for p in _MODERNBERT_PREFIXES)
@@ -91,7 +110,8 @@ def load_model_and_tokenizer(
     if device_map is not None:
         model_kwargs["device_map"] = device_map
     if is_modernbert or is_ettin:
-        model_kwargs["reference_compile"] = False
+        if _accepts_reference_compile():
+            model_kwargs["reference_compile"] = False
         model_kwargs["attn_implementation"] = "eager"
     if revision is not None:
         model_kwargs["revision"] = revision

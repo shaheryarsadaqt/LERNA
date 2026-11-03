@@ -90,7 +90,7 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
             model_loader,
             "load_tokenizer",
             return_value=object(),
-        ):
+        ), mock.patch.object(model_loader, "_accepts_reference_compile", return_value=True):
             with mock.patch.object(
                 model_loader.AutoModelForSequenceClassification,
                 "from_pretrained",
@@ -108,7 +108,7 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
             model_loader,
             "load_tokenizer",
             return_value=object(),
-        ):
+        ), mock.patch.object(model_loader, "_accepts_reference_compile", return_value=True):
             with mock.patch.object(
                 model_loader.AutoModelForSequenceClassification,
                 "from_pretrained",
@@ -247,6 +247,55 @@ class TokenizerOnlyLoaderTests(unittest.TestCase):
                     local_files_only=False,
                 )
             self.assertIn("40-character lowercase hex SHA", str(ctx.exception))
+
+
+class ReferenceCompileSupportTests(unittest.TestCase):
+    """reference_compile is passed only when the installed transformers still has it."""
+
+    def _kwargs(self, model_name, supported, **call):
+        with mock.patch.object(model_loader, "load_tokenizer", return_value=object()), \
+                mock.patch.object(model_loader, "_accepts_reference_compile", return_value=supported), \
+                mock.patch.object(model_loader.AutoModelForSequenceClassification, "from_pretrained") as fp:
+            model_loader.load_model_and_tokenizer(model_name, num_labels=2, **call)
+        return fp.call_args[1]
+
+    def test_modernbert_without_support_omits_reference_compile(self):
+        kwargs = self._kwargs("answerdotai/ModernBERT-base", supported=False)
+        self.assertNotIn("reference_compile", kwargs)
+        self.assertEqual(kwargs["attn_implementation"], "eager")
+        self.assertEqual(kwargs["num_labels"], 2)
+
+    def test_ettin_without_support_omits_reference_compile(self):
+        kwargs = self._kwargs(model_loader.ETTIN_MODEL_ID, supported=False,
+                              revision=model_loader.ETTIN_REVISION, local_files_only=True)
+        self.assertNotIn("reference_compile", kwargs)
+        self.assertEqual(kwargs["attn_implementation"], "eager")
+        self.assertEqual(kwargs["revision"], model_loader.ETTIN_REVISION)
+        self.assertIs(kwargs["local_files_only"], True)
+
+    def _support_with(self, fake_transformers):
+        saved = sys.modules.get("transformers")
+        sys.modules["transformers"] = fake_transformers
+        try:
+            return model_loader._accepts_reference_compile()
+        finally:
+            if saved is None:
+                sys.modules.pop("transformers", None)
+            else:
+                sys.modules["transformers"] = saved
+
+    def test_support_detected_when_config_has_the_option(self):
+        fake = ModuleType("transformers")
+        fake.ModernBertConfig = type("ModernBertConfig", (), {"__init__": lambda self: setattr(self, "reference_compile", None)})
+        self.assertIs(self._support_with(fake), True)
+
+    def test_no_support_when_config_lacks_the_option(self):
+        fake = ModuleType("transformers")
+        fake.ModernBertConfig = type("ModernBertConfig", (), {})
+        self.assertIs(self._support_with(fake), False)
+
+    def test_no_support_when_modernbert_config_is_missing(self):
+        self.assertIs(self._support_with(ModuleType("transformers")), False)
 
 
 if __name__ == "__main__":
