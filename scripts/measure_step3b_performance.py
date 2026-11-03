@@ -34,7 +34,7 @@ from lerna.utils.forward_gate import ScoreQuantileGate, _eligible_phase_quota
 
 def _source_hash(path: Path) -> str:
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        return hashlib.sha256(path.read_bytes()).hexdigest()
     except Exception:
         return "unknown"
 
@@ -46,9 +46,25 @@ _MEASUREMENT_SOURCE_BINDINGS = {
     "phase_suffix_feasibility": _source_hash(
         Path(__file__).resolve().parents[1] / "lerna" / "utils" / "phase_suffix_feasibility.py"
     ),
-    "runner": _source_hash(Path(__file__).resolve()),
+    # This script's own hash (it is the measurement script, not the ablation runner).
+    "measurement_script": _source_hash(Path(__file__).resolve()),
     "max_allowed_cells": PhaseSuffixFeasibility.MAX_ALLOWED_CELLS,
 }
+
+# Gate settings used by every measurement below, recorded in each record as effective_config.
+GATE_SETTINGS = {
+    "controller_version": "phase_exact_v1",
+    "seed": 12,
+    "score_history_window": 64,
+    "anneal_fraction": 0.88,
+    "score_source": "constant 0.5",
+}
+SCORE_CONSTANT = 0.5
+
+
+def _effective_config(T: int, P: int, W: int, Q: int, K: int) -> dict:
+    return dict(GATE_SETTINGS, rate=Q / T, total_steps=T, min_step=W,
+                max_consecutive_skips=K, n_phases=P)
 
 
 def const_score(val):
@@ -94,9 +110,10 @@ def measure_helper(task_name: str, T: int, P: int, W: int, Q: int, K: int, repea
     gate = ScoreQuantileGate(
         rate=Q / T, total_steps=T, min_step=W,
         max_consecutive_skips=K, n_phases=P,
-        score_history_window=64, anneal_fraction=0.88,
-        seed=12, score_source=lambda *a: 0.5,
-        controller_version="phase_exact_v1",
+        score_history_window=GATE_SETTINGS["score_history_window"],
+        anneal_fraction=GATE_SETTINGS["anneal_fraction"],
+        seed=GATE_SETTINGS["seed"], score_source=lambda *a: SCORE_CONSTANT,
+        controller_version=GATE_SETTINGS["controller_version"],
     )
     # Pre-run to establish legal state at each step
     legal_states = []
@@ -118,6 +135,7 @@ def measure_helper(task_name: str, T: int, P: int, W: int, Q: int, K: int, repea
     return {
         "task": task_name,
         "T": T, "P": P, "W": W, "Q": Q, "K": K,
+        "effective_config": _effective_config(T, P, W, Q, K),
         "quotas": phase_quota,
         "requested_total": requested_total,
         "total_eligible": total_eligible,
@@ -150,9 +168,10 @@ def measure_gate(task_name: str, T: int, P: int, W: int, Q: int, K: int, repeats
         g = ScoreQuantileGate(
             rate=rate, total_steps=T, min_step=W,
             max_consecutive_skips=K, n_phases=P,
-            score_history_window=64, anneal_fraction=0.88,
-            seed=12, score_source=const_score(0.5),
-            controller_version="phase_exact_v1",
+            score_history_window=GATE_SETTINGS["score_history_window"],
+            anneal_fraction=GATE_SETTINGS["anneal_fraction"],
+            seed=GATE_SETTINGS["seed"], score_source=const_score(SCORE_CONSTANT),
+            controller_version=GATE_SETTINGS["controller_version"],
         )
         init_ms = (time.perf_counter() - t0) * 1000
         cur, peak = tracemalloc.get_traced_memory()
@@ -170,6 +189,7 @@ def measure_gate(task_name: str, T: int, P: int, W: int, Q: int, K: int, repeats
     return {
         "task": task_name,
         "T": T, "P": P, "W": W, "Q": Q, "K": K,
+        "effective_config": _effective_config(T, P, W, Q, K),
         "rate": rate,
         "repeats": repeats,
         "source_bindings": _MEASUREMENT_SOURCE_BINDINGS,
@@ -192,6 +212,7 @@ def measure_gate(task_name: str, T: int, P: int, W: int, Q: int, K: int, repeats
 def main():
     results = {
         "scope": "Actual helper/gate measurement, CPU-only, no training.",
+        "command": [sys.executable, *sys.argv],
         "note": "Phase lookup is O(P), not strict O(1). Big-integer bit operations "
                 f"scale with quota in machine words. Pre-allocation guard: "
                 f"MAX_ALLOWED_CELLS={PhaseSuffixFeasibility.MAX_ALLOWED_CELLS}.",
