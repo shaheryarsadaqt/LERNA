@@ -1044,30 +1044,19 @@ class TestVariableBatches:
                 "scripts.run_controller_ablation._dynamic_padding_collator",
                 collator_spy,
             ):
+                start = len(collator_calls)
                 result = run_execution(cfg)
 
             assert result["status"] == "OK", f"{task}: {result.get('reason')}"
+            calls = collator_calls[start:]
 
-            # Collator saw at least one batch with unequal input lengths
-            lengths_seen = set()
-            for features, output in collator_calls:
-                for f in features:
-                    ids = f.get("input_ids", [])
-                    if isinstance(ids, list):
-                        lengths_seen.add(len(ids))
-                    elif hasattr(ids, 'shape'):
-                        lengths_seen.add(ids.shape[0])
-            assert len(lengths_seen) > 1, f"{task}: collator saw only one input length: {lengths_seen}"
-
-            # Every row of every collated input_ids equals that batch's maximum length
-            for features, output in collator_calls:
-                input_ids = output.get("input_ids")
-                if input_ids is not None:
-                    rows = input_ids if isinstance(input_ids, list) else input_ids.tolist()
-                    max_len = max(len(row) for row in rows)
-                    for row in rows:
-                        assert len(row) == max_len, \
-                            f"{task}: row length {len(row)} != batch max {max_len}"
+            # At least one collated batch mixed input lengths, so padding was exercised
+            assert any(len({len(f["input_ids"]) for f in feats}) > 1 for feats, _ in calls), \
+                f"{task}: no collated batch mixed input lengths"
+            # Every collated batch is padded to exactly its longest row
+            for feats, out in calls:
+                assert out["input_ids"].shape[1] == max(len(f["input_ids"]) for f in feats), \
+                    f"{task}: padded width {out['input_ids'].shape[1]} != longest row"
 
             assert result.get("result", {}).get("final_learning_rate") is not None, f"{task}: no final LR recorded"
 
@@ -1154,7 +1143,8 @@ class TestQnliAcrossArms:
 
         tok = self._make_train_tokenizer()
 
-        for arm in self.ARMS:
+        from scripts.run_controller_ablation import ARMS
+        for arm in ARMS:
             cfg = ExperimentConfig(
                 task="qnli", arm=arm,
                 controller_version="legacy_v4", score_source=ARM_SOURCE[arm],
@@ -1184,10 +1174,9 @@ class TestQnliAcrossArms:
             assert len(result_ds) == 9997, \
                 f"{arm}: expected 9,997 rows, got {len(result_ds)}"
             expected_indices = [i for i in range(10000) if i not in {1, 3, 7000}]
-            kept_labels = list(result_ds["labels"])
-            expected_labels = [i % 2 for i in expected_indices]
-            assert kept_labels == expected_labels, \
-                f"{arm}: kept labels don't match expected order"
+            kept = [int(row[1]) for row in result_ds["input_ids"]]
+            assert kept == expected_indices, \
+                f"{arm}: kept rows {kept[:6]}... are not the expected rows in order"
 
     def test_qnli_wrong_hash_rejected(self):
         """A wrong probe_exclusions_hash causes config validation failure."""
@@ -1300,8 +1289,17 @@ class TestQnliAcrossArms:
             "label": [i % 2 for i in range(50)],
         })
 
+        train_ds = Dataset.from_dict({
+            "idx": list(range(10000)),
+            "question": [f"q{i}" for i in range(10000)],
+            "sentence": [f"s{i}" for i in range(10000)],
+            "label": [i % 2 for i in range(10000)],
+        })
+        requested = []
+
         def load_side_effect(dataset_name, config=None, split=None, **kwargs):
-            return val_ds
+            requested.append(split)
+            return {"train": train_ds, "validation": val_ds}[split]
 
         tok = self._make_train_tokenizer()
 
@@ -1316,10 +1314,9 @@ class TestQnliAcrossArms:
 
         assert len(result_ds) == 50, \
             f"expected all 50 validation rows, got {len(result_ds)}"
-        kept_labels = list(result_ds["labels"])
-        expected_labels = [i % 2 for i in range(50)]
-        assert kept_labels == expected_labels, \
-            f"validation labels should be intact, got {kept_labels[:10]}..."
+        assert requested == ["validation"], f"eval loader asked for split(s) {requested}"
+        kept = [int(row[1]) for row in result_ds["input_ids"]]
+        assert kept == list(range(50)), f"validation rows changed: {kept[:6]}..."
 
 
 # ---------------------------------------------------------------------------
@@ -1611,7 +1608,7 @@ class TestRunnerCorruption:
         from scripts.run_controller_ablation import ExperimentConfig
         with pytest.raises(ValueError, match="not bool"):
             ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
+                task="sst-2", arm="gate_s1_p1",
                 controller_version="legacy_v4", score_source="s1",
                 total_steps=4, min_step=0, n_phases=1,
                 max_consecutive_skips=4, policy_seed=0,
@@ -2134,7 +2131,7 @@ class TestTrainerActualFreezing:
                 for p in model.parameters():
                     st = trainer.optimizer.state.get(p, {})
                     adam[id(p)] = {
-                        "step": st.get("step", 0),
+                        "step": float(st["step"]) if "step" in st else 0.0,
                         "exp_avg": st.get("exp_avg", None).clone() if "exp_avg" in st else None,
                         "exp_avg_sq": st.get("exp_avg_sq", None).clone() if "exp_avg_sq" in st else None,
                     }
@@ -2218,6 +2215,13 @@ class TestTrainerActualFreezing:
         )
         assert any_changed, "params should change on retained batch after skip"
 
+        # Adam step: unchanged by the skipped batch, +1 on each retained batch after it
+        for pid in snapshots[0]["adam"]:
+            steps = [s["adam"][pid]["step"] for s in snapshots]
+            assert steps[1] == steps[0], f"Adam step moved on the skipped batch: {steps}"
+            assert steps[2] == steps[1] + 1, f"Adam step did not rise by 1 after the skip: {steps}"
+            assert steps[3] == steps[2] + 1, f"Adam step did not rise by 1 on batch 4: {steps}"
+
     def test_cached_logits_distinct_successive_batches_zero_extra_forwards(self):
         """B5: Real S1 policy reads cached logits with zero extra scoring forwards.
 
@@ -2263,43 +2267,35 @@ class TestTrainerActualFreezing:
             allow_grad_accumulation_with_skipping=True,
         )
 
-        # Spy on S1 scoring function before training, to verify each batch's
-        # cached logits and labels are scored (no extra scoring forwards).
-        scored_logits = []
-        scored_labels = []
-        orig_score = forward_gain_score
+        import lerna.utils.forward_gate as fg_mod
+        forward_records = []
+
+        def _record_forward(module, args, kwargs, output):
+            forward_records.append((kwargs["labels"].detach().clone(), output.logits.detach().clone()))
+
+        handle = model.register_forward_hook(_record_forward, with_kwargs=True)
+        scored = []
+        orig_score = fg_mod.forward_gain_score
 
         def spy_score(logits, labels):
-            scored_logits.append(
-                logits.detach().clone() if hasattr(logits, 'detach') else logits
-            )
-            scored_labels.append(
-                labels.detach().clone() if hasattr(labels, 'detach') else labels
-            )
+            scored.append((labels.detach().clone(), logits.detach().clone()))
             return orig_score(logits, labels)
 
-        import lerna.utils.forward_gate as fg_mod
         fg_mod.forward_gain_score = spy_score
-
         try:
             trainer.train()
         finally:
             fg_mod.forward_gain_score = orig_score
+            handle.remove()
 
-        # forwards == scheduled batches (3) via trainer's instrumentation
-        assert trainer.instr.forward_calls == 3, \
-            f"expected 3 forwards (one per batch), got {trainer.instr.forward_calls}"
-
-        assert len(scored_logits) == 3, \
-            f"expected 3 scoring calls, got {len(scored_logits)}"
-        assert len(scored_labels) == 3, \
-            f"expected 3 label recordings, got {len(scored_labels)}"
-
+        # Every model forward is counted here, including any extra scoring forward
+        assert len(forward_records) == 3, f"model forwards: {len(forward_records)}, batches: 3"
+        assert len(scored) == 3, f"S1 scoring calls: {len(scored)}"
         for i in range(3):
-            assert scored_logits[i] is not None, \
-                f"batch {i}: no logits recorded by scoring spy"
-            assert scored_labels[i] is not None, \
-                f"batch {i}: no labels recorded by scoring spy"
+            assert torch.equal(scored[i][1], forward_records[i][1]), f"batch {i}: S1 scored other logits"
+            assert torch.equal(scored[i][0], forward_records[i][0]), f"batch {i}: S1 scored other labels"
+        assert not torch.equal(forward_records[0][1], forward_records[1][1]), \
+            "successive batches gave equal logits"
 
     def test_exact_phase_quota_total_matches_Q_not_T(self):
         """phase_exact_v1: sum(phase_quota) must equal requested skips Q,
@@ -3495,275 +3491,6 @@ class TestOneRunSeed:
 
 
 # ---------------------------------------------------------------------------
-# B1: tokenizer padding_side rejection test
-# ---------------------------------------------------------------------------
-
-class TestB1PaddingSideRejection:
-    """B1: tokenizer with non-right padding_side is rejected with
-    failure_stage: tokenizer_padding_side."""
-
-    def test_left_padding_side_rejected(self):
-        """A tokenizer that pads on the left is rejected before any data loads."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b1_padding",
-            attempt_id="b1",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
-
-        class LeftPadTok:
-            padding_side = "left"
-            pad_token_id = 0
-
-        def fake_load_tokenizer(cfg, tokenizer_loader=None):
-            return LeftPadTok()
-
-        with mock.patch(
-            "scripts.run_controller_ablation._load_tokenizer",
-            side_effect=fake_load_tokenizer,
-        ):
-            result = run_execution(cfg)
-
-        assert result["status"] == "FAILED", result.get("reason")
-        assert result["failure_stage"] == "tokenizer_padding_side", \
-            f"expected failure_stage tokenizer_padding_side, got {result.get('failure_stage')}"
-
-
-# ---------------------------------------------------------------------------
-# B2: provenance execution_mode labels test
-# ---------------------------------------------------------------------------
-
-class TestB2ProvenanceExecutionMode:
-    """B2: provenance records truthful execution_mode labels:
-    dry-run -> mock_fixtures_cpu;
-    non-dry-run -> production_loaders."""
-
-    def test_dry_run_provenance_mock_fixtures_cpu(self):
-        """dry_run=True records execution_mode mock_fixtures_cpu."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_dry_run,
-        )
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b2_dry",
-            attempt_id="b2",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
-        result = run_dry_run(cfg)
-        prov = result["provenance"]
-        assert prov.get("execution_mode") == "mock_fixtures_cpu", \
-            f"expected mock_fixtures_cpu, got {prov.get('execution_mode')}"
-
-    def test_non_dry_run_provenance_production_loaders(self):
-        """non-dry-run records execution_mode production_loaders."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        cfg = ExperimentConfig(
-            task="sst-2", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b2_prod",
-            attempt_id="b2p2",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=False,
-        )
-        # Mock all production loaders to return TinyModel fixtures so run_execution
-        # can complete without real downloads.
-        def fake_model(cfg): return TinyModel(seed=cfg.policy_seed)
-        def fake_tokenizer(cfg): return None
-        def fake_train(cfg, n): return list(TinyDataLoader(num_examples=n, seed=cfg.data_seed))
-        def fake_eval(cfg): return list(TinyDataLoader(num_examples=4, seed=cfg.data_seed + 1))
-
-        with mock.patch(
-            "scripts.run_controller_ablation._load_model_production",
-            side_effect=fake_model,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_tokenizer_production",
-            side_effect=fake_tokenizer,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_train_dataset_production",
-            side_effect=fake_train,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_eval_dataset_production",
-            side_effect=fake_eval,
-        ):
-            result = run_execution(cfg)
-
-        assert result["status"] == "OK", result.get("reason")
-        prov = result["provenance"]
-        assert prov.get("execution_mode") == "production_loaders", \
-            f"expected production_loaders, got {prov.get('execution_mode')}"
-
-
-# ---------------------------------------------------------------------------
-# B4: LR tolerance boundary test
-# ---------------------------------------------------------------------------
-
-class TestB4LR:
-    """B4: LR tolerance boundary — values just outside tolerance fail,
-    values within tolerance pass."""
-
-    def test_lr_tolerance_rejects_wrong_rate(self):
-        """B4: run_execution rejects a final LR outside tolerance (9e-7
-        vs expected 2e-5). Must call the runner, not just compare numbers."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        class MockInstr:
-            forward_calls = 4
-            backward_calls = 4
-            scheduler_step_calls = 4
-            skipped_backward_steps = 0
-            skipped_batches = 0
-            optimizer_step_attempts = 4
-            capture_logits_enabled = True
-
-            def as_dict(self):
-                return {
-                    "forward_calls": self.forward_calls,
-                    "backward_calls": self.backward_calls,
-                    "scheduler_step_calls": self.scheduler_step_calls,
-                    "skipped_backward_steps": self.skipped_backward_steps,
-                    "skipped_batches": self.skipped_batches,
-                    "optimizer_step_attempts": self.optimizer_step_attempts,
-                }
-
-        class MockOptimizer:
-            param_groups = [{"lr": 9e-7}]  # wrong LR: 450x off from 2e-5
-
-        class MockTrainer:
-            def __init__(self, *args, **kwargs):
-                self.instr = MockInstr()
-                self.optimizer = MockOptimizer()
-                self.capture_logits = True
-
-            def train(self):
-                pass
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="full_finetune",
-            controller_version="legacy_v4", score_source="uniform",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.0, output_dir="/tmp/test_b4_lr_runner",
-            attempt_id="b4r",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-            learning_rate=2e-5,
-            lr_schedule_shape="constant",
-        )
-
-        with mock.patch(
-            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
-            MockTrainer,
-        ):
-            result = run_execution(cfg)
-
-        assert result["status"] == "FAILED", result.get("reason")
-        assert "final LR" in result["reason"], \
-            f"expected LR rejection reason, got {result.get('reason')}"
-
-    def test_lr_tolerance_accepts_near_expected(self):
-        """B4: run_execution accepts a final LR within tolerance."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        class MockInstr:
-            forward_calls = 4
-            backward_calls = 4
-            scheduler_step_calls = 4
-            skipped_backward_steps = 0
-            skipped_batches = 0
-            optimizer_step_attempts = 4
-            capture_logits_enabled = True
-
-            def as_dict(self):
-                return {
-                    "forward_calls": self.forward_calls,
-                    "backward_calls": self.backward_calls,
-                    "scheduler_step_calls": self.scheduler_step_calls,
-                    "skipped_backward_steps": self.skipped_backward_steps,
-                    "skipped_batches": self.skipped_batches,
-                    "optimizer_step_attempts": self.optimizer_step_attempts,
-                }
-
-        class MockOptimizer:
-            param_groups = [{"lr": 2e-5 + 1e-13}]  # within tolerance
-
-        class MockTrainer:
-            def __init__(self, *args, **kwargs):
-                self.instr = MockInstr()
-                self.optimizer = MockOptimizer()
-                self.capture_logits = True
-
-            def train(self):
-                pass
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="full_finetune",
-            controller_version="legacy_v4", score_source="uniform",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.0, output_dir="/tmp/test_b4_ok_runner",
-            attempt_id="b4okr",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-            learning_rate=2e-5,
-            lr_schedule_shape="constant",
-        )
-
-        with mock.patch(
-            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
-            MockTrainer,
-        ):
-            result = run_execution(cfg)
-
-        assert result["status"] == "OK", result.get("reason")
-
-
-# ---------------------------------------------------------------------------
 # B6: evaluator failure test
 # ---------------------------------------------------------------------------
 
@@ -3873,92 +3600,7 @@ class TestB6EvaluatorFailure:
 
 
 # ---------------------------------------------------------------------------
-# B7: dry-run IDs rejection test
-# ---------------------------------------------------------------------------
-
-class TestB7DryRunIDsRejection:
-    """B7: blank or missing model, tokenizer and dataset IDs are rejected
-    even in dry_run mode."""
-
-    def test_blank_model_id_rejected_in_dry_run(self):
-        """Empty model_id is rejected even when dry_run=True."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        try:
-            ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=4, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_b7",
-                attempt_id="b7",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-                model_id="",
-            )
-            assert False, "expected ValueError for blank model_id"
-        except ValueError as e:
-            assert "model_id" in str(e), f"expected model_id in error, got {e}"
-
-    def test_none_tokenizer_id_rejected_in_dry_run(self):
-        """None tokenizer_id is rejected even when dry_run=True."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        try:
-            ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=4, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_b7b",
-                attempt_id="b7b",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-                tokenizer_id=None,
-            )
-            assert False, "expected ValueError for None tokenizer_id"
-        except ValueError as e:
-            assert "tokenizer_id" in str(e), f"expected tokenizer_id in error, got {e}"
-
-    def test_whitespace_dataset_id_rejected_in_dry_run(self):
-        """Whitespace-only dataset_id is rejected even when dry_run=True."""
-        from scripts.run_controller_ablation import ExperimentConfig
-
-        try:
-            ExperimentConfig(
-                task="qnli", arm="gate_s1_p1",
-                controller_version="legacy_v4", score_source="s1",
-                total_steps=4, min_step=0, n_phases=1,
-                max_consecutive_skips=4, policy_seed=0,
-                target_skip_rate=0.5, output_dir="/tmp/test_b7c",
-                attempt_id="b7c",
-                probe_exclusions_file=None,
-                probe_exclusions_hash=None,
-                model_revision="a" * 40,
-                tokenizer_revision="b" * 40,
-                dataset_revision="c" * 40,
-                dry_run=True,
-                dataset_id="   ",
-            )
-            assert False, "expected ValueError for whitespace dataset_id"
-        except ValueError as e:
-            assert "dataset_id" in str(e), f"expected dataset_id in error, got {e}"
-
-
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Additional Part B tests
-# ---------------------------------------------------------------------------
+# B6: _evaluate_model raises EvalDataLoaderConstructionError
 # ---------------------------------------------------------------------------
 
 class TestEvalDataLoaderConstructionErrorRaised:
@@ -4011,185 +3653,237 @@ class TestEvalDataLoaderConstructionErrorRaised:
                     f"expected eval_data_loader error, got {e}"
 
 
-class TestB1RightPaddingAccepted:
-    """B1: tokenizer with padding_side='right' is NOT rejected."""
+# ---------------------------------------------------------------------------
+# Part B: reviewer-supplied tests (B1, B4, B6/R1, B7, provenance)
+# ---------------------------------------------------------------------------
 
-    def test_right_padding_side_accepted(self):
-        """A right-padding tokenizer passes the padding_side check."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
+class _NonDryFixtures:
+    """Production loaders replaced by CPU fixtures, exactly as test_lr_endpoints_vs_hf_scheduler does."""
+
+    @staticmethod
+    def cfg(**overrides):
+        from scripts.run_controller_ablation import ExperimentConfig
+        kw = dict(
+            task="sst-2", arm="full_finetune", controller_version="legacy_v4", score_source="uniform",
+            total_steps=8, min_step=0, n_phases=1, max_consecutive_skips=4, policy_seed=0,
+            target_skip_rate=0.0, output_dir="/tmp/test_partb_fixtures", attempt_id="pb",
+            model_revision="a" * 40, tokenizer_revision="b" * 40, dataset_revision="c" * 40,
+            learning_rate=2e-5, lr_warmup_steps=0, lr_schedule_shape="linear", dry_run=False,
         )
-        from unittest import mock
+        kw.update(overrides)
+        return ExperimentConfig(**kw)
 
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=4, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b1_right",
-            attempt_id="b1r",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-        )
+    @staticmethod
+    def run(cfg, tokenizer=None, trainer_cls=None, evaluate=None, dataloader=None):
+        """Run run_execution with fixture loaders. Returns (result, calls) where calls lists the
+        data loaders and the evaluator that actually ran."""
+        from scripts.run_controller_ablation import run_execution, TinyModel
+        calls = []
 
-        class RightPadTok:
-            padding_side = "right"
+        class _PadTok:
             pad_token_id = 0
 
-        def fake_load_tokenizer(cfg, tokenizer_loader=None):
-            return RightPadTok()
+        def fake_model(cfg):
+            return TinyModel(hidden=8, classes=2)
 
-        def fake_load_model(cfg): return TinyModel(seed=cfg.policy_seed)
-        def fake_train(cfg, n): return list(TinyDataLoader(num_examples=n, seed=cfg.data_seed))
-        def fake_eval(cfg): return list(TinyDataLoader(num_examples=4, seed=cfg.data_seed + 1))
+        def fake_tokenizer(cfg):
+            return tokenizer if tokenizer is not None else _PadTok()
 
-        with mock.patch(
-            "scripts.run_controller_ablation._load_model",
-            side_effect=fake_load_model,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_tokenizer",
-            side_effect=fake_load_tokenizer,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_train_dataset",
-            side_effect=fake_train,
-        ), mock.patch(
-            "scripts.run_controller_ablation._load_eval_dataset",
-            side_effect=fake_eval,
-        ):
-            result = run_execution(cfg)
+        def fake_train(cfg, num_examples):
+            calls.append("train_data")
+            return [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]),
+                 "labels": torch.tensor(0)},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.tensor([1, 1]),
+                 "labels": torch.tensor(1)},
+            ]
 
-        assert result["status"] == "OK", f"right padding should be accepted: {result.get('reason')}"
+        def fake_eval(cfg):
+            calls.append("eval_data")
+            return [{"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]),
+                     "labels": torch.tensor(0)}]
 
-
-class TestB5CallbackSnapshotsPerBatch:
-    """B5: freeze evidence via TrainerCallback records per-batch snapshots
-    inside train()."""
-
-    def test_trainer_callback_records_per_batch_snapshots(self):
-        """A TrainerCallback.on_step_end is called once per batch inside
-        train(), recording params and Adam state per batch."""
-        from transformers import TrainerCallback
-
-        model = TinyModel(hidden=4, classes=2, seed=1)
-        args = TrainingArguments(
-            output_dir="/tmp/test_b5_callback",
-            max_steps=4,
-            learning_rate=1e-3,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=1,
-            warmup_steps=0, weight_decay=0.0,
-            lr_scheduler_type="constant", optim="adamw_torch",
-            eval_strategy="no", save_strategy="no",
-            logging_strategy="no", report_to=[], disable_tqdm=True,
-            use_cpu=True, fp16=False, bf16=False,
-        )
-        dataset = [
-            {"input_ids": torch.randn(1, 4), "labels": torch.tensor([i % 2])}
-            for i in range(4)
+        patches = [
+            mock.patch("scripts.run_controller_ablation._load_model_production", side_effect=fake_model),
+            mock.patch("scripts.run_controller_ablation._load_tokenizer_production", side_effect=fake_tokenizer),
+            mock.patch("scripts.run_controller_ablation._load_train_dataset_production", side_effect=fake_train),
+            mock.patch("scripts.run_controller_ablation._load_eval_dataset_production", side_effect=fake_eval),
         ]
-
-        class AlwaysRetainPolicy:
-            name = "always_retain"
-            def should_skip(self, trainer, model, inputs):
-                return False
-            def get_diagnostics(self):
-                return {"name": self.name}
-
-        policy = AlwaysRetainPolicy()
-        trainer = TrueBackwardSkippingTrainer(
-            model=model, args=args,
-            train_dataset=dataset,
-            skip_policy=policy,
-            scheduler_step_policy=SchedulerStepPolicy.ALWAYS_STEP,
-            capture_logits=True, online_ler_enabled=False,
-            allow_grad_accumulation_with_skipping=True,
-        )
-
-        snapshots = []
-
-        class SnapshotCallback(TrainerCallback):
-            def on_step_end(self, args, state, control, model=None, **kwargs):
-                snapshots.append(state.global_step)
-
-        trainer.add_callback(SnapshotCallback())
-        trainer.train()
-
-        # Callback called once per batch (4 batches)
-        assert len(snapshots) == 4, \
-            f"expected 4 callback calls (one per batch), got {len(snapshots)}"
-        assert snapshots == [1, 2, 3, 4], \
-            f"expected steps [1,2,3,4], got {snapshots}"
-
-
-class TestB4LRCosineBoundary:
-    """B4: LR tolerance boundary for cosine schedule."""
-
-    def test_cosine_lr_tolerance_rejects_wrong_rate(self):
-        """B4: run_execution rejects a cosine final LR outside tolerance."""
-        from scripts.run_controller_ablation import (
-            ExperimentConfig, run_execution,
-        )
-        from unittest import mock
-
-        class MockInstr:
-            forward_calls = 8
-            backward_calls = 8
-            scheduler_step_calls = 8
-            skipped_backward_steps = 0
-            skipped_batches = 0
-            optimizer_step_attempts = 8
-            capture_logits_enabled = True
-
-            def as_dict(self):
-                return {
-                    "forward_calls": self.forward_calls,
-                    "backward_calls": self.backward_calls,
-                    "scheduler_step_calls": self.scheduler_step_calls,
-                    "skipped_backward_steps": self.skipped_backward_steps,
-                    "skipped_batches": self.skipped_batches,
-                    "optimizer_step_attempts": self.optimizer_step_attempts,
-                }
-
-        class MockOptimizer:
-            param_groups = [{"lr": 2e-5}]  # wrong LR: cosine decays to ~0
-
-        class MockTrainer:
-            def __init__(self, *args, **kwargs):
-                self.instr = MockInstr()
-                self.optimizer = MockOptimizer()
-                self.capture_logits = True
-
-            def train(self):
-                pass
-
-        cfg = ExperimentConfig(
-            task="qnli", arm="gate_s1_p1",
-            controller_version="legacy_v4", score_source="s1",
-            total_steps=8, min_step=0, n_phases=1,
-            max_consecutive_skips=4, policy_seed=0,
-            target_skip_rate=0.5, output_dir="/tmp/test_b4_cos_runner",
-            attempt_id="b4cr",
-            probe_exclusions_file=None,
-            probe_exclusions_hash=None,
-            model_revision="a" * 40,
-            tokenizer_revision="b" * 40,
-            dataset_revision="c" * 40,
-            dry_run=True,
-            learning_rate=2e-5,
-            lr_warmup_steps=0,
-            lr_schedule_shape="cosine",
-        )
-
-        with mock.patch(
-            "scripts.run_controller_ablation.TrueBackwardSkippingTrainer",
-            MockTrainer,
-        ):
+        if trainer_cls is not None:
+            patches.append(mock.patch("scripts.run_controller_ablation.TrueBackwardSkippingTrainer", trainer_cls))
+        if evaluate is not None:
+            def eval_wrapper(*args, **kwargs):
+                calls.append("evaluate")
+                return evaluate(*args, **kwargs)
+            patches.append(mock.patch("scripts.run_controller_ablation._evaluate_model", side_effect=eval_wrapper))
+        if dataloader is not None:
+            patches.append(mock.patch("scripts.run_controller_ablation.DataLoader", side_effect=dataloader))
+        for p in patches:
+            p.start()
+        try:
             result = run_execution(cfg)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return result, calls
 
+
+class TestPartBPaddingSide:
+    """B1: a tokenizer that does not pad on the right is rejected before any data loads."""
+
+    @pytest.mark.parametrize("side, expected", [("left", "FAILED"), ("right", "OK"), ("absent", "OK")])
+    def test_padding_side(self, side, expected):
+        class Tok:
+            pad_token_id = 0
+        tok = Tok()
+        if side != "absent":
+            tok.padding_side = side
+        result, calls = _NonDryFixtures.run(_NonDryFixtures.cfg(), tokenizer=tok)
+        assert result["status"] == expected, result.get("reason")
+        if side == "left":
+            assert result.get("failure_stage") == "tokenizer_padding_side", result.get("reason")
+            assert calls == [], f"data was loaded before the padding-side check: {calls}"
+
+
+class TestPartBInjectedFinalLR:
+    """B4 at the runner boundary: train() runs normally, then the final LR is overwritten."""
+
+    @staticmethod
+    def _trainer_with_final_lr(value):
+        from scripts.run_controller_ablation import TrueBackwardSkippingTrainer as _Base
+
+        class _InjectFinalLR(_Base):
+            def train(self, *args, **kwargs):
+                out = super().train(*args, **kwargs)
+                if value == "missing":
+                    self.optimizer.param_groups.clear()
+                else:
+                    self.optimizer.param_groups[0]["lr"] = value
+                return out
+        return _InjectFinalLR
+
+    @pytest.mark.parametrize("value, fragment", [
+        (0.0, None),
+        (9e-7, "final LR 9e-07 != expected 0.0"),
+        (2e-6, "!= expected 0.0"),
+        (float("nan"), "is not finite"),
+        (float("inf"), "is not finite"),
+        ("missing", "final LR is unavailable"),
+    ])
+    def test_linear_completed_endpoint(self, value, fragment):
+        result, calls = _NonDryFixtures.run(
+            _NonDryFixtures.cfg(lr_schedule_shape="linear", lr_warmup_steps=0),
+            trainer_cls=self._trainer_with_final_lr(value), evaluate=lambda *a, **k: (0.0, 0.5, None))
+        if fragment is None:
+            assert result["status"] == "OK", result.get("reason")
+            assert "evaluate" in calls
+        else:
+            assert result["status"] == "FAILED", result.get("reason")
+            assert fragment in result["reason"], result["reason"]
+            assert "evaluate" not in calls, "the evaluator ran after a failed LR check"
+
+    @pytest.mark.parametrize("value, ok", [(2e-5, True), (2e-5 * (1 + 1e-6), False)])
+    def test_cosine_peak_endpoint(self, value, ok):
+        result, calls = _NonDryFixtures.run(
+            _NonDryFixtures.cfg(lr_schedule_shape="cosine", lr_warmup_steps=8),
+            trainer_cls=self._trainer_with_final_lr(value), evaluate=lambda *a, **k: (0.0, 0.5, None))
+        assert (result["status"] == "OK") is ok, result.get("reason")
+        assert ("evaluate" in calls) is ok
+
+
+class TestPartBEvaluationFailures:
+    """B6 and R1: DataLoader construction errors and every other evaluation error give FAILED manifests."""
+
+    def test_dataloader_runtime_error_reaches_manifest(self):
+        result, _ = _NonDryFixtures.run(_NonDryFixtures.cfg(), dataloader=RuntimeError("boom"))
         assert result["status"] == "FAILED", result.get("reason")
-        assert "final LR" in result["reason"], \
-            f"expected LR rejection reason, got {result.get('reason')}"
+        assert result.get("failure_stage") == "eval_data_loader_construction", result.get("reason")
+        assert "boom" in result["reason"], result["reason"]
+
+    def test_other_runtime_error_returns_failed_evaluation(self):
+        def raise_shape_mismatch(*args, **kwargs):
+            raise RuntimeError("shape mismatch")
+        result, _ = _NonDryFixtures.run(_NonDryFixtures.cfg(), evaluate=raise_shape_mismatch)
+        assert result["status"] == "FAILED", result.get("reason")
+        assert result.get("failure_stage") == "evaluation", result.get("reason")
+        assert "shape mismatch" in result["reason"], result["reason"]
+
+
+class TestPartBIdentityIDs:
+    """B7: dry-run rejects None, empty and whitespace IDs with the same message as non-dry."""
+
+    @pytest.mark.parametrize("field", ["model_id", "tokenizer_id", "dataset_id"])
+    @pytest.mark.parametrize("value", [None, "", "  "])
+    def test_dry_run_rejects_bad_id_like_non_dry(self, field, value):
+        from scripts.run_controller_ablation import ExperimentConfig
+        base = dict(task="sst-2", arm="gate_s1_p1", controller_version="legacy_v4", score_source="s1",
+                    total_steps=4, min_step=0, n_phases=1, max_consecutive_skips=4, policy_seed=0,
+                    target_skip_rate=0.5, output_dir="/tmp/test_b7_ids", attempt_id="b7",
+                    model_revision="a" * 40, tokenizer_revision="b" * 40, dataset_revision="c" * 40)
+        with pytest.raises(ValueError) as dry:
+            ExperimentConfig(**base, dry_run=True, **{field: value})
+        with pytest.raises(ValueError) as nondry:
+            ExperimentConfig(**base, dry_run=False, **{field: value})
+        assert str(dry.value) == str(nondry.value)
+
+
+PLAN_NOTE = "dry-run validation only; no training, no model download, no GPU"
+FIXTURE_NOTE = ("fixture model and data on CPU; trainer.train() runs on the fixtures; "
+                "no pretrained weights, no downloads, no GPU")
+PRODUCTION_NOTE = "production loader functions selected"
+
+
+class TestPartBProvenanceModes:
+    """Item 4: one execution_mode and note per path."""
+
+    @staticmethod
+    def _dry_cfg(**overrides):
+        from scripts.run_controller_ablation import ExperimentConfig
+        kw = dict(task="sst-2", arm="gate_s1_p1", controller_version="legacy_v4", score_source="s1",
+                  total_steps=4, min_step=0, n_phases=1, max_consecutive_skips=4, policy_seed=0,
+                  target_skip_rate=0.5, output_dir="/tmp/test_prov_modes", attempt_id="pm", dry_run=True)
+        kw.update(overrides)
+        return ExperimentConfig(**kw)
+
+    @staticmethod
+    def _main_json(args, capsys):
+        import json
+        from scripts.run_controller_ablation import main
+        with mock.patch.object(sys, "argv", ["run_controller_ablation.py", *args]):
+            rc = main()
+        return rc, json.loads(capsys.readouterr().out)
+
+    def test_run_dry_run_gate_arm_is_plan_only(self):
+        from scripts.run_controller_ablation import run_dry_run
+        prov = run_dry_run(self._dry_cfg())["provenance"]
+        assert (prov["execution_mode"], prov["note"]) == ("plan_only", PLAN_NOTE)
+
+    def test_run_dry_run_reference_arm_is_plan_only(self):
+        from scripts.run_controller_ablation import run_dry_run
+        prov = run_dry_run(self._dry_cfg(arm="full_finetune", score_source="uniform",
+                                         target_skip_rate=0.0))["provenance"]
+        assert (prov["execution_mode"], prov["note"]) == ("plan_only", PLAN_NOTE)
+
+    def test_dry_run_execution_is_mock_fixtures(self):
+        from scripts.run_controller_ablation import run_execution
+        result = run_execution(self._dry_cfg())
+        assert result["status"] == "OK", result.get("reason")
+        prov = result["provenance"]
+        assert (prov["execution_mode"], prov["note"]) == ("mock_fixtures_cpu", FIXTURE_NOTE)
+
+    def test_non_dry_execution_is_production_loaders(self):
+        result, _ = _NonDryFixtures.run(_NonDryFixtures.cfg())
+        assert result["status"] == "OK", result.get("reason")
+        prov = result["provenance"]
+        assert (prov["execution_mode"], prov["note"]) == ("production_loaders", PRODUCTION_NOTE)
+
+    def test_main_rejected_manifests(self, capsys, tmp_path):
+        common = ["--task", "sst-2", "--arm", "gate_s1_p1", "--total-steps", "4", "--min-step", "0",
+                  "--n-phases", "1", "--skip-rate", "1.5", "--output-dir", str(tmp_path)]
+        rc, out = self._main_json(common, capsys)
+        assert rc == 1 and out["status"] == "REJECTED"
+        assert (out["provenance"]["execution_mode"], out["provenance"]["note"]) == ("production_loaders",
+                                                                                   PRODUCTION_NOTE)
+        rc, out = self._main_json(common + ["--dry-run"], capsys)
+        assert rc == 1 and out["status"] == "REJECTED"
+        assert (out["provenance"]["execution_mode"], out["provenance"]["note"]) == ("plan_only", PLAN_NOTE)

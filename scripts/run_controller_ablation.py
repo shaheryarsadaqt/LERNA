@@ -3,10 +3,10 @@
 LERNA Step 3B — Configurable controller ablation runner with safe dry-run mode
 and CPU/mock execution-path verification.
 
-CPU-only. Implements the experiment execution path (configuration, validation,
-scheduling, mock score-source invocation) without launching real-model training,
-GPU work, model/data downloads, or dependency installation. Actual execution
-remains deferred to Step 4 after review.
+CPU-only (TrainingArguments use_cpu=True). Implements the experiment execution path:
+configuration, validation, scheduling and score-source invocation. --dry-run validates and
+plans only. run_execution trains the CPU fixtures when cfg.dry_run is True, and calls the
+production loaders when it is False. Real training is Step 4, after review.
 
 Per STEP3B_CLI_CORRECTION_PROMPT.md section 5:
   * One explicit validated configuration drives dry-run and later execution:
@@ -686,7 +686,7 @@ def run_dry_run(cfg: ExperimentConfig) -> dict:
             "reason": "infeasible_suffix",
             "config": cfg.to_dict(),
             "error": str(e),
-            "provenance": _provenance(dry_run=True),
+            "provenance": _provenance(dry_run=True, execution_mode="plan_only"),
         }
 
     wall = time.perf_counter() - t0
@@ -788,7 +788,7 @@ def run_dry_run(cfg: ExperimentConfig) -> dict:
             "reason": "; ".join(errors),
             "config": cfg.to_dict(),
             "diagnostics": diag,
-            "provenance": _provenance(dry_run=True),
+            "provenance": _provenance(dry_run=True, execution_mode="plan_only"),
         }
 
     return {
@@ -808,7 +808,7 @@ def run_dry_run(cfg: ExperimentConfig) -> dict:
             "wall_seconds": wall,
         },
         "diagnostics": diag,
-        "provenance": _provenance(dry_run=True),
+        "provenance": _provenance(dry_run=True, execution_mode="plan_only"),
     }
 
 # --------------------------------------------------------------------------- #
@@ -971,13 +971,13 @@ def _dynamic_padding_collator(features, pad_token_id: int = 0):
 # --------------------------------------------------------------------------- #
 
 def run_execution(cfg: ExperimentConfig) -> dict:
-    """Execute the controller sweep through TrueBackwardSkippingTrainer with
-    CPU mock score sources and tiny CPU states.
+    """Execute the controller sweep through TrueBackwardSkippingTrainer.
 
-    Real pretrained training is not invoked; no GPU, no model downloads, no
-    dependency installation. This is a distinct code path from dry-run
-    validation: provenance records dry_run=false and execution_mode =
-    "production_loaders".
+    With cfg.dry_run=True, the fixture loaders supply a TinyModel and TinyDataLoader batches
+    on CPU, and trainer.train() runs on them. With cfg.dry_run=False, the production loaders
+    are called: _load_model_production and _load_tokenizer_production (local_files_only=True)
+    and datasets.load_dataset (no offline flag). Tests replace them with stand-ins; with real
+    pins and cached weights this is real training (Step 4).
 
     The execution wires ScoreQuantileGatePolicy.should_skip() into the
     TrueBackwardSkippingTrainer training loop:
@@ -1193,7 +1193,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
         }
 
-    # --- Instantiate TrueBackwardSkippingTrainer with CPU mock loading ---
+    # --- Instantiate TrueBackwardSkippingTrainer ---
     try:
         trainer = TrueBackwardSkippingTrainer(
             model=model,
@@ -1597,9 +1597,8 @@ def _load_model_production(cfg: ExperimentConfig):
     compile disabled). Requires ``_MODEL_LOADER_AVAILABLE`` and immutable
     revision preflight (already enforced in ExperimentConfig.__post_init__).
 
-    Only used when a test or caller explicitly requests production loading.
-    No pretrained weights are downloaded in this step; callers must supply
-    local_files_only-compatible revisions or inject their own loader.
+    Called by run_execution whenever cfg.dry_run is False. Loads with
+    local_files_only=True, so it uses only weights already in the local cache.
     """
     if not _MODEL_LOADER_AVAILABLE:
         raise ImportError(
@@ -1620,7 +1619,7 @@ def _load_tokenizer_production(cfg: ExperimentConfig):
     """Production tokenizer loading via the approved training primitives.
 
     Uses ``lerna.utils.model_loader.load_tokenizer`` with revision enforcement.
-    Only used when a test or caller explicitly requests production loading.
+    Called by run_execution whenever cfg.dry_run is False (local_files_only=True).
     """
     if not _MODEL_LOADER_AVAILABLE:
         raise ImportError(
@@ -1642,9 +1641,9 @@ def _load_train_dataset_production(cfg: ExperimentConfig, num_examples: int):
     applies QNLI matched-probe-ID exclusions before idx removal (training
     split only), removes ``idx`` and other non-model inputs, and preserves
     approved sentence order. Returns a torch Dataset with dynamic padding
-    deferred to the minibatch collator. Only used when a test or caller
-    explicitly requests production loading. Real-dataset training is not
-    performed in this step.
+    deferred to the minibatch collator. Called by run_execution whenever
+    cfg.dry_run is False; datasets.load_dataset is called without an offline
+    flag, so it can download GLUE.
     """
     from datasets import load_dataset
 
@@ -1901,8 +1900,16 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
             "skip_gate": None,
             "note": f"{cfg.arm} arm does not use a skip gate",
         },
-        "provenance": _provenance(),
+        "provenance": _provenance(execution_mode="plan_only"),
     }
+
+
+_PROVENANCE_NOTES = {
+    "plan_only": "dry-run validation only; no training, no model download, no GPU",
+    "mock_fixtures_cpu": ("fixture model and data on CPU; trainer.train() runs on the fixtures; "
+                          "no pretrained weights, no downloads, no GPU"),
+    "production_loaders": "production loader functions selected",
+}
 
 
 def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
@@ -1930,11 +1937,7 @@ def _provenance(dry_run: bool = True, execution_mode: Optional[str] = None,
         prov["seed"] = seed
     if seed_source is not None:
         prov["seed_source"] = seed_source
-    prov["note"] = (
-        "dry-run validation only; no training, no model download, no GPU"
-        if dry_run
-        else "production loader functions selected"
-    )
+    prov["note"] = _PROVENANCE_NOTES[prov["execution_mode"]]
     return prov
 
 
@@ -2087,7 +2090,7 @@ def main() -> int:
                 "status": "REJECTED",
                 "reason": f"config validation failed: {type(e).__name__}: {e}",
                 "config": raw_cfg,
-                "provenance": _provenance(dry_run=True),
+                "provenance": _provenance(dry_run=True, execution_mode="plan_only"),
             }
             print(json.dumps(manifest, indent=2, default=str))
             return 1
@@ -2099,7 +2102,7 @@ def main() -> int:
                 "reason": "output_path_exists",
                 "config": cfg.to_dict(),
                 "error": str(e),
-                "provenance": _provenance(),
+                "provenance": _provenance(execution_mode="plan_only"),
             }
             print(json.dumps(manifest, indent=2, default=str))
             return 1
@@ -2112,9 +2115,9 @@ def main() -> int:
         print(json.dumps(result, indent=2, default=str))
         return 0 if result["status"] == "OK" else 1
 
-    # Non-dry-run: execute the controller sweep with CPU mock score sources.
-    # Execution uses CPU mock loading boundaries and tiny CPU states.
-    # Full config validation runs before any output is written.
+    # Non-dry run: run_execution calls the production loaders. With real pins and cached
+    # weights this trains the real model (Step 4). Full config validation runs before any
+    # output is written.
     raw_cfg = {
         "task": args.task,
         "arm": args.arm,
@@ -2186,7 +2189,7 @@ def main() -> int:
         print(json.dumps(manifest, indent=2, default=str))
         return 1
 
-    # Run the actual controller sweep (mock score source, no pretrained model).
+    # Run the controller sweep through the production loaders.
     result = run_execution(cfg)
     result["output_dir"] = str(out_dir)
     (out_dir / "execution_manifest.json").write_text(
