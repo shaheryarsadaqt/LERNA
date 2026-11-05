@@ -1112,7 +1112,7 @@ class TestQnliAcrossArms:
         return _Tok()
 
     def test_qnli_exclusions_across_all_arms(self):
-        """For each of the six arms: exclusion set stored as {1, 3, 7000},
+        """For each arm: exclusion set stored as {1, 3, 7000},
         then _load_train_dataset_production keeps 9,997 rows with correct labels."""
         from unittest import mock
         from datasets import Dataset
@@ -1122,16 +1122,13 @@ class TestQnliAcrossArms:
 
         excl_path, excl_hash = self._make_exclusions_file()
 
-        ARM_PHASES = {
-            "gate_s1_p1": 1, "gate_s1_p4": 4,
-            "control_uniform_p1": 1, "control_uniform_p4": 4,
-            "full_finetune": 1, "reduced_steps": 1,
-        }
-        ARM_SOURCE = {
-            "gate_s1_p1": "s1", "gate_s1_p4": "s1",
-            "control_uniform_p1": "uniform", "control_uniform_p4": "uniform",
-            "full_finetune": "s1", "reduced_steps": "s1",
-        }
+        # Step 5 (5 Nov 2026): derived from the runner, so new arms are covered.
+        from scripts.run_controller_ablation import GATE_ARMS, PLAIN_ARMS
+        ARM_PHASES = {arm: v[0] for arm, v in GATE_ARMS.items()}
+        ARM_SOURCE = {arm: v[1] for arm, v in GATE_ARMS.items()}
+        for _plain in PLAIN_ARMS:
+            ARM_PHASES[_plain] = 1
+            ARM_SOURCE[_plain] = "s1"
 
         # 10,000-row train stand-in with idx == row position
         train_ds = Dataset.from_dict({

@@ -1139,6 +1139,28 @@ def forward_gain_score(logits, labels) -> float:
     return score
 
 
+def forward_loss_score(logits, labels) -> float:
+    """Batch-mean cross-entropy of the current forward (the max-loss baseline).
+
+    Same inputs and NaN rules as forward_gain_score. Higher = keep the batch,
+    as in selective backprop.
+    """
+    import torch
+
+    if logits is None or labels is None:
+        return float("nan")
+    if not isinstance(logits, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        return float("nan")
+    logits = logits.detach()
+    if logits.dim() < 2 or labels.numel() == 0 or logits.shape[0] != labels.shape[0]:
+        return float("nan")
+    with torch.no_grad():
+        score = float(torch.nn.functional.cross_entropy(logits.float(), labels.view(-1).long()).item())
+    if not math.isfinite(score):
+        return float("nan")
+    return score
+
+
 # ---------------------------------------------------------------------------
 # S2: last-layer alignment score
 # ---------------------------------------------------------------------------
@@ -1363,9 +1385,10 @@ class ScoreQuantileGatePolicy:
                 f"controller_version must be 'legacy_v4' or 'phase_exact_v1', "
                 f"got {controller_version!r}"
             )
-        if score_source not in ("s1", "s2", "uniform"):
+        if score_source not in ("s1", "s2", "uniform", "loss", "s1_inverted"):
             raise ValueError(
-                f"score_source must be 's1', 's2', or 'uniform', got {score_source!r}"
+                f"score_source must be 's1', 's2', 'uniform', 'loss' or 's1_inverted', "
+                f"got {score_source!r}"
             )
         # phase_exact_v1 does not support S2 in this stage; reject clearly.
         if controller_version == "phase_exact_v1" and score_source == "s2":
@@ -1429,11 +1452,13 @@ class ScoreQuantileGatePolicy:
         def _source(decision_index, model, inputs):
             if score_source == "uniform":
                 return self._rng.random()
-            elif score_source == "s1":
-                return forward_gain_score(
-                    getattr(self._trainer_ref, "_last_real_logits", None),
-                    inputs.get("labels") if inputs is not None and hasattr(inputs, "get") else None,
-                )
+            elif score_source in ("s1", "s1_inverted", "loss"):
+                logits = getattr(self._trainer_ref, "_last_real_logits", None)
+                labels = inputs.get("labels") if inputs is not None and hasattr(inputs, "get") else None
+                if score_source == "loss":
+                    return forward_loss_score(logits, labels)
+                s = forward_gain_score(logits, labels)
+                return -s if score_source == "s1_inverted" else s  # NaN stays NaN
             else:  # s2
                 return alignment_score(
                     trainer=self._trainer_ref,
@@ -1554,6 +1579,7 @@ __all__ = [
     "ScoreQuantileGate",
     "ScoreQuantileGatePolicy",
     "forward_gain_score",
+    "forward_loss_score",
     "alignment_score",
     "AlignmentProbe",
     "TerminalInvalidScoreError",
