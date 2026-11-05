@@ -829,6 +829,28 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.last_logits = None
         return (loss, outputs) if return_outputs else loss
 
+    def _record_batch(self, decision_index, inputs, loss_val, skipped) -> None:
+        """Per-batch record for compute accounting (Step 5):
+        [decision_index, real_tokens, padded_tokens, batch_size, skipped, forward_loss].
+        """
+        log = getattr(self, "lerna_batch_log", None)
+        if log is None:
+            log = self.lerna_batch_log = []
+        real = padded = bs = None
+        try:
+            ids = inputs.get("input_ids") if hasattr(inputs, "get") else None
+            mask = inputs.get("attention_mask") if hasattr(inputs, "get") else None
+            if isinstance(ids, torch.Tensor):
+                padded = int(ids.numel())
+                bs = int(ids.shape[0]) if ids.dim() > 0 else 1
+            if isinstance(mask, torch.Tensor):
+                real = int(mask.sum().item())
+            elif padded is not None:
+                real = padded
+        except Exception:
+            real = padded = bs = None
+        log.append([int(decision_index), real, padded, bs, int(bool(skipped)), float(loss_val)])
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         import time
         step_start = time.perf_counter()
@@ -939,6 +961,7 @@ class TrueBackwardSkippingTrainer(Trainer):
                 original_exception_type=type(exc).__name__,
             ) from exc
 
+        self._record_batch(decision_index, inputs, loss_val, should_skip)
         if should_skip:
             # [CRIT-1] Set BOTH flags independently.
             self._skip_optimizer_step = True

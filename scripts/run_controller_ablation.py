@@ -3,7 +3,8 @@
 LERNA Step 3B — Configurable controller ablation runner with safe dry-run mode
 and CPU/mock execution-path verification.
 
-CPU-only (TrainingArguments use_cpu=True). Implements the experiment execution path:
+CPU by default (TrainingArguments use_cpu=True); with --device cuda it trains on the single
+visible GPU (Step 5). Implements the experiment execution path:
 configuration, validation, scheduling and score-source invocation. --dry-run validates and
 plans only. run_execution trains the CPU fixtures when cfg.dry_run is True, and calls the
 production loaders when it is False. Real training is Step 4, after review.
@@ -171,7 +172,22 @@ TASK_INPUTS = {
 }
 
 ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
-        "full_finetune", "reduced_steps"]
+        "full_finetune", "reduced_steps",
+        # Step 5 additions (5 Nov 2026): the max-loss and inverted-S1 baselines
+        # under the same controller, and the plain equal-compute arm (A9).
+        "gate_loss_p1", "gate_loss_p4", "gate_s1inv_p1", "gate_s1inv_p4",
+        "equal_compute"]
+
+# Gated arms: (number of phases, score source). Every other arm is plain.
+GATE_ARMS = {
+    "gate_s1_p1": (1, "s1"), "gate_s1_p4": (4, "s1"),
+    "control_uniform_p1": (1, "uniform"), "control_uniform_p4": (4, "uniform"),
+    "gate_loss_p1": (1, "loss"), "gate_loss_p4": (4, "loss"),
+    "gate_s1inv_p1": (1, "s1_inverted"), "gate_s1inv_p4": (4, "s1_inverted"),
+}
+# Plain arms: no skip gate; every scheduled batch is an ordinary training step.
+PLAIN_ARMS = ("full_finetune", "reduced_steps", "equal_compute")
+DEVICES = ("cpu", "cuda")
 
 
 def _glue_config_for_task(task: str) -> Optional[str]:
@@ -220,10 +236,14 @@ class ExperimentConfig:
 
     # LR / training recipe (historical-compatible first recipe)
     lr_warmup_steps: int = 12
+    # Step 5: when set, warmup = floor(ratio * the arm's own horizon), replacing
+    # lr_warmup_steps (0.06 gives 392 / 157 / 235 for 6548 / 2619 / 3928 steps).
+    lr_warmup_ratio: Optional[float] = None
     lr_scheduler: str = "always_step"
     lr_schedule_shape: str = "constant_with_warmup"
     precision: str = "fp32"
     attention: str = "eager"
+    device: str = "cpu"  # "cuda" trains on the single visible GPU
     train_batch_size: int = 32
     eval_batch_size: int = 64
     gradient_accumulation: int = 1
@@ -273,22 +293,17 @@ class ExperimentConfig:
                 "score_source='s2' is not supported for controller_version="
                 "'phase_exact_v1'. Use 's1' or 'uniform'."
             )
-        if self.arm in ("full_finetune", "reduced_steps"):
-            # Full/reduced arms do not use a skip gate
+        if self.arm in PLAIN_ARMS:
+            # Full/reduced/equal-compute arms do not use a skip gate
             self.controller_version = "legacy_v4"
             self.score_source = "uniform"
         else:
             # Arm consistency: gate/control arms must match n_phases and
             # score_source. P1 = 1 phase, P4 = 4 phases; s1 = gain score,
-            # uniform = random control.
-            ARM_PHASES = {
-                "gate_s1_p1": 1, "gate_s1_p4": 4,
-                "control_uniform_p1": 1, "control_uniform_p4": 4,
-            }
-            ARM_SOURCE = {
-                "gate_s1_p1": "s1", "gate_s1_p4": "s1",
-                "control_uniform_p1": "uniform", "control_uniform_p4": "uniform",
-            }
+            # uniform = random control, loss = batch-mean cross-entropy
+            # (max-loss baseline), s1_inverted = -S1.
+            ARM_PHASES = {arm: v[0] for arm, v in GATE_ARMS.items()}
+            ARM_SOURCE = {arm: v[1] for arm, v in GATE_ARMS.items()}
             expected_phases = ARM_PHASES[self.arm]
             expected_source = ARM_SOURCE[self.arm]
             if self.n_phases != expected_phases:
@@ -318,6 +333,21 @@ class ExperimentConfig:
                 f"or increase total_steps."
             )
         # Reject zero reduced horizons (all steps skipped leaves nothing to train).
+        if self.arm == "equal_compute" and self.equal_compute_steps <= 0:
+            raise ValueError(
+                f"equal_compute_steps={self.equal_compute_steps} <= 0 for "
+                f"target_skip_rate={self.target_skip_rate}, "
+                f"total_steps={self.total_steps}. Lower the skip rate."
+            )
+        if self.device not in DEVICES:
+            raise ValueError(f"device={self.device!r} not in {DEVICES}")
+        if self.lr_warmup_ratio is not None:
+            r = self.lr_warmup_ratio
+            if isinstance(r, bool) or not isinstance(r, (int, float)) or not math.isfinite(float(r)) \
+                    or not 0.0 <= float(r) < 1.0:
+                raise ValueError(
+                    f"lr_warmup_ratio={r!r} must be a finite number in [0, 1)"
+                )
         if self.arm == "reduced_steps" and self.reduced_steps <= 0:
             raise ValueError(
                 f"reduced_steps={self.reduced_steps} <= 0 for "
@@ -517,6 +547,21 @@ class ExperimentConfig:
     def reduced_steps(self) -> int:
         return self.total_steps - self.requested_skips
 
+    @property
+    def equal_compute_steps(self) -> int:
+        """Plain steps costing what a gated arm costs, if a backward pass costs
+        two forward passes: floor((3T - 2Q) / 3) = T - ceil(2Q / 3).
+
+        T=6548 and Q=3929 give 3928 (the archived E1 run at 60% of the steps).
+        """
+        return self.total_steps - (2 * self.requested_skips + 2) // 3
+
+    def warmup_steps_for(self, horizon: int) -> int:
+        """Warmup steps for an arm whose scheduler runs `horizon` steps."""
+        if self.lr_warmup_ratio is None:
+            return self.lr_warmup_steps
+        return int(math.floor(float(self.lr_warmup_ratio) * int(horizon) + 1e-9))
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -655,8 +700,8 @@ def run_dry_run(cfg: ExperimentConfig) -> dict:
     Tests the actual gate/policy wiring with CPU mock score sources.
     """
     # --- Validate config before any execution ---
-    if cfg.arm in ("full_finetune", "reduced_steps"):
-        # No gate for full/reduced arms
+    if cfg.arm in PLAIN_ARMS:
+        # No gate for full/reduced/equal-compute arms
         return _dry_run_reference_arm(cfg)
 
     # Build the gate directly (bypasses policy's torch-dependent _source closure)
@@ -1000,6 +1045,10 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         effective_total = cfg.reduced_steps
         skip_policy_obj = None  # AlwaysFalsePolicy default
         use_gate = False
+    elif cfg.arm == "equal_compute":
+        effective_total = cfg.equal_compute_steps
+        skip_policy_obj = None  # AlwaysFalsePolicy default
+        use_gate = False
     else:
         effective_total = cfg.total_steps
         skip_policy_obj = None  # set below
@@ -1115,7 +1164,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     if isinstance(train_dataset, list):
         train_dataset = _TinyDataset(train_dataset)
 
-    # TrainingArguments for CPU-only execution; no eval, no saving, no logging.
+    # TrainingArguments: CPU unless cfg.device == 'cuda'; no eval, no saving, no logging.
     # Values come from config so provenance matches execution.
     #
     # R4-B: lr_schedule_shape (schedule shape: constant_with_warmup, constant,
@@ -1131,6 +1180,20 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     }
     lr_scheduler_type = LR_SHAPE_TO_HF[cfg.lr_schedule_shape]
 
+    # --- Device check: one visible GPU, so HF never wraps the model in DataParallel ---
+    if cfg.device == "cuda":
+        n_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if n_visible != 1:
+            return {
+                "status": "FAILED",
+                "reason": (f"device='cuda' needs exactly one visible GPU (pin it with "
+                           f"CUDA_VISIBLE_DEVICES); {n_visible} visible"),
+                "config": cfg.to_dict(),
+                "failure_stage": "device",
+                "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
+            }
+    warmup_steps_effective = cfg.warmup_steps_for(effective_total)
+
     # --- Build TrainingArguments (wrapped for structured failure) ---
     try:
         training_args = TrainingArguments(
@@ -1139,7 +1202,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             learning_rate=cfg.learning_rate,
             per_device_train_batch_size=cfg.train_batch_size,
             gradient_accumulation_steps=cfg.gradient_accumulation,
-            warmup_steps=cfg.lr_warmup_steps,
+            warmup_steps=warmup_steps_effective,
             weight_decay=cfg.weight_decay,
             lr_scheduler_type=lr_scheduler_type,
             max_grad_norm=cfg.grad_clip,
@@ -1149,7 +1212,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             logging_strategy="no",
             report_to=[],
             disable_tqdm=True,
-            use_cpu=True,
+            use_cpu=(cfg.device == "cpu"),
             seed=cfg.policy_seed,
             fp16=False,
             bf16=False,
@@ -1426,7 +1489,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     else:
         lr_schedule_shape = cfg.lr_schedule_shape
         learning_rate = cfg.learning_rate
-        warmup_steps = cfg.lr_warmup_steps
+        warmup_steps = warmup_steps_effective
         if lr_schedule_shape in ("constant_with_warmup", "constant", "linear", "cosine"):
             if lr_schedule_shape == "constant":
                 # Constant schedule: no warmup, LR stays at peak throughout.
@@ -1542,7 +1605,9 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "lr_schedule_shape": cfg.lr_schedule_shape,
             "lr_scheduler_step_policy": "always_step",
             "grad_clip_max_grad_norm": cfg.grad_clip,
-            "lr_warmup_steps": cfg.lr_warmup_steps,
+            "lr_warmup_steps": warmup_steps_effective,
+            "lr_warmup_ratio": cfg.lr_warmup_ratio,
+            "device": cfg.device,
             "learning_rate": cfg.learning_rate,
             # Measured final LR from the optimizer after training completes.
             "final_learning_rate": (
@@ -1553,7 +1618,11 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             # Tokenizer loading boundary result (None in CPU mock path;
             # production tokenizer loaded via _load_tokenizer_production).
             "tokenizer_loaded": tokenizer is not None,
+            # Step 5: measured compute from the per-batch log (padded tokens).
+            "batch_log_summary": _batch_log_summary(getattr(trainer, "lerna_batch_log", None)),
         },
+        "runtime": _runtime_block(trainer, model, cfg),
+        "batch_log": list(getattr(trainer, "lerna_batch_log", None) or []),
         "diagnostics": instr.as_dict(),
         "provenance": _provenance(dry_run=cfg.dry_run, seed=cfg.policy_seed, seed_source=seed_source),
     }
@@ -1832,8 +1901,14 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_tok
         raise EvalDataLoaderConstructionError(
             f"eval_data_loader construction failed: {type(e).__name__}: {e}"
         )
+    try:
+        _eval_device = next(model.parameters()).device
+    except (StopIteration, AttributeError, TypeError):
+        _eval_device = torch.device("cpu")
     with torch.no_grad():
         for batch in eval_loader:
+            batch = {k: (v.to(_eval_device) if isinstance(v, torch.Tensor) else v)
+                     for k, v in batch.items()}
             outputs = model(**batch)
             logits = outputs.logits
             # GLUE datasets use "label"; some fixtures use "labels".
@@ -1843,7 +1918,8 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_tok
                 correct += int((preds == labels).sum().item())
                 total += int(labels.numel())
                 if outputs.loss is not None:
-                    total_loss += float(outputs.loss.item())
+                    # outputs.loss is the batch mean; weight it by the batch size
+                    total_loss += float(outputs.loss.item()) * int(labels.numel())
                 # MRPC F1: positive class is label 1
                 if cfg.task == "mrpc":
                     for p, l in zip(preds.tolist(), labels.tolist()):
@@ -1855,7 +1931,7 @@ def _evaluate_model(trainer, model, eval_dataset, cfg: ExperimentConfig, pad_tok
                             fn += 1
     model.train()
     accuracy = correct / total if total > 0 else 0.0
-    avg_loss = total_loss / max(1, len(eval_dataset))
+    avg_loss = total_loss / max(1, total)  # mean per-example loss
     f1 = None
     if cfg.task == "mrpc":
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
@@ -1873,6 +1949,17 @@ def _make_score_source(cfg: ExperimentConfig):
     if cfg.score_source == "uniform":
         rng = random.Random(cfg.policy_seed + 777)
         return mock_uniform_score(rng)
+    elif cfg.score_source in ("loss", "s1_inverted"):
+        # CPU mock for plan validation only: the S1 mock value (negated for
+        # s1_inverted). The real sources are in ScoreQuantileGatePolicy.
+        logits = TinyLogits(batch=4, classes=2, seed=cfg.policy_seed + 31337)
+        labels = [0, 1, 0, 1]
+        sign = -1.0 if cfg.score_source == "s1_inverted" else 1.0
+
+        def _src(decision_index, model, inputs):
+            return sign * mock_forward_gain_score(logits, labels)
+
+        return _src
     elif cfg.score_source == "s1":
         # CPU mock: tiny logits + labels, no pretrained model
         logits = TinyLogits(batch=4, classes=2, seed=cfg.policy_seed + 31337)
@@ -1896,7 +1983,8 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
         "config_hash": _config_hash(cfg.to_dict()),
         "result": {
             "arm": cfg.arm,
-            "total_steps": cfg.total_steps if cfg.arm == "full_finetune" else cfg.reduced_steps,
+            "total_steps": {"full_finetune": cfg.total_steps, "reduced_steps": cfg.reduced_steps,
+                            "equal_compute": cfg.equal_compute_steps}[cfg.arm],
             "skip_gate": None,
             "note": f"{cfg.arm} arm does not use a skip gate",
         },
@@ -2005,6 +2093,125 @@ def test_cpu_score_paths() -> dict:
 # CLI
 # --------------------------------------------------------------------------- #
 
+def _recipe_overrides(args) -> dict:
+    """Recipe options given on the command line (unset ones keep the defaults)."""
+    out = {}
+    if args.lr_schedule_shape is not None:
+        out["lr_schedule_shape"] = args.lr_schedule_shape
+    if args.lr_warmup_steps is not None:
+        out["lr_warmup_steps"] = args.lr_warmup_steps
+    if args.lr_warmup_ratio is not None:
+        out["lr_warmup_ratio"] = args.lr_warmup_ratio
+    if args.device is not None:
+        out["device"] = args.device
+    return out
+
+
+BATCH_LOG_COLUMNS = ["decision_index", "real_tokens", "padded_tokens", "batch_size", "skipped", "forward_loss"]
+
+
+def _batch_log_summary(rows) -> Optional[dict]:
+    """Measured compute from the per-batch log.
+
+    compute_units = padded tokens of every forward + 2 x padded tokens of every
+    update (a backward pass costing two forward passes). Divide an arm's units
+    by full fine-tuning's units for the measured compute fraction.
+    """
+    if not rows:
+        return None
+    padded_all = sum(int(r[2] or 0) for r in rows)
+    padded_upd = sum(int(r[2] or 0) for r in rows if not r[4])
+    real_all = sum(int(r[1] or 0) for r in rows)
+    real_upd = sum(int(r[1] or 0) for r in rows if not r[4])
+    return {
+        "columns": BATCH_LOG_COLUMNS,
+        "batches": len(rows),
+        "updates": sum(1 for r in rows if not r[4]),
+        "skips": sum(1 for r in rows if r[4]),
+        "padded_tokens_all": padded_all,
+        "padded_tokens_updated": padded_upd,
+        "real_tokens_all": real_all,
+        "real_tokens_updated": real_upd,
+        "compute_units_padded": padded_all + 2 * padded_upd,
+        "compute_fraction_within_arm": (
+            (padded_all + 2 * padded_upd) / (3 * padded_all) if padded_all else None
+        ),
+    }
+
+
+def _write_batch_log(result: dict, out_dir: Path) -> None:
+    """Move the per-batch log out of the manifest into batch_log.csv."""
+    rows = result.pop("batch_log", None)
+    if rows is None:
+        return
+    lines = [",".join(BATCH_LOG_COLUMNS)]
+    for r in rows:
+        lines.append(",".join("" if v is None else repr(v) if isinstance(v, float) else str(v) for v in r))
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    path = out_dir / "batch_log.csv"
+    path.write_bytes(data)
+    result["batch_log_file"] = {"file": path.name, "rows": len(rows),
+                                "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _runtime_block(trainer, model, cfg: ExperimentConfig) -> dict:
+    """Interpreter, library versions, device and optimizer facts of this run."""
+    import importlib
+    import platform
+    info = {
+        "python": sys.version.split()[0],
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+        "platform": platform.platform(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "device": cfg.device,
+        "versions": {},
+    }
+    for name in ("torch", "transformers", "datasets", "tokenizers", "accelerate", "numpy"):
+        try:
+            info["versions"][name] = getattr(importlib.import_module(name), "__version__", None)
+        except Exception:
+            info["versions"][name] = None
+    try:
+        p0 = next(model.parameters())
+        info["model_device"] = str(p0.device)
+        info["model_dtype"] = str(p0.dtype)
+        info["parameters"] = int(sum(p.numel() for p in model.parameters()))
+        info["layernorms_with_bias"] = int(sum(
+            1 for m in model.modules() if isinstance(m, torch.nn.LayerNorm) and m.bias is not None))
+    except Exception as e:
+        info["model_error"] = f"{type(e).__name__}: {e}"
+    mcfg = getattr(model, "config", None)
+    info["attn_implementation"] = getattr(mcfg, "_attn_implementation", None) if mcfg is not None else None
+    info["cudnn_deterministic"] = bool(torch.backends.cudnn.deterministic)
+    info["cudnn_benchmark"] = bool(torch.backends.cudnn.benchmark)
+    if torch.cuda.is_available():
+        try:
+            info["cuda"] = {
+                "device_count": torch.cuda.device_count(),
+                "name": torch.cuda.get_device_name(0),
+                "capability": list(torch.cuda.get_device_capability(0)),
+                "cuda_version": torch.version.cuda,
+                "cudnn_version": torch.backends.cudnn.version(),
+            }
+        except Exception as e:
+            info["cuda"] = {"error": f"{type(e).__name__}: {e}"}
+    opt = getattr(trainer, "optimizer", None)
+    inner = getattr(opt, "optimizer", opt)
+    if inner is not None and getattr(inner, "param_groups", None):
+        g = inner.param_groups[0]
+        info["optimizer"] = {
+            "class": type(inner).__name__,
+            "betas": list(g.get("betas", ())) or None,
+            "eps": g.get("eps"),
+            "weight_decay_by_group": [pg.get("weight_decay") for pg in inner.param_groups],
+            "initial_lr": g.get("initial_lr"),
+        }
+    sched = getattr(trainer, "lr_scheduler", None)
+    info["lr_scheduler_class"] = type(sched).__name__ if sched is not None else None
+    return info
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="LERNA Step 3B configurable controller ablation runner "
@@ -2014,7 +2221,13 @@ def main() -> int:
     parser.add_argument("--arm", default="gate_s1_p1", choices=ARMS)
     parser.add_argument("--controller-version", default="legacy_v4",
                         choices=["legacy_v4", "phase_exact_v1"])
-    parser.add_argument("--score-source", default="s1", choices=["s1", "uniform"])
+    parser.add_argument("--score-source", default="s1", choices=["s1", "uniform", "loss", "s1_inverted"])
+    parser.add_argument("--lr-schedule-shape", default=None,
+                        choices=["constant_with_warmup", "constant", "linear", "cosine"])
+    parser.add_argument("--lr-warmup-steps", type=int, default=None)
+    parser.add_argument("--lr-warmup-ratio", type=float, default=None,
+                        help="warmup = floor(ratio * the arm's horizon); Step 5 uses 0.06")
+    parser.add_argument("--device", default=None, choices=list(DEVICES))
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate configuration without training")
     parser.add_argument("--cpu-mock-test", action="store_true",
@@ -2083,6 +2296,7 @@ def main() -> int:
             raw_cfg["probe_exclusions_file"] = args.probe_exclusions_file
         if args.probe_exclusions_hash is not None:
             raw_cfg["probe_exclusions_hash"] = args.probe_exclusions_hash
+        raw_cfg.update(_recipe_overrides(args))
         try:
             cfg = ExperimentConfig(**raw_cfg)
         except (ValueError, TypeError) as e:
@@ -2149,6 +2363,7 @@ def main() -> int:
         raw_cfg["probe_exclusions_file"] = args.probe_exclusions_file
     if args.probe_exclusions_hash is not None:
         raw_cfg["probe_exclusions_hash"] = args.probe_exclusions_hash
+    raw_cfg.update(_recipe_overrides(args))
     try:
         cfg = ExperimentConfig(**raw_cfg)
     except (ValueError, TypeError) as e:
@@ -2165,7 +2380,7 @@ def main() -> int:
     # This catches infeasible quotas, invalid indices, and W=T Q>0 rejection
     # before any output is written.
     try:
-        if cfg.arm in ("gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4"):
+        if cfg.arm in GATE_ARMS:
             ScoreQuantileGate(
                 rate=cfg.target_skip_rate,
                 total_steps=cfg.total_steps,
@@ -2192,6 +2407,7 @@ def main() -> int:
     # Run the controller sweep through the production loaders.
     result = run_execution(cfg)
     result["output_dir"] = str(out_dir)
+    _write_batch_log(result, out_dir)
     (out_dir / "execution_manifest.json").write_text(
         json.dumps(result, indent=2, default=str)
     )
