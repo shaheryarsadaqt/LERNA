@@ -35,6 +35,12 @@ Today's scale
     mean fresh residual of examples seen for the first time: the model's current error on data it
     hasn't trained on.
 
+Hard selection (round 15, selection="topk")
+    A compared method, not LERNA v2: the same keep probabilities and budget controller, but the
+    K = round(sum pi) examples with the largest pi are kept deterministically, and each counts
+    n / K, so the loss is the plain mean over the kept examples. This is hard pruning without
+    reweighting, as in dynamic EL2N pruning (Attendu and Corbeil, 2023).
+
 The budget controller
     Units are those of the batch log: padded tokens of the forward pass plus twice those of the
     update, so 3 x kept examples x their longest length (the trainer trims the unused padding).
@@ -64,6 +70,11 @@ class LernaBudgetPolicy:
 
     name = "lerna_budget"
     TRAJECTORY_EVERY = 64
+    # "sample": keep each example with probability pi, weight 1 / pi (LERNA v2).
+    # "topk" (round 15): keep the K = round(sum pi) examples with the largest pi, deterministically,
+    # each weighted n / K so the loss is the plain mean over the kept examples: hard pruning without
+    # reweighting, as in dynamic EL2N pruning (Attendu and Corbeil, 2023), under the same budget.
+    SELECTIONS = ("sample", "topk")
 
     def __init__(
         self,
@@ -79,7 +90,10 @@ class LernaBudgetPolicy:
         window: int = 64,
         chunks: int = 16,
         policy_seed: int = 0,
+        selection: str = "sample",
     ):
+        if selection not in self.SELECTIONS:
+            raise ValueError(f"selection must be one of {self.SELECTIONS}, got {selection!r}")
         for nm, v in (("total_steps", total_steps), ("num_examples", num_examples),
                       ("batches_per_epoch", batches_per_epoch), ("window", window), ("chunks", chunks)):
             if isinstance(v, bool) or not isinstance(v, int) or v < 1:
@@ -109,6 +123,7 @@ class LernaBudgetPolicy:
         self.window = int(window)
         self.chunks = int(chunks)
         self.policy_seed = int(policy_seed)
+        self.selection = selection
         self._rng = np.random.default_rng(np.random.SeedSequence([self.policy_seed, 14]))
         self._residual = np.full(self.num_examples, np.nan, dtype=np.float64)
         self._lr_w: Optional[np.ndarray] = None
@@ -293,12 +308,19 @@ class LernaBudgetPolicy:
             else:
                 pi = np.clip(w_t * s / mu, self.pi_min, 1.0)
         self.last_pi, self.last_mu, self.last_scores = pi.copy(), mu, np.array(s, dtype=np.float64)
-        draws = self._rng.random(n)
-        keep = [i for i in range(n) if draws[i] < pi[i]]
-        if not keep:
-            keep = [int(np.argmax(pi))]
-            self.empty_batch_fallbacks += 1
-        weights = [1.0 / float(pi[i]) for i in keep]
+        if self.selection == "topk":
+            k = max(1, min(n, int(round(float(pi.sum())))))
+            # largest pi first; ties by the larger score, then by position
+            order = sorted(range(n), key=lambda i: (-float(pi[i]), -float(s[i]), i))
+            keep = sorted(order[:k])
+            weights = [float(n) / float(k)] * k
+        else:
+            draws = self._rng.random(n)
+            keep = [i for i in range(n) if draws[i] < pi[i]]
+            if not keep:
+                keep = [int(np.argmax(pi))]
+                self.empty_batch_fallbacks += 1
+            weights = [1.0 / float(pi[i]) for i in keep]
         longest = max(max(lengths[i] for i in keep), 1)
         realized = 3 * len(keep) * longest
         self.spent_units += realized
@@ -378,6 +400,7 @@ class LernaBudgetPolicy:
             "budget": self.budget,
             "use_scores": self.use_scores,
             "use_lr_weight": self.use_lr_weight,
+            "selection": self.selection,
             "pi_min": self.pi_min,
             "window": self.window,
             "chunks": self.chunks,
