@@ -80,6 +80,7 @@ from lerna.trainers.true_skip_trainer import (
     SkipPolicyDecisionError,
 )
 from lerna.utils.stale_selection import InfoBatchPolicy, StaleS1GatePolicy
+from lerna.utils.budget_selection import LernaBudgetPolicy
 
 try:
     from lerna.utils.model_loader import load_model_and_tokenizer, load_tokenizer
@@ -182,7 +183,27 @@ ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
         # per-example residuals, so a skip can avoid the forward pass), InfoBatch
         # at a fixed step count, and plain runs at fixed fractions of T for the
         # accuracy-compute reference curve.
-        "stale_s1_p4", "infobatch", "plain_030", "plain_050", "plain_070"]
+        "stale_s1_p4", "infobatch", "plain_030", "plain_050", "plain_070",
+        # Round 14 additions (6 Nov 2026): LERNA v2 (example selection under an
+        # exact compute budget, every step runs) and its controls.
+        "lerna2_b035", "lerna2_nolr_b035", "randkeep_lr_b035", "randkeep_b035",
+        "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083"]
+
+# Round 14: LERNA v2 arms -> (compute budget as a fraction of full fine-tuning,
+# use the stored residual scores, use the learning-rate factor). The random-keep
+# arms give every example the same score, so only the budget controller (and,
+# for randkeep_lr, the learning-rate factor) decides how many are kept.
+LERNA2_ARMS = {
+    "lerna2_b035": (0.35, True, True),
+    "lerna2_nolr_b035": (0.35, True, False),
+    "randkeep_lr_b035": (0.35, False, True),
+    "randkeep_b035": (0.35, False, False),
+    "lerna2_b040": (0.40, True, True),
+    "randkeep_b040": (0.40, False, False),
+    "lerna2_b060": (0.60, True, True),
+    "lerna2_b083": (0.83, True, True),
+}
+LERNA2_MIN_BUDGET = min(v[0] for v in LERNA2_ARMS.values())
 
 # Gated arms: (number of phases, score source). Every other arm is plain.
 GATE_ARMS = {
@@ -196,9 +217,12 @@ GATE_ARMS = {
 PLAIN_FRACTIONS = {"plain_030": 0.30, "plain_050": 0.50, "plain_070": 0.70}
 # Plain arms: no skip gate; every scheduled batch is an ordinary training step
 # (InfoBatch drops examples inside a batch but never skips a step).
-PLAIN_ARMS = ("full_finetune", "reduced_steps", "equal_compute") + tuple(PLAIN_FRACTIONS) + ("infobatch",)
+PLAIN_ARMS = (("full_finetune", "reduced_steps", "equal_compute") + tuple(PLAIN_FRACTIONS) + ("infobatch",)
+              + tuple(LERNA2_ARMS))
 # Arms whose policy keeps per-example scores: the training data carries lerna_uid.
-STORED_SCORE_ARMS = ("stale_s1_p4", "infobatch")
+STORED_SCORE_ARMS = ("stale_s1_p4", "infobatch") + tuple(LERNA2_ARMS)
+# Arms that drop examples inside a batch before its forward pass (no step is skipped).
+EXAMPLE_SELECTION_ARMS = ("infobatch",) + tuple(LERNA2_ARMS)
 DEVICES = ("cpu", "cuda")
 
 
@@ -269,6 +293,12 @@ class ExperimentConfig:
     # step floor(anneal * T) on)
     infobatch_prune_ratio: float = 0.5
     infobatch_anneal_fraction: float = 0.875
+    # Round 14: LERNA v2's keep-probability floor (weights stay <= 1 / floor),
+    # the window of recent batches its controller projects from, and the
+    # number of chunks the remaining learning-rate multipliers are grouped into.
+    lerna2_pi_min: float = 0.1
+    lerna2_window: int = 64
+    lerna2_chunks: int = 16
 
     # Logits capture (historical working)
     capture_logits: bool = True
@@ -377,6 +407,17 @@ class ExperimentConfig:
             raise ValueError(
                 f"infobatch_anneal_fraction={self.infobatch_anneal_fraction!r} must be in [0, 1]"
             )
+        _pm = self.lerna2_pi_min
+        if isinstance(_pm, bool) or not isinstance(_pm, (int, float)) or not math.isfinite(float(_pm)) \
+                or not 0.0 < float(_pm) < LERNA2_MIN_BUDGET:
+            raise ValueError(
+                f"lerna2_pi_min={_pm!r} must be a finite number in (0, {LERNA2_MIN_BUDGET}), "
+                "below every LERNA v2 budget"
+            )
+        for _name in ("lerna2_window", "lerna2_chunks"):
+            _v = getattr(self, _name)
+            if isinstance(_v, bool) or not isinstance(_v, int) or _v < 1:
+                raise ValueError(f"{_name}={_v!r} must be a positive int")
         if self.device not in DEVICES:
             raise ValueError(f"device={self.device!r} not in {DEVICES}")
         if self.lr_warmup_ratio is not None:
@@ -1107,9 +1148,9 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         effective_total = cfg.equal_compute_steps
         skip_policy_obj = None  # AlwaysFalsePolicy default
         use_gate = False
-    elif cfg.arm in PLAIN_FRACTIONS or cfg.arm == "infobatch":
+    elif cfg.arm in PLAIN_FRACTIONS or cfg.arm in EXAMPLE_SELECTION_ARMS:
         effective_total = cfg.arm_horizon()
-        skip_policy_obj = None  # set below for infobatch
+        skip_policy_obj = None  # set below for infobatch and the LERNA v2 arms
         use_gate = False
     else:
         effective_total = cfg.total_steps
@@ -1317,6 +1358,21 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                 batches_per_epoch=batches_per_epoch,
                 prune_ratio=float(cfg.infobatch_prune_ratio),
                 anneal_fraction=float(cfg.infobatch_anneal_fraction),
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm in LERNA2_ARMS:
+            _budget, _use_scores, _use_lr = LERNA2_ARMS[cfg.arm]
+            policy = LernaBudgetPolicy(
+                budget=_budget,
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                warmup_steps=int(warmup_steps_effective),
+                use_scores=_use_scores,
+                use_lr_weight=_use_lr,
+                pi_min=float(cfg.lerna2_pi_min),
+                window=int(cfg.lerna2_window),
+                chunks=int(cfg.lerna2_chunks),
                 policy_seed=cfg.policy_seed,
             )
         elif use_gate:
@@ -1538,11 +1594,21 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     elif forward_skipped != 0:
         errors.append(f"forward_skipped={forward_skipped} for arm {cfg.arm!r}, expected 0")
     dropped = int(getattr(instr, "examples_dropped_before_forward", 0))
-    if cfg.arm == "infobatch":
+    if cfg.arm in EXAMPLE_SELECTION_ARMS:
         if dropped != int(policy.pruned_examples):
             errors.append(
                 f"examples_dropped={dropped} != policy pruned_examples={policy.pruned_examples}"
             )
+        if cfg.arm in LERNA2_ARMS:
+            # Round 14: every scheduled batch was selected once, nothing was
+            # dropped during the warmup, and the run spent its budget.
+            if int(policy.steps_seen) != effective_total:
+                errors.append(f"LERNA v2 selected {policy.steps_seen} batches, expected {effective_total}")
+            if int(policy.pruned_during_warmup) != 0:
+                errors.append(f"LERNA v2 dropped {policy.pruned_during_warmup} examples during the warmup")
+            _rf = policy.realized_fraction
+            if _rf is None or abs(_rf - policy.budget) > 0.02:
+                errors.append(f"LERNA v2 spent {_rf} of the scheduled units, budget {policy.budget}")
     elif dropped != 0:
         errors.append(f"examples_dropped={dropped} for arm {cfg.arm!r}, expected 0")
     # Backwards must equal effective_total - realized exactly.
@@ -2123,7 +2189,10 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
             "skip_gate": None,
             "note": (f"{cfg.arm} arm does not use a skip gate"
                      + ("; it drops low-loss examples inside batches (InfoBatch)"
-                        if cfg.arm == "infobatch" else "")),
+                        if cfg.arm == "infobatch" else "")
+                     + ("; it keeps each example with probability clip(w_t s_i / mu_t, pi_min, 1) "
+                        "under an exact compute budget (LERNA v2)"
+                        if cfg.arm in LERNA2_ARMS else "")),
         },
         "provenance": _provenance(execution_mode="plan_only"),
     }
@@ -2306,7 +2375,7 @@ def _selection_summary(cfg, policy, gate_diag) -> Optional[dict]:
         return {k: d.get(k) for k in ("score_source", "stale_decisions", "fresh_decisions",
                                        "forward_skips", "stale_retains",
                                        "examples_with_stored_score", "num_examples")}
-    if cfg.arm == "infobatch":
+    if cfg.arm in EXAMPLE_SELECTION_ARMS:
         return policy.get_diagnostics()
     return None
 

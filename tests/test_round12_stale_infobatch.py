@@ -87,7 +87,8 @@ def test_round12_arm_lists():
     assert {"stale_s1_p4", "infobatch", "plain_030", "plain_050", "plain_070"} <= set(ARMS)
     assert GATE_ARMS["stale_s1_p4"] == (4, "s1_stale")
     assert set(PLAIN_FRACTIONS) <= set(PLAIN_ARMS) and "infobatch" in PLAIN_ARMS
-    assert set(STORED_SCORE_ARMS) == {"stale_s1_p4", "infobatch"}
+    # round 14 adds the LERNA v2 arms to the stored-score arms
+    assert {"stale_s1_p4", "infobatch"} <= set(STORED_SCORE_ARMS)
     assert set(GATE_ARMS) | set(PLAIN_ARMS) == set(ARMS)
     assert not set(GATE_ARMS) & set(PLAIN_ARMS)
 
