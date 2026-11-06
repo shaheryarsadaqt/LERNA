@@ -79,6 +79,7 @@ from lerna.trainers.true_skip_trainer import (
     SchedulerStepPolicy,
     SkipPolicyDecisionError,
 )
+from lerna.utils.stale_selection import InfoBatchPolicy, StaleS1GatePolicy
 
 try:
     from lerna.utils.model_loader import load_model_and_tokenizer, load_tokenizer
@@ -176,7 +177,12 @@ ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
         # Step 5 additions (5 Nov 2026): the max-loss and inverted-S1 baselines
         # under the same controller, and the plain equal-compute arm (A9).
         "gate_loss_p1", "gate_loss_p4", "gate_s1inv_p1", "gate_s1inv_p4",
-        "equal_compute"]
+        "equal_compute",
+        # Round 12 additions (6 Nov 2026): M1 (the gate scored from stored
+        # per-example residuals, so a skip can avoid the forward pass), InfoBatch
+        # at a fixed step count, and plain runs at fixed fractions of T for the
+        # accuracy-compute reference curve.
+        "stale_s1_p4", "infobatch", "plain_030", "plain_050", "plain_070"]
 
 # Gated arms: (number of phases, score source). Every other arm is plain.
 GATE_ARMS = {
@@ -184,9 +190,15 @@ GATE_ARMS = {
     "control_uniform_p1": (1, "uniform"), "control_uniform_p4": (4, "uniform"),
     "gate_loss_p1": (1, "loss"), "gate_loss_p4": (4, "loss"),
     "gate_s1inv_p1": (1, "s1_inverted"), "gate_s1inv_p4": (4, "s1_inverted"),
+    "stale_s1_p4": (4, "s1_stale"),
 }
-# Plain arms: no skip gate; every scheduled batch is an ordinary training step.
-PLAIN_ARMS = ("full_finetune", "reduced_steps", "equal_compute")
+# Plain fractions: round(fraction * T) ordinary steps with their own LR schedule.
+PLAIN_FRACTIONS = {"plain_030": 0.30, "plain_050": 0.50, "plain_070": 0.70}
+# Plain arms: no skip gate; every scheduled batch is an ordinary training step
+# (InfoBatch drops examples inside a batch but never skips a step).
+PLAIN_ARMS = ("full_finetune", "reduced_steps", "equal_compute") + tuple(PLAIN_FRACTIONS) + ("infobatch",)
+# Arms whose policy keeps per-example scores: the training data carries lerna_uid.
+STORED_SCORE_ARMS = ("stale_s1_p4", "infobatch")
 DEVICES = ("cpu", "cuda")
 
 
@@ -252,6 +264,11 @@ class ExperimentConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     freeze_on_skips: bool = True
+
+    # Round 12: InfoBatch at a fixed step count (prune ratio r, full data from
+    # step floor(anneal * T) on)
+    infobatch_prune_ratio: float = 0.5
+    infobatch_anneal_fraction: float = 0.875
 
     # Logits capture (historical working)
     capture_logits: bool = True
@@ -338,6 +355,27 @@ class ExperimentConfig:
                 f"equal_compute_steps={self.equal_compute_steps} <= 0 for "
                 f"target_skip_rate={self.target_skip_rate}, "
                 f"total_steps={self.total_steps}. Lower the skip rate."
+            )
+        # Round 12 arms. M1 exists only with the phase-exact controller, so the
+        # arm sets it, as the plain arms set theirs.
+        if self.arm == "stale_s1_p4":
+            self.controller_version = "phase_exact_v1"
+        if self.arm in PLAIN_FRACTIONS and self.plain_fraction_steps < 1:
+            raise ValueError(
+                f"{self.arm} gives {self.plain_fraction_steps} steps for "
+                f"total_steps={self.total_steps}; it needs at least 1"
+            )
+        for _name in ("infobatch_prune_ratio", "infobatch_anneal_fraction"):
+            _v = getattr(self, _name)
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)) or not math.isfinite(float(_v)):
+                raise ValueError(f"{_name}={_v!r} must be a finite number")
+        if not 0.0 <= float(self.infobatch_prune_ratio) < 1.0:
+            raise ValueError(
+                f"infobatch_prune_ratio={self.infobatch_prune_ratio!r} must be in [0, 1)"
+            )
+        if not 0.0 <= float(self.infobatch_anneal_fraction) <= 1.0:
+            raise ValueError(
+                f"infobatch_anneal_fraction={self.infobatch_anneal_fraction!r} must be in [0, 1]"
             )
         if self.device not in DEVICES:
             raise ValueError(f"device={self.device!r} not in {DEVICES}")
@@ -555,6 +593,26 @@ class ExperimentConfig:
         T=6548 and Q=3929 give 3928 (the archived E1 run at 60% of the steps).
         """
         return self.total_steps - (2 * self.requested_skips + 2) // 3
+
+    @property
+    def plain_fraction_steps(self) -> int:
+        """Steps of a plain-fraction arm: round(fraction * T); 0 for other arms.
+
+        T=6548 gives 1964 / 3274 / 4584 for 0.30 / 0.50 / 0.70; T=4210 (SST-2)
+        gives 1263 / 2105 / 2947.
+        """
+        f = PLAIN_FRACTIONS.get(self.arm)
+        return int(round(f * self.total_steps)) if f is not None else 0
+
+    def arm_horizon(self) -> int:
+        """Scheduled batches (and scheduler steps) of this arm."""
+        if self.arm == "reduced_steps":
+            return self.reduced_steps
+        if self.arm == "equal_compute":
+            return self.equal_compute_steps
+        if self.arm in PLAIN_FRACTIONS:
+            return self.plain_fraction_steps
+        return self.total_steps
 
     def warmup_steps_for(self, horizon: int) -> int:
         """Warmup steps for an arm whose scheduler runs `horizon` steps."""
@@ -1049,6 +1107,10 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         effective_total = cfg.equal_compute_steps
         skip_policy_obj = None  # AlwaysFalsePolicy default
         use_gate = False
+    elif cfg.arm in PLAIN_FRACTIONS or cfg.arm == "infobatch":
+        effective_total = cfg.arm_horizon()
+        skip_policy_obj = None  # set below for infobatch
+        use_gate = False
     else:
         effective_total = cfg.total_steps
         skip_policy_obj = None  # set below
@@ -1216,6 +1278,10 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             seed=cfg.policy_seed,
             fp16=False,
             bf16=False,
+            # Round 12: keep the lerna_uid column for the stored-score arms (the
+            # trainer pops it before the model sees the batch). True, the
+            # default, for every other arm.
+            remove_unused_columns=(cfg.arm not in STORED_SCORE_ARMS),
         )
     except Exception as e:
         return {
@@ -1229,7 +1295,31 @@ def run_execution(cfg: ExperimentConfig) -> dict:
     # --- Build the real policy as the skip policy ---
     from lerna.trainers.policies import AlwaysFalsePolicy
     try:
-        if use_gate:
+        n_train_examples = len(train_dataset)
+        batches_per_epoch = int(math.ceil(n_train_examples / max(int(cfg.train_batch_size), 1)))
+        if cfg.arm == "stale_s1_p4":
+            policy = StaleS1GatePolicy(
+                target_skip_rate=cfg.target_skip_rate,
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                min_step=cfg.min_step,
+                max_consecutive_skips=cfg.max_consecutive_skips,
+                n_phases=cfg.n_phases,
+                score_history_window=cfg.score_history_window,
+                anneal_fraction=cfg.anneal_fraction,
+                policy_seed=cfg.policy_seed,
+                controller_version=cfg.controller_version,
+            )
+        elif cfg.arm == "infobatch":
+            policy = InfoBatchPolicy(
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                prune_ratio=float(cfg.infobatch_prune_ratio),
+                anneal_fraction=float(cfg.infobatch_anneal_fraction),
+                policy_seed=cfg.policy_seed,
+            )
+        elif use_gate:
             policy = ScoreQuantileGatePolicy(
                 target_skip_rate=cfg.target_skip_rate,
                 total_steps=effective_total,
@@ -1429,11 +1519,32 @@ def run_execution(cfg: ExperimentConfig) -> dict:
         longest_skip_run = 0
 
     # --- EXACT completion validation (not upper bounds) ---
-    # Forwards must equal effective_total exactly.
-    if instr.forward_calls != effective_total:
+    # Forwards must equal effective_total exactly; round 12: a skip decided
+    # before the forward pass (stale_s1_p4) counts as a scheduled batch with
+    # no forward call.
+    forward_skipped = int(getattr(instr, "forward_skipped_batches", 0))
+    if instr.forward_calls + forward_skipped != effective_total:
         errors.append(
-            f"forward_calls={instr.forward_calls} != effective_total={effective_total}"
+            f"forward_calls={instr.forward_calls} + forward_skipped={forward_skipped} "
+            f"!= effective_total={effective_total}"
         )
+    if cfg.arm == "stale_s1_p4":
+        if forward_skipped != int(policy.forward_skips):
+            errors.append(
+                f"forward_skipped={forward_skipped} != policy forward_skips={policy.forward_skips}"
+            )
+        if forward_skipped > realized:
+            errors.append(f"forward_skipped={forward_skipped} > realized skips={realized}")
+    elif forward_skipped != 0:
+        errors.append(f"forward_skipped={forward_skipped} for arm {cfg.arm!r}, expected 0")
+    dropped = int(getattr(instr, "examples_dropped_before_forward", 0))
+    if cfg.arm == "infobatch":
+        if dropped != int(policy.pruned_examples):
+            errors.append(
+                f"examples_dropped={dropped} != policy pruned_examples={policy.pruned_examples}"
+            )
+    elif dropped != 0:
+        errors.append(f"examples_dropped={dropped} for arm {cfg.arm!r}, expected 0")
     # Backwards must equal effective_total - realized exactly.
     expected_backward = effective_total - realized
     if instr.backward_calls != expected_backward:
@@ -1454,9 +1565,9 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             f"backward_calls={instr.backward_calls}"
         )
     # Invariants (must also hold exactly).
-    if instr.forward_calls != instr.backward_calls + instr.skipped_backward_steps:
+    if instr.forward_calls + forward_skipped != instr.backward_calls + instr.skipped_backward_steps:
         errors.append(
-            f"forward_calls={instr.forward_calls} != "
+            f"forward_calls={instr.forward_calls} + forward_skipped={forward_skipped} != "
             f"backward_calls={instr.backward_calls} + skipped={instr.skipped_backward_steps}"
         )
     if instr.optimizer_step_attempts > instr.backward_calls:
@@ -1618,6 +1729,11 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             # Tokenizer loading boundary result (None in CPU mock path;
             # production tokenizer loaded via _load_tokenizer_production).
             "tokenizer_loaded": tokenizer is not None,
+            # Round 12: skips with no forward pass, examples dropped before the
+            # forward pass, and the stored-score policy's own counters.
+            "forward_skipped": forward_skipped,
+            "examples_dropped_before_forward": dropped,
+            "selection": _selection_summary(cfg, policy, gate_diag),
             # Step 5: measured compute from the per-batch log (padded tokens).
             "batch_log_summary": _batch_log_summary(getattr(trainer, "lerna_batch_log", None)),
         },
@@ -1769,6 +1885,13 @@ def _load_train_dataset_production(cfg: ExperimentConfig, num_examples: int):
             )
         ds = ds.select(keep_indices)
 
+    # Round 12: the stored-score arms need a stable id per training example:
+    # its row position after the exclusions (the order the other arms see).
+    if cfg.arm in STORED_SCORE_ARMS:
+        if "lerna_uid" in ds.column_names:
+            raise ValueError("training split already has a lerna_uid column")
+        ds = ds.add_column("lerna_uid", list(range(len(ds))))
+
     tokenizer = _load_tokenizer_production(cfg)
 
     def tokenize_fn(examples):
@@ -1797,6 +1920,13 @@ def _load_train_dataset_production(cfg: ExperimentConfig, num_examples: int):
     # GLUE datasets use "label"; downstream evaluator expects "labels".
     if "label" in ds.column_names and "labels" not in ds.column_names:
         ds = ds.rename_column("label", "labels")
+    if cfg.arm in STORED_SCORE_ARMS:
+        # These arms train with remove_unused_columns=False, so keep exactly the
+        # model inputs, the labels and the id (the trainer pops the id).
+        extra = [c for c in ds.column_names
+                 if c not in ("input_ids", "attention_mask", "labels", "lerna_uid")]
+        if extra:
+            ds = ds.remove_columns(extra)
     ds.set_format("torch")
 
     return ds
@@ -1862,7 +1992,12 @@ def _load_train_dataset(cfg: ExperimentConfig, num_examples: int,
     """
     if dataset_loader is not None:
         return dataset_loader(cfg, num_examples)
-    return list(TinyDataLoader(num_examples=num_examples, seed=cfg.data_seed))
+    data = list(TinyDataLoader(num_examples=num_examples, seed=cfg.data_seed))
+    if cfg.arm in STORED_SCORE_ARMS:
+        # Round 12: the stored-score arms need a stable id per example.
+        for i, ex in enumerate(data):
+            ex["lerna_uid"] = torch.tensor(i, dtype=torch.long)
+    return data
 
 
 def _load_eval_dataset(cfg: ExperimentConfig, dataset_loader=None):
@@ -1960,8 +2095,9 @@ def _make_score_source(cfg: ExperimentConfig):
             return sign * mock_forward_gain_score(logits, labels)
 
         return _src
-    elif cfg.score_source == "s1":
-        # CPU mock: tiny logits + labels, no pretrained model
+    elif cfg.score_source in ("s1", "s1_stale"):
+        # CPU mock: tiny logits + labels, no pretrained model (plan validation
+        # only; the stale-score arm plans exactly like S1)
         logits = TinyLogits(batch=4, classes=2, seed=cfg.policy_seed + 31337)
         labels = [0, 1, 0, 1]
         call_count = [0]
@@ -1983,10 +2119,11 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
         "config_hash": _config_hash(cfg.to_dict()),
         "result": {
             "arm": cfg.arm,
-            "total_steps": {"full_finetune": cfg.total_steps, "reduced_steps": cfg.reduced_steps,
-                            "equal_compute": cfg.equal_compute_steps}[cfg.arm],
+            "total_steps": cfg.arm_horizon(),
             "skip_gate": None,
-            "note": f"{cfg.arm} arm does not use a skip gate",
+            "note": (f"{cfg.arm} arm does not use a skip gate"
+                     + ("; it drops low-loss examples inside batches (InfoBatch)"
+                        if cfg.arm == "infobatch" else "")),
         },
         "provenance": _provenance(execution_mode="plan_only"),
     }
@@ -2104,39 +2241,74 @@ def _recipe_overrides(args) -> dict:
         out["lr_warmup_ratio"] = args.lr_warmup_ratio
     if args.device is not None:
         out["device"] = args.device
+    if getattr(args, "infobatch_prune_ratio", None) is not None:
+        out["infobatch_prune_ratio"] = args.infobatch_prune_ratio
+    if getattr(args, "infobatch_anneal_fraction", None) is not None:
+        out["infobatch_anneal_fraction"] = args.infobatch_anneal_fraction
     return out
 
 
-BATCH_LOG_COLUMNS = ["decision_index", "real_tokens", "padded_tokens", "batch_size", "skipped", "forward_loss"]
+BATCH_LOG_COLUMNS = ["decision_index", "real_tokens", "padded_tokens", "batch_size", "skipped", "forward_loss",
+                     # round 12
+                     "forward_ran", "scheduled_batch_size", "scheduled_padded_tokens"]
+
+
+def _row_forward_ran(r) -> bool:
+    """Rows written before round 12 have 6 fields; every one of them had a forward pass."""
+    return bool(int(r[6])) if len(r) > 6 and r[6] is not None else True
+
+
+def _row_scheduled_padded(r) -> int:
+    return int(r[8] or 0) if len(r) > 8 and r[8] is not None else int(r[2] or 0)
 
 
 def _batch_log_summary(rows) -> Optional[dict]:
     """Measured compute from the per-batch log.
 
-    compute_units = padded tokens of every forward + 2 x padded tokens of every
-    update (a backward pass costing two forward passes). Divide an arm's units
-    by full fine-tuning's units for the measured compute fraction.
+    compute_units = padded tokens of every forward pass + 2 x padded tokens of
+    every update (a backward pass costing two forward passes). A skip decided
+    before the forward pass (round 12) adds nothing; for InfoBatch the padded
+    tokens are those of the examples it kept. Divide an arm's units by full
+    fine-tuning's units for the measured compute fraction.
     """
     if not rows:
         return None
     padded_all = sum(int(r[2] or 0) for r in rows)
+    padded_fwd = sum(int(r[2] or 0) for r in rows if _row_forward_ran(r))
     padded_upd = sum(int(r[2] or 0) for r in rows if not r[4])
     real_all = sum(int(r[1] or 0) for r in rows)
     real_upd = sum(int(r[1] or 0) for r in rows if not r[4])
+    sched_padded = sum(_row_scheduled_padded(r) for r in rows)
+    units = padded_fwd + 2 * padded_upd
     return {
         "columns": BATCH_LOG_COLUMNS,
         "batches": len(rows),
         "updates": sum(1 for r in rows if not r[4]),
         "skips": sum(1 for r in rows if r[4]),
+        "forward_free_skips": sum(1 for r in rows if not _row_forward_ran(r)),
         "padded_tokens_all": padded_all,
+        "padded_tokens_forward": padded_fwd,
         "padded_tokens_updated": padded_upd,
+        "scheduled_padded_tokens": sched_padded,
         "real_tokens_all": real_all,
         "real_tokens_updated": real_upd,
-        "compute_units_padded": padded_all + 2 * padded_upd,
+        "compute_units_padded": units,
         "compute_fraction_within_arm": (
-            (padded_all + 2 * padded_upd) / (3 * padded_all) if padded_all else None
+            units / (3 * sched_padded) if sched_padded else None
         ),
     }
+
+
+def _selection_summary(cfg, policy, gate_diag) -> Optional[dict]:
+    """Round 12: the stored-score policy's counters (None for every other arm)."""
+    if cfg.arm == "stale_s1_p4":
+        d = gate_diag or {}
+        return {k: d.get(k) for k in ("score_source", "stale_decisions", "fresh_decisions",
+                                       "forward_skips", "stale_retains",
+                                       "examples_with_stored_score", "num_examples")}
+    if cfg.arm == "infobatch":
+        return policy.get_diagnostics()
+    return None
 
 
 def _write_batch_log(result: dict, out_dir: Path) -> None:
@@ -2221,7 +2393,12 @@ def main() -> int:
     parser.add_argument("--arm", default="gate_s1_p1", choices=ARMS)
     parser.add_argument("--controller-version", default="legacy_v4",
                         choices=["legacy_v4", "phase_exact_v1"])
-    parser.add_argument("--score-source", default="s1", choices=["s1", "uniform", "loss", "s1_inverted"])
+    parser.add_argument("--score-source", default="s1",
+                        choices=["s1", "uniform", "loss", "s1_inverted", "s1_stale"])
+    parser.add_argument("--infobatch-prune-ratio", type=float, default=None,
+                        help="InfoBatch arm: drop probability of a below-mean-loss example (default 0.5)")
+    parser.add_argument("--infobatch-anneal-fraction", type=float, default=None,
+                        help="InfoBatch arm: no pruning from step floor(fraction * T) on (default 0.875)")
     parser.add_argument("--lr-schedule-shape", default=None,
                         choices=["constant_with_warmup", "constant", "linear", "cosine"])
     parser.add_argument("--lr-warmup-steps", type=int, default=None)

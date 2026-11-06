@@ -376,6 +376,12 @@ class SkipInstrumentation:
     mean_step_ms_skipped: Optional[float] = None
     avg_dataloader_wait_ms: Optional[float] = None
 
+    # Round 12: skips decided before any forward pass (stored scores), and
+    # examples dropped from a batch before its forward pass (InfoBatch).
+    forward_skipped_batches: int = 0
+    mean_step_time_forward_skipped: Optional[float] = None
+    examples_dropped_before_forward: int = 0
+
     def as_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
         d["skip_ratio_by_batch"] = (
@@ -385,9 +391,11 @@ class SkipInstrumentation:
         d["skip_ratio_by_optimizer_opportunity"] = (
             self.skipped_backward_steps / max(denom, 1)
         )
-        # Documented invariants (booleans for quick audit)
+        # Documented invariants (booleans for quick audit). A skip decided
+        # before the forward pass (round 12) has no forward call.
         d["invariant_forward_eq_backward_plus_skipped"] = (
-            self.forward_calls == self.backward_calls + self.skipped_backward_steps
+            self.forward_calls + self.forward_skipped_batches
+            == self.backward_calls + self.skipped_backward_steps
         )
         d["invariant_opt_le_backward"] = (
             self.optimizer_step_attempts <= self.backward_calls
@@ -815,6 +823,24 @@ class TrueBackwardSkippingTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        weights = getattr(self, "_lerna_example_weights", None)
+        if weights is not None:
+            # Round 12 (InfoBatch): weighted per-example cross-entropy over the
+            # kept examples, normalized by the scheduled batch size, so the
+            # batch gradient stays unbiased (Horvitz-Thompson).
+            w_logits = getattr(outputs, "logits", None)
+            if w_logits is None and isinstance(outputs, dict):
+                w_logits = outputs.get("logits")
+            w_labels = inputs.get("labels") if hasattr(inputs, "get") else None
+            sched = getattr(self, "_lerna_scheduled_batch", None)
+            if w_logits is None or w_labels is None or not sched:
+                raise RuntimeError("weighted loss needs logits, labels and the scheduled batch size")
+            per = torch.nn.functional.cross_entropy(
+                w_logits, w_labels.view(-1).long(), reduction="none"
+            )
+            if per.shape != weights.shape:
+                raise RuntimeError(f"{tuple(per.shape)} losses for {tuple(weights.shape)} weights")
+            loss = (per * weights.to(per.dtype)).sum() / float(sched[0])
         if self.capture_logits:
             logits = getattr(outputs, "logits", None)
             if logits is None and isinstance(outputs, dict):
@@ -829,9 +855,15 @@ class TrueBackwardSkippingTrainer(Trainer):
             self.last_logits = None
         return (loss, outputs) if return_outputs else loss
 
-    def _record_batch(self, decision_index, inputs, loss_val, skipped) -> None:
-        """Per-batch record for compute accounting (Step 5):
-        [decision_index, real_tokens, padded_tokens, batch_size, skipped, forward_loss].
+    def _record_batch(self, decision_index, inputs, loss_val, skipped, forward_ran=True) -> None:
+        """Per-batch record for compute accounting (Step 5; round 12 adds the last three):
+        [decision_index, real_tokens, padded_tokens, batch_size, skipped, forward_loss,
+         forward_ran, scheduled_batch_size, scheduled_padded_tokens].
+
+        real/padded/batch_size describe the batch the forward pass ran on: the
+        scheduled batch, or the examples InfoBatch kept. scheduled_* describe the
+        scheduled batch. forward_ran is 0 for a skip decided before any forward
+        pass (its forward_loss is NaN).
         """
         log = getattr(self, "lerna_batch_log", None)
         if log is None:
@@ -849,7 +881,97 @@ class TrueBackwardSkippingTrainer(Trainer):
                 real = padded
         except Exception:
             real = padded = bs = None
-        log.append([int(decision_index), real, padded, bs, int(bool(skipped)), float(loss_val)])
+        sched = getattr(self, "_lerna_scheduled_batch", None)
+        s_bs, s_pad = (sched[0], sched[1]) if sched else (bs, padded)
+        log.append([int(decision_index), real, padded, bs, int(bool(skipped)), float(loss_val),
+                    int(bool(forward_ran)), s_bs, s_pad])
+
+    # ----------------------------------------------------- round 12 helpers
+    def _raise_policy_failure(self, exc: Exception) -> None:
+        """Same strict handling as a failed should_skip(): invalidate and raise."""
+        self.instr.policy_decision_failures += 1
+        self.instr.last_policy_error_type = type(exc).__name__
+        self.instr.run_invalidated = True
+        self._skip_optimizer_step = False
+        self._skip_scheduler_step = False
+        try:
+            self._uninstall_wrappers()
+        except Exception as cleanup_exc:
+            logger.warning(
+                "[TrueSkip] wrapper cleanup after policy failure raised %s",
+                type(cleanup_exc).__name__,
+            )
+        self._dump_instrumentation()
+        raise SkipPolicyDecisionError(
+            policy_name=getattr(self.skip_policy, "name", type(self.skip_policy).__name__),
+            decision_index=self.instr.batches_seen,
+            original_exception_type=type(exc).__name__,
+        ) from exc
+
+    def _forward_free_skip(self, model, inputs, step_start):
+        """A skip decided before the forward pass: no forward, backward or update."""
+        decision_index = max(self.instr.batches_seen - 1, 0)
+        self._note_sampled_lagged_decision(decision_index)
+        self._record_batch(decision_index, inputs, float("nan"), True, forward_ran=False)
+        self._skip_optimizer_step = True
+        self._skip_scheduler_step = True
+        self.instr.skipped_batches += 1
+        self.instr.skipped_backward_steps += 1
+        self.instr.forward_skipped_batches += 1
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        step_time = time.perf_counter() - step_start
+        n = self.instr.forward_skipped_batches
+        prev = self.instr.mean_step_time_forward_skipped
+        self.instr.mean_step_time_forward_skipped = (
+            step_time if prev is None else (prev * (n - 1) + step_time) / n
+        )
+        if self._cuda_event_start is not None and self._cuda_step_started:
+            self._cuda_event_end.record()
+            torch.cuda.synchronize(self.args.local_rank)
+            self._cuda_step_started = False
+        try:
+            device = next(model.parameters()).device
+        except (StopIteration, AttributeError, TypeError):
+            device = None
+        return torch.zeros((), device=device)
+
+    def _apply_example_selection(self, inputs, keep, weights):
+        """Keep only the selected examples of the batch, trimming unused padding."""
+        ids = inputs.get("input_ids") if hasattr(inputs, "get") else None
+        if not isinstance(ids, torch.Tensor) or ids.dim() < 1:
+            raise ValueError("example selection needs a batched input_ids tensor")
+        n = int(ids.shape[0])
+        keep = [int(k) for k in keep]
+        if (not keep or len(keep) != len(weights) or len(set(keep)) != len(keep)
+                or any(k < 0 or k >= n for k in keep)):
+            raise ValueError(f"invalid example selection {keep!r} for a batch of {n}")
+        self._lerna_scheduled_batch = (n, int(ids.numel()))
+        idx = torch.tensor(keep, dtype=torch.long, device=ids.device)
+        out = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 1 and int(v.shape[0]) == n:
+                out[k] = v.index_select(0, idx)
+            else:
+                out[k] = v
+        mask = out.get("attention_mask")
+        if isinstance(mask, torch.Tensor) and mask.dim() == 2 and mask.shape[1] > 0:
+            # Right padding: the kept examples need only their longest length.
+            longest = max(int(mask.sum(dim=1).max().item()), 1)
+            width = int(mask.shape[1])
+            for k in ("input_ids", "attention_mask", "token_type_ids"):
+                v = out.get(k)
+                if isinstance(v, torch.Tensor) and v.dim() == 2 and int(v.shape[1]) == width:
+                    out[k] = v[:, :longest]
+        if self._lerna_batch_uids is not None:
+            self._lerna_batch_uids = [self._lerna_batch_uids[k] for k in keep]
+        self._lerna_example_weights = torch.tensor(
+            [float(w) for w in weights], dtype=torch.float32, device=ids.device
+        )
+        self.instr.examples_dropped_before_forward += n - len(keep)
+        return out
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         import time
@@ -874,6 +996,42 @@ class TrueBackwardSkippingTrainer(Trainer):
         self.instr.dataloader_wait_seconds += (time.perf_counter() - dataloader_start)
         
         self.instr.batches_seen += 1
+
+        # Round 12: stable example ids for stored-score policies. The model
+        # never sees them; policies read them as trainer._lerna_batch_uids.
+        self._lerna_batch_uids = None
+        self._lerna_example_weights = None
+        self._lerna_scheduled_batch = None
+        if isinstance(inputs, dict) and "lerna_uid" in inputs:
+            _uids = inputs.pop("lerna_uid")
+            if isinstance(_uids, torch.Tensor):
+                _uids = _uids.detach().view(-1).tolist()
+            self._lerna_batch_uids = [int(u) for u in _uids]
+
+        policy = self.skip_policy
+        # Round 12: a policy with stored scores may decide before the forward
+        # pass. True = skip with no forward pass at all; False = retain (the
+        # forward and backward passes follow, no second decision); None = no
+        # decision yet (the forward pass runs and should_skip() decides).
+        pre_decision = None
+        if hasattr(policy, "pre_forward_decision"):
+            self._check_authoritative_horizon()
+            try:
+                pre_decision = policy.pre_forward_decision(self, model, inputs)
+            except Exception as exc:
+                self._raise_policy_failure(exc)
+            if pre_decision is not None:
+                pre_decision = bool(pre_decision)
+        if pre_decision is True:
+            return self._forward_free_skip(model, inputs, step_start)
+
+        # Round 12: a policy may drop examples before the forward pass (InfoBatch).
+        if hasattr(policy, "select_examples"):
+            try:
+                keep, weights = policy.select_examples(self, inputs)
+                inputs = self._apply_example_selection(inputs, keep, weights)
+            except Exception as exc:
+                self._raise_policy_failure(exc)
 
         # [FIX P0-3] Forward ALWAYS happens first.
         with self.compute_loss_context_manager():
@@ -928,6 +1086,13 @@ class TrueBackwardSkippingTrainer(Trainer):
         # Legacy dense diagnostics remain available only when explicitly enabled.
         self._online_ler_update(loss.detach(), self._last_real_logits, model)
 
+        # Round 12: stored-score policies record what this forward pass saw.
+        if hasattr(policy, "observe_forward"):
+            try:
+                policy.observe_forward(self, inputs, self._last_real_logits)
+            except Exception as exc:
+                self._raise_policy_failure(exc)
+
         # [Piece 8] Authoritative horizon validation before the first policy decision.
         self._check_authoritative_horizon()
 
@@ -938,7 +1103,10 @@ class TrueBackwardSkippingTrainer(Trainer):
         # silently become ordinary backward steps because that changes the
         # realized compute budget and invalidates matched-run accounting.
         try:
-            should_skip = bool(self.skip_policy.should_skip(self, model, inputs))
+            if pre_decision is False:
+                should_skip = False  # retained before the forward pass (round 12)
+            else:
+                should_skip = bool(self.skip_policy.should_skip(self, model, inputs))
         except Exception as exc:
             self.instr.policy_decision_failures += 1
             self.instr.last_policy_error_type = type(exc).__name__
