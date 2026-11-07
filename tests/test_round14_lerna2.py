@@ -357,8 +357,9 @@ def _cfg(arm, total_steps=64, **kw):
 
 
 def test_round14_arm_lists():
-    assert set(LERNA2_ARMS) == {"lerna2_b035", "lerna2_nolr_b035", "randkeep_lr_b035", "randkeep_b035",
-                                "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083"}
+    # round 15 adds randkeep_b060/b083 and el2n_topk_b035/b060 to these eight
+    assert {"lerna2_b035", "lerna2_nolr_b035", "randkeep_lr_b035", "randkeep_b035",
+            "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083"} <= set(LERNA2_ARMS)
     assert set(LERNA2_ARMS) <= set(ARMS) and set(LERNA2_ARMS) <= set(PLAIN_ARMS)
     assert set(LERNA2_ARMS) <= set(STORED_SCORE_ARMS) and set(LERNA2_ARMS) <= set(EXAMPLE_SELECTION_ARMS)
     assert "infobatch" in EXAMPLE_SELECTION_ARMS and "stale_s1_p4" not in EXAMPLE_SELECTION_ARMS

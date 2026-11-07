@@ -187,7 +187,10 @@ ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
         # Round 14 additions (6 Nov 2026): LERNA v2 (example selection under an
         # exact compute budget, every step runs) and its controls.
         "lerna2_b035", "lerna2_nolr_b035", "randkeep_lr_b035", "randkeep_b035",
-        "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083"]
+        "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083",
+        # Round 15 additions (6 Nov 2026): random keep at 60% and 83%, and hard
+        # top-k selection (dynamic EL2N pruning) at 35% and 60%.
+        "randkeep_b060", "randkeep_b083", "el2n_topk_b035", "el2n_topk_b060"]
 
 # Round 14: LERNA v2 arms -> (compute budget as a fraction of full fine-tuning,
 # use the stored residual scores, use the learning-rate factor). The random-keep
@@ -202,8 +205,18 @@ LERNA2_ARMS = {
     "randkeep_b040": (0.40, False, False),
     "lerna2_b060": (0.60, True, True),
     "lerna2_b083": (0.83, True, True),
+    # round 15
+    "randkeep_b060": (0.60, False, False),
+    "randkeep_b083": (0.83, False, False),
+    "el2n_topk_b035": (0.35, True, False),
+    "el2n_topk_b060": (0.60, True, False),
 }
 LERNA2_MIN_BUDGET = min(v[0] for v in LERNA2_ARMS.values())
+# Round 15: arms that keep the K = round(sum pi) highest-scored examples
+# deterministically, each weighted n / K (hard pruning without reweighting, as
+# in dynamic EL2N pruning, Attendu and Corbeil 2023), under the same budget
+# controller. Every other LERNA2 arm samples (LERNA v2's own rule).
+LERNA2_TOPK_ARMS = ("el2n_topk_b035", "el2n_topk_b060")
 
 # Gated arms: (number of phases, score source). Every other arm is plain.
 GATE_ARMS = {
@@ -1374,6 +1387,7 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                 window=int(cfg.lerna2_window),
                 chunks=int(cfg.lerna2_chunks),
                 policy_seed=cfg.policy_seed,
+                selection=("topk" if cfg.arm in LERNA2_TOPK_ARMS else "sample"),
             )
         elif use_gate:
             policy = ScoreQuantileGatePolicy(
@@ -2192,7 +2206,10 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
                         if cfg.arm == "infobatch" else "")
                      + ("; it keeps each example with probability clip(w_t s_i / mu_t, pi_min, 1) "
                         "under an exact compute budget (LERNA v2)"
-                        if cfg.arm in LERNA2_ARMS else "")),
+                        if cfg.arm in LERNA2_ARMS and cfg.arm not in LERNA2_TOPK_ARMS else "")
+                     + ("; it keeps the highest-scored examples of each batch, unweighted, under an "
+                        "exact compute budget (hard top-k: dynamic EL2N pruning)"
+                        if cfg.arm in LERNA2_TOPK_ARMS else "")),
         },
         "provenance": _provenance(execution_mode="plan_only"),
     }
