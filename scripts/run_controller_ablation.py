@@ -81,6 +81,14 @@ from lerna.trainers.true_skip_trainer import (
 )
 from lerna.utils.stale_selection import InfoBatchPolicy, StaleS1GatePolicy
 from lerna.utils.budget_selection import LernaBudgetPolicy
+from lerna.utils.compared_methods import (
+    DropBPPolicy,
+    FreshImportancePolicy,
+    IESPolicy,
+    KakurenboPolicy,
+    RankedSubsetPolicy,
+    SelectiveBackpropPolicy,
+)
 
 try:
     from lerna.utils.model_loader import load_model_and_tokenizer, load_tokenizer
@@ -190,7 +198,13 @@ ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
         "lerna2_b040", "randkeep_b040", "lerna2_b060", "lerna2_b083",
         # Round 15 additions (6 Nov 2026): random keep at 60% and 83%, and hard
         # top-k selection (dynamic EL2N pruning) at 35% and 60%.
-        "randkeep_b060", "randkeep_b083", "el2n_topk_b035", "el2n_topk_b060"]
+        "randkeep_b060", "randkeep_b083", "el2n_topk_b035", "el2n_topk_b060",
+        # Round 16 additions (7 Nov 2026): LERNA v2 without the learning-rate
+        # factor at the other budgets, and the compared methods of the final
+        # comparison (lerna/utils/compared_methods.py).
+        "lerna2_nolr_b040", "lerna2_nolr_b060", "lerna2_nolr_b083",
+        "egreedy_b035", "ucb_b035", "orderdp_b035", "isfresh_b060", "isfresh_b083",
+        "sb_b060", "sb_b083", "kakurenbo", "ies", "dropbp_p050", "dropbp_p0875"]
 
 # Round 14: LERNA v2 arms -> (compute budget as a fraction of full fine-tuning,
 # use the stored residual scores, use the learning-rate factor). The random-keep
@@ -210,6 +224,10 @@ LERNA2_ARMS = {
     "randkeep_b083": (0.83, False, False),
     "el2n_topk_b035": (0.35, True, False),
     "el2n_topk_b060": (0.60, True, False),
+    # round 16
+    "lerna2_nolr_b040": (0.40, True, False),
+    "lerna2_nolr_b060": (0.60, True, False),
+    "lerna2_nolr_b083": (0.83, True, False),
 }
 LERNA2_MIN_BUDGET = min(v[0] for v in LERNA2_ARMS.values())
 # Round 15: arms that keep the K = round(sum pi) highest-scored examples
@@ -217,6 +235,18 @@ LERNA2_MIN_BUDGET = min(v[0] for v in LERNA2_ARMS.values())
 # in dynamic EL2N pruning, Attendu and Corbeil 2023), under the same budget
 # controller. Every other LERNA2 arm samples (LERNA v2's own rule).
 LERNA2_TOPK_ARMS = ("el2n_topk_b035", "el2n_topk_b060")
+# Round 16: the compared methods (lerna/utils/compared_methods.py), all at a fixed
+# step count. eps-greedy, UCB and OrderDP: (budget, method), LERNA v2's controller
+# sets how many examples each batch keeps. Fresh-score importance sampling and
+# Selective Backprop: budget (each pays a scoring pass). DropBP: drop rate.
+RANKED_ARMS = {"egreedy_b035": (0.35, "egreedy"), "ucb_b035": (0.35, "ucb"), "orderdp_b035": (0.35, "orderdp")}
+FRESH_IS_ARMS = {"isfresh_b060": 0.60, "isfresh_b083": 0.83}
+SB_ARMS = {"sb_b060": 0.60, "sb_b083": 0.83}
+DROPBP_ARMS = {"dropbp_p050": 0.5, "dropbp_p0875": 0.875}
+COMPARED_ARMS = (tuple(RANKED_ARMS) + tuple(FRESH_IS_ARMS) + tuple(SB_ARMS) + ("kakurenbo", "ies")
+                 + tuple(DROPBP_ARMS))
+# Arms built on LERNA v2's budget controller: nothing dropped in the warmup, budget spent.
+CONTROLLED_COMPARED_ARMS = tuple(RANKED_ARMS) + tuple(FRESH_IS_ARMS)
 
 # Gated arms: (number of phases, score source). Every other arm is plain.
 GATE_ARMS = {
@@ -231,11 +261,13 @@ PLAIN_FRACTIONS = {"plain_030": 0.30, "plain_050": 0.50, "plain_070": 0.70}
 # Plain arms: no skip gate; every scheduled batch is an ordinary training step
 # (InfoBatch drops examples inside a batch but never skips a step).
 PLAIN_ARMS = (("full_finetune", "reduced_steps", "equal_compute") + tuple(PLAIN_FRACTIONS) + ("infobatch",)
-              + tuple(LERNA2_ARMS))
+              + tuple(LERNA2_ARMS) + COMPARED_ARMS)
 # Arms whose policy keeps per-example scores: the training data carries lerna_uid.
-STORED_SCORE_ARMS = ("stale_s1_p4", "infobatch") + tuple(LERNA2_ARMS)
+STORED_SCORE_ARMS = (("stale_s1_p4", "infobatch") + tuple(LERNA2_ARMS) + tuple(RANKED_ARMS)
+                     + tuple(FRESH_IS_ARMS) + ("kakurenbo", "ies"))
 # Arms that drop examples inside a batch before its forward pass (no step is skipped).
-EXAMPLE_SELECTION_ARMS = ("infobatch",) + tuple(LERNA2_ARMS)
+# Round 16: DropBP keeps every example but uses the same hook to set its dropped blocks.
+EXAMPLE_SELECTION_ARMS = ("infobatch",) + tuple(LERNA2_ARMS) + COMPARED_ARMS
 DEVICES = ("cpu", "cuda")
 
 
@@ -1389,6 +1421,62 @@ def run_execution(cfg: ExperimentConfig) -> dict:
                 policy_seed=cfg.policy_seed,
                 selection=("topk" if cfg.arm in LERNA2_TOPK_ARMS else "sample"),
             )
+        # Round 16: the compared methods of the final comparison.
+        elif cfg.arm in RANKED_ARMS:
+            _budget, _method = RANKED_ARMS[cfg.arm]
+            policy = RankedSubsetPolicy(
+                budget=_budget,
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                warmup_steps=int(warmup_steps_effective),
+                selection=_method,
+                pi_min=float(cfg.lerna2_pi_min),
+                window=int(cfg.lerna2_window),
+                chunks=int(cfg.lerna2_chunks),
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm in FRESH_IS_ARMS:
+            policy = FreshImportancePolicy(
+                budget=FRESH_IS_ARMS[cfg.arm],
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                warmup_steps=int(warmup_steps_effective),
+                pi_min=float(cfg.lerna2_pi_min),
+                window=int(cfg.lerna2_window),
+                chunks=int(cfg.lerna2_chunks),
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm in SB_ARMS:
+            policy = SelectiveBackpropPolicy(
+                budget=SB_ARMS[cfg.arm],
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm == "kakurenbo":
+            policy = KakurenboPolicy(
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm == "ies":
+            policy = IESPolicy(
+                total_steps=effective_total,
+                num_examples=n_train_examples,
+                batches_per_epoch=batches_per_epoch,
+                policy_seed=cfg.policy_seed,
+            )
+        elif cfg.arm in DROPBP_ARMS:
+            policy = DropBPPolicy(
+                model=model,
+                drop_rate=DROPBP_ARMS[cfg.arm],
+                total_steps=effective_total,
+                policy_seed=cfg.policy_seed,
+            )
         elif use_gate:
             policy = ScoreQuantileGatePolicy(
                 target_skip_rate=cfg.target_skip_rate,
@@ -1623,6 +1711,19 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             _rf = policy.realized_fraction
             if _rf is None or abs(_rf - policy.budget) > 0.02:
                 errors.append(f"LERNA v2 spent {_rf} of the scheduled units, budget {policy.budget}")
+        if cfg.arm in COMPARED_ARMS:
+            # Round 16: every scheduled batch was decided once; the arms on LERNA v2's
+            # controller dropped nothing in the warmup and spent their budget.
+            if int(policy.steps_seen) != effective_total:
+                errors.append(f"{cfg.arm} decided {policy.steps_seen} batches, expected {effective_total}")
+            if cfg.arm in CONTROLLED_COMPARED_ARMS:
+                if int(policy.pruned_during_warmup) != 0:
+                    errors.append(f"{cfg.arm} dropped {policy.pruned_during_warmup} examples during the warmup")
+                _rf = policy.realized_fraction
+                if _rf is None or abs(_rf - policy.budget) > 0.02:
+                    errors.append(f"{cfg.arm} spent {_rf} of the scheduled units, budget {policy.budget}")
+            if cfg.arm in DROPBP_ARMS and len(policy.drop_counts) != effective_total:
+                errors.append(f"DropBP recorded {len(policy.drop_counts)} steps, expected {effective_total}")
     elif dropped != 0:
         errors.append(f"examples_dropped={dropped} for arm {cfg.arm!r}, expected 0")
     # Backwards must equal effective_total - realized exactly.
@@ -1816,6 +1917,8 @@ def run_execution(cfg: ExperimentConfig) -> dict:
             "selection": _selection_summary(cfg, policy, gate_diag),
             # Step 5: measured compute from the per-batch log (padded tokens).
             "batch_log_summary": _batch_log_summary(getattr(trainer, "lerna_batch_log", None)),
+            **({"compute_accounting": _compared_compute(cfg, policy, getattr(trainer, "lerna_batch_log", None))}
+               if cfg.arm in COMPARED_ARMS else {}),
         },
         "runtime": _runtime_block(trainer, model, cfg),
         "batch_log": list(getattr(trainer, "lerna_batch_log", None) or []),
@@ -2191,6 +2294,32 @@ def _make_score_source(cfg: ExperimentConfig):
         raise ValueError(f"unsupported score_source for dry-run: {cfg.score_source}")
 
 
+COMPARED_NOTES = {
+    "egreedy_b035": "; eps-greedy (Raju et al. 2021): most of each batch's K highest-EMA-loss examples "
+                    "plus a few random ones, K set by LERNA v2's controller at 35%",
+    "ucb_b035": "; UCB (Raju et al. 2021): each batch's K highest EMA loss + variance, K set by LERNA "
+                "v2's controller at 35%",
+    "orderdp_b035": "; OrderDP (ICLR 2026): a random candidate set, then its K highest stored losses, "
+                    "K set by LERNA v2's controller at 35%",
+    "isfresh_b060": "; importance sampling by the fresh residual of a scoring pass (Katharopoulos and "
+                    "Fleuret 2018), weights 1 / pi, under an exact 60% budget that includes the scoring passes",
+    "isfresh_b083": "; importance sampling by the fresh residual of a scoring pass (Katharopoulos and "
+                    "Fleuret 2018), weights 1 / pi, under an exact 83% budget that includes the scoring passes",
+    "sb_b060": "; Selective Backprop (Jiang et al. 2019): keep with probability CDF(loss)^beta from a "
+               "scoring pass, beta set for an expected 60% of the compute",
+    "sb_b083": "; Selective Backprop (Jiang et al. 2019): keep with probability CDF(loss)^beta from a "
+               "scoring pass, beta set for an expected 83% of the compute",
+    "kakurenbo": "; KAKURENBO (NeurIPS 2023): hides the lowest-loss, confidently right examples for an "
+                 "epoch, kept examples weighted 1 / (1 - F)",
+    "ies": "; IES (ICLR 2025): excludes the examples whose loss has stopped changing (second-order "
+           "difference below 1e-3) from the update",
+    "dropbp_p050": "; DropBP (NeurIPS 2024): each attention and MLP block skips its backward pass with "
+                   "probability 0.5",
+    "dropbp_p0875": "; DropBP (NeurIPS 2024): each attention and MLP block skips its backward pass with "
+                    "probability 0.875",
+}
+
+
 def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
     """Dry-run for full_finetune and reduced_steps arms (no skip gate)."""
     return {
@@ -2209,7 +2338,8 @@ def _dry_run_reference_arm(cfg: ExperimentConfig) -> dict:
                         if cfg.arm in LERNA2_ARMS and cfg.arm not in LERNA2_TOPK_ARMS else "")
                      + ("; it keeps the highest-scored examples of each batch, unweighted, under an "
                         "exact compute budget (hard top-k: dynamic EL2N pruning)"
-                        if cfg.arm in LERNA2_TOPK_ARMS else "")),
+                        if cfg.arm in LERNA2_TOPK_ARMS else "")
+                     + (COMPARED_NOTES.get(cfg.arm, ""))),
         },
         "provenance": _provenance(execution_mode="plan_only"),
     }
@@ -2395,6 +2525,39 @@ def _selection_summary(cfg, policy, gate_diag) -> Optional[dict]:
     if cfg.arm in EXAMPLE_SELECTION_ARMS:
         return policy.get_diagnostics()
     return None
+
+
+def _compared_compute(cfg, policy, rows) -> Optional[dict]:
+    """Round 16: measured compute of a compared method from its batch log and its own counts.
+
+    units = padded tokens of every training forward pass + those of the method's extra forward
+    passes (scoring, refreshing, monitoring) + 2 x padded tokens of every update x the share of the
+    backward pass that ran (1, except for DropBP). Divide by full fine-tuning's units for the
+    measured compute fraction.
+    """
+    if not rows:
+        return None
+    fwd = sum(int(r[2] or 0) for r in rows if _row_forward_ran(r))
+    sched = sum(_row_scheduled_padded(r) for r in rows)
+    extra = int(getattr(policy, "extra_forward_padded_tokens", 0) or 0)
+    if cfg.arm in DROPBP_ARMS:
+        upd = 0.0
+        for r in rows:
+            if r[4]:
+                continue
+            width = int(r[2] or 0) // max(int(r[3] or 1), 1)
+            upd += int(r[2] or 0) * policy.backward_fraction(int(r[0]), width)
+    else:
+        upd = float(sum(int(r[2] or 0) for r in rows if not r[4]))
+    units = fwd + extra + 2.0 * upd
+    return {
+        "forward_padded_tokens": fwd,
+        "extra_forward_padded_tokens": extra,
+        "backward_token_equivalents": upd,
+        "compute_units": units,
+        "scheduled_padded_tokens": sched,
+        "compute_fraction_within_arm": (units / (3 * sched) if sched else None),
+    }
 
 
 def _write_batch_log(result: dict, out_dir: Path) -> None:
