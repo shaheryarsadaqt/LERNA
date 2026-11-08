@@ -640,12 +640,19 @@ class IESPolicy:
 
 # --------------------------------------------------------------------------- DropBP
 def _encoder_layers(model) -> list:
-    """The encoder layers (each with .attn and .mlp) of a ModernBERT-style classifier."""
+    """The encoder layers of a ModernBERT-style classifier (each with .attn and .mlp) or, from
+    round 17, of an UltraBERT classifier (each with .self_attn and .mlp)."""
     for owner in (getattr(model, "model", None), getattr(model, "base_model", None), model):
         layers = getattr(owner, "layers", None) if owner is not None else None
-        if layers is not None and len(layers) > 0 and all(hasattr(l, "attn") and hasattr(l, "mlp") for l in layers):
+        if layers is not None and len(layers) > 0 and all(
+                (hasattr(l, "attn") or hasattr(l, "self_attn")) and hasattr(l, "mlp") for l in layers):
             return list(layers)
-    raise ValueError("DropBP needs a model whose encoder layers have .attn and .mlp blocks")
+    raise ValueError("DropBP needs a model whose encoder layers have .attn (or .self_attn) and .mlp blocks")
+
+
+def _attention_block(layer):
+    """The attention module of an encoder layer: ModernBERT's .attn, UltraBERT's .self_attn."""
+    return layer.attn if hasattr(layer, "attn") else layer.self_attn
 
 
 def _linear_macs(module) -> int:
@@ -683,20 +690,25 @@ class DropBPPolicy:
         self._blocks = []  # (layer, kind, module)
         for li, layer in enumerate(layers):
             for kind in ("attn", "mlp"):
-                mod = getattr(layer, kind)
+                mod = _attention_block(layer) if kind == "attn" else layer.mlp
                 if hasattr(mod, "_lerna_dropbp"):
                     raise ValueError("the model already carries DropBP wrappers")
                 _patch_dropbp(mod)
                 self._blocks.append((li, kind, mod))
         hidden = int(getattr(mcfg, "hidden_size", 0) or 0) if mcfg is not None else 0
+        # the attention scores' width: heads x head size where the configuration gives a head
+        # size (UltraBERT), otherwise the hidden size (ModernBERT, as in round 16)
+        head_dim = getattr(mcfg, "head_dim", None) if mcfg is not None else None
+        heads = getattr(mcfg, "num_attention_heads", None) if mcfg is not None else None
+        width = int(heads) * int(head_dim) if head_dim and heads else hidden
         self.flops_per_token = {
             "layers": len(layers),
-            "attn_linear": _linear_macs(layers[0].attn),
-            "attn_scores_per_position": 2 * hidden,
+            "attn_linear": _linear_macs(_attention_block(layers[0])),
+            "attn_scores_per_position": 2 * width,
             "mlp": _linear_macs(layers[0].mlp),
         }
         for layer in layers:
-            if (_linear_macs(layer.attn) != self.flops_per_token["attn_linear"]
+            if (_linear_macs(_attention_block(layer)) != self.flops_per_token["attn_linear"]
                     or _linear_macs(layer.mlp) != self.flops_per_token["mlp"]):
                 raise ValueError("DropBP's accounting assumes identical layers")
         self._rng = np.random.default_rng(np.random.SeedSequence([self.policy_seed, 16, 3]))
