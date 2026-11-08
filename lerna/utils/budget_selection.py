@@ -51,6 +51,13 @@ The budget controller
     of scheduled batches (their decision scores and widths) stands in for the future batches, the
     future multipliers w are known from the schedule, and the ratio of realized to projected units
     over the window corrects the projection for trimmed padding.
+
+Round 16 hooks
+    _batch_scores (the decision scores of a batch) and _choose (which examples to keep, given pi)
+    let the compared methods in lerna/utils/compared_methods.py reuse this controller, and
+    overhead_ratio charges a scoring pass to the budget: the pass's units, and those of the
+    remaining steps' passes, are taken from the budget before mu is solved. LERNA v2's own
+    decisions are unchanged.
 """
 
 from __future__ import annotations
@@ -136,6 +143,10 @@ class LernaBudgetPolicy:
         self._win_first: deque = deque(maxlen=self.window)  # (sum w*fresh, sum w) of first visits
         self._win_all: deque = deque(maxlen=self.window)  # (sum w*fresh, sum w) of every kept example
         self._pending: Optional[dict] = None
+        # Round 16: units a subclass spends on a batch before its selection (a scoring forward
+        # pass), as a fraction of the batch's scheduled units after the warmup; 0 for LERNA v2.
+        self.overhead_ratio = 0.0
+        self.overhead_units = 0
         # accounting
         self.steps_seen = 0
         self.scheduled_units = 0
@@ -257,6 +268,40 @@ class LernaBudgetPolicy:
                 b = mid
         return math.exp(0.5 * (a + b))
 
+    # ------------------------------------------------------------------ hooks (round 16)
+    def _batch_scores(self, trainer, inputs, t: int, uids: Sequence[int], stored: np.ndarray,
+                      seen: np.ndarray, n: int, width: int):
+        """(decision scores, revisit ratio, first-visit prior, overhead units) of this batch.
+
+        LERNA v2 scores from the stored residuals and spends nothing before the selection. The
+        round-16 compared methods override this (fresh scores from a scoring pass).
+        """
+        if self.use_scores:
+            ratio, prior = self._revisit_ratio(), self._first_visit_prior()
+            s = np.where(seen, np.nan_to_num(stored) * ratio, prior)
+        else:
+            ratio, prior = None, None
+            s = np.ones(n, dtype=np.float64)
+        return s, ratio, prior, 0
+
+    def _choose(self, t: int, pi: np.ndarray, s: np.ndarray, n: int,
+                uids: Sequence[int]) -> Tuple[List[int], List[float]]:
+        """Positions kept and their weights, given the keep probabilities pi."""
+        if self.selection == "topk":
+            k = max(1, min(n, int(round(float(pi.sum())))))
+            # largest pi first; ties by the larger score, then by position
+            order = sorted(range(n), key=lambda i: (-float(pi[i]), -float(s[i]), i))
+            keep = sorted(order[:k])
+            weights = [float(n) / float(k)] * k
+        else:
+            draws = self._rng.random(n)
+            keep = [i for i in range(n) if draws[i] < pi[i]]
+            if not keep:
+                keep = [int(np.argmax(pi))]
+                self.empty_batch_fallbacks += 1
+            weights = [1.0 / float(pi[i]) for i in keep]
+        return keep, weights
+
     # ------------------------------------------------------------------ the policy interface
     def select_examples(self, trainer, inputs) -> Tuple[List[int], List[float]]:
         """Positions to keep in this batch and their loss weights (1 / pi)."""
@@ -286,18 +331,18 @@ class LernaBudgetPolicy:
         w_t = self._lr_weight(trainer, t)
         stored = self._residual[np.asarray(uids, dtype=np.int64)]
         seen = ~np.isnan(stored)
-        if self.use_scores:
-            ratio, prior = self._revisit_ratio(), self._first_visit_prior()
-            s = np.where(seen, np.nan_to_num(stored) * ratio, prior)
-        else:
-            ratio, prior = None, None
-            s = np.ones(n, dtype=np.float64)
+        s, ratio, prior, overhead = self._batch_scores(trainer, inputs, t, uids, stored, seen, n, width)
         if t < self.warmup_steps:
             mu = None
             pi = np.ones(n, dtype=np.float64)
         else:
             est_total = self.scheduled_units + (self.total_steps - t - 1) * (self.scheduled_units / (t + 1))
             remaining = self.budget * est_total - self.spent_units
+            if self.overhead_ratio:
+                # Round 16: this batch's scoring pass and those of the remaining steps are spent
+                # whatever is kept, so only the rest of the budget is left for the kept examples.
+                remaining = (remaining - overhead
+                             - self.overhead_ratio * (self.total_steps - t - 1) * (self.scheduled_units / (t + 1)))
             mu = self._solve_mu(t, w_t, s, width, remaining)
             if mu == 0.0:
                 pi = np.ones(n, dtype=np.float64)
@@ -308,22 +353,13 @@ class LernaBudgetPolicy:
             else:
                 pi = np.clip(w_t * s / mu, self.pi_min, 1.0)
         self.last_pi, self.last_mu, self.last_scores = pi.copy(), mu, np.array(s, dtype=np.float64)
-        if self.selection == "topk":
-            k = max(1, min(n, int(round(float(pi.sum())))))
-            # largest pi first; ties by the larger score, then by position
-            order = sorted(range(n), key=lambda i: (-float(pi[i]), -float(s[i]), i))
-            keep = sorted(order[:k])
-            weights = [float(n) / float(k)] * k
-        else:
-            draws = self._rng.random(n)
-            keep = [i for i in range(n) if draws[i] < pi[i]]
-            if not keep:
-                keep = [int(np.argmax(pi))]
-                self.empty_batch_fallbacks += 1
-            weights = [1.0 / float(pi[i]) for i in keep]
+        keep, weights = self._choose(t, pi, s, n, uids)
         longest = max(max(lengths[i] for i in keep), 1)
         realized = 3 * len(keep) * longest
         self.spent_units += realized
+        if overhead:
+            self.spent_units += overhead
+            self.overhead_units += overhead
         self._win_scores.append(np.array(s, dtype=np.float64))
         self._win_width.append(width)
         self._win_proj.append(3.0 * width * float(pi.sum()))
