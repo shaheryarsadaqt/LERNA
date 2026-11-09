@@ -204,7 +204,10 @@ ARMS = ["gate_s1_p1", "gate_s1_p4", "control_uniform_p1", "control_uniform_p4",
         # comparison (lerna/utils/compared_methods.py).
         "lerna2_nolr_b040", "lerna2_nolr_b060", "lerna2_nolr_b083",
         "egreedy_b035", "ucb_b035", "orderdp_b035", "isfresh_b060", "isfresh_b083",
-        "sb_b060", "sb_b083", "kakurenbo", "ies", "dropbp_p050", "dropbp_p0875"]
+        "sb_b060", "sb_b083", "kakurenbo", "ies", "dropbp_p050", "dropbp_p0875",
+        # Round 18 addition (9 Nov 2026): the plain run at 35% of the steps, the same compute
+        # as LERNA v2 at 35%, for the causal LLMs.
+        "plain_035"]
 
 # Round 14: LERNA v2 arms -> (compute budget as a fraction of full fine-tuning,
 # use the stored residual scores, use the learning-rate factor). The random-keep
@@ -257,7 +260,7 @@ GATE_ARMS = {
     "stale_s1_p4": (4, "s1_stale"),
 }
 # Plain fractions: round(fraction * T) ordinary steps with their own LR schedule.
-PLAIN_FRACTIONS = {"plain_030": 0.30, "plain_050": 0.50, "plain_070": 0.70}
+PLAIN_FRACTIONS = {"plain_030": 0.30, "plain_050": 0.50, "plain_070": 0.70, "plain_035": 0.35}
 # Plain arms: no skip gate; every scheduled batch is an ordinary training step
 # (InfoBatch drops examples inside a batch but never skips a step).
 PLAIN_ARMS = (("full_finetune", "reduced_steps", "equal_compute") + tuple(PLAIN_FRACTIONS) + ("infobatch",)
@@ -2607,6 +2610,10 @@ def _runtime_block(trainer, model, cfg: ExperimentConfig) -> dict:
         info["model_error"] = f"{type(e).__name__}: {e}"
     mcfg = getattr(model, "config", None)
     info["attn_implementation"] = getattr(mcfg, "_attn_implementation", None) if mcfg is not None else None
+    # round 18: the causal LLMs recompute activations in the backward pass (gradient checkpointing)
+    info["gradient_checkpointing"] = bool(getattr(model, "is_gradient_checkpointing", False))
+    info["model_type"] = getattr(mcfg, "model_type", None) if mcfg is not None else None
+    info["model_class"] = type(model).__name__
     info["cudnn_deterministic"] = bool(torch.backends.cudnn.deterministic)
     info["cudnn_benchmark"] = bool(torch.backends.cudnn.benchmark)
     if torch.cuda.is_available():

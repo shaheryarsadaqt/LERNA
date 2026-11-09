@@ -54,6 +54,24 @@ def _ultrabert_module():
     return ultrabert_model
 
 
+def is_causal_lm_model(model_name: str) -> bool:
+    """Round 18: the decoder-only LLMs (lerna/utils/causal_lm_classifier.py)."""
+    return _causal_lm_module().is_causal_lm_model(model_name)
+
+
+def _causal_lm_module():
+    try:
+        from . import causal_lm_classifier
+    except ImportError:
+        spec = importlib.util.spec_from_file_location(
+            "lerna_model_loader_causal_lm_classifier", Path(__file__).with_name("causal_lm_classifier.py"))
+        if spec is None or spec.loader is None:
+            raise ImportError("could not load lerna.utils.causal_lm_classifier")
+        causal_lm_classifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(causal_lm_classifier)
+    return causal_lm_classifier
+
+
 def _require_pinned(model_name: str, revision: Optional[str]) -> str:
     if (not isinstance(revision, str) or len(revision) != 40
             or any(ch not in "0123456789abcdef" for ch in revision)):
@@ -84,6 +102,10 @@ def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_fil
     if is_ultrabert_model(model_name):
         # always from the local Hub cache, at a pinned revision
         return _ultrabert_module().load_ultrabert_tokenizer(model_name, revision=_require_pinned(model_name, revision))
+    if is_causal_lm_model(model_name):
+        # Round 18: the model's own tokenizer behind the round-18 input format, from the local
+        # Hub cache at a pinned revision
+        return _causal_lm_module().load_causal_lm_tokenizer(model_name, revision=_require_pinned(model_name, revision))
     if is_ettin_model(model_name):
         validated_revision = validate_ettin_revision(model_name, revision)
         if validated_revision is None:
@@ -124,6 +146,18 @@ def load_model_and_tokenizer(
         ub = _ultrabert_module()
         tokenizer = ub.load_ultrabert_tokenizer(model_name, revision=pinned)
         model = ub.load_ultrabert_for_sequence_classification(
+            model_name, revision=pinned, num_labels=num_labels, problem_type=problem_type)
+        return model, tokenizer
+
+    if is_causal_lm_model(model_name):
+        # Round 18: a decoder-only LLM with a last-token head, FP32, eager attention and gradient
+        # checkpointing, from the local Hub cache at a pinned revision; only the head is new.
+        if device_map is not None:
+            raise ValueError("the round-18 LLMs are loaded without device_map; the trainer places them")
+        pinned = _require_pinned(model_name, revision)
+        cl = _causal_lm_module()
+        tokenizer = cl.load_causal_lm_tokenizer(model_name, revision=pinned)
+        model = cl.load_causal_lm_for_sequence_classification(
             model_name, revision=pinned, num_labels=num_labels, problem_type=problem_type)
         return model, tokenizer
 
@@ -173,4 +207,8 @@ MODELS = {
     "deberta": "microsoft/deberta-v3-base",
     "ettin": ETTIN_MODEL_ID,
     "ultrabert": "dmis-lab/UltraBERT-150M",
+    # round 18
+    "llama-3.2-1b": "alpindale/Llama-3.2-1B",
+    "qwen3-0.6b-base": "Qwen/Qwen3-0.6B-Base",
+    "granite-3.1-1b-a400m-base": "ibm-granite/granite-3.1-1b-a400m-base",
 }
