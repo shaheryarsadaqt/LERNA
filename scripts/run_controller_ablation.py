@@ -2461,6 +2461,9 @@ def _recipe_overrides(args) -> dict:
         out["infobatch_prune_ratio"] = args.infobatch_prune_ratio
     if getattr(args, "infobatch_anneal_fraction", None) is not None:
         out["infobatch_anneal_fraction"] = args.infobatch_anneal_fraction
+    if getattr(args, "learning_rate", None) is not None:
+        # round 17: the second model's learning rate, set by its pilot's rule
+        out["learning_rate"] = args.learning_rate
     return out
 
 
@@ -2648,6 +2651,9 @@ def main() -> int:
                         help="InfoBatch arm: drop probability of a below-mean-loss example (default 0.5)")
     parser.add_argument("--infobatch-anneal-fraction", type=float, default=None,
                         help="InfoBatch arm: no pruning from step floor(fraction * T) on (default 0.875)")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="peak learning rate (default 2e-5, the archived recipe; round 17's second model "
+                             "takes the one its pilot's rule chose)")
     parser.add_argument("--lr-schedule-shape", default=None,
                         choices=["constant_with_warmup", "constant", "linear", "cosine"])
     parser.add_argument("--lr-warmup-steps", type=int, default=None)

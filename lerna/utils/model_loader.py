@@ -28,10 +28,37 @@ except ImportError:
 
 _MODERNBERT_PREFIXES = ("answerdotai/ModernBERT",)
 _ETTIN_PREFIXES = ("jhu-clsp/ettin-encoder-150m",)
+# Round 17: UltraBERT runs on LERNA's own implementation (lerna/utils/ultrabert_model.py),
+# because transformers 4.56 has none.
+_ULTRABERT_PREFIXES = ("dmis-lab/UltraBERT-",)
 
 
 def is_ettin_model(model_name: str) -> bool:
     return any(model_name.startswith(p) for p in _ETTIN_PREFIXES)
+
+
+def is_ultrabert_model(model_name: str) -> bool:
+    return isinstance(model_name, str) and any(model_name.startswith(p) for p in _ULTRABERT_PREFIXES)
+
+
+def _ultrabert_module():
+    try:
+        from . import ultrabert_model
+    except ImportError:
+        spec = importlib.util.spec_from_file_location(
+            "lerna_model_loader_ultrabert_model", Path(__file__).with_name("ultrabert_model.py"))
+        if spec is None or spec.loader is None:
+            raise ImportError("could not load lerna.utils.ultrabert_model")
+        ultrabert_model = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ultrabert_model)
+    return ultrabert_model
+
+
+def _require_pinned(model_name: str, revision: Optional[str]) -> str:
+    if (not isinstance(revision, str) or len(revision) != 40
+            or any(ch not in "0123456789abcdef" for ch in revision)):
+        raise ValueError(f"{model_name} requires an explicit 40-character lowercase hex revision; got {revision!r}")
+    return revision
 
 
 def _accepts_reference_compile() -> bool:
@@ -54,6 +81,9 @@ def _accepts_reference_compile() -> bool:
 
 def load_tokenizer(model_name: str, *, revision: Optional[str] = None, local_files_only: bool = False):
     """Load tokenizer assets without model weights for CPU-side planning."""
+    if is_ultrabert_model(model_name):
+        # always from the local Hub cache, at a pinned revision
+        return _ultrabert_module().load_ultrabert_tokenizer(model_name, revision=_require_pinned(model_name, revision))
     if is_ettin_model(model_name):
         validated_revision = validate_ettin_revision(model_name, revision)
         if validated_revision is None:
@@ -85,6 +115,18 @@ def load_model_and_tokenizer(
     when the installed transformers still has that option
     Others: standard AutoModel loading
     """
+    if is_ultrabert_model(model_name):
+        # Round 17: LERNA's UltraBERT implementation, eager attention, FP32, from the local
+        # Hub cache at a pinned revision; only the classifier is newly initialized.
+        if device_map is not None:
+            raise ValueError("UltraBERT is loaded without device_map; the trainer places it")
+        pinned = _require_pinned(model_name, revision)
+        ub = _ultrabert_module()
+        tokenizer = ub.load_ultrabert_tokenizer(model_name, revision=pinned)
+        model = ub.load_ultrabert_for_sequence_classification(
+            model_name, revision=pinned, num_labels=num_labels, problem_type=problem_type)
+        return model, tokenizer
+
     is_modernbert = any(model_name.startswith(p) for p in _MODERNBERT_PREFIXES)
     is_ettin = is_ettin_model(model_name)
 
@@ -130,4 +172,5 @@ MODELS = {
     "modernbert": "answerdotai/ModernBERT-base",
     "deberta": "microsoft/deberta-v3-base",
     "ettin": ETTIN_MODEL_ID,
+    "ultrabert": "dmis-lab/UltraBERT-150M",
 }
